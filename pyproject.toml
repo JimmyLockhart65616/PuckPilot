@@ -1,0 +1,47 @@
+[project]
+name = "puckpilot"
+version = "0.1.0"
+description = "Yahoo fantasy hockey manager: draft-day analytics, automated daily lineups, waiver sniping with human-in-the-loop approvals"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "yahoo-fantasy-api>=2.9",
+    "yahoo-oauth>=2.0",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pandas>=2.2",
+    "scipy>=1.14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "respx>=0.21",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+ppilot = "puckpilot.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/puckpilot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: hits real external APIs; excluded by default (run with: pytest -m live)",
+]
+addopts = "-m 'not live'"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

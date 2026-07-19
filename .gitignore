@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# secrets & local state
+.env
+secrets/
+data/*.db
+data/*.db-*
+data/cache/
+
+# internal working notes — not for the public repo
+docs/STATUS.md
+
+.pytest_cache/
+.ruff_cache/
