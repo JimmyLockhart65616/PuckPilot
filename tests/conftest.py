@@ -16,7 +16,23 @@ def add_player(conn, pid, name, pos, team="AAA"):
     store.upsert_player(conn, pid, name, pos, team)
 
 
-def add_skater_game(conn, pid, season, game_id, date="2024-01-01", **stats):
+def add_boxscore(conn, pid, season, game_id, hits=0, blocks=0, **extra):
+    """Boxscore row carrying hits/blocks, which the game-log endpoint omits."""
+    store.upsert_boxscore_rows(
+        conn,
+        [
+            (
+                game_id,
+                pid,
+                season,
+                "AAA",
+                json.dumps({"playerId": pid, "hits": hits, "blockedShots": blocks, **extra}),
+            )
+        ],
+    )
+
+
+def add_skater_game(conn, pid, season, game_id, date="2024-01-01", hits=None, blocks=None, **stats):
     entry = {
         "gameId": game_id,
         "gameDate": date,
@@ -46,6 +62,8 @@ def add_skater_game(conn, pid, season, game_id, date="2024-01-01", **stats):
         is_home=1,
         stats_json=json.dumps(entry),
     )
+    if hits is not None or blocks is not None:
+        add_boxscore(conn, pid, season, game_id, hits=hits or 0, blocks=blocks or 0)
 
 
 def add_goalie_game(

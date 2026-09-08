@@ -12,8 +12,47 @@ class Category:
     rate: bool = False  # rate stats are volume-weighted in valuation, never summed
 
 
-# Yahoo default H2H categories. The real league's set replaces these once
-# Yahoo API access lands (league settings -> Category list).
+# Every category the engines know how to score, keyed by the label leagues use
+# in their config files. Add an entry here (plus its stat mapping in
+# aggregate.SKATER_LOG_KEYS / replay.LOG_KEYS) to support a new category.
+CATALOG: dict[str, Category] = {
+    c.label: c
+    for c in (
+        Category("goals", "G", "skater"),
+        Category("assists", "A", "skater"),
+        Category("points", "P", "skater"),
+        Category("plus_minus", "+/-", "skater"),
+        Category("pim", "PIM", "skater"),
+        Category("ppp", "PPP", "skater"),
+        Category("shp", "SHP", "skater"),
+        Category("gwg", "GWG", "skater"),
+        Category("sog", "SOG", "skater"),
+        Category("hits", "HIT", "skater"),
+        Category("blocks", "BLK", "skater"),
+        Category("wins", "W", "goalie"),
+        Category("saves", "SV", "goalie"),
+        Category("shutouts", "SHO", "goalie"),
+        Category("save_pct", "SV%", "goalie", rate=True),
+        Category("gaa", "GAA", "goalie", higher_is_better=False, rate=True),
+    )
+}
+
+
+class UnknownCategory(KeyError):
+    pass
+
+
+def resolve(label: str) -> Category:
+    """Look up a category by its config label (e.g. 'SV%'), case-insensitively."""
+    for key in (label, label.upper()):
+        if key in CATALOG:
+            return CATALOG[key]
+    raise UnknownCategory(
+        f"unknown category {label!r}; known categories: {', '.join(sorted(CATALOG))}"
+    )
+
+
+# Yahoo default H2H categories, used when a league config omits them.
 SKATER_CATS_DEFAULT = (
     Category("goals", "G", "skater"),
     Category("assists", "A", "skater"),

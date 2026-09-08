@@ -28,9 +28,18 @@ class LeagueShape:
     bench_slots: int = 4
 
     @property
+    def roster_size(self) -> int:
+        return sum(n for _, n in self.slots) + self.util_slots + self.bench_slots
+
+    @property
+    def bench_skater_slots(self) -> int:
+        """Bench spots that realistically hold skaters — one tends to go to a 3rd goalie."""
+        return max(0, self.bench_slots - 1)
+
+    @property
     def skater_pool_size(self) -> int:
         starters = sum(n for pos, n in self.slots if pos != "G") + self.util_slots
-        return self.n_teams * (starters + 3)
+        return self.n_teams * (starters + self.bench_skater_slots)
 
     @property
     def goalie_pool_size(self) -> int:

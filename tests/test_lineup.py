@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from puckpilot.data.goalies import HindsightGoalieSource, NoisyGoalieSource
-from puckpilot.draft.replay import ReplayData
+from puckpilot.draft.replay import G_GA, G_HOURS, G_SA, G_STARTS, G_WIDTH, G_WINS, ReplayData
 from puckpilot.engine.lineup import optimize_lineup, slot_instances
 from puckpilot.engine.lineup_replay import (
     GameValueModel,
@@ -71,7 +71,9 @@ def _fixture_data():
         2: {0: np.array([0.0, 1, 0, 0, 0, 1])},
         3: {1: np.array([3.0, 2, 1, 0, 1, 5])},
     }
-    data.goalie = {10: {0: np.array([1.0, 0, 2.0, 30.0, 1.0])}}
+    gv = np.zeros(G_WIDTH)
+    gv[G_WINS], gv[G_GA], gv[G_SA], gv[G_HOURS], gv[G_STARTS] = 1.0, 2.0, 30.0, 1.0, 1.0
+    data.goalie = {10: {0: gv}}
     return data
 
 
@@ -90,7 +92,50 @@ def test_policy_ordering_hindsight_beats_all():
     h = _hindsight_total(roster, positions, data, SHAPE, vm)
     o = _daily_optimizer_total(roster, positions, pg, data, SHAPE, avail, Hind(), vm)
     b = _set_and_forget_total(roster, positions, pg, data, SHAPE, vm)
-    assert h >= o >= b > 0
+    # on a fixture this small the three policies can tie exactly; allow float slack
+    tol = 1e-9
+    assert h + tol >= o
+    assert o + tol >= b
+    assert b > 0
+
+
+def test_weekly_goalie_minimum_forces_a_start():
+    """A goalie too weak to be worth starting must still be played when the
+    week's remaining days can no longer satisfy the league minimum."""
+    data = ReplayData()
+    data.dates = ["2025-10-06", "2025-10-07"]  # same fantasy week
+    gv = np.zeros(G_WIDTH)
+    gv[G_WINS], gv[G_GA], gv[G_SA], gv[G_HOURS], gv[G_STARTS] = 1.0, 2.0, 30.0, 1.0, 1.0
+    data.goalie = {10: {0: gv, 1: gv}}
+    data.skater = {1: {0: np.array([2.0, 1, 0, 0, 1, 4])}}
+
+    vm = GameValueModel(data, {1, 10})
+    positions = {1: "C", 10: "G"}
+    pg = {1: 5.0, 10: -99.0}  # goalie is actively bad by projection
+    avail = {1: {0}}
+
+    class AlwaysStarting:
+        def starts(self, date):
+            return {10: 1.0}
+
+    roster = [1, 10]
+    unconstrained = _daily_optimizer_total(
+        roster, positions, pg, data, SHAPE, avail, AlwaysStarting(), vm
+    )
+    forced = _daily_optimizer_total(
+        roster,
+        positions,
+        pg,
+        data,
+        SHAPE,
+        avail,
+        AlwaysStarting(),
+        vm,
+        min_goalie_appearances=2,
+    )
+    # unconstrained benches the negative-value goalie; the floor plays him twice
+    assert forced > unconstrained
+    assert forced == pytest.approx(unconstrained + 2 * vm.goalie(gv))
 
 
 def test_game_value_model_orders_lines():

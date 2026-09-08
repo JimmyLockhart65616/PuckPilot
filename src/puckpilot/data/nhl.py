@@ -66,5 +66,9 @@ class NhlClient:
     def boxscore(self, game_id: int) -> dict:
         return self._get(f"/gamecenter/{game_id}/boxscore")
 
+    def roster(self, team_abbrev: str, season: str) -> dict:
+        """Team roster with biographical fields (birthDate, height, weight)."""
+        return self._get(f"/roster/{team_abbrev}/{season}")
+
     def standings_now(self) -> dict:
         return self._get("/standings/now")

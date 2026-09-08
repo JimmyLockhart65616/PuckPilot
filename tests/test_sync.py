@@ -12,6 +12,7 @@ class FakeNhl:
 
     def __init__(self):
         self.game_log_calls = []
+        self.boxscore_calls = []
 
     def standings_now(self):
         return {
@@ -32,6 +33,25 @@ class FakeNhl:
             "awayTeam": {"abbrev": "CGY"},
         }
         return {"games": [game]}
+
+    def boxscore(self, game_id):
+        self.boxscore_calls.append(game_id)
+        return {
+            "awayTeam": {"abbrev": "CGY"},
+            "homeTeam": {"abbrev": "EDM"},
+            "playerByGameStats": {
+                "homeTeam": {
+                    "forwards": [{"playerId": 8478402, "hits": 3, "blockedShots": 1}],
+                    "defense": [{"playerId": 8477498, "hits": 5, "blockedShots": 4}],
+                    "goalies": [{"playerId": 8479973, "saves": 28, "starter": True}],
+                },
+                "awayTeam": {
+                    "forwards": [{"playerId": 8480012, "hits": 2, "blockedShots": 0}],
+                    "defense": [],
+                    "goalies": [],
+                },
+            },
+        }
 
     def player_game_log(self, player_id, season, game_type=2):
         self.game_log_calls.append((player_id, season))
@@ -137,6 +157,37 @@ def test_current_season_logs_always_refetched(tmp_path):
     assert len(nhl.game_log_calls) == 4
     done_keys = conn.execute("SELECT key FROM sync_meta WHERE value='done'").fetchall()
     assert done_keys == []
+
+
+def test_sync_boxscores_stores_hits_and_blocks(tmp_path):
+    conn = _db(tmp_path)
+    nhl = FakeNhl()
+    sync.sync_schedules(conn, nhl, [COMPLETED], delay=0)
+    report = sync.sync_boxscores(conn, nhl, [COMPLETED], delay=0, today=date(2024, 6, 1))
+
+    assert report[COMPLETED]["synced"] == 1
+    assert report[COMPLETED]["rows"] == 4  # both teams, all three player groups
+    row = conn.execute("SELECT * FROM nhl_boxscore_stats WHERE player_id = 8477498").fetchone()
+    assert row["team_abbrev"] == "EDM"
+    stats = json.loads(row["stats_json"])
+    assert (stats["hits"], stats["blockedShots"]) == (5, 4)
+
+
+def test_sync_boxscores_is_incremental_and_skips_unplayed(tmp_path):
+    conn = _db(tmp_path)
+    nhl = FakeNhl()
+    sync.sync_schedules(conn, nhl, [COMPLETED], delay=0)
+
+    # game_date 2023-10-08 is still in the future -> nothing to fetch yet
+    report = sync.sync_boxscores(conn, nhl, [COMPLETED], delay=0, today=date(2023, 10, 1))
+    assert report[COMPLETED]["games"] == 0
+    assert nhl.boxscore_calls == []
+
+    sync.sync_boxscores(conn, nhl, [COMPLETED], delay=0, today=date(2024, 6, 1))
+    assert len(nhl.boxscore_calls) == 1
+    report = sync.sync_boxscores(conn, nhl, [COMPLETED], delay=0, today=date(2024, 6, 1))
+    assert report[COMPLETED]["skipped"] == 1
+    assert len(nhl.boxscore_calls) == 1  # not refetched
 
 
 def test_unpublished_season_is_skipped(tmp_path):

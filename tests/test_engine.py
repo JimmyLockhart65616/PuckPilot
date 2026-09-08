@@ -3,7 +3,13 @@ import pytest
 
 from puckpilot.engine import aggregate, valuation
 from puckpilot.engine.categories import GOALIE_CATS_DEFAULT, Category
-from puckpilot.engine.projections import blend_counting, project_goalies
+from puckpilot.engine.projections import (
+    AGE_CLIP,
+    AGE_PEAK,
+    age_factor,
+    blend_counting,
+    project_goalies,
+)
 from tests.conftest import add_goalie_game, add_player, add_skater_game
 
 
@@ -39,6 +45,30 @@ def test_season_aggregates_splits_and_sums(db):
     assert g["shots_against"] == 50
     assert g["save_pct"] == pytest.approx(1 - 3 / 50)
     assert g["gaa"] == pytest.approx(3 / 1.5)  # 3 GA in 90 minutes
+
+
+def test_season_aggregates_pulls_hits_blocks_from_boxscores(db):
+    add_player(db, 1, "Grinder", "L")
+    add_skater_game(db, 1, "20242025", 100, goals=1, hits=4, blocks=2)
+    add_skater_game(db, 1, "20242025", 101, goals=0, hits=3, blocks=1)
+    add_skater_game(db, 1, "20242025", 102, goals=1)  # no boxscore row at all
+
+    skaters, _ = aggregate.season_aggregates(db, "20242025")
+    s = skaters.loc[1]
+    assert s["gp"] == 3
+    assert s["goals"] == 2
+    # the game missing its boxscore contributes 0 rather than dropping the game
+    assert s["hits"] == 7
+    assert s["blocks"] == 3
+
+
+def test_season_aggregates_derives_goalie_saves(db):
+    add_player(db, 2, "Goalie One", "G")
+    add_goalie_game(db, 2, "20242025", 100, shots_against=30, goals_against=3)
+    add_goalie_game(db, 2, "20242025", 101, shots_against=20, goals_against=0)
+
+    _, goalies = aggregate.season_aggregates(db, "20242025")
+    assert goalies.loc[2, "saves"] == 47  # (30-3) + (20-0)
 
 
 def test_season_games_from_schedule(db):
@@ -110,7 +140,103 @@ def test_project_goalies_volume_weighted_rates():
     assert out.loc[1, "save_pct"] == pytest.approx(96 / 110)  # (0.5*90+0.3*170)/(0.5*100+0.3*200)
     assert out.loc[1, "gaa"] == pytest.approx(14 / 11)  # (0.5*10+0.3*30)/(0.5*10+0.3*20)
     assert out.loc[1, "proj_gp"] == pytest.approx(14.4)
-    assert out.loc[1, "wins"] == pytest.approx(0.4625 * 14.4)
+    # counting stats are sample-weighted: (0.5*5 + 0.3*8) wins over
+    # (0.5*10 + 0.3*20) games, so the 20-game season outweighs the 10-game one.
+    # Averaging the per-season rates instead would give 0.4625/game.
+    assert out.loc[1, "wins"] == pytest.approx((4.9 / 11.0) * 14.4)
+    assert out.loc[1, "saves"] == pytest.approx(
+        out.loc[1, "shots_against"] - out.loc[1, "goals_against"]
+    )
+
+
+def test_blend_counting_weights_by_sample_size():
+    """A 60-game season must outweigh a 10-game hot streak in the same weight slot."""
+    recent = _frame({1: {"gp": 10, "goals": 10}})  # 1.0 g/gm over 10 games
+    older = _frame({1: {"gp": 60, "goals": 12}})  # 0.2 g/gm over 60 games
+    out = blend_counting([(recent, 82), (older, 82)], (0.5, 0.5), ["goals"], 82, 1)
+    rate = out.loc[1, "goals"] / out.loc[1, "proj_gp"]
+    # sample-weighted: (0.5*10 + 0.5*12) / (0.5*10 + 0.5*60) = 11/35
+    assert rate == pytest.approx(11 / 35)
+    assert rate < 0.6  # a plain average of the two rates would give 0.6
+
+
+def test_gp_regression_shrinks_availability_toward_the_mean():
+    """Games played is only ~0.45 repeatable, so an outlier gets pulled in."""
+    frames = [
+        (_frame({1: {"gp": 82, "goals": 20}, 2: {"gp": 20, "goals": 5}}), 82),
+    ]
+    raw = blend_counting(frames, (1.0,), ["goals"], 82, 1, gp_regress=0.0)
+    shrunk = blend_counting(frames, (1.0,), ["goals"], 82, 1, gp_regress=1.5)
+    # the iron man comes down, the part-timer comes up, order preserved
+    assert shrunk.loc[1, "proj_gp"] < raw.loc[1, "proj_gp"]
+    assert shrunk.loc[2, "proj_gp"] > raw.loc[2, "proj_gp"]
+    assert shrunk.loc[1, "proj_gp"] > shrunk.loc[2, "proj_gp"]
+
+
+def test_blend_counting_tolerates_unsynced_seasons():
+    """Configuring 3 training seasons but syncing 2 must degrade, not crash."""
+    real = _frame({1: {"gp": 40, "goals": 20}})
+    out = blend_counting(
+        [(real, 82), (pd.DataFrame(), 82)], (0.5, 0.3), ["goals"], 82, min_train_gp=1
+    )
+    assert out.loc[1, "goals"] > 0
+    empty = blend_counting([(pd.DataFrame(), 82)], (1.0,), ["goals"], 82, 1)
+    assert empty.empty and "proj_gp" in empty.columns
+
+
+def test_age_factor_rewards_youth_and_fades_veterans():
+    ages = pd.Series({1: 21.0, 2: AGE_PEAK, 3: 36.0, 4: float("nan")})
+    f = age_factor(ages)
+    assert f[1] > 1.0  # ascending
+    assert f[2] == pytest.approx(1.0)  # at peak
+    assert f[3] < 1.0  # declining
+    assert f[4] == 1.0  # unknown age is never penalised
+    assert f.between(*AGE_CLIP).all()
+
+
+def test_goalie_wins_blend_toward_team_strength():
+    """A goalie on a strong team gets a win bump; one on a weak team gets docked,
+    even with identical personal win rates."""
+    # two goalies per team so the leave-one-out team rate is non-trivial
+    frame = _frame(
+        {
+            1: {"gp": 40, "wins": 20, "shutouts": 2, "shots_against": 1200,
+                "goals_against": 100, "toi_hours": 40.0, "team": "STRONG"},
+            2: {"gp": 20, "wins": 12, "shutouts": 1, "shots_against": 600,
+                "goals_against": 50, "toi_hours": 20.0, "team": "STRONG"},
+            3: {"gp": 40, "wins": 20, "shutouts": 2, "shots_against": 1200,
+                "goals_against": 100, "toi_hours": 40.0, "team": "WEAK"},
+            4: {"gp": 20, "wins": 4, "shutouts": 0, "shots_against": 600,
+                "goals_against": 60, "toi_hours": 20.0, "team": "WEAK"},
+        }
+    )
+    base = project_goalies([(frame, 82)], 82, (1.0,), team_win_blend=0.0)
+    blended = project_goalies([(frame, 82)], 82, (1.0,), team_win_blend=0.5)
+    # goalies 1 and 3 have identical personal stats (0.5 win rate) but 1's
+    # teammate wins more, so 1's projected wins rise above 3's after blending
+    assert base.loc[1, "wins"] == pytest.approx(base.loc[3, "wins"])
+    assert blended.loc[1, "wins"] > blended.loc[3, "wins"]
+
+
+def test_age_never_pushes_save_pct_above_one():
+    """Age must scale goalie volume, not the derived rates."""
+    young = _frame(
+        {
+            9: {
+                "gp": 60,
+                "wins": 30,
+                "shutouts": 3,
+                "shots_against": 1800,
+                "goals_against": 150,
+                "toi_hours": 60.0,
+            }
+        }
+    )
+    out = project_goalies([(young, 82)], 82, (1.0,), ages=pd.Series({9: 20.0}))
+    assert 0.0 < out.loc[9, "save_pct"] < 1.0
+    assert out.loc[9, "saves"] == pytest.approx(
+        out.loc[9, "shots_against"] - out.loc[9, "goals_against"]
+    )
 
 
 def test_value_players_counting_z():

@@ -17,13 +17,16 @@ from puckpilot.draft.engine import (
     RosterValuePolicy,
     Universe,
 )
-from puckpilot.draft.replay import build_replay_data, replay_roster, roto_standings
+from puckpilot.draft.h2h import run_h2h_season
+from puckpilot.draft.replay import G_WIDTH, build_replay_data, replay_roster, roto_standings
 from puckpilot.engine import projections
 from puckpilot.engine.aggregate import season_aggregates
 from puckpilot.engine.valuation import rank_players
+from puckpilot.league import DEFAULT_LEAGUE, LeagueConfig
 
 UNIVERSE_SIZE = 350
-PUNTABLE = ["plus_minus", "pim", "sog"]
+# peripheral categories a punt strategy might concede (scoring cats never are)
+PUNTABLE_KEYS = {"plus_minus", "pim", "sog", "hits", "blocks", "ppp"}
 
 
 def snake_order(n_teams: int, rounds: int) -> list[int]:
@@ -34,15 +37,106 @@ def snake_order(n_teams: int, rounds: int) -> list[int]:
     return order
 
 
+def simulate_keepers(
+    u: Universe,
+    n_teams: int,
+    n_keepers: int,
+    rng: np.random.Generator,
+    pool_factor: float = 1.5,
+) -> dict[int, list[int]]:
+    """Plausible keeper assignment when the real keeper list is unknown.
+
+    Keepers skew elite but aren't simply the top N — managers also hold mid-round
+    value contracts. Modelled as a uniform draw from the top
+    `n_teams * n_keepers * pool_factor` by ADP, dealt evenly across seats.
+    Replace with the real list (seat -> player ids) whenever it is known.
+    """
+    if n_keepers <= 0:
+        return {}
+    need = n_teams * n_keepers
+    pool_size = min(len(u), int(need * pool_factor))
+    pool = np.argsort(u.adp_rank)[:pool_size]
+    chosen = rng.choice(pool, size=need, replace=False)
+    return {
+        seat: [int(u.ids[i]) for i in chosen[seat * n_keepers : (seat + 1) * n_keepers]]
+        for seat in range(n_teams)
+    }
+
+
+def effective_adp(adp_rank: np.ndarray, avail: np.ndarray) -> np.ndarray:
+    """ADP re-ranked over available players only: 1 = first off the post-keeper board.
+
+    Unavailable players keep a rank past the end so nothing ever selects them.
+    """
+    out = np.full(len(adp_rank), float(len(adp_rank) + 1))
+    rows = np.flatnonzero(avail)
+    out[rows[np.argsort(adp_rank[rows], kind="stable")]] = np.arange(1, len(rows) + 1)
+    return out
+
+
+def keepers_for(
+    conn: sqlite3.Connection,
+    u: Universe,
+    season: str,
+    league: LeagueConfig,
+    rng: np.random.Generator,
+    warn: Callable[[str], None] | None = None,
+) -> dict[int, list[int]]:
+    """The league's recorded keeper board for `season`, or a simulated draw when
+    the config lists none. Keepers outside the universe are reported, never
+    dropped quietly — a missing keeper leaves an elite player wrongly available.
+    """
+    from puckpilot.keepers import keeper_seats, resolve_keeper_ids
+
+    n_teams = league.shape.n_teams
+    names = league.keepers_for_season(season)
+    if not names:
+        return simulate_keepers(u, n_teams, league.n_keepers, rng)
+    resolved, unmatched = resolve_keeper_ids(conn, names)
+    known = set(u.ids.tolist())
+    missing = [n for n, pid in resolved.items() if pid not in known]
+    if warn and (unmatched or missing):
+        if unmatched:
+            warn(f"  keepers not found in nhl_players: {', '.join(unmatched)}")
+        if missing:
+            warn(f"  keepers outside the ranked universe: {', '.join(missing)}")
+    return keeper_seats([pid for pid in resolved.values() if pid in known], n_teams, rng)
+
+
 def run_draft(
-    u: Universe, bots: list, rules: DraftRules, rng: np.random.Generator
+    u: Universe,
+    bots: list,
+    rules: DraftRules,
+    rng: np.random.Generator,
+    keepers: dict[int, list[int]] | None = None,
 ) -> list[list[int]]:
-    """Snake draft; returns per-seat lists of universe row indices."""
+    """Snake draft; returns per-seat lists of universe row indices.
+
+    `keepers` maps seat -> player ids already on that roster: they come off the
+    board and pre-fill position counts, but do not consume any of the
+    `rules.rounds` picks (rounds already excludes them).
+    """
     n = len(bots)
     avail = np.ones(len(u), dtype=bool)
     rosters: list[list[int]] = [[] for _ in range(n)]
     counts: list[dict[str, int]] = [{} for _ in range(n)]
     remaining = [rules.rounds] * n
+
+    if keepers:
+        row_of = {int(pid): i for i, pid in enumerate(u.ids)}
+        for seat, pids in keepers.items():
+            for pid in pids:
+                i = row_of.get(int(pid))
+                if i is None or not avail[i]:
+                    continue
+                avail[i] = False
+                rosters[seat].append(i)
+                counts[seat][u.pos[i]] = counts[seat].get(u.pos[i], 0) + 1
+        # Re-base ADP onto the post-keeper board. Keepers are elite, so leaving
+        # ADP on the full-board scale would make every remaining player look
+        # later-going than they are and wreck any pick-number comparison.
+        u = u.with_adp(effective_adp(u.adp_rank, avail))
+
     order = snake_order(n, rules.rounds)
     seat_picks: dict[int, list[int]] = {}
     for i, seat in enumerate(order):
@@ -65,17 +159,25 @@ def run_draft(
 
 
 def build_universe(
-    conn: sqlite3.Connection, target_season: str, train_seasons: tuple[str, ...]
+    conn: sqlite3.Connection,
+    target_season: str,
+    train_seasons: tuple[str, ...],
+    league: LeagueConfig = DEFAULT_LEAGUE,
 ) -> Universe:
     """Projection-ranked pool with pseudo-ADP.
 
     Pseudo-ADP = prior-season ACTUAL value order (what casual drafters chase);
     swaps for real Yahoo ADP when API access lands.
     """
+    kw = {
+        "shape": league.shape,
+        "skater_cats": league.skater_cats,
+        "goalie_cats": league.goalie_cats,
+    }
     proj_sk, proj_g = projections.project(conn, target_season, list(train_seasons))
-    ranked = rank_players(proj_sk, proj_g)
+    ranked = rank_players(proj_sk, proj_g, **kw)
     act_sk, act_g = season_aggregates(conn, train_seasons[0])
-    adp_ranked = rank_players(act_sk, act_g)
+    adp_ranked = rank_players(act_sk, act_g, **kw)
     adp = pd.Series(
         np.arange(1, len(adp_ranked) + 1, dtype=float), index=adp_ranked.index, name="adp_rank"
     )
@@ -120,8 +222,15 @@ class SimReport:
     text: str
 
 
-def _default_opponents(rng: np.random.Generator) -> list:
-    punts = rng.choice(PUNTABLE, size=2, replace=False)
+def puntable_cats(league: LeagueConfig) -> list[str]:
+    """Categories a rival plausibly concedes — the peripheral ones, never scoring."""
+    return [c.key for c in league.skater_cats if c.key in PUNTABLE_KEYS] or [
+        league.skater_cats[-1].key
+    ]
+
+
+def _default_opponents(rng: np.random.Generator, league: LeagueConfig = DEFAULT_LEAGUE) -> list:
+    punts = rng.choice(puntable_cats(league), size=2, replace=False)
     return [
         *(AdpBot(noise_sd) for noise_sd in (2, 3, 4, 5, 6, 7, 8)),
         GreedyZBot(),
@@ -136,34 +245,39 @@ def run_sims(
     n_sims: int,
     seed: int | None = None,
     target_season: str = "20252026",
-    train_seasons: tuple[str, ...] = ("20242025", "20232024"),
+    train_seasons: tuple[str, ...] = ("20242025", "20232024", "20222023"),
     rules: DraftRules | None = None,
     top_k: int = 3,
     engine_factory: Callable[[], object] | None = None,
+    league: LeagueConfig = DEFAULT_LEAGUE,
+    scoring: str = "h2h",
     progress: Callable[[str], None] | None = None,
 ) -> SimReport:
     """Monte Carlo snake drafts vs bot field, each roster replayed over the
     REAL target season (walk-forward: projections never see target data).
 
-    Success criterion: engine's top-k finish rate beats the best bot archetype's
-    per-team rate (one-sided two-proportion z-test).
+    scoring='h2h' plays the league's real weekly category matchups plus a
+    reseeded playoff bracket; 'roto' keeps the older season-total ranking as a
+    regression baseline. Success criterion: engine's top-k finish rate beats the
+    best bot archetype's per-team rate (one-sided two-proportion z-test).
     """
-    rules = rules or DraftRules()
+    rules = rules or league.draft_rules()
     shape = rules.shape
     engine_factory = engine_factory or RosterValuePolicy
     rng = np.random.default_rng(seed)
 
-    u = build_universe(conn, target_season, train_seasons)
-    data = build_replay_data(conn, target_season)
+    skater_keys = [c.key for c in league.skater_cats]
+    u = build_universe(conn, target_season, train_seasons, league)
+    data = build_replay_data(conn, target_season, skater_keys)
     positions = dict(zip(u.ids.tolist(), u.pos.tolist(), strict=True))
     scalar = dict(zip(u.ids.tolist(), u.z_total.tolist(), strict=True))
 
     engine_finishes: list[int] = []
     bot_finishes: dict[str, list[int]] = defaultdict(list)
-    n_cats = 6
+    n_weeks = max(data.n_weeks, 1)
     for s in range(n_sims):
         engine_seat = int(rng.integers(0, shape.n_teams))
-        opponents = _default_opponents(rng)
+        opponents = _default_opponents(rng, league)
         order = rng.permutation(len(opponents))
         bots = []
         oi = 0
@@ -174,13 +288,29 @@ def run_sims(
                 bots.append(opponents[order[oi]])
                 oi += 1
 
-        rosters = run_draft(u, bots, rules, rng)
-        sk = np.zeros((shape.n_teams, n_cats))
-        g = np.zeros((shape.n_teams, 5))
+        keepers = keepers_for(conn, u, target_season, league, rng)
+        rosters = run_draft(u, bots, rules, rng, keepers)
+        sk = np.zeros((shape.n_teams, n_weeks, len(skater_keys)))
+        g = np.zeros((shape.n_teams, n_weeks, G_WIDTH))
         for t, ridx in enumerate(rosters):
             ids = [int(u.ids[i]) for i in ridx]
             sk[t], g[t] = replay_roster(ids, positions, scalar, data, shape)
-        _points, finish = roto_standings(sk, g)
+
+        if scoring == "h2h":
+            finish = run_h2h_season(
+                sk,
+                g,
+                league.skater_cats,
+                league.goalie_cats,
+                skater_keys,
+                regular_weeks=league.regular_weeks,
+                playoff_teams=league.playoff_teams,
+                playoff_weeks=league.playoff_weeks,
+            ).finish
+        else:
+            _points, finish = roto_standings(
+                sk, g, league.skater_cats, league.goalie_cats, skater_keys
+            )
 
         engine_finishes.append(int(finish[engine_seat]))
         for t, bot in enumerate(bots):
@@ -208,9 +338,11 @@ def run_sims(
 
     ci = wilson_ci(k_e, n_sims)
     baseline = top_k / shape.n_teams
+    keeper_note = f", {league.n_keepers} keepers/team" if league.n_keepers else ""
     lines = [
-        f"Draft sim: {n_sims} snake drafts, {shape.n_teams} teams, {rules.rounds} rounds, "
-        f"target {target_season} (walk-forward), replay on real game logs",
+        f"Draft sim: {n_sims} snake drafts, {shape.n_teams} teams, {rules.rounds} rounds"
+        f"{keeper_note}, target {target_season} (walk-forward), replay on real game logs",
+        f"League: {league.name} ({len(league.all_cats)} cats, {scoring.upper()} scoring)",
         f"Random-seat baseline top-{top_k} rate: {baseline:.3f}",
         "",
         f"engine     top-{top_k} {engine_rate:.3f}  CI [{ci[0]:.3f}, {ci[1]:.3f}]  "

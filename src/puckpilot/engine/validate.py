@@ -7,8 +7,8 @@ from scipy.stats import spearmanr
 
 from puckpilot.engine import projections
 from puckpilot.engine.aggregate import season_aggregates
-from puckpilot.engine.categories import GOALIE_CATS_DEFAULT, SKATER_CATS_DEFAULT
-from puckpilot.engine.valuation import DEFAULT_SHAPE, LeagueShape, rank_players
+from puckpilot.engine.valuation import rank_players
+from puckpilot.league import DEFAULT_LEAGUE, LeagueConfig
 
 MIN_ACTUAL_GP_SKATER = 10
 MIN_ACTUAL_GP_GOALIE = 5
@@ -50,8 +50,8 @@ def _spearman(proj_ranked: pd.DataFrame, act_ranked: pd.DataFrame, act_gp: pd.Se
 def walk_forward(
     conn: sqlite3.Connection,
     target_season: str = "20252026",
-    train_seasons: tuple[str, ...] = ("20242025", "20232024"),
-    shape: LeagueShape = DEFAULT_SHAPE,
+    train_seasons: tuple[str, ...] = ("20242025", "20232024", "20222023"),
+    league: LeagueConfig = DEFAULT_LEAGUE,
 ) -> tuple[dict, str]:
     """Train on train_seasons, predict target_season, score against actuals.
 
@@ -61,17 +61,23 @@ def walk_forward(
     proj_sk, proj_g = projections.project(conn, target_season, list(train_seasons))
     act_sk, act_g = season_aggregates(conn, target_season)
 
-    sk_keys = [c.key for c in SKATER_CATS_DEFAULT]
-    g_keys = [c.key for c in GOALIE_CATS_DEFAULT]
+    skater_cats, goalie_cats = league.skater_cats, league.goalie_cats
+    rank_kw = {
+        "shape": league.shape,
+        "skater_cats": skater_cats,
+        "goalie_cats": goalie_cats,
+    }
+    sk_keys = [c.key for c in skater_cats]
+    g_keys = [c.key for c in goalie_cats]
     mae_sk = _cat_mae(proj_sk, act_sk, sk_keys, MIN_ACTUAL_GP_SKATER)
     mae_g = _cat_mae(proj_g, act_g, g_keys, MIN_ACTUAL_GP_GOALIE)
 
     act_gp = pd.concat([act_sk["gp"], act_g["gp"]])
-    act_ranked = rank_players(act_sk, act_g, shape)
-    sp = _spearman(rank_players(proj_sk, proj_g, shape), act_ranked, act_gp)
+    act_ranked = rank_players(act_sk, act_g, **rank_kw)
+    sp = _spearman(rank_players(proj_sk, proj_g, **rank_kw), act_ranked, act_gp)
 
     naive_sk, naive_g = projections.project(conn, target_season, [train_seasons[0]], weights=(1.0,))
-    sp_naive = _spearman(rank_players(naive_sk, naive_g, shape), act_ranked, act_gp)
+    sp_naive = _spearman(rank_players(naive_sk, naive_g, **rank_kw), act_ranked, act_gp)
 
     metrics = {
         "target": target_season,
@@ -86,13 +92,14 @@ def walk_forward(
 
     lines = [
         f"Walk-forward validation: train {' + '.join(train_seasons)} -> predict {target_season}",
+        f"League: {league.name} ({'/'.join(c.label for c in league.all_cats)})",
         "",
         f"Skater category MAE (n={mae_sk['n']}, actual GP >= {MIN_ACTUAL_GP_SKATER}):",
         f"  GP {mae_sk['gp']:.1f}  "
-        + "  ".join(f"{c.label} {mae_sk[c.key]:.2f}" for c in SKATER_CATS_DEFAULT),
+        + "  ".join(f"{c.label} {mae_sk[c.key]:.2f}" for c in skater_cats),
         f"Goalie category MAE (n={mae_g['n']}, actual GP >= {MIN_ACTUAL_GP_GOALIE}):",
         f"  GP {mae_g['gp']:.1f}  "
-        + "  ".join(f"{c.label} {mae_g[c.key]:.2f}" for c in GOALIE_CATS_DEFAULT),
+        + "  ".join(f"{c.label} {mae_g[c.key]:.2f}" for c in goalie_cats),
         "",
         f"Spearman rank corr, projected vs actual VORP (n={sp['n']}):",
         f"  overall {sp['overall']:.3f}   skaters {sp['skaters']:.3f}   "

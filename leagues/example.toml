@@ -1,0 +1,51 @@
+# Fantasy hockey league settings.
+#
+# Copy this file, edit it for your league, and point LEAGUE_FILE at it in your
+# .env (or pass --league <path> on the CLI). No Python changes required.
+
+name = "My League"
+league_id = "12345"          # optional; Yahoo league number, informational
+
+[roster]
+teams = 12
+# Starting slots, in order. `pos` is an NHL position: C, L (LW), R (RW), D, G.
+slots = [
+  { pos = "C", count = 2 },
+  { pos = "L", count = 2 },
+  { pos = "R", count = 2 },
+  { pos = "D", count = 4 },
+  { pos = "G", count = 2 },
+]
+util = 1                     # UTIL slots (any skater)
+bench = 3                    # bench spots; IR slots are not modelled
+
+[scoring]
+type = "h2h"                 # "h2h" (weekly category matchups) or "roto"
+# Categories by label. Skaters: G A P +/- PIM PPP SHP GWG SOG HIT BLK
+#                     Goalies: W SV SHO SV% GAA
+skater = ["G", "A", "P", "PIM", "PPP", "SOG", "HIT", "BLK"]
+goalie = ["W", "SV", "SV%"]
+
+[schedule]
+regular_weeks = 19           # weeks before the playoffs
+playoff_teams = 8
+playoff_weeks = 3
+
+[keepers]
+count = 0                    # keepers per team; 0 disables keepers entirely
+years = 3                    # seasons a player stays on contract once drafted
+
+# Players under contract going into each season's draft, by season id
+# ("YYYYYYYY"). Names are matched against the NHL player list, ignoring accents,
+# punctuation and case. Any name that fails to match is reported, never dropped.
+[keepers.by_season]
+# "20262027" = ["Connor McDavid", "Cale Makar"]
+
+[transactions]
+season_acquisitions = 65     # Yahoo "max acquisitions for entire season"
+weekly_acquisitions = 3      # Yahoo "max acquisitions per week"
+
+[lineup]
+# Yahoo forfeits your goalie categories for the week if you miss this floor,
+# so the optimizer treats it as a hard constraint. 0 disables it.
+min_goalie_appearances = 3

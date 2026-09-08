@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/puckpilot.db")
     cache_dir: Path = Path("data/cache")
     token_path: Path = Path("secrets/oauth2.json")
+    # league settings live in TOML so a different league needs no code changes
+    league_file: Path = Path("leagues/default.toml")
 
     def _resolve(self, p: Path) -> Path:
         return p if p.is_absolute() else REPO_ROOT / p
@@ -42,3 +44,7 @@ class Settings(BaseSettings):
     @property
     def resolved_token_path(self) -> Path:
         return self._resolve(self.token_path)
+
+    @property
+    def resolved_league_path(self) -> Path:
+        return self._resolve(self.league_file)

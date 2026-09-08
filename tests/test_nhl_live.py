@@ -41,6 +41,17 @@ def test_player_game_log_schema(nhl):
     )
 
 
+def test_boxscore_carries_hits_and_blocks(nhl):
+    """HIT/BLK are scoring categories but appear nowhere in the game-log endpoint;
+    this is the only source, so schema drift here silently zeroes two categories."""
+    data = nhl.boxscore(2025020001)
+    pbg = data["playerByGameStats"]
+    skater = pbg["homeTeam"]["forwards"][0]
+    assert {"playerId", "hits", "blockedShots", "goals", "assists", "sog"} <= set(skater.keys())
+    goalie = pbg["homeTeam"]["goalies"][0]
+    assert {"playerId", "saves", "shotsAgainst", "starter"} <= set(goalie.keys())
+
+
 def test_standings_has_32_teams(nhl):
     data = nhl.standings_now()
     assert len(data["standings"]) == 32

@@ -67,6 +67,29 @@ CREATE TABLE IF NOT EXISTS nhl_game_logs (
     PRIMARY KEY (player_id, game_id)
 );
 CREATE INDEX IF NOT EXISTS idx_nhl_game_logs_season ON nhl_game_logs (season, game_type);
+
+-- Per-game hits/blocks live only in the boxscore endpoint, not the player game
+-- log, so HIT/BLK categories need this table joined onto nhl_game_logs.
+CREATE TABLE IF NOT EXISTS nhl_boxscore_stats (
+    game_id     INTEGER NOT NULL,
+    player_id   INTEGER NOT NULL,
+    season      TEXT NOT NULL,
+    team_abbrev TEXT,
+    stats_json  TEXT NOT NULL,
+    PRIMARY KEY (game_id, player_id)
+);
+CREATE INDEX IF NOT EXISTS idx_nhl_boxscore_player ON nhl_boxscore_stats (player_id, season);
+
+-- Biographical data (birth date drives age curves). Kept in its own table so
+-- adding it needs no migration of nhl_players.
+CREATE TABLE IF NOT EXISTS nhl_player_bio (
+    player_id   INTEGER PRIMARY KEY,
+    birth_date  TEXT,
+    height_in   INTEGER,
+    weight_lb   INTEGER,
+    shoots      TEXT,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -178,6 +201,36 @@ def list_proposals(conn: sqlite3.Connection, status: str | None = None) -> list[
     return conn.execute(
         "SELECT * FROM waiver_proposals WHERE status = ? ORDER BY id", (status,)
     ).fetchall()
+
+
+def upsert_player_bio(
+    conn: sqlite3.Connection,
+    *,
+    player_id: int,
+    birth_date: str | None,
+    height_in: int | None,
+    weight_lb: int | None,
+    shoots: str | None,
+) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO nhl_player_bio"
+        " (player_id, birth_date, height_in, weight_lb, shoots)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (player_id, birth_date, height_in, weight_lb, shoots),
+    )
+
+
+def upsert_boxscore_rows(
+    conn: sqlite3.Connection,
+    rows: list[tuple[int, int, str, str | None, str]],
+) -> None:
+    """Bulk upsert of (game_id, player_id, season, team_abbrev, stats_json)."""
+    conn.executemany(
+        "INSERT OR REPLACE INTO nhl_boxscore_stats"
+        " (game_id, player_id, season, team_abbrev, stats_json)"
+        " VALUES (?, ?, ?, ?, ?)",
+        rows,
+    )
 
 
 def upsert_game_log(

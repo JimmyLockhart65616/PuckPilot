@@ -6,7 +6,13 @@ from puckpilot.draft.engine import DraftRules
 from puckpilot.draft.replay import ReplayData
 from puckpilot.engine.lineup_replay import GameValueModel
 from puckpilot.engine.valuation import LeagueShape
-from puckpilot.engine.waivers import best_move, blended_pg_value, expected_games
+from puckpilot.engine.waivers import (
+    best_move,
+    best_moves,
+    blended_pg_value,
+    budget_threshold,
+    expected_games,
+)
 
 RULES = DraftRules(
     shape=LeagueShape(n_teams=2, slots=(("C", 1), ("D", 1), ("G", 1)), util_slots=0),
@@ -89,6 +95,93 @@ def test_best_move_returns_none_below_threshold():
         [2], {1}, range(0, 7), 5, positions, data, vm, proj, avail, {}, RULES, min_gain=5.0
     )
     assert mv is None
+
+
+def test_budget_threshold_rises_as_acquisitions_run_short():
+    base = 0.5
+    # plenty of budget left relative to weeks -> base churn threshold
+    assert budget_threshold(40, 10, 3, base) == base
+    assert budget_threshold(10, 10, 3, base) == base
+    # one acquisition for four weeks -> only a 4x-better move is worth it
+    assert budget_threshold(1, 4, 3, base) == pytest.approx(base * 4)
+    # exhausted -> nothing clears the bar
+    assert budget_threshold(0, 5, 3, base) == float("inf")
+    # no cap configured -> unchanged
+    assert budget_threshold(None, 5, 3, base) == base
+
+
+def test_budget_threshold_respects_weekly_cap():
+    # 30 acquisitions over 2 weeks is capped at 3/week, still abundant
+    assert budget_threshold(30, 2, 3, 0.5) == 0.5
+
+
+def test_best_moves_returns_multiple_and_stops_at_max():
+    data = _data()
+    vm = GameValueModel(data, {1, 2})
+    positions = {1: "C", 2: "C", 5: "D", 10: "D", 11: "G"}
+    proj = {1: 5.0, 2: 0.1, 5: 9.0, 10: 0.2, 11: 0.3}
+    avail = {p: set(range(20)) for p in positions}
+    roster = [2, 10, 11]
+    moves = best_moves(
+        roster,
+        {1, 5},
+        range(0, 7),
+        5,
+        positions,
+        data,
+        vm,
+        proj,
+        avail,
+        {},
+        RULES,
+        min_gain=0.0,
+        max_moves=2,
+    )
+    assert len(moves) == 2
+    # both upgrades taken, each at its own position, no player added twice
+    assert {m[0] for m in moves} == {1, 5}
+    assert moves[0][2] >= moves[1][2]  # best first
+
+    capped = best_moves(
+        roster,
+        {1, 5},
+        range(0, 7),
+        5,
+        positions,
+        data,
+        vm,
+        proj,
+        avail,
+        {},
+        RULES,
+        min_gain=0.0,
+        max_moves=1,
+    )
+    assert len(capped) == 1
+
+
+def test_best_moves_zero_budget_makes_no_moves():
+    data = _data()
+    vm = GameValueModel(data, {1, 2})
+    positions = {1: "C", 2: "C"}
+    proj = {1: 9.0, 2: 0.1}
+    avail = {p: set(range(20)) for p in positions}
+    moves = best_moves(
+        [2],
+        {1},
+        range(0, 7),
+        5,
+        positions,
+        data,
+        vm,
+        proj,
+        avail,
+        {},
+        RULES,
+        min_gain=0.0,
+        max_moves=0,
+    )
+    assert moves == []
 
 
 def test_proposals_store_roundtrip(tmp_path):

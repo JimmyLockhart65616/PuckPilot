@@ -18,7 +18,14 @@ SKATER_LOG_KEYS = {
     "gameWinningGoals": "gwg",
 }
 
-SKATER_COLS = list(SKATER_LOG_KEYS.values())
+# hits/blocks are absent from the game-log endpoint and come from the boxscore
+# table instead (see data.sync.sync_boxscores); keep both mappings in sync.
+BOXSCORE_LOG_KEYS = {
+    "hits": "hits",
+    "blockedShots": "blocks",
+}
+
+SKATER_COLS = list(SKATER_LOG_KEYS.values()) + list(BOXSCORE_LOG_KEYS.values())
 
 
 def toi_seconds(toi: str) -> int:
@@ -44,10 +51,15 @@ def season_aggregates(conn: sqlite3.Connection, season: str) -> tuple[pd.DataFra
 
     skater_rows: list[dict] = []
     goalie_rows: list[dict] = []
+    # LEFT JOIN so a game missing its boxscore still counts, with hits/blocks 0
     cur = conn.execute(
-        "SELECT player_id, stats_json FROM nhl_game_logs WHERE season = ?", (season,)
+        "SELECT l.player_id, l.stats_json, b.stats_json FROM nhl_game_logs l"
+        " LEFT JOIN nhl_boxscore_stats b"
+        "   ON b.game_id = l.game_id AND b.player_id = l.player_id"
+        " WHERE l.season = ?",
+        (season,),
     )
-    for pid, stats_json in cur:
+    for pid, stats_json, box_json in cur:
         s = json.loads(stats_json)
         if pid in goalie_ids:
             sa = s.get("shotsAgainst") or 0
@@ -60,6 +72,7 @@ def season_aggregates(conn: sqlite3.Connection, season: str) -> tuple[pd.DataFra
                     "shutouts": s.get("shutouts", 0),
                     "shots_against": sa,
                     "goals_against": ga,
+                    "saves": sa - ga,
                     "toi_hours": toi_seconds(s["toi"]) / 3600 if s.get("toi") else 0.0,
                 }
             )
@@ -67,6 +80,9 @@ def season_aggregates(conn: sqlite3.Connection, season: str) -> tuple[pd.DataFra
             row = {"player_id": pid}
             for key, col in SKATER_LOG_KEYS.items():
                 row[col] = s.get(key) or 0
+            box = json.loads(box_json) if box_json else {}
+            for key, col in BOXSCORE_LOG_KEYS.items():
+                row[col] = box.get(key) or 0
             skater_rows.append(row)
 
     def _finish(rows: list[dict]) -> pd.DataFrame:

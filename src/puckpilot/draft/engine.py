@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -59,6 +60,16 @@ class Universe:
     def __len__(self) -> int:
         return len(self.ids)
 
+    def with_adp(self, adp_rank: np.ndarray) -> Universe:
+        """Shallow view sharing all arrays but carrying a different ADP.
+
+        Used to re-base ADP after keepers come off the board: the shared arrays
+        make this cheap enough to call once per simulated draft.
+        """
+        u = copy.copy(self)
+        u.adp_rank = adp_rank
+        return u
+
 
 def _pick_best(
     u: Universe,
@@ -94,11 +105,24 @@ class RosterValuePolicy:
     survival_discount devalues players the ADP-following room will likely leave
     for our next turn (logistic in adp_rank around our next pick number).
 
-    Defaults are what the 2025-26 walk-forward draft sim selected empirically:
-    goalie_weight 1.0 (both boosting goalies for category leverage and fading
-    them for projection noise LOWERED finish rates), no cat reliability weights
-    (conceding unpredictable cats costs more than refocusing gains), and
-    survival_discount 0.3 (the one knob that beat the bot field, p<0.005).
+    Defaults come from the 2025-26 walk-forward draft sim under the real league
+    (H2H categories, 12 teams, 3 keepers). BOTH tunable knobs reversed direction
+    when the objective moved from roto to H2H:
+
+    - bench_factor 0.70 (was 0.15). With 3 bench spots on a 16-man roster almost
+      every drafted player accumulates stats, so heavily discounting "bench"
+      value was calibrated for a roster shape this league does not have.
+    - survival_discount 0.50 (was 0.30). H2H rewards winning categories outright,
+      so spending picks where the market is about to strike matters more.
+
+    Confirmed on a held-out seed: top-3 rate 0.342 vs the best bot's 0.272
+    (n=600, p=0.0002). The old roto defaults FAIL the same test (0.265, p=0.70).
+
+    Re-tested under H2H and still rejected, as under roto: goalie_weight in
+    either direction (0.85 -> 0.310, 1.15 -> 0.333 vs 0.350 baseline), and
+    category weights — damping the collinear P=G+A costs value (0.280) and
+    chasing HIT/BLK is disastrous (0.130), because the peripheral categories are
+    cheap to acquire on waivers but scoring is not.
     """
 
     name = "engine"
@@ -106,9 +130,9 @@ class RosterValuePolicy:
     def __init__(
         self,
         goalie_weight: float = 1.0,
-        bench_factor: float = 0.15,
+        bench_factor: float = 0.70,
         cat_weights: dict[str, float] | None = None,
-        survival_discount: float = 0.3,
+        survival_discount: float = 0.50,
         survival_spread: float = 6.0,
     ):
         self.goalie_weight = goalie_weight

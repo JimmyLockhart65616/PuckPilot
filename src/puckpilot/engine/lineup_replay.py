@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,65 +16,86 @@ from puckpilot.draft.replay import (
     G_HOURS,
     G_SA,
     G_SHO,
+    G_STARTS,
+    G_WIDTH,
     G_WINS,
-    SKATER_KEYS,
     ReplayData,
     build_replay_data,
 )
-from puckpilot.draft.sim import _default_opponents, build_universe, run_draft
+from puckpilot.draft.sim import (
+    _default_opponents,
+    build_universe,
+    keepers_for,
+    run_draft,
+)
+from puckpilot.engine.categories import Category
 from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.engine.valuation import LeagueShape
+from puckpilot.league import DEFAULT_LEAGUE, LeagueConfig
+
+# value assigned to a goalie start that the weekly minimum forces; large enough
+# to outrank any real skater's expected value for that slot
+_FORCED_START_VALUE = 1e6
 
 
 class GameValueModel:
     """Scalar per-game fantasy value in z-like units, from the pool's real lines.
 
-    Skater line: sum(stat_c / per-game SD of stat_c). Goalie line: wins and
-    shutouts over their SDs plus save-impact and GAA-impact (deviation from the
-    pool's per-game averages, volume-weighted) over theirs. One number per game
-    makes bench regret additive across a season.
+    Skater line: sum(stat_c / per-game SD of stat_c) over the LEAGUE'S skater
+    categories. Goalie line: the league's goalie categories over their SDs, with
+    rate cats (SV%, GAA) entering as impact — deviation from the pool average,
+    volume-weighted — so one number per game keeps bench regret additive.
     """
 
-    def __init__(self, data: ReplayData, pool_ids: set[int]):
+    def __init__(
+        self,
+        data: ReplayData,
+        pool_ids: set[int],
+        goalie_cats: tuple[Category, ...] = DEFAULT_LEAGUE.goalie_cats,
+    ):
+        self.goalie_cats = goalie_cats
         sk = np.array(
             [v for pid in pool_ids for v in data.skater.get(pid, {}).values()], dtype=float
         )
         self.sk_sd = (
             np.where(sk.std(axis=0) > 0, sk.std(axis=0), 1.0)
             if len(sk)
-            else np.ones(len(SKATER_KEYS))
+            else np.ones(len(data.skater_keys))
         )
         g = np.array(
             [v for pid in pool_ids for v in data.goalie.get(pid, {}).values()], dtype=float
         )
         if len(g):
-            self.pool_sv = 1.0 - g[:, G_GA].sum() / g[:, G_SA].sum()
-            self.pool_ga60 = g[:, G_GA].sum() / g[:, G_HOURS].sum()
-            sv_imp = (g[:, G_SA] - g[:, G_GA]) - self.pool_sv * g[:, G_SA]
-            gaa_imp = self.pool_ga60 * g[:, G_HOURS] - g[:, G_GA]
+            self.pool_sv = 1.0 - g[:, G_GA].sum() / max(g[:, G_SA].sum(), 1.0)
+            self.pool_ga60 = g[:, G_GA].sum() / max(g[:, G_HOURS].sum(), 1e-9)
             self.g_sd = np.array(
-                [
-                    g[:, G_WINS].std() or 1.0,
-                    g[:, G_SHO].std() or 1.0,
-                    sv_imp.std() or 1.0,
-                    gaa_imp.std() or 1.0,
-                ]
+                [np.std(self._g_raw(g, c)) or 1.0 for c in goalie_cats], dtype=float
             )
         else:
             self.pool_sv, self.pool_ga60 = 0.9, 3.0
-            self.g_sd = np.ones(4)
+            self.g_sd = np.ones(len(goalie_cats))
+
+    def _g_raw(self, vec: np.ndarray, cat: Category) -> np.ndarray:
+        """Per-game contribution of one goalie category; vec may be 1-D or a stack."""
+        v = np.asarray(vec, dtype=float)
+        if cat.key == "wins":
+            return v[..., G_WINS]
+        if cat.key == "shutouts":
+            return v[..., G_SHO]
+        if cat.key == "saves":
+            return v[..., G_SA] - v[..., G_GA]
+        if cat.key == "save_pct":  # saves above what a pool-average goalie makes
+            return (v[..., G_SA] - v[..., G_GA]) - self.pool_sv * v[..., G_SA]
+        if cat.key == "gaa":  # goals prevented vs the pool rate (already sign-correct)
+            return self.pool_ga60 * v[..., G_HOURS] - v[..., G_GA]
+        raise KeyError(f"no goalie accumulator mapping for category {cat.key!r}")
 
     def skater(self, vec: np.ndarray) -> float:
         return float((vec / self.sk_sd).sum())
 
     def goalie(self, vec: np.ndarray) -> float:
-        sv_imp = (vec[G_SA] - vec[G_GA]) - self.pool_sv * vec[G_SA]
-        gaa_imp = self.pool_ga60 * vec[G_HOURS] - vec[G_GA]
         return float(
-            vec[G_WINS] / self.g_sd[0]
-            + vec[G_SHO] / self.g_sd[1]
-            + sv_imp / self.g_sd[2]
-            + gaa_imp / self.g_sd[3]
+            sum(self._g_raw(vec, c) / sd for c, sd in zip(self.goalie_cats, self.g_sd, strict=True))
         )
 
     def actual(self, data: ReplayData, pid: int, didx: int) -> float:
@@ -87,7 +108,7 @@ class GameValueModel:
         return 0.0
 
 
-def projected_pg_values(frame, vm: GameValueModel) -> dict[int, float]:
+def projected_pg_values(frame, vm: GameValueModel, skater_keys: list[str]) -> dict[int, float]:
     """Expected per-game value in the model's units, from projected totals."""
     out: dict[int, float] = {}
     for pid, r in frame.iterrows():
@@ -95,14 +116,15 @@ def projected_pg_values(frame, vm: GameValueModel) -> dict[int, float]:
         if r["position"] == "G":
             sa = float(r.get("shots_against") or 0) / gp
             ga = sa * (1.0 - float(r.get("save_pct") or 0))
-            hours = float(r.get("toi_hours") or 0) / gp
-            vec = np.zeros(5)
+            vec = np.zeros(G_WIDTH)
             vec[G_WINS] = float(r.get("wins") or 0) / gp
             vec[G_SHO] = float(r.get("shutouts") or 0) / gp
-            vec[G_GA], vec[G_SA], vec[G_HOURS] = ga, sa, hours
+            vec[G_GA], vec[G_SA] = ga, sa
+            vec[G_HOURS] = float(r.get("toi_hours") or 0) / gp
+            vec[G_STARTS] = 1.0
             out[pid] = vm.goalie(vec)
         else:
-            vec = np.array([float(r.get(k) or 0) / gp for k in SKATER_KEYS])
+            vec = np.array([float(r.get(k) or 0) / gp for k in skater_keys])
             out[pid] = vm.skater(vec)
     return out
 
@@ -162,24 +184,85 @@ def _daily_optimizer_total(
     goalie_src: GoalieStartSource,
     vm: GameValueModel,
     day_range: range | None = None,
+    min_goalie_appearances: int = 0,
 ) -> float:
     """Optimizer-captured value over the season, or a date-index sub-range so a
     timeline of weekly roster changes can be scored segment by segment."""
     total = 0.0
-    for i in day_range if day_range is not None else range(len(data.dates)):
+    for i, assigned in iter_daily_assignments(
+        lambda _day: roster,
+        positions,
+        pg_value,
+        data,
+        shape,
+        avail,
+        goalie_src,
+        day_range=day_range,
+        min_goalie_appearances=min_goalie_appearances,
+    ):
+        for pid in assigned:
+            total += vm.actual(data, pid, i)
+    return total
+
+
+def iter_daily_assignments(
+    roster_at: Callable[[int], list[int]],
+    positions: dict[int, str],
+    pg_value: dict[int, float],
+    data: ReplayData,
+    shape: LeagueShape,
+    avail: dict[int, set[int]],
+    goalie_src: GoalieStartSource,
+    day_range: range | None = None,
+    min_goalie_appearances: int = 0,
+) -> Iterator[tuple[int, dict[int, str]]]:
+    """Yield (date index, {player_id: slot}) for each day, using morning knowledge.
+
+    `roster_at(day)` supplies the roster for that day so mid-season adds/drops
+    replay correctly. When the league sets a weekly goalie floor, a goalie whose
+    expected value is otherwise too low to start is forced in once the days left
+    in the week can no longer cover the shortfall — missing the floor forfeits
+    the goalie categories for the week, which costs far more than a bad start.
+    """
+    days = list(day_range if day_range is not None else range(len(data.dates)))
+    weeks = [int(data.weeks[i]) if len(data.weeks) else 0 for i in days]
+    # days remaining in the same week, counting the current one
+    days_left_in_week: list[int] = []
+    seen: dict[int, int] = {}
+    for w in reversed(weeks):
+        seen[w] = seen.get(w, 0) + 1
+        days_left_in_week.append(seen[w])
+    days_left_in_week.reverse()
+
+    starts_this_week = 0
+    prev_week: int | None = None
+    for k, i in enumerate(days):
         date = data.dates[i]
+        week = weeks[k]
+        if week != prev_week:
+            starts_this_week = 0
+            prev_week = week
         goalie_starts = goalie_src.starts(date)
         cands = []
-        for pid in roster:
+        for pid in roster_at(i):
             if positions.get(pid) == "G":
                 p = goalie_starts.get(pid, 0.0)
                 if p > 0:
                     cands.append((pid, "G", p * pg_value.get(pid, 0.0)))
             elif i in avail.get(pid, ()):
                 cands.append((pid, positions.get(pid, "C"), pg_value.get(pid, 0.0)))
-        for pid in optimize_lineup(cands, shape):
-            total += vm.actual(data, pid, i)
-    return total
+
+        if min_goalie_appearances:
+            short = min_goalie_appearances - starts_this_week
+            if short >= days_left_in_week[k]:  # must start every goalie chance from here
+                cands = [
+                    (pid, pos, max(v, _FORCED_START_VALUE) if pos == "G" else v)
+                    for pid, pos, v in cands
+                ]
+
+        assigned = optimize_lineup(cands, shape)
+        starts_this_week += sum(1 for pid in assigned if positions.get(pid) == "G")
+        yield i, assigned
 
 
 def _hindsight_total(
@@ -235,10 +318,11 @@ class LineupReplayReport:
 def bench_regret_report(
     conn: sqlite3.Connection,
     season: str = "20252026",
-    train_seasons: tuple[str, ...] = ("20242025", "20232024"),
+    train_seasons: tuple[str, ...] = ("20242025", "20232024", "20222023"),
     n_drafts: int = 2,
     seed: int | None = 123,
     goalie_accuracy: float = 0.9,
+    league: LeagueConfig = DEFAULT_LEAGUE,
     progress: Callable[[str], None] | None = None,
 ) -> LineupReplayReport:
     """Replay drafted rosters over the real season under four lineup policies.
@@ -248,21 +332,22 @@ def bench_regret_report(
     expected ordering; the gap optimizer-vs-baseline is what daily automation
     is worth, and hindsight-vs-optimizer is the bench regret.
     """
-    from puckpilot.draft.engine import DraftRules, RosterValuePolicy
+    from puckpilot.draft.engine import RosterValuePolicy
 
-    rules = DraftRules()
+    rules = league.draft_rules()
     shape = rules.shape
     rng = np.random.default_rng(seed)
 
-    u = build_universe(conn, season, train_seasons)
-    data = build_replay_data(conn, season)
-    vm = GameValueModel(data, set(u.ids.tolist()))
-    pg_value = projected_pg_values(u.frame, vm)
+    skater_keys = [c.key for c in league.skater_cats]
+    u = build_universe(conn, season, train_seasons, league)
+    data = build_replay_data(conn, season, skater_keys)
+    vm = GameValueModel(data, set(u.ids.tolist()), league.goalie_cats)
+    pg_value = projected_pg_values(u.frame, vm, skater_keys)
     positions = dict(zip(u.ids.tolist(), u.pos.tolist(), strict=True))
 
     rosters: list[list[int]] = []
     for _ in range(n_drafts):
-        opponents = _default_opponents(rng)
+        opponents = _default_opponents(rng, league)
         order = rng.permutation(len(opponents))
         engine_seat = int(rng.integers(0, shape.n_teams))
         bots = []
@@ -273,7 +358,8 @@ def bench_regret_report(
             else:
                 bots.append(opponents[order[oi]])
                 oi += 1
-        for ridx in run_draft(u, bots, rules, rng):
+        keepers = keepers_for(conn, u, season, league, rng)
+        for ridx in run_draft(u, bots, rules, rng, keepers):
             rosters.append([int(u.ids[i]) for i in ridx])
 
     all_pids = {pid for r in rosters for pid in r}
@@ -285,10 +371,26 @@ def bench_regret_report(
     for k, roster in enumerate(rosters):
         sums["hindsight"] += _hindsight_total(roster, positions, data, shape, vm)
         sums["perfect"] += _daily_optimizer_total(
-            roster, positions, pg_value, data, shape, avail, hind_g, vm
+            roster,
+            positions,
+            pg_value,
+            data,
+            shape,
+            avail,
+            hind_g,
+            vm,
+            min_goalie_appearances=league.min_goalie_appearances,
         )
         sums["noisy"] += _daily_optimizer_total(
-            roster, positions, pg_value, data, shape, avail, noisy_g, vm
+            roster,
+            positions,
+            pg_value,
+            data,
+            shape,
+            avail,
+            noisy_g,
+            vm,
+            min_goalie_appearances=league.min_goalie_appearances,
         )
         sums["baseline"] += _set_and_forget_total(roster, positions, pg_value, data, shape, vm)
         if progress and (k + 1) % 6 == 0:

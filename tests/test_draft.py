@@ -10,8 +10,25 @@ from puckpilot.draft.engine import (
     VorpPolicy,
     eligible_positions,
 )
-from puckpilot.draft.replay import ReplayData, replay_roster, roto_standings
-from puckpilot.draft.sim import run_draft, snake_order, two_prop_pvalue, wilson_ci
+from puckpilot.draft.replay import (
+    G_GA,
+    G_HOURS,
+    G_SA,
+    G_SHO,
+    G_STARTS,
+    G_WIDTH,
+    G_WINS,
+    ReplayData,
+    replay_roster,
+    roto_standings,
+)
+from puckpilot.draft.sim import (
+    effective_adp,
+    run_draft,
+    snake_order,
+    two_prop_pvalue,
+    wilson_ci,
+)
 from puckpilot.engine.valuation import LeagueShape
 
 
@@ -122,8 +139,21 @@ def _replay_fixture():
         2: {0: np.array([2.0, 0, 0, 0, 0, 0])},
         3: {0: np.array([1.0, 0, 0, 0, 0, 0]), 1: np.array([5.0, 0, 0, 0, 0, 0])},
     }
-    data.goalie = {10: {0: np.array([1.0, 1.0, 0.0, 30.0, 1.0])}}
+    data.goalie = {10: {0: _gvec(wins=1.0, sho=1.0, ga=0.0, sa=30.0, hours=1.0)}}
     return data
+
+
+def _gvec(wins=0.0, sho=0.0, ga=0.0, sa=0.0, hours=0.0, starts=1.0):
+    v = np.zeros(G_WIDTH)
+    v[G_WINS], v[G_SHO], v[G_GA], v[G_SA], v[G_HOURS], v[G_STARTS] = (
+        wins,
+        sho,
+        ga,
+        sa,
+        hours,
+        starts,
+    )
+    return v
 
 
 def test_replay_roster_slot_competition_and_util():
@@ -133,30 +163,78 @@ def test_replay_roster_slot_competition_and_util():
     scalar = {1: 3.0, 2: 2.0, 3: 1.0, 10: 1.0}
     sk, g = replay_roster([1, 2, 3, 10], positions, scalar, data, shape)
     # d0: player 1 takes C, player 2 takes util, player 3 benched; d1: player 3 plays
-    assert sk[0] == pytest.approx(3.0 + 2.0 + 5.0)
-    assert g[0] == 1.0  # goalie win counted
+    assert sk.sum(axis=0)[0] == pytest.approx(3.0 + 2.0 + 5.0)
+    assert g.sum(axis=0)[G_WINS] == 1.0  # goalie win counted
+
+
+def test_replay_roster_splits_by_week():
+    data = ReplayData()
+    data.dates = ["2025-10-06", "2025-10-13"]  # consecutive Mondays -> weeks 0 and 1
+    data.skater = {1: {0: np.array([3.0, 0, 0, 0, 0, 0]), 1: np.array([4.0, 0, 0, 0, 0, 0])}}
+    shape = LeagueShape(n_teams=2, slots=(("C", 1),), util_slots=0)
+    sk, _g = replay_roster([1], {1: "C"}, {1: 1.0}, data, shape)
+    assert sk.shape[0] == 2
+    assert sk[0][0] == 3.0 and sk[1][0] == 4.0
 
 
 def test_replay_goalie_needs_open_slot():
     data = ReplayData()
     data.dates = ["d0"]
     data.goalie = {
-        10: {0: np.array([1.0, 0, 2.0, 30.0, 1.0])},
-        11: {0: np.array([1.0, 0, 0.0, 30.0, 1.0])},
+        10: {0: _gvec(wins=1.0, ga=2.0, sa=30.0, hours=1.0)},
+        11: {0: _gvec(wins=1.0, ga=0.0, sa=30.0, hours=1.0)},
     }
     shape = LeagueShape(n_teams=2, slots=(("G", 1),), util_slots=1)
     positions = {10: "G", 11: "G"}
-    sk, g = replay_roster([10, 11], positions, {10: 2.0, 11: 1.0}, data, shape)
-    assert g[0] == 1.0 and g[2] == 2.0  # only the higher-scalar goalie played
+    _sk, g = replay_roster([10, 11], positions, {10: 2.0, 11: 1.0}, data, shape)
+    gt = g.sum(axis=0)
+    assert gt[G_WINS] == 1.0 and gt[G_GA] == 2.0  # only the higher-scalar goalie played
 
 
 def test_roto_standings_directions():
     sk = np.array([[10.0, 0, 0, 0, 0, 0], [5.0, 0, 0, 0, 0, 0]])
     # team 0: better W and GAA (1 GA in 2h = 0.5); team 1: 6 GA in 2h = 3.0
-    g = np.array([[2.0, 1.0, 1.0, 60.0, 2.0], [1.0, 0.0, 6.0, 60.0, 2.0]])
+    g = np.stack(
+        [
+            _gvec(wins=2.0, sho=1.0, ga=1.0, sa=60.0, hours=2.0),
+            _gvec(wins=1.0, sho=0.0, ga=6.0, sa=60.0, hours=2.0),
+        ]
+    )
     points, finish = roto_standings(sk, g)
     assert finish[0] == 1
     assert points[0] > points[1]
+
+
+def test_effective_adp_rebases_onto_available_players():
+    adp = np.array([5.0, 1.0, 3.0, 9.0, 2.0])
+    avail = np.array([True, False, True, True, False])  # the two best are kept
+    out = effective_adp(adp, avail)
+    # available ADPs 3, 5, 9 become ranks 1, 2, 3; kept players sort past the end
+    assert list(out) == [2.0, 6.0, 1.0, 3.0, 6.0]
+
+
+def test_run_draft_keepers_leave_board_and_rebase_adp():
+    u = _universe(n_per_pos=6)
+    rules = DraftRules(
+        shape=LeagueShape(n_teams=2, slots=(("C", 1), ("L", 1), ("R", 1), ("D", 1), ("G", 1))),
+        rounds=4,
+        caps={"C": 2, "L": 2, "R": 2, "D": 2, "G": 2},
+        mins={"C": 1, "L": 1, "R": 1, "D": 1, "G": 1},
+    )
+    keeper_ids = [int(u.ids[0]), int(u.ids[1])]
+    rosters = run_draft(
+        u,
+        [VorpPolicy(), VorpPolicy()],
+        rules,
+        np.random.default_rng(0),
+        keepers={0: [keeper_ids[0]], 1: [keeper_ids[1]]},
+    )
+    # keepers occupy a roster spot without consuming any of the 4 picks
+    assert len(rosters[0]) == 5 and len(rosters[1]) == 5
+    assert rosters[0][0] == 0 and rosters[1][0] == 1
+    # nobody is drafted twice, and keepers are never re-drafted
+    picked = [i for r in rosters for i in r]
+    assert len(picked) == len(set(picked))
 
 
 def test_wilson_and_two_prop_sanity():

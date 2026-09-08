@@ -8,7 +8,7 @@ from datetime import date
 
 from puckpilot.data import store
 from puckpilot.data.moneypuck import KINDS, MoneyPuckClient
-from puckpilot.data.nhl import REGULAR_SEASON, NhlClient
+from puckpilot.data.nhl import REGULAR_SEASON, NhlApiError, NhlClient
 
 POLITE_DELAY_S = 0.1
 
@@ -71,6 +71,134 @@ def sync_schedules(
         counts[season] = len(seen)
         progress(f"  {season}: {len(seen)} games")
     return counts
+
+
+BOXSCORE_GROUPS = ("forwards", "defense", "goalies")
+
+
+BoxscoreRow = tuple[int, int, str, str | None, str]
+
+
+def boxscore_rows(bs: dict, game_id: int, season: str) -> list[BoxscoreRow]:
+    """Flatten a boxscore's playerByGameStats into upsert tuples.
+
+    Hits and blocked shots appear only here — the player game-log endpoint omits
+    both, so these rows are what make the HIT/BLK categories scoreable.
+    """
+    pbg = bs.get("playerByGameStats") or {}
+    out: list[tuple[int, int, str, str | None, str]] = []
+    for side in ("awayTeam", "homeTeam"):
+        team = (bs.get(side) or {}).get("abbrev")
+        for group in BOXSCORE_GROUPS:
+            for p in (pbg.get(side) or {}).get(group, []):
+                pid = p.get("playerId")
+                if pid is None:
+                    continue
+                out.append((game_id, int(pid), season, team, json.dumps(p)))
+    return out
+
+
+def sync_boxscores(
+    conn: sqlite3.Connection,
+    nhl: NhlClient,
+    seasons: list[str],
+    *,
+    delay: float = POLITE_DELAY_S,
+    today: date | None = None,
+    progress: Progress = _noop,
+) -> dict[str, dict[str, int]]:
+    """Fetch per-game boxscores for regular-season games already played.
+
+    Incremental via sync_meta key 'boxscore:{game_id}', mirroring the
+    'gamelog:{pid}:{season}' convention. Unplayed games are skipped rather than
+    stored empty, so re-running after games are played picks them up.
+    """
+    today = today or date.today()
+    cutoff = today.isoformat()
+    report: dict[str, dict[str, int]] = {}
+    for season in seasons:
+        games = conn.execute(
+            "SELECT game_id, game_date FROM nhl_schedule"
+            " WHERE season = ? AND game_type = ? AND game_date < ?"
+            " ORDER BY game_date, game_id",
+            (season, REGULAR_SEASON, cutoff),
+        ).fetchall()
+        synced = skipped = empty = rows_written = 0
+        for i, g in enumerate(games, start=1):
+            gid = int(g["game_id"])
+            key = f"boxscore:{gid}"
+            if store.get_meta(conn, key) == "done":
+                skipped += 1
+                continue
+            rows = boxscore_rows(nhl.boxscore(gid), gid, season)
+            if not rows:
+                empty += 1
+                continue
+            store.upsert_boxscore_rows(conn, rows)
+            store.set_meta(conn, key, "done")
+            rows_written += len(rows)
+            synced += 1
+            if synced % 50 == 0:
+                conn.commit()
+                progress(f"    {season}: {i}/{len(games)} games")
+            time.sleep(delay)
+        conn.commit()
+        progress(
+            f"  {season}: {synced} boxscores synced, {skipped} already done, "
+            f"{empty} without player stats, {rows_written} player rows"
+        )
+        report[season] = {
+            "games": len(games),
+            "synced": synced,
+            "skipped": skipped,
+            "empty": empty,
+            "rows": rows_written,
+        }
+    return report
+
+
+ROSTER_GROUPS = ("forwards", "defensemen", "goalies")
+
+
+def sync_player_bios(
+    conn: sqlite3.Connection,
+    nhl: NhlClient,
+    seasons: list[str],
+    *,
+    delay: float = POLITE_DELAY_S,
+    progress: Progress = _noop,
+) -> int:
+    """Birth dates etc. from team rosters - 32 requests per season, not one per player.
+
+    Walking several seasons picks up players who have since retired or changed
+    teams; later seasons overwrite earlier ones, which is fine for static bio data.
+    """
+    teams = current_team_abbrevs(nhl)
+    seen: set[int] = set()
+    for season in seasons:
+        for team in teams:
+            try:
+                data = nhl.roster(team, season)
+            except NhlApiError:
+                continue  # franchise did not exist that season
+            for group in ROSTER_GROUPS:
+                for p in data.get(group, []):
+                    pid = p.get("id")
+                    if pid is None:
+                        continue
+                    store.upsert_player_bio(
+                        conn,
+                        player_id=int(pid),
+                        birth_date=p.get("birthDate"),
+                        height_in=p.get("heightInInches"),
+                        weight_lb=p.get("weightInPounds"),
+                        shoots=p.get("shootsCatches"),
+                    )
+                    seen.add(int(pid))
+            time.sleep(delay)
+        conn.commit()
+        progress(f"  {season}: {len(seen)} players with bio data so far")
+    return len(seen)
 
 
 def sync_players_and_logs(

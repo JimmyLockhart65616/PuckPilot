@@ -1,0 +1,114 @@
+# Ajaxians - Jimmy's real Yahoo league (12-team H2H categories, keeper league).
+# Settings transcribed from the Yahoo league settings page.
+
+name = "Ajaxians"
+league_id = "36899"
+
+[roster]
+teams = 12
+# C,C,LW,LW,RW,RW,D,D,D,D,Util,G,G,BN,BN,BN (+ IR,IR+x3, not modelled)
+slots = [
+  { pos = "C", count = 2 },
+  { pos = "L", count = 2 },
+  { pos = "R", count = 2 },
+  { pos = "D", count = 4 },
+  { pos = "G", count = 2 },
+]
+util = 1
+bench = 3
+
+[scoring]
+type = "h2h"
+# NOTE: P = G + A, so goals and assists each carry roughly double weight across
+# the eight skater categories. That is the league's design, not an artifact.
+skater = ["G", "A", "P", "PIM", "PPP", "SOG", "HIT", "BLK"]
+goalie = ["W", "SV", "SV%"]
+
+[schedule]
+regular_weeks = 19
+playoff_teams = 8
+playoff_weeks = 3
+
+[keepers]
+count = 3
+years = 3
+
+# Under contract going into each season's draft. A drafted player is held for up
+# to three seasons and then returns to the pool.
+[keepers.by_season]
+"20252026" = [
+  "Connor McDavid",
+  "Leon Draisaitl",
+  "Mikko Rantanen",
+  "David Pastrnak",
+  "Auston Matthews",
+  "Artemi Panarin",
+  "Cale Makar",
+  "Brady Tkachuk",
+  "Victor Hedman",
+  "Nathan MacKinnon",
+  "J.T. Miller",
+  "Roman Josi",
+  "Sidney Crosby",
+  "Jack Eichel",
+  "Josh Morrissey",
+  "Zach Hyman",
+  "Connor Bedard",
+  "Filip Forsberg",
+  "Connor Hellebuyck",
+  "Sam Reinhart",
+  "Andrei Vasilevskiy",
+  "Brayden Point",
+  "Matthew Knies",
+  "Adrian Kempe",
+  "Jesper Bratt",
+  "Anthony Stolarz",
+  "Clayton Keller",
+  "Zach Werenski",
+  "Matt Boldy",
+  "Mika Zibanejad",
+  "Nikita Kucherov",
+  "Alex Ovechkin",
+  "William Nylander",
+  "Tage Thompson",
+  "Quinn Hughes",
+]
+# Zibanejad, Kucherov, Ovechkin, Nylander, Thompson and Q. Hughes hit FA.
+"20262027" = [
+  "Connor McDavid",
+  "Leon Draisaitl",
+  "Mikko Rantanen",
+  "David Pastrnak",
+  "Auston Matthews",
+  "Artemi Panarin",
+  "Cale Makar",
+  "Brady Tkachuk",
+  "Victor Hedman",
+  "Nathan MacKinnon",
+  "J.T. Miller",
+  "Roman Josi",
+  "Sidney Crosby",
+  "Jack Eichel",
+  "Josh Morrissey",
+  "Zach Hyman",
+  "Connor Bedard",
+  "Filip Forsberg",
+  "Connor Hellebuyck",
+  "Sam Reinhart",
+  "Andrei Vasilevskiy",
+  "Brayden Point",
+  "Matthew Knies",
+  "Adrian Kempe",
+  "Jesper Bratt",
+  "Anthony Stolarz",
+  "Clayton Keller",
+  "Zach Werenski",
+  "Matt Boldy",
+]
+
+[transactions]
+season_acquisitions = 65
+weekly_acquisitions = 3
+
+[lineup]
+min_goalie_appearances = 3

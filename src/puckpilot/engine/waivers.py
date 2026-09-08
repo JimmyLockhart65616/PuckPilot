@@ -9,13 +9,19 @@ import numpy as np
 from puckpilot.data.goalies import HindsightGoalieSource
 from puckpilot.draft.engine import DraftRules, RosterValuePolicy
 from puckpilot.draft.replay import ReplayData, build_replay_data
-from puckpilot.draft.sim import _default_opponents, build_universe, run_draft
+from puckpilot.draft.sim import (
+    _default_opponents,
+    build_universe,
+    keepers_for,
+    run_draft,
+)
 from puckpilot.engine.lineup_replay import (
     GameValueModel,
     _daily_optimizer_total,
     projected_pg_values,
     skater_availability,
 )
+from puckpilot.league import DEFAULT_LEAGUE, LeagueConfig
 
 FORM_WINDOW_DAYS = 14
 FORM_SHRINK_K = 10.0  # games of trailing form worth as much as the prior
@@ -73,6 +79,80 @@ class Move:
     drop_pid: int
     expected_gain: float
     realized_gain: float = 0.0
+
+
+def budget_threshold(
+    remaining_acquisitions: int | None,
+    remaining_weeks: int,
+    weekly_cap: int | None,
+    base: float = MIN_WEEKLY_GAIN,
+) -> float:
+    """Minimum gain worth spending one acquisition on.
+
+    With a season cap (Yahoo: 65) every add has an opportunity cost — the best
+    move some later week can no longer make. When acquisitions are scarce
+    relative to the weeks left, the bar rises; when they're abundant it relaxes
+    to the base churn threshold.
+    """
+    if remaining_acquisitions is None:
+        return base
+    if remaining_acquisitions <= 0:
+        return float("inf")
+    per_week = remaining_acquisitions / max(remaining_weeks, 1)
+    if weekly_cap:
+        per_week = min(per_week, weekly_cap)
+    if per_week >= 1.0:
+        return base
+    return base / max(per_week, 1e-3)
+
+
+def best_moves(
+    roster: list[int],
+    fa_pool: set[int],
+    week: range,
+    today: int,
+    positions: dict[int, str],
+    data: ReplayData,
+    vm: GameValueModel,
+    proj_pg: dict[int, float],
+    avail: dict[int, set[int]],
+    goalie_starts_by_day: dict[int, set[int]],
+    rules: DraftRules,
+    min_gain: float = MIN_WEEKLY_GAIN,
+    max_moves: int = 1,
+) -> list[tuple[int, int, float]]:
+    """Up to `max_moves` add/drop pairs, best first, each keeping the roster legal.
+
+    Applied greedily: after each accepted move the roster and pool update, so
+    later moves in the same week see the new counts.
+    """
+    roster = list(roster)
+    fa_pool = set(fa_pool)
+    out: list[tuple[int, int, float]] = []
+    for _ in range(max(max_moves, 0)):
+        mv = best_move(
+            roster,
+            fa_pool,
+            week,
+            today,
+            positions,
+            data,
+            vm,
+            proj_pg,
+            avail,
+            goalie_starts_by_day,
+            rules,
+            min_gain,
+        )
+        if mv is None:
+            break
+        add, drop, _gain = mv
+        roster.remove(drop)
+        roster.append(add)
+        fa_pool.discard(add)
+        fa_pool.add(drop)
+        out.append(mv)
+    return out
 
 
 def best_move(
@@ -136,9 +216,10 @@ class WaiverBacktestReport:
 def waiver_backtest(
     conn: sqlite3.Connection,
     season: str = "20252026",
-    train_seasons: tuple[str, ...] = ("20242025", "20232024"),
+    train_seasons: tuple[str, ...] = ("20242025", "20232024", "20222023"),
     n_teams_tested: int = 6,
     seed: int | None = 7,
+    league: LeagueConfig = DEFAULT_LEAGUE,
     progress: Callable[[str], None] | None = None,
 ) -> WaiverBacktestReport:
     """Weekly waiver moves vs standing pat over the real season.
@@ -149,14 +230,15 @@ def waiver_backtest(
     value with perfect goalie info for both arms, so the delta isolates the
     waiver engine itself.
     """
-    rules = DraftRules()
+    rules = league.draft_rules()
     shape = rules.shape
     rng = np.random.default_rng(seed)
 
-    u = build_universe(conn, season, train_seasons)
-    data = build_replay_data(conn, season)
-    vm = GameValueModel(data, set(u.ids.tolist()))
-    proj_pg = projected_pg_values(u.frame, vm)
+    skater_keys = [c.key for c in league.skater_cats]
+    u = build_universe(conn, season, train_seasons, league)
+    data = build_replay_data(conn, season, skater_keys)
+    vm = GameValueModel(data, set(u.ids.tolist()), league.goalie_cats)
+    proj_pg = projected_pg_values(u.frame, vm, skater_keys)
     positions = dict(zip(u.ids.tolist(), u.pos.tolist(), strict=True))
     avail = skater_availability(conn, season, data, set(u.ids.tolist()))
 
@@ -164,7 +246,7 @@ def waiver_backtest(
     didx = {d: i for i, d in enumerate(data.dates)}
     goalie_starts_by_day = {didx[d]: set(hind.starts(d)) for d in data.dates if hind.starts(d)}
 
-    opponents = _default_opponents(rng)
+    opponents = _default_opponents(rng, league)
     order = rng.permutation(len(opponents))
     engine_seat = int(rng.integers(0, shape.n_teams))
     bots = []
@@ -175,7 +257,8 @@ def waiver_backtest(
         else:
             bots.append(opponents[order[oi]])
             oi += 1
-    rosters = [[int(u.ids[i]) for i in r] for r in run_draft(u, bots, rules, rng)]
+    keepers = keepers_for(conn, u, season, league, rng)
+    rosters = [[int(u.ids[i]) for i in r] for r in run_draft(u, bots, rules, rng, keepers)]
     drafted = {pid for r in rosters for pid in r}
 
     n_days = len(data.dates)
@@ -191,9 +274,14 @@ def waiver_backtest(
         team_moves: list[Move] = []
 
         segments: list[tuple[int, list[int]]] = [(0, list(roster))]
-        for w0 in week_starts:
+        budget = league.season_acquisitions
+        for wi, w0 in enumerate(week_starts):
+            if budget is not None and budget <= 0:
+                break
             week = range(w0, min(w0 + 7, n_days))
-            mv = best_move(
+            weekly_cap = league.weekly_acquisitions or 1
+            allowed = weekly_cap if budget is None else min(weekly_cap, budget)
+            moves = best_moves(
                 roster,
                 fa,
                 week,
@@ -205,9 +293,12 @@ def waiver_backtest(
                 avail,
                 goalie_starts_by_day,
                 rules,
+                min_gain=budget_threshold(
+                    budget, len(week_starts) - wi, league.weekly_acquisitions
+                ),
+                max_moves=allowed,
             )
-            if mv:
-                add, drop, gain = mv
+            for add, drop, gain in moves:
                 roster.remove(drop)
                 roster.append(add)
                 fa.discard(add)
@@ -217,6 +308,9 @@ def waiver_backtest(
                     vm.actual(data, drop, i) for i in fwd
                 )
                 team_moves.append(Move(w0, add, drop, gain, realized))
+                if budget is not None:
+                    budget -= 1
+            if moves:
                 segments.append((w0, list(roster)))
 
         moving_total = 0.0
@@ -232,9 +326,18 @@ def waiver_backtest(
                 hind,
                 vm,
                 day_range=range(start, end),
+                min_goalie_appearances=league.min_goalie_appearances,
             )
         frozen_total = _daily_optimizer_total(
-            frozen, positions, proj_pg, data, shape, avail, hind, vm
+            frozen,
+            positions,
+            proj_pg,
+            data,
+            shape,
+            avail,
+            hind,
+            vm,
+            min_goalie_appearances=league.min_goalie_appearances,
         )
         improvements.append((moving_total - frozen_total) / frozen_total)
         hits += sum(1 for m in team_moves if m.realized_gain > 0)
