@@ -15,6 +15,7 @@ wide.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 
@@ -217,3 +218,38 @@ def test_a_real_harvest_round_trips(tmp_path):
     assert save(result, tmp_path) is not None
     back = load_all(tmp_path)
     assert len(back) == 1 and len(back[0].picks) == len(result.picks)
+
+
+def test_harvest_capture_reads_only_what_the_room_broadcast(tmp_path):
+    """The `sent` side of the socket carries our own browser's identifiers - the
+    handshake frame embeds the full user-agent - and none of it is a pick."""
+    from puckpilot.draft.farm import harvest_capture
+
+    cap = tmp_path / "cap"
+    cap.mkdir()
+    rows = [
+        {
+            "dir": "sent",
+            "payload": "8|2227628|3|Mozilla%2F5.0%20(Windows)",
+            "wall": "2026-09-08T12:47:07+00:00",
+        },
+        {"dir": "recv", "payload": "0|1|6743|1|C|0", "wall": "2026-09-08T12:47:09+00:00"},
+        {"dir": "recv", "payload": "0|2|5980|2|C|0", "wall": "2026-09-08T12:47:20+00:00"},
+        {"dir": "sent", "payload": "0|3|9999|3|C|0", "wall": "2026-09-08T12:47:30+00:00"},
+    ]
+    (cap / "websocket.jsonl").write_text(
+        chr(10).join(json.dumps(r) for r in rows), encoding="utf-8"
+    )
+
+    result = harvest_capture(cap)
+    assert [p["pick"] for p in result.picks] == [1, 2], "a sent frame was treated as a pick"
+    # stamped with when the draft happened, so re-banking overwrites rather than
+    # double-counting that draft in the calibration
+    assert result.started.startswith("2026-09-08")
+
+
+def test_harvest_capture_survives_a_capture_with_no_socket(tmp_path):
+    from puckpilot.draft.farm import harvest_capture
+
+    result = harvest_capture(tmp_path)
+    assert result.picks == [] and "no websocket.jsonl" in result.note

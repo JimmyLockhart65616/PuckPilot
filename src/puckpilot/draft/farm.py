@@ -196,6 +196,53 @@ def run_one(
     return recorder.result(teams, complete, note)
 
 
+def harvest_capture(capture_dir: Path) -> MockResult:
+    """Turn an existing `ppilot draft capture` recording into a harvest.
+
+    A capture of a completed draft holds exactly the frames a live run would
+    have seen, so it is worth the same to the calibration - and it costs nobody
+    a seat in a mock room to replay one.
+
+    Only `recv` frames are read. The `sent` side carries our own browser's
+    identifiers (the handshake frame embeds the full user-agent string), and
+    none of it is anything the room broadcast.
+    """
+    path = Path(capture_dir) / "websocket.jsonl"
+    recorder = MockRecorder()
+    seats: set[int] = set()
+    if not path.is_file():
+        return recorder.result(0, False, f"no websocket.jsonl in {capture_dir}")
+
+    first_wall = ""
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("dir") != "recv":
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, str):
+            continue
+        if not first_wall and isinstance(row.get("wall"), str):
+            first_wall = row["wall"]
+        recorder.ingest(payload)
+
+    # Stamp the harvest with when the DRAFT happened, not when it was replayed.
+    # `save` names the file from this, so re-banking the same capture overwrites
+    # rather than double-counting that draft in the calibration.
+    if first_wall:
+        recorder.started = first_wall
+
+    for frame in recorder.picks.values():
+        seats.add(frame.seat)
+    teams = max(seats) if seats else 0
+    gaps = [n for n in range(1, max(recorder.picks, default=0) + 1) if n not in recorder.picks]
+    return recorder.result(
+        teams, bool(recorder.picks) and not gaps, f"gaps at {gaps[:5]}" if gaps else ""
+    )
+
+
 def save(result: MockResult, root: Path) -> Path | None:
     """Write a harvest to disk. A draft that never started is not written.
 

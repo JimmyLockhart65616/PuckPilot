@@ -305,6 +305,26 @@ def _cmd_draft_farm(args: argparse.Namespace) -> int:
     say(f"{len(ymap)} Yahoo ids mapped; harvesting to {out_root}")
     say("Read-only: this records what the room broadcasts and never picks for you.")
 
+    if args.from_capture:
+        # Replaying a recording costs nobody a seat, so no browser and no cap.
+        from puckpilot.draft.farm import harvest_capture
+
+        roots = (
+            [Path(args.from_capture)]
+            if args.from_capture != "all"
+            else sorted(d for d in settings._resolve(Path("data/captures")).glob("*") if d.is_dir())
+        )
+        banked = 0
+        for src in roots:
+            result = harvest_capture(src)
+            path = save(result, out_root)
+            say(f"  {src.name}: {result.summary}  -> {path.name if path else 'nothing to save'}")
+            banked += 1 if path else 0
+        say("")
+        say(f"{banked} draft(s) banked; {len(load_all(out_root))} mock(s) on disk")
+        say("Next: ppilot draft calibrate")
+        return 0
+
     runs = max(1, min(args.runs, MAX_RUNS))
     if runs != args.runs:
         say(f"Capping at {MAX_RUNS} runs: each one takes a seat in a room of real people.")
@@ -728,6 +748,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="How long to hold the lobby open waiting for you to join a mock "
         "(default: farm.JOIN_TIMEOUT_S, 15 min)",
+    )
+    farm.add_argument(
+        "--from-capture",
+        default=None,
+        metavar="DIR|all",
+        help="Bank an existing `draft capture` recording instead of sitting through a "
+        "live mock. No browser, no seat taken. 'all' replays every capture on disk.",
     )
     farm.set_defaults(func=_cmd_draft_farm)
 
