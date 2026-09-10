@@ -200,14 +200,42 @@ def test_goalie_wins_blend_toward_team_strength():
     # two goalies per team so the leave-one-out team rate is non-trivial
     frame = _frame(
         {
-            1: {"gp": 40, "wins": 20, "shutouts": 2, "shots_against": 1200,
-                "goals_against": 100, "toi_hours": 40.0, "team": "STRONG"},
-            2: {"gp": 20, "wins": 12, "shutouts": 1, "shots_against": 600,
-                "goals_against": 50, "toi_hours": 20.0, "team": "STRONG"},
-            3: {"gp": 40, "wins": 20, "shutouts": 2, "shots_against": 1200,
-                "goals_against": 100, "toi_hours": 40.0, "team": "WEAK"},
-            4: {"gp": 20, "wins": 4, "shutouts": 0, "shots_against": 600,
-                "goals_against": 60, "toi_hours": 20.0, "team": "WEAK"},
+            1: {
+                "gp": 40,
+                "wins": 20,
+                "shutouts": 2,
+                "shots_against": 1200,
+                "goals_against": 100,
+                "toi_hours": 40.0,
+                "team": "STRONG",
+            },
+            2: {
+                "gp": 20,
+                "wins": 12,
+                "shutouts": 1,
+                "shots_against": 600,
+                "goals_against": 50,
+                "toi_hours": 20.0,
+                "team": "STRONG",
+            },
+            3: {
+                "gp": 40,
+                "wins": 20,
+                "shutouts": 2,
+                "shots_against": 1200,
+                "goals_against": 100,
+                "toi_hours": 40.0,
+                "team": "WEAK",
+            },
+            4: {
+                "gp": 20,
+                "wins": 4,
+                "shutouts": 0,
+                "shots_against": 600,
+                "goals_against": 60,
+                "toi_hours": 20.0,
+                "team": "WEAK",
+            },
         }
     )
     base = project_goalies([(frame, 82)], 82, (1.0,), team_win_blend=0.0)

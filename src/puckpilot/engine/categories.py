@@ -31,6 +31,9 @@ CATALOG: dict[str, Category] = {
         Category("blocks", "BLK", "skater"),
         Category("wins", "W", "goalie"),
         Category("saves", "SV", "goalie"),
+        # Yahoo scores SA as higher-is-better (stat_id 24, sort_order=1): as a
+        # counting stat it rewards workload, not weak goaltending.
+        Category("shots_against", "SA", "goalie"),
         Category("shutouts", "SHO", "goalie"),
         Category("save_pct", "SV%", "goalie", rate=True),
         Category("gaa", "GAA", "goalie", higher_is_better=False, rate=True),

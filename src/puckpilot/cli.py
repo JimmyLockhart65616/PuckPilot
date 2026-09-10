@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
+import time
+from functools import partial
 
 from puckpilot.config import Settings
 
@@ -45,6 +48,88 @@ def _cmd_yahoo_probe(args: argparse.Namespace) -> int:
     return 0 if result.scope_granted else 1
 
 
+def _cmd_yahoo_league(args: argparse.Namespace) -> int:
+    """League overview via the browser session, for when OAuth scope is blocked."""
+    import datetime
+    from pathlib import Path
+
+    from puckpilot.yahoo.session import YahooSession, YahooSessionError
+
+    settings = Settings()
+    profile = settings._resolve(Path("secrets/chrome-profile"))
+    if not profile.exists():
+        print(
+            "No logged-in profile yet. Run `ppilot draft capture --profile` "
+            "and sign into Yahoo first.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        with YahooSession(profile) as session:
+            keys = [args.league_key] if args.league_key else session.league_keys("nhl")
+            if not keys:
+                print("No NHL leagues found for this account.", file=sys.stderr)
+                return 1
+            for key in keys:
+                meta = session.league_meta(key)
+                print(f"League:  {meta.get('name')}  ({key})")
+                print(f"Teams:   {meta.get('num_teams')}   Scoring: {meta.get('scoring_type')}")
+                if meta.get("draft_time"):
+                    when = datetime.datetime.fromtimestamp(int(meta["draft_time"]))
+                    print(f"Draft:   {when:%A %Y-%m-%d %H:%M}   status: {meta.get('draft_status')}")
+                print()
+                print("Teams:")
+                for team in session.teams(key):
+                    mine = "  <- you" if str(team.get("is_owned_by_current_login")) == "1" else ""
+                    pos = team.get("draft_position") or "-"
+                    print(
+                        f"  {team.get('team_key', ''):<18} {str(team.get('name'))[:26]:<28}"
+                        f"draft_pos={pos}{mine}"
+                    )
+                picks = session.draft_results(key)
+                print()
+                print(f"Draft results: {len(picks)} picks recorded")
+                for p in picks[: args.picks]:
+                    print(
+                        f"  R{p.get('round', '?'):<3} #{p.get('pick', '?'):<4}"
+                        f"{p.get('team_key', ''):<18} {p.get('player_key', '')}"
+                    )
+    except YahooSessionError as e:
+        print(f"\n{e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_yahoo_watch(args: argparse.Namespace) -> int:
+    """Poll draftresults through a live draft to see whether it updates live."""
+    from pathlib import Path
+
+    from puckpilot.yahoo.session import YahooSession
+    from puckpilot.yahoo.watch import watch
+
+    settings = Settings()
+    profile = settings._resolve(Path("secrets/chrome-profile"))
+    out = settings._resolve(Path("data/captures")) / "draftwatch.json"
+    with YahooSession(profile) as session:
+        key = args.league_key or (session.league_keys("nhl") or [None])[0]
+        if not key:
+            print("No NHL league found.", file=sys.stderr)
+            return 2
+        report = watch(
+            session,
+            key,
+            interval=args.interval,
+            duration=args.duration,
+            out_path=out,
+            progress=print,
+        )
+    print()
+    print(report.text)
+    print()
+    print(f"Samples written to {out}")
+    return 0
+
+
 def _cmd_draft_capture(args: argparse.Namespace) -> int:
     from pathlib import Path
 
@@ -71,17 +156,192 @@ def _cmd_draft_capture(args: argparse.Namespace) -> int:
         )
         return 2
 
-    path = run_capture(
-        out_dir=out_dir,
-        cdp_url=args.cdp,
-        user_data_dir=profile,
-        dom_interval=args.dom_interval,
-        duration=args.duration,
-        progress=print,
-    )
+    from puckpilot.draft.capture import ProfileInUse
+
+    try:
+        path = run_capture(
+            out_dir=out_dir,
+            cdp_url=args.cdp,
+            user_data_dir=profile,
+            url=args.url,
+            dom_interval=args.dom_interval,
+            values_interval=args.values_interval,
+            duration=args.duration,
+            all_hosts=args.all_hosts,
+            progress=print,
+        )
+    except ProfileInUse as e:
+        print(f"\n{e}", file=sys.stderr)
+        return 2
     print(f"\nCapture written to {path}")
     print("Contents: network.jsonl, websocket.jsonl, events.jsonl, dom/, manifest.json")
     print("Git-ignored — it holds live session data.")
+    return 0
+
+
+def _cmd_draft_live(args: argparse.Namespace) -> int:
+    """The draft-night console.
+
+    The engine never picks here. It ranks, explains both sides of each option,
+    and a human decides - `--web` puts that on a second screen alongside the
+    full remaining board, the roster, and what the roster still needs.
+    """
+    from pathlib import Path
+
+    from puckpilot.data import store
+    from puckpilot.draft.live import LiveConfig, build_live_board, run_live
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    league = _league(args)
+
+    adp, feed, ctx, pump_fn = None, None, None, None
+    if args.yahoo:
+        # The websocket carries picks in any Yahoo draft room, mock or real, and
+        # is the only source measured at 100% on the picks it can map.
+        from playwright.sync_api import sync_playwright
+
+        from puckpilot.draft.wsfeed import WebsocketFeed, load_yahoo_id_map, pump
+        from puckpilot.yahoo.playermap import load_adp
+
+        profile = settings._resolve(Path("secrets/chrome-profile"))
+        pw = sync_playwright().start()
+        ctx = pw.chromium.launch_persistent_context(str(profile), headless=False, channel="chrome")
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        with contextlib.suppress(Exception):
+            page.goto(args.room, wait_until="domcontentloaded")
+        feed = WebsocketFeed(ctx, load_yahoo_id_map(conn))
+        key = args.yahoo if "." in str(args.yahoo) else None
+        adp = load_adp(conn, key) if key else None
+        pump_fn = partial(pump, ctx)
+        print(f"Websocket feed armed ({len(feed.yahoo_to_nhl)} ids). Join your draft room.")
+
+    board = build_live_board(
+        conn, league, seat=args.seat, season=args.season, adp=adp, progress=print
+    )
+    if args.web:
+        return _serve_live(board, feed, ctx, args)
+    run_live(board, feed=feed, cfg=LiveConfig(top=args.top), pump=pump_fn)
+    return 0
+
+
+def _serve_live(board, feed, ctx, args: argparse.Namespace) -> int:
+    """Second-screen web view, pumped from the browser the feed is attached to."""
+    import webbrowser
+
+    from puckpilot.draft.wsfeed import pump
+    from puckpilot.web.server import LiveState, serve
+
+    state = LiveState(board=board, feed=feed, top=args.top)
+    serve(state, port=args.port)
+    url = f"http://127.0.0.1:{args.port}"
+    print()
+    print(f"  Draft view: {url}")
+    print("  Ctrl+C to stop.")
+    print()
+    if not args.no_open:
+        webbrowser.open(url)
+
+    # The web view must outlive anything the browser does - tabs opening and
+    # closing, navigations, the draft room replacing the lobby. Nothing in here
+    # is allowed to end the process except Ctrl+C.
+    strikes = 0
+    try:
+        while True:
+            try:
+                landed = state.pump()
+                if landed:
+                    print(f"  +{landed} pick(s)  total={board.made}", flush=True)
+                strikes = 0
+            except Exception as e:
+                strikes += 1
+                if strikes in (1, 10, 50):
+                    print(f"  feed poll failed ({e.__class__.__name__}); still serving", flush=True)
+            if ctx is None:
+                time.sleep(args.interval)
+            else:
+                # Must be a Playwright call, not time.sleep: the sync driver only
+                # dispatches events (including "a new tab opened") from inside one.
+                pump(ctx, args.interval)
+    except KeyboardInterrupt:
+        print()
+        print("stopping")
+    if feed is not None:
+        st = feed.status()
+        print(
+            f"{board.made} picks on the board; feed saw {st.get('picks_detected', 0)} "
+            f"(gaps {st.get('gaps') or 'none'}, {st.get('unmapped', 0)} unmapped)"
+        )
+    return 0
+
+
+def _cmd_draft_farm(args: argparse.Namespace) -> int:
+    """Run mock drafts unattended and harvest ADP + pool-coverage data."""
+    from pathlib import Path
+
+    from playwright.sync_api import sync_playwright
+
+    from puckpilot.data import store
+    from puckpilot.draft.farm import LOBBY, MAX_RUNS, load_all, run_one, save
+    from puckpilot.draft.wsfeed import load_yahoo_id_map
+
+    def say(msg: str) -> None:
+        # An unattended run's stdout is usually a pipe, and CPython block-buffers
+        # a pipe: without flushing, a healthy 40-minute harvest looks dead.
+        print(msg, flush=True)
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    league = _league(args)
+    out_root = settings._resolve(Path("data/mocks"))
+    ymap = load_yahoo_id_map(conn)
+    say(f"{len(ymap)} Yahoo ids mapped; harvesting to {out_root}")
+    say("Read-only: this records what the room broadcasts and never picks for you.")
+
+    runs = max(1, min(args.runs, MAX_RUNS))
+    if runs != args.runs:
+        say(f"Capping at {MAX_RUNS} runs: each one takes a seat in a room of real people.")
+
+    profile = settings._resolve(Path("secrets/chrome-profile"))
+    done = 0
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(str(profile), headless=False, channel="chrome")
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        try:
+            for run in range(1, runs + 1):
+                say("")
+                say(f"[{run}/{runs}] opening the mock lobby")
+                with contextlib.suppress(Exception):
+                    page.goto(LOBBY, wait_until="domcontentloaded")
+                say("  join a mock draft in the browser; recording starts automatically")
+                result = run_one(ctx, conn, league, ymap, progress=say)
+                path = save(result, out_root)
+                done += 1
+                say(f"  {result.summary}  -> {path.name if path else 'not saved'}")
+        except KeyboardInterrupt:
+            say("")
+            say("stopping")
+        except Exception as e:
+            say("")
+            say(f"browser session ended ({e.__class__.__name__})")
+
+    harvested = load_all(out_root)
+    say("")
+    say(f"{done} run(s) this session; {len(harvested)} mock(s) on disk")
+    say("Next: ppilot draft calibrate")
+    return 0
+
+
+def _cmd_draft_calibrate(args: argparse.Namespace) -> int:
+    """Fit survival_spread against harvested mock drafts."""
+    from pathlib import Path
+
+    from puckpilot.draft.calibrate import calibrate
+    from puckpilot.draft.farm import load_all
+
+    root = Path(args.mocks) if args.mocks else Settings()._resolve(Path("data/mocks"))
+    report = calibrate(load_all(root), incumbent=args.incumbent)
+    print(report.text)
     return 0
 
 
@@ -167,6 +427,25 @@ def _cmd_draft_sim(args: argparse.Namespace) -> int:
     )
     print(report.text)
     return 0 if report.passed else 1
+
+
+def _cmd_draft_mock(args: argparse.Namespace) -> int:
+    from puckpilot.data import store
+    from puckpilot.draft.mock import run_mock
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    result = run_mock(
+        conn,
+        league=_league(args),
+        seat=args.seat,
+        seed=args.seed,
+        auto=args.auto,
+        target_season=args.season,
+        progress=print,
+    )
+    print(result.text)
+    return 0
 
 
 def _cmd_lineup_replay(args: argparse.Namespace) -> int:
@@ -279,6 +558,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     probe.set_defaults(func=_cmd_yahoo_probe)
 
+    yl = yahoo_sub.add_parser(
+        "league",
+        help="League settings, teams and draft results via the logged-in browser session",
+    )
+    yl.add_argument("--league-key", default=None, help="e.g. 477.l.29326 (default: auto-detect)")
+    yl.add_argument("--picks", type=int, default=10, help="Draft picks to print")
+    yl.set_defaults(func=_cmd_yahoo_league)
+
+    yw = yahoo_sub.add_parser(
+        "watch-draft",
+        help="Poll draftresults through a live draft to prove whether it updates live",
+    )
+    yw.add_argument("--league-key", default=None, help="e.g. 477.l.29326 (default: auto-detect)")
+    yw.add_argument("--interval", type=float, default=3.0, help="Seconds between polls")
+    yw.add_argument("--duration", type=float, default=5400.0, help="Give up after N seconds")
+    yw.set_defaults(func=_cmd_yahoo_watch)
+
     data = sub.add_parser("data", help="Local data store commands")
     data_sub = data.add_subparsers(dest="subcommand", required=True)
     init = data_sub.add_parser("init", help="Create/upgrade the local SQLite database")
@@ -348,10 +644,92 @@ def build_parser() -> argparse.ArgumentParser:
         "--dom-interval", type=float, default=15.0, help="Seconds between DOM snapshots"
     )
     capture.add_argument(
+        "--values-interval",
+        type=float,
+        default=1.5,
+        help="Seconds between reads of the header pick counter (default 1.5)",
+    )
+    capture.add_argument(
         "--duration", type=float, default=None, help="Stop after N seconds (default: until Ctrl+C)"
+    )
+    capture.add_argument(
+        "--url", default=None, help="Open this URL on start (e.g. the Yahoo mock draft lobby)"
+    )
+    capture.add_argument(
+        "--all-hosts",
+        action="store_true",
+        help="Record every host, not just Yahoo's. A fantasy page is mostly ad "
+        "exchanges, so the default keeps the log readable.",
     )
     capture.add_argument("--out", default=None, help="Output root (default data/captures)")
     capture.set_defaults(func=_cmd_draft_capture)
+
+    mock = draft_sub.add_parser(
+        "mock",
+        help="Draft interactively vs the bot field, then replay the roster over a real season",
+    )
+    mock.add_argument("--seat", type=int, default=0, help="Your draft slot (0-based)")
+    mock.add_argument("--seed", type=int, default=None, help="RNG seed for a repeatable field")
+    mock.add_argument(
+        "--auto",
+        action="store_true",
+        help="Let the engine draft your seat too (regression check, no prompting)",
+    )
+    mock.add_argument(
+        "--season",
+        default="20252026",
+        help="Season to draft for and replay; must be complete to be graded",
+    )
+    mock.set_defaults(func=_cmd_draft_mock)
+
+    farm = draft_sub.add_parser(
+        "farm",
+        help="Sit through Yahoo mock drafts (read-only) and harvest ADP / pool-coverage data",
+    )
+    farm.add_argument(
+        "--runs",
+        type=int,
+        default=5,
+        help="Mock drafts to sit through (capped: each run occupies a seat in a room "
+        "of real people)",
+    )
+    farm.set_defaults(func=_cmd_draft_farm)
+
+    cal = draft_sub.add_parser("calibrate", help="Fit survival_spread to harvested mock drafts")
+    cal.add_argument("--mocks", default=None, help="Harvest dir (default data/mocks)")
+    cal.add_argument("--incumbent", type=float, default=6.0, help="Current survival_spread")
+    cal.set_defaults(func=_cmd_draft_calibrate)
+
+    live = draft_sub.add_parser("live", help="Draft-night console: live recommendations")
+    live.add_argument("--seat", type=int, default=0, help="Your draft slot (0-based)")
+    live.add_argument("--season", default="20262027", help="Season to draft for")
+    live.add_argument("--top", type=int, default=12, help="Candidates on screen")
+    live.add_argument(
+        "--yahoo",
+        nargs="?",
+        const="auto",
+        default=None,
+        metavar="LEAGUE_KEY",
+        help="Read picks from the draft room websocket (needs a logged-in profile "
+        "and a built player map). Optionally name a league key for real ADP.",
+    )
+    live.add_argument(
+        "--room",
+        default="https://hockey.fantasysports.yahoo.com/hockey",
+        help="Page to open when --yahoo is used",
+    )
+    live.add_argument(
+        "--web",
+        action="store_true",
+        help="Serve the second-screen view (shortlist + full board + roster) instead "
+        "of the terminal console",
+    )
+    live.add_argument("--port", type=int, default=8765, help="Port for --web")
+    live.add_argument("--no-open", action="store_true", help="Do not open a browser tab")
+    live.add_argument(
+        "--interval", type=float, default=1.0, help="Seconds between feed polls with --web"
+    )
+    live.set_defaults(func=_cmd_draft_live)
 
     lineup = sub.add_parser("lineup", help="Daily lineup tools")
     lineup_sub = lineup.add_subparsers(dest="subcommand", required=True)

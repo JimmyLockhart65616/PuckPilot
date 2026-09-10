@@ -51,6 +51,12 @@ def goalie_values(acc: np.ndarray, cats: tuple[Category, ...]) -> np.ndarray:
                 v = a[..., G_SHO]
             elif c.key == "saves":
                 v = sa - ga
+            elif c.key == "shots_against":
+                # A scoring category in the real league (Yahoo stat_id 24,
+                # sort_order=1 -> higher is better). It reads as a bad thing but
+                # as a counting stat it is a pure workload proxy, which is the
+                # most repeatable goalie signal there is.
+                v = sa
             elif c.key == "save_pct":
                 v = np.where(sa > 0, 1.0 - ga / np.where(sa > 0, sa, 1.0), 0.0)
             elif c.key == "gaa":

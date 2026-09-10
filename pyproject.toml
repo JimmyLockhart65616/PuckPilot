@@ -22,6 +22,10 @@ dev = [
     "respx>=0.21",
     "ruff>=0.5",
 ]
+# Draft-room observation only (`ppilot draft capture`); not needed to run any engine.
+capture = [
+    "playwright>=1.44",
+]
 
 [project.scripts]
 ppilot = "puckpilot.cli:main"

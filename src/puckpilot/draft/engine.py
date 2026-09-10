@@ -149,7 +149,25 @@ class RosterValuePolicy:
             score += self.cat_weights.get(cat, 1.0) * z
         return score
 
-    def pick(self, u, avail, counts, rules, picks_left, rng, ctx=None) -> int:
+    def survival(self, u: Universe, ctx=None) -> np.ndarray:
+        """P(each player is still there at our next turn), per the ADP model.
+
+        Exposed because the live console shows it: "he'll last, take the other
+        guy" is the single most useful thing to put in front of a human on the
+        clock. Returns all-zeros when there is no next pick (last round), which
+        makes the discount vanish — nothing survives a draft that is over.
+        """
+        if not (ctx and ctx.get("next_pick_no") is not None):
+            return np.zeros(len(u))
+        taken_by_next = ctx["next_pick_no"]
+        return 1.0 / (1.0 + np.exp(-(u.adp_rank - taken_by_next) / self.survival_spread))
+
+    def score(self, u: Universe, counts, rules, ctx=None) -> np.ndarray:
+        """Per-player score before availability and position eligibility.
+
+        Split out of pick() so the live console can rank the whole board rather
+        than only learn the argmax. pick() calls this, so the two can never drift.
+        """
         slots = dict(rules.shape.slots)
         util_used = sum(max(0, counts.get(p, 0) - s) for p, s in slots.items() if p != "G")
         util_open = util_used < rules.shape.util_slots
@@ -171,11 +189,12 @@ class RosterValuePolicy:
         if self.survival_discount and ctx and ctx.get("next_pick_no") is not None:
             # discount players the ADP-following room will likely leave for our
             # next turn — spend this pick where the market is about to strike
-            taken_by_next = ctx["next_pick_no"]
-            p_survive = 1.0 / (1.0 + np.exp(-(u.adp_rank - taken_by_next) / self.survival_spread))
-            factor = 1.0 - self.survival_discount * p_survive
+            factor = 1.0 - self.survival_discount * self.survival(u, ctx)
             score = np.where(score > 0, score * factor, score)
-        return _pick_best(u, avail, counts, rules, picks_left, score)
+        return score
+
+    def pick(self, u, avail, counts, rules, picks_left, rng, ctx=None) -> int:
+        return _pick_best(u, avail, counts, rules, picks_left, self.score(u, counts, rules, ctx))
 
 
 class AdpBot:

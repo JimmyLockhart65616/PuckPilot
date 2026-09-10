@@ -84,6 +84,8 @@ class GameValueModel:
             return v[..., G_SHO]
         if cat.key == "saves":
             return v[..., G_SA] - v[..., G_GA]
+        if cat.key == "shots_against":  # scored higher-is-better: a workload stat
+            return v[..., G_SA]
         if cat.key == "save_pct":  # saves above what a pool-average goalie makes
             return (v[..., G_SA] - v[..., G_GA]) - self.pool_sv * v[..., G_SA]
         if cat.key == "gaa":  # goals prevented vs the pool rate (already sign-correct)

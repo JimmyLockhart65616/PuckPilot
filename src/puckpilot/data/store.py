@@ -90,6 +90,22 @@ CREATE TABLE IF NOT EXISTS nhl_player_bio (
     shoots      TEXT,
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Yahoo identifies drafted players only by player_key, so every pick arriving
+-- from a live draft has to cross this bridge to reach an NHL player_id. Built
+-- once before the draft; nhl_player_id is NULL for players we cannot match
+-- (minor leaguers, late call-ups) rather than dropped, so the gap is visible.
+CREATE TABLE IF NOT EXISTS yahoo_player_map (
+    player_key      TEXT PRIMARY KEY,
+    league_key      TEXT NOT NULL,
+    full_name       TEXT NOT NULL,
+    team_abbrev     TEXT,
+    positions       TEXT,          -- comma-separated Yahoo eligibility
+    nhl_player_id   INTEGER,
+    adp_rank        INTEGER,       -- 1-based order from Yahoo's own ADP sort
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_yahoo_map_nhl ON yahoo_player_map(nhl_player_id);
 """
 
 
