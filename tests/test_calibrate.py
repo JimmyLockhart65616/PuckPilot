@@ -111,19 +111,51 @@ def test_a_player_whose_adp_is_past_the_draft_yields_nothing():
     assert [o for o in obs if o.adp_rank == 400.0] == []
 
 
-def test_falls_back_to_draft_order_when_yahoo_publishes_no_adp():
-    """Without published ADP, when a player went is the only statement the
-    draft makes about where the market valued him."""
-    result = MockResult(
+def _no_adp_draft(n=40):
+    return MockResult(
         started="t",
         picks=[
-            {"pick": 1, "yahoo_id": "a", "seat": 1, "position": "C"},
-            {"pick": 2, "yahoo_id": "b", "seat": 2, "position": "C"},
+            {"pick": i, "yahoo_id": str(i), "seat": 1, "position": "C"} for i in range(1, n + 1)
         ],
         adp_observations=[],
         n_teams=12,
     )
-    assert observations_from(result), "draft order must stand in for ADP"
+
+
+def test_draft_order_must_not_stand_in_for_adp():
+    """Using the pick a player went at AS his rank makes survival a tautology:
+    `survived` becomes exactly `target <= rank` for everyone, and the log-loss
+    of a tautology falls monotonically as the spread shrinks.
+
+    An earlier version did exactly this whenever Yahoo published no ADP. On the
+    real 2026-09-08 mock it collapsed to the bottom of the grid at loss 0.06,
+    against 0.57 for the same 192 picks fitted on Yahoo's pool ADP - and pooled
+    with honest drafts it would have dragged the whole fit toward zero."""
+    assert observations_from(_no_adp_draft()) == []
+
+
+def test_a_draft_with_no_adp_is_counted_not_silently_dropped():
+    """A harvest that contributed nothing has to be visible, or the report
+    overstates how much evidence a spread rests on."""
+    report = calibrate([_no_adp_draft()])
+    assert report.n_drafts == 0
+    assert report.n_skipped == 1
+    assert "no usable ADP" in report.text
+
+
+def test_external_adp_is_used_in_preference_to_the_in_draft_channel():
+    """Yahoo's in-draft advice channel covered 26 of 192 picks in the real
+    2026-09-08 mock. The pool ADP covers the whole board, so passing it must
+    widen the sample rather than be ignored."""
+    result = MockResult(
+        started="t",
+        picks=[{"pick": i, "yahoo_id": str(i), "seat": 1, "position": "C"} for i in range(1, 41)],
+        adp_observations=[{"yahoo_id": "1", "adp_rank": 1.0}],  # sparse: one player
+        n_teams=12,
+    )
+    sparse = observations_from(result)
+    full = observations_from(result, adp={str(i): float(i) for i in range(1, 41)})
+    assert len(full) > len(sparse) * 5
 
 
 def test_a_draft_with_no_picks_yields_nothing():

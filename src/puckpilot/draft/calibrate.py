@@ -50,10 +50,17 @@ class CalibrationReport:
     losses: dict[float, float] = field(default_factory=dict)
     best: float | None = None
     incumbent: float = 6.0
+    n_skipped: int = 0
 
     @property
     def text(self) -> str:
         if not self.losses:
+            if self.n_skipped:
+                return (
+                    f"{self.n_skipped} harvested draft(s) carried no usable ADP, so none of "
+                    "them says anything about survival.\nBuild the Yahoo player map first "
+                    "(`ppilot yahoo playermap`) so pool ADP is available to fit against."
+                )
             return (
                 "No usable observations. Harvest mock drafts first (`ppilot draft farm --runs N`)."
             )
@@ -97,13 +104,28 @@ class CalibrationReport:
         return "\n".join(lines)
 
 
-def observations_from(result: MockResult, max_lookahead: int = MAX_LOOKAHEAD) -> list[Observation]:
+def observations_from(
+    result: MockResult,
+    max_lookahead: int = MAX_LOOKAHEAD,
+    adp: dict[str, float] | None = None,
+) -> list[Observation]:
     """Turn one draft into survive/gone observations.
 
-    `adp_rank` here is the player's position in *this* draft's own consensus
-    order, approximated by Yahoo's published ADP when present and otherwise by
-    the order players actually went. The question the model asks is about the
-    room, so the room's own ordering is the right yardstick.
+    `adp` is the pre-draft market rank per Yahoo player id, and it must come
+    from OUTSIDE this draft. Pass Yahoo's published pool ADP
+    (`pool_adp(conn, league_key)`) when it is available: the in-draft
+    `draft-labels` channel only covers the handful of players Yahoo happened to
+    advise on - 26 of 192 in the 2026-09-08 mock - so relying on it alone throws
+    away seven eighths of every harvest.
+
+    There is deliberately NO fallback to draft order. Setting a player's rank to
+    the pick he went at makes survival a tautology (`survived` is then exactly
+    `target <= rank`), and the log-loss of a tautology falls monotonically as the
+    spread shrinks - on the real 2026-09-08 draft it collapsed to the bottom of
+    the grid at a loss of 0.06, against 0.46 for the same draft fitted on real
+    ADP. Pooled with honest drafts it would drag the whole fit toward zero. A
+    draft with no external ADP says nothing about survival, so it contributes
+    nothing.
     """
     picked_at: dict[str, int] = {}
     for row in result.picks:
@@ -114,15 +136,14 @@ def observations_from(result: MockResult, max_lookahead: int = MAX_LOOKAHEAD) ->
     if not picked_at:
         return []
 
-    adp = {
-        str(row["yahoo_id"]): float(row["adp_rank"])
-        for row in result.adp_observations
-        if row.get("adp_rank") is not None
-    }
+    if adp is None:
+        adp = {
+            str(row["yahoo_id"]): float(row["adp_rank"])
+            for row in result.adp_observations
+            if row.get("adp_rank") is not None
+        }
     if not adp:
-        # Fall back to draft order: with no published ADP, when a player went is
-        # the only statement this draft makes about where the market valued him.
-        adp = {pid: float(pick) for pid, pick in picked_at.items()}
+        return []
 
     last_pick = max(picked_at.values())
     out: list[Observation] = []
@@ -159,8 +180,13 @@ def calibrate(
     grid: tuple[float, ...] = GRID,
     incumbent: float = 6.0,
     sample_every: int = 7,
+    adp: dict[str, float] | None = None,
 ) -> CalibrationReport:
     """Fit survival_spread across every harvested draft.
+
+    `adp` is Yahoo's published pool ADP (see `observations_from`). Without it
+    only the sparse in-draft advice channel is available, which covers a small
+    fraction of each draft.
 
     `sample_every` thins the observations: consecutive target picks for one
     player are near-duplicates, and keeping all of them would overstate the
@@ -168,14 +194,23 @@ def calibrate(
     """
     observations: list[Observation] = []
     used = 0
+    skipped = 0
     for result in results:
-        rows = observations_from(result)
+        rows = observations_from(result, adp=adp)
         if not rows:
+            # No external ADP for this draft. Counted and reported rather than
+            # quietly dropped, so a harvest that contributed nothing is visible.
+            skipped += 1
             continue
         used += 1
         observations.extend(rows[::sample_every])
 
-    report = CalibrationReport(n_observations=len(observations), n_drafts=used, incumbent=incumbent)
+    report = CalibrationReport(
+        n_observations=len(observations),
+        n_drafts=used,
+        incumbent=incumbent,
+        n_skipped=skipped,
+    )
     if not observations:
         return report
     report.losses = {spread: _log_loss(observations, spread) for spread in grid}

@@ -350,11 +350,25 @@ def _cmd_draft_calibrate(args: argparse.Namespace) -> int:
     """Fit survival_spread against harvested mock drafts."""
     from pathlib import Path
 
+    from puckpilot.data import store
     from puckpilot.draft.calibrate import calibrate
     from puckpilot.draft.farm import load_all
+    from puckpilot.yahoo.playermap import pool_adp
 
-    root = Path(args.mocks) if args.mocks else Settings()._resolve(Path("data/mocks"))
-    report = calibrate(load_all(root), incumbent=args.incumbent)
+    settings = Settings()
+    root = Path(args.mocks) if args.mocks else settings._resolve(Path("data/mocks"))
+
+    # Yahoo's own pool ADP, not the sparse in-draft advice channel: the latter
+    # covered 26 of 192 picks in the 2026-09-08 mock, and a draft's own order
+    # cannot stand in for the rank it is being measured against.
+    conn = store.connect(settings.resolved_db_path)
+    adp = pool_adp(conn, args.league_key)
+    if not adp:
+        print("No Yahoo pool ADP in the player map; run `ppilot yahoo playermap` first.")
+        return 2
+    print(f"Fitting against {len(adp)} Yahoo ADP ranks.")
+
+    report = calibrate(load_all(root), incumbent=args.incumbent, adp=adp)
     print(report.text)
     return 0
 
@@ -720,6 +734,12 @@ def build_parser() -> argparse.ArgumentParser:
     cal = draft_sub.add_parser("calibrate", help="Fit survival_spread to harvested mock drafts")
     cal.add_argument("--mocks", default=None, help="Harvest dir (default data/mocks)")
     cal.add_argument("--incumbent", type=float, default=6.0, help="Current survival_spread")
+    cal.add_argument(
+        "--league-key",
+        default=None,
+        metavar="KEY",
+        help="Restrict pool ADP to one league key (default: every mapped league)",
+    )
     cal.set_defaults(func=_cmd_draft_calibrate)
 
     live = draft_sub.add_parser("live", help="Draft-night console: live recommendations")

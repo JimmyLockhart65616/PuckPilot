@@ -276,3 +276,24 @@ def load_adp(conn: sqlite3.Connection, league_key: str) -> dict[int, int]:
             (league_key,),
         )
     }
+
+
+def pool_adp(conn: sqlite3.Connection, league_key: str | None = None) -> dict[str, float]:
+    """Bare Yahoo player id -> ADP rank, over the whole fetched pool.
+
+    Keyed to match the draft-room websocket, which sends "6743" where the map
+    table stores "477.p.6743" - the same convention as
+    `wsfeed.load_yahoo_id_map`.
+
+    This is the ADP the survival calibration should fit against. It is Yahoo's
+    own pre-draft market view of ~400 players, independent of any one draft, so
+    it is neither sparse (the in-draft advice channel covered 26 of 192 picks in
+    the 2026-09-08 mock) nor circular (draft order cannot stand in for the rank
+    the draft is being measured against).
+    """
+    sql = "SELECT player_key, adp_rank FROM yahoo_player_map WHERE adp_rank IS NOT NULL"
+    params: tuple = ()
+    if league_key:
+        sql += " AND league_key = ?"
+        params = (league_key,)
+    return {str(k).rsplit(".", 1)[-1]: float(rank) for k, rank in conn.execute(sql, params)}
