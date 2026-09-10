@@ -37,6 +37,35 @@ The valuation, projection, draft, and lineup engines are built and validated
 against historical seasons. Yahoo OAuth is implemented; full Fantasy API access
 (reads and writes) is pending approval of our Yahoo Developer API application.
 
+## Yahoo access and conduct
+
+PuckPilot integrates with Yahoo Fantasy through the **official Fantasy Sports
+API over OAuth 2.0** (`src/puckpilot/yahoo/client.py`, the only module permitted
+to import `yahoo_fantasy_api`). Full read/write scope is pending approval of our
+Yahoo Developer API application.
+
+While that application is pending, two read-only fallbacks exist so development
+can continue. Both are marked `DIAGNOSTIC` in their module docstrings, neither is
+required by any engine, and both are written to retire themselves:
+
+- `yahoo/session.py` reads the same `/fantasy/v2` paths the Yahoo web app calls,
+  authenticated by the user's own logged-in browser session. It is read-only by
+  construction (no write method exists, and a test asserts none appears), covers
+  only the signed-in user's own leagues, throttles its requests, and **refuses to
+  run once OAuth returns 200** — approval switches it off automatically.
+- `draft/capture.py` and `draft/wsfeed.py` observe a draft room the user has
+  joined by hand. They never click, type, submit, or navigate, and issue no
+  requests of their own — they read what that browser already receives. Captured
+  output stays local and git-ignored, with cookies and auth headers redacted.
+
+`draft/farm.py` sits through public mock drafts to measure when players actually
+go. It never picks and never clicks; the seat is the user's own and is played
+exactly as it would be without the tool running. Harvest sessions are capped
+because each one occupies a seat in a room of real people.
+
+On draft night the engine does not draft. It ranks the board, shows the case for
+and against each option, and a human makes every pick.
+
 ## Setup
 
 ```bash
