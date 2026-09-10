@@ -282,7 +282,14 @@ def _cmd_draft_farm(args: argparse.Namespace) -> int:
     from playwright.sync_api import sync_playwright
 
     from puckpilot.data import store
-    from puckpilot.draft.farm import LOBBY, MAX_RUNS, load_all, run_one, save
+    from puckpilot.draft.farm import (
+        JOIN_TIMEOUT_S,
+        LOBBY,
+        MAX_RUNS,
+        load_all,
+        run_one,
+        save,
+    )
     from puckpilot.draft.wsfeed import load_yahoo_id_map
 
     def say(msg: str) -> None:
@@ -314,7 +321,14 @@ def _cmd_draft_farm(args: argparse.Namespace) -> int:
                 with contextlib.suppress(Exception):
                     page.goto(LOBBY, wait_until="domcontentloaded")
                 say("  join a mock draft in the browser; recording starts automatically")
-                result = run_one(ctx, conn, league, ymap, progress=say)
+                result = run_one(
+                    ctx,
+                    conn,
+                    league,
+                    ymap,
+                    progress=say,
+                    join_timeout=args.join_timeout or JOIN_TIMEOUT_S,
+                )
                 path = save(result, out_root)
                 done += 1
                 say(f"  {result.summary}  -> {path.name if path else 'not saved'}")
@@ -692,6 +706,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=5,
         help="Mock drafts to sit through (capped: each run occupies a seat in a room "
         "of real people)",
+    )
+    farm.add_argument(
+        "--join-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="How long to hold the lobby open waiting for you to join a mock "
+        "(default: farm.JOIN_TIMEOUT_S, 15 min)",
     )
     farm.set_defaults(func=_cmd_draft_farm)
 

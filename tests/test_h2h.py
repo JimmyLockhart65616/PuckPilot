@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import numpy as np
+import pytest
 
 from puckpilot.draft.h2h import round_robin_schedule, run_h2h_season, score_matchup
 from puckpilot.draft.replay import G_GA, G_HOURS, G_SA, G_WIDTH, G_WINS
@@ -11,12 +14,22 @@ GAA = Category("gaa", "GAA", "goalie", higher_is_better=False, rate=True)
 
 def test_configured_keeper_names_all_resolve(db):
     """A keeper name that fails to resolve would leave an elite player wrongly
-    available on the simulated draft board, so this must never silently pass."""
+    available on the simulated draft board, so this must never silently pass.
+
+    Skipped where the real league file is absent: it holds a live league id and
+    is deliberately git-ignored, so a clone of this public repo does not have
+    one. The mechanism itself is covered by tests/test_league_config.py against
+    a fixture; this is the check against the actual keeper list.
+    """
     from puckpilot.data import store
     from puckpilot.keepers import keeper_seats, resolve_keeper_ids
     from puckpilot.league import load_league
 
-    league = load_league("leagues/ajaxians.toml")
+    league_file = Path("leagues/ajaxians.toml")
+    if not league_file.is_file():
+        pytest.skip(f"{league_file} not present (private league config)")
+
+    league = load_league(league_file)
     names = league.keepers_for_season("20262027")
     assert len(names) > 0
     for i, n in enumerate(names):
