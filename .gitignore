@@ -11,6 +11,9 @@ secrets/
 data/*.db
 data/*.db-*
 data/cache/
+# draft-room recordings: live session cookies and personal league data
+data/captures/
+data/mocks/
 
 # internal working notes — not for the public repo
 docs/STATUS.md
@@ -18,3 +21,4 @@ CLAUDE.md
 
 .pytest_cache/
 .ruff_cache/
+leagues/ajaxians.toml
