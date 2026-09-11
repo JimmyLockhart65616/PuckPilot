@@ -5,20 +5,49 @@ __pycache__/
 dist/
 build/
 
-# secrets & local state
+# Secrets and local state.
+# .env.* as well as .env: a stray .env.local holds the same credentials.
 .env
+.env.*
+!.env.example
 secrets/
-data/*.db
-data/*.db-*
-data/cache/
-# draft-room recordings: live session cookies and personal league data
-data/captures/
-data/mocks/
+# Token caches, wherever Settings.token_path is pointed. Naming only
+# secrets/oauth2.json would protect the default and nothing else.
+oauth2.json
+token.json
+*.token.json
 
-# internal working notes — not for the public repo
-docs/STATUS.md
+# Local data. `data/` is ignored wholesale and the tracked exceptions are named,
+# so a new subdirectory of recordings is private by default rather than by
+# someone remembering to add a rule. Draft-room recordings in particular hold
+# live session cookies and personal league data.
+data/
+
+# League configs are PRIVATE: they carry a live Yahoo league id, the league
+# name, and named keeper rosters for every team in it. Ignore the directory and
+# allow only the documented template back in. Listing one filename instead
+# protected exactly that filename - and left `leagues/default.toml`, which is
+# the built-in default path in config.py, publishable.
+leagues/*
+!leagues/example.toml
+
+# Internal working notes - not for the public repo.
+docs/
 CLAUDE.md
 
+# Tooling output.
 .pytest_cache/
 .ruff_cache/
-leagues/ajaxians.toml
+.coverage
+coverage.xml
+htmlcov/
+*.log
+
+# Playwright artefacts: traces and videos of a logged-in Yahoo session.
+playwright-report/
+test-results/
+trace.zip
+
+# Editors.
+.idea/
+.vscode/

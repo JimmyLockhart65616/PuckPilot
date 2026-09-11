@@ -91,17 +91,16 @@ def _redact(headers: dict[str, str]) -> dict[str, str]:
 # untouched: a crumb in a query string, a token in a JSON response body, and the
 # frames the browser SENDS to a websocket - which is exactly where a client-side
 # auth handshake appears. `scrub` runs over every string written to disk.
+_KEYS = r"access_token|refresh_token|id_token|crumb|password|secret|sessionid|auth|sig|token"
+# `\\?` before every quote: these run over JSON-serialized lines as well as raw
+# values, and a nested body arrives escaped - `\"access_token\": \"ya29...\"`.
+# Without tolerating the backslash the escaped form matched nothing, which was
+# verified leaking a token through the serialized path.
+_Q = r"\\?[\"']"
 SECRET_PATTERNS = (
-    re.compile(
-        r"(?i)\b(access_token|refresh_token|id_token|crumb|auth|sig|sessionid|token)"
-        r"=([^&\s\"']{6,})"
-    ),
+    re.compile(rf"(?i)\b({_KEYS})=([^&\s\"'\\]{{6,}})"),
     re.compile(r"(?i)\b(bearer)\s+([A-Za-z0-9._\-]{12,})"),
-    # "access_token": "..."  /  'crumb':'...'
-    re.compile(
-        r"(?i)[\"']?(access_token|refresh_token|id_token|crumb|password|secret)[\"']?"
-        r"\s*:\s*[\"']([^\"']{6,})[\"']"
-    ),
+    re.compile(rf"(?i){_Q}?({_KEYS}){_Q}?\s*:\s*{_Q}([^\"'\\]{{6,}}){_Q}"),
     # bare JWTs, wherever they appear
     re.compile(r"\b(eyJ)[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*"),
 )
@@ -188,9 +187,18 @@ class CaptureSession:
         return self._files[name]
 
     def write(self, stream: str, record: dict) -> None:
+        """Append one record. Everything is scrubbed HERE, at the chokepoint.
+
+        Scrubbing at each call site was tried and failed the obvious way: six
+        paths were covered and twelve were not, including the exception text in
+        `dom_snapshot_failed` and the manifest's record of the local profile
+        path. Doing it on the serialized line means a write path added later
+        cannot bypass it by omission.
+        """
         record["t"] = round(time.time() - self.started_at, 3)
         record["wall"] = datetime.now(UTC).isoformat()
-        self._stream(stream).write(json.dumps(record, ensure_ascii=False) + "\n")
+        line = scrub(json.dumps(record, ensure_ascii=False))
+        self._stream(stream).write(line + "\n")
         self.counts[stream] = self.counts.get(stream, 0) + 1
 
     def snapshot_dom(self, page, seq: int) -> None:
@@ -208,8 +216,9 @@ class CaptureSession:
     def finalize(self, manifest: dict) -> None:
         manifest["counts"] = self.counts
         manifest["duration_s"] = round(time.time() - self.started_at, 1)
+        # The manifest records the attach mode and the local profile path.
         (self.out_dir / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+            scrub(json.dumps(manifest, indent=2, ensure_ascii=False)), encoding="utf-8"
         )
         for f in self._files.values():
             f.close()

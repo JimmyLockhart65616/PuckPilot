@@ -1,0 +1,71 @@
+name: ci
+
+# The repo is public and holds a real league's tooling, so the guards that
+# matter most are not "do the tests pass" but "did a private identifier or a
+# credential just get committed". Both run on every push and PR.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      # Offline unit tests only. `-m live` hits real NHL/MoneyPuck APIs and is
+      # excluded by default in pyproject; CI must not depend on a third party
+      # being up, and must never need Yahoo credentials.
+      - run: pytest -q
+
+  no-secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Private files must not be tracked
+        run: |
+          set -eu
+          fail=0
+          # League configs carry a live Yahoo league id and named keeper
+          # rosters. Only the documented template may be tracked.
+          for f in $(git ls-files 'leagues/*'); do
+            if [ "$f" != "leagues/example.toml" ]; then
+              echo "::error file=$f::private league config is tracked"; fail=1
+            fi
+          done
+          for pattern in 'secrets/*' '.env' '.env.*' 'docs/*' 'CLAUDE.md' \
+                         '*oauth2.json' '*token.json' 'data/*'; do
+            for f in $(git ls-files "$pattern"); do
+              case "$f" in
+                .env.example) ;;
+                *) echo "::error file=$f::must not be tracked"; fail=1 ;;
+              esac
+            done
+          done
+          exit $fail
+
+      - name: Credential-shaped strings must not be committed
+        run: |
+          set -eu
+          # Deliberately narrow: token/key VALUES, not variable names. A hit
+          # here is either a real secret or a placeholder that should look less
+          # like one.
+          if git grep -nIE \
+               -e '(access_token|refresh_token|client_secret|consumer_secret)["'"'"']?\s*[:=]\s*["'"'"'][^"'"'"']{12,}' \
+               -e 'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.' \
+               -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' \
+               -- . ':(exclude)tests/test_capture.py'; then
+            echo "::error::credential-shaped string committed"
+            exit 1
+          fi
+          echo "no credential-shaped strings found"

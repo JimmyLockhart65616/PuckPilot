@@ -93,7 +93,7 @@ def test_session_dirs_are_distinct_per_run(tmp_path):
 # merely inconvenient.
 HEADER_R5 = (
     "YAHOO FANTASY HOCKEY DRAFT\n"
-    "Penalty Box - H2H\n00:27\n"
+    "Some Mock League - H2H\n00:27\n"
     "Manager Four's Pick \u2022 You're up in 1 Picks \u2022 Round 5, Pick 67\n"
     "Last: J. SANDERSON (D-OTT)   Team Delta"
 )
@@ -134,7 +134,7 @@ def test_draft_urls_survive_the_host_filter():
     the draft client itself - that assumption already cost two captures."""
     from puckpilot.draft.capture import _on_allowed_host
 
-    assert _on_allowed_host("https://hockey.fantasysports.yahoo.com/draftclient/hockey/2223773/12")
+    assert _on_allowed_host("https://hockey.fantasysports.yahoo.com/draftclient/hockey/1234567/12")
     assert _on_allowed_host("https://some-cdn.example.net/draft/socket")
     assert _on_allowed_host("wss://anything.example.org/draftclient/live")
     assert not _on_allowed_host("https://eus.rubiconproject.com/usync.js")
@@ -145,7 +145,7 @@ def test_draft_client_page_is_recognised_explicitly():
     'sports.yahoo.com'. This is the page the harness exists for."""
     from puckpilot.draft.capture import PAGE_URL_HINTS
 
-    url = "https://hockey.fantasysports.yahoo.com/draftclient/hockey/2223773/12?auth="
+    url = "https://hockey.fantasysports.yahoo.com/draftclient/hockey/1234567/12?auth="
     assert "draftclient" in PAGE_URL_HINTS
     assert any(h in url for h in PAGE_URL_HINTS)
 
@@ -194,21 +194,43 @@ def test_scrub_leaves_ordinary_draft_traffic_alone():
     assert scrub("Round 5, Pick 67") == "Round 5, Pick 67"
 
 
-def test_every_capture_write_path_is_scrubbed():
-    """Five write paths bypassed redaction entirely before this; a new one must
-    not quietly join them."""
+def test_scrubbing_happens_at_the_chokepoint_not_per_call_site():
+    """Scrubbing each call site was tried and covered 6 paths of 18. Doing it on
+    the serialized line means a path added later cannot bypass it by omission."""
     import inspect
 
-    from puckpilot.draft import capture
+    from puckpilot.draft.capture import CaptureSession
 
-    src = inspect.getsource(capture)
-    for sink in (
-        '"url": scrub(request.url)',
-        '"post_data": scrub(',
-        "body = scrub(",
-        '"url": scrub(response.url)',
-        '"dir": "recv", "url": ws.url, "payload": scrub(',
-        '"dir": "sent", "url": ws.url, "payload": scrub(',
-        "write_text(scrub(html)",
-    ):
-        assert sink in src, f"unscrubbed capture write path: {sink}"
+    src = inspect.getsource(CaptureSession.write)
+    assert "scrub(json.dumps(record" in src, "CaptureSession.write stopped scrubbing"
+
+
+def test_a_token_nested_in_a_json_body_does_not_survive_serialization(tmp_path):
+    """The record is serialized before it is written, so a nested body arrives
+    with its quotes escaped. Patterns that only matched bare quotes let this
+    through - verified leaking before the escape handling was added."""
+    session = CaptureSession(out_dir=tmp_path / "s")
+    session.write(
+        "network",
+        {"kind": "response", "body": '{"access_token": "ya29.SECRETVALUE", "ok": 1}'},
+    )
+    session.finalize({})
+    written = (tmp_path / "s" / "network.jsonl").read_text(encoding="utf-8")
+    assert "ya29.SECRETVALUE" not in written
+    assert "access_token" in written  # the key survives; only the value goes
+
+
+def test_the_manifest_is_scrubbed_too(tmp_path):
+    session = CaptureSession(out_dir=tmp_path / "s")
+    session.finalize({"attach": {"mode": "cdp", "url": "http://h/x?token=SUPERSECRETVALUE"}})
+    text = (tmp_path / "s" / "manifest.json").read_text(encoding="utf-8")
+    assert "SUPERSECRETVALUE" not in text
+
+
+def test_scrub_does_not_corrupt_real_pick_frames():
+    """Over-redaction would silently destroy a capture. These are the exact
+    shapes the 2026-09-08 draft emitted; zero of its 687 frames were altered."""
+    from puckpilot.draft.capture import scrub
+
+    for frame in ("0|1|6743|1|C|0", "D|192|1|30", "C|24", "H|S|30|0|0|0"):
+        assert scrub(frame) == frame

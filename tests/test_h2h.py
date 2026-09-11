@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -14,20 +12,23 @@ GAA = Category("gaa", "GAA", "goalie", higher_is_better=False, rate=True)
 
 def test_configured_keeper_names_all_resolve(db):
     """A keeper name that fails to resolve would leave an elite player wrongly
-    available on the simulated draft board, so this must never silently pass.
+    available on the draft board, so this must never silently pass.
 
-    Skipped where the real league file is absent: it holds a live league id and
-    is deliberately git-ignored, so a clone of this public repo does not have
-    one. The mechanism itself is covered by tests/test_league_config.py against
-    a fixture; this is the check against the actual keeper list.
+    Runs against whatever LEAGUE_FILE points at, and skips when there is none.
+    League configs are private - they carry a live league id and named keeper
+    rosters - so a clone of this public repo has no such file, and naming one
+    here would put the league's identity back into tracked source. The mechanism
+    is covered against a fixture in tests/test_league_config.py; this is the
+    check against a real keeper list.
     """
+    from puckpilot.config import Settings
     from puckpilot.data import store
     from puckpilot.keepers import keeper_seats, resolve_keeper_ids
     from puckpilot.league import load_league
 
-    league_file = Path("leagues/ajaxians.toml")
+    league_file = Settings().resolved_league_path
     if not league_file.is_file():
-        pytest.skip(f"{league_file} not present (private league config)")
+        pytest.skip("no league config present (LEAGUE_FILE unset or private file absent)")
 
     league = load_league(league_file)
     names = league.keepers_for_season("20262027")

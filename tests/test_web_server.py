@@ -133,3 +133,27 @@ def test_it_binds_loopback_only(server):
     """The board and roster are private and there is no auth, so this must not
     be reachable from the network."""
     assert server.server_address[0] == "127.0.0.1"
+
+
+def test_a_rebound_host_header_is_refused(server):
+    """Sec-Fetch-Site alone does not survive DNS rebinding: the attacker's own
+    name resolves to 127.0.0.1, so the browser truthfully says same-origin while
+    the page is theirs. Host is the header that still distinguishes them."""
+    for route, method in (("/undo", "POST"), ("/state", "GET")):
+        status, _ = _request(
+            server,
+            route,
+            method=method,
+            headers={"Host": "evil.example.com", "Sec-Fetch-Site": "same-origin"},
+        )
+        assert status == 403, f"{method} {route} accepted a rebound Host"
+    assert server.state.board.undone == 0
+
+
+def test_the_page_can_still_undo(server):
+    """A regression guard: making /undo POST-only left `draft live --web` with
+    no reachable undo at all until the page got a button."""
+    from puckpilot.web.server import PAGE
+
+    assert 'id="undo"' in PAGE
+    assert "'/undo', {method:'POST'}" in PAGE

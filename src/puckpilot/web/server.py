@@ -61,6 +61,9 @@ PAGE = """<!doctype html>
  input{background:transparent;border:1px solid var(--line);color:var(--fg);
    padding:5px 8px;width:100%;font:inherit;border-radius:4px;margin-bottom:6px}
  .need{color:var(--warn)} code{color:var(--dim);font-size:11px}
+ button{background:var(--card);border:1px solid var(--line);color:var(--fg);
+   font:inherit;padding:4px 10px;border-radius:4px;cursor:pointer}
+ button:hover{border-color:var(--warn);color:var(--warn)}
 </style>
 <h1>PuckPilot</h1>
 <div class="bar">
@@ -70,6 +73,9 @@ PAGE = """<!doctype html>
   <div><span class="k">feed</span> <span id="detected" class="big">0</span></div>
   <div><span class="k">last</span> <span id="age">never</span></div>
   <div id="gaps"></div>
+  <div style="margin-left:auto">
+    <button id="undo" title="Take back the last pick the feed recorded">undo last pick</button>
+    <span id="undone" class="k"></span></div>
 </div>
 <div class="cols">
   <div class="col" style="flex:1.15">
@@ -137,6 +143,14 @@ function render(s){
   });
   document.getElementById('diag').textContent = s.diagnostics;
 }
+document.getElementById('undo').addEventListener('click', async () => {
+  const note = document.getElementById('undone');
+  try {
+    const r = await fetch('/undo', {method:'POST'});
+    note.textContent = (await r.json()).result || '';
+  } catch(e) { note.textContent = 'undo failed'; }
+  tick();
+});
 async function tick(){
   try { window.__s = await (await fetch('/state')).json(); render(window.__s); }
   catch(e){ document.getElementById('gaps').innerHTML =
@@ -245,7 +259,7 @@ class LiveState:
         }
 
 
-def make_handler(state: LiveState, port: int = 8765):
+def make_handler(state: LiveState):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # keep the console clean
             pass
@@ -276,17 +290,40 @@ def make_handler(state: LiveState, port: int = 8765):
             fixed default, so the target is guessable. Fetch metadata is the
             primary check; Origin is the fallback for clients that omit it.
             """
+            # Host first. Sec-Fetch-Site alone does not survive DNS rebinding:
+            # the attacker's own name resolves to 127.0.0.1, so the browser
+            # truthfully reports same-origin while the page is theirs. Pinning
+            # Host to the loopback names we actually serve closes that, and
+            # also protects the read routes.
+            # Read the port off the listening socket rather than trusting the
+            # value passed in: serve(port=0) lets the OS choose, and comparing
+            # against the literal 0 rejected every legitimate request.
+            bound = self.server.server_address[1]
+            host = (self.headers.get("Host") or "").lower()
+            if host and host not in (
+                f"127.0.0.1:{bound}",
+                f"localhost:{bound}",
+                f"[::1]:{bound}",
+            ):
+                return False
             site = self.headers.get("Sec-Fetch-Site")
             if site is not None:
                 return site in ("same-origin", "none")
             origin = self.headers.get("Origin")
             if origin is None:
                 return True  # curl and friends: no browser, no CSRF vector
-            return origin in (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
+            return origin in (f"http://127.0.0.1:{bound}", f"http://localhost:{bound}")
 
         def do_GET(self):
             route = self._route()
             if route == "/state":
+                # Guarded as well: /state is the entire board, roster and needs,
+                # which is exactly what a rebinding attack would want to read.
+                if not self._is_same_origin():
+                    self._send(
+                        403, json.dumps({"error": "cross-origin refused"}), "application/json"
+                    )
+                    return
                 self._send(200, json.dumps(state.snapshot()), "application/json")
             elif route == "/undo":
                 # Mutating routes are POST-only, so a bare navigation or an
@@ -314,6 +351,6 @@ def make_handler(state: LiveState, port: int = 8765):
 def serve(state: LiveState, port: int = 8765) -> ThreadingHTTPServer:
     """Start the server on a background thread; returns it so callers can stop it."""
     # Loopback only: the board and roster are private, and the server has no auth.
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(state, port))
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(state))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
