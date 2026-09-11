@@ -285,3 +285,94 @@ def test_run_sims_smoke_on_fixture_db(db):
     assert 0.0 <= report.engine_top_rate <= 1.0
     assert report.best_bot in report.archetypes
     assert "Draft sim" in report.text
+
+
+# ---- what the engine actually scores on ------------------------------------
+#
+# `_base_score` returned `z_total` for a long time, so positional replacement
+# level - the whole point of VORP - never entered the pick decision: a
+# defenceman and a centre with equal z looked identical, even though the
+# replacement-level defenceman is far worse. VORP was computed, displayed on the
+# board, and then left out of the choice.
+
+
+def _two_basis_universe():
+    """A board where VORP and z_total disagree, so the tests cannot pass by
+    accident. The D is worse in raw z but scarcer, hence better in VORP."""
+    import pandas as pd
+
+    from puckpilot.draft.engine import Universe
+
+    rows = {
+        1: {"name": "Rich C", "position": "C", "team": "AAA", "vorp": 1.0, "z_total": 9.0},
+        2: {"name": "Scarce D", "position": "D", "team": "AAA", "vorp": 9.0, "z_total": 1.0},
+    }
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    df.index.name = "player_id"
+    return Universe(df)
+
+
+def test_the_default_basis_is_vorp():
+    """Measured at n=1500 on a locked seed against the real 12-cat league:
+    top-3 0.443 -> 0.525 on target 2025-26 and 0.294 -> 0.379 on 2024-25, with
+    non-overlapping CIs both times. Two seasons, same sign."""
+    from puckpilot.draft.engine import RosterValuePolicy
+
+    assert RosterValuePolicy().basis == "vorp"
+
+
+def test_each_basis_scores_on_what_it_says():
+    from puckpilot.draft.engine import RosterValuePolicy
+
+    u = _two_basis_universe()
+    by_vorp = RosterValuePolicy(basis="vorp")._base_score(u)
+    by_z = RosterValuePolicy(basis="z")._base_score(u)
+    # the two disagree about who is better, which is the point
+    assert by_vorp.argmax() != by_z.argmax()
+    assert list(by_vorp) == [1.0, 9.0]
+    assert list(by_z) == [9.0, 1.0]
+
+
+def test_an_unknown_basis_is_refused_at_construction():
+    """A silently-ignored typo here would change every recommendation."""
+    from puckpilot.draft.engine import RosterValuePolicy
+
+    with pytest.raises(ValueError, match="basis must be"):
+        RosterValuePolicy(basis="vorpp")
+
+
+def test_category_weights_still_work_on_the_z_basis():
+    """VORP is already a scalar so the two do not compose; per-category
+    weighting stays meaningful on z, where the categories still exist."""
+    import numpy as np
+    import pandas as pd
+
+    from puckpilot.draft.engine import RosterValuePolicy, Universe
+
+    df = pd.DataFrame.from_dict(
+        {
+            1: {
+                "name": "A",
+                "position": "C",
+                "team": "X",
+                "vorp": 1.0,
+                "z_total": 2.0,
+                "z_goals": 2.0,
+                "z_hits": 0.0,
+            },
+            2: {
+                "name": "B",
+                "position": "C",
+                "team": "X",
+                "vorp": 1.0,
+                "z_total": 2.0,
+                "z_goals": 0.0,
+                "z_hits": 2.0,
+            },
+        },
+        orient="index",
+    )
+    df.index.name = "player_id"
+    u = Universe(df)
+    blind = RosterValuePolicy(basis="z", cat_weights={"goals": 0.0, "hits": 1.0})
+    assert np.argmax(blind._base_score(u)) == 1, "zeroing goals must favour the hits player"

@@ -123,6 +123,11 @@ class RosterValuePolicy:
     category weights — damping the collinear P=G+A costs value (0.280) and
     chasing HIT/BLK is disastrous (0.130), because the peripheral categories are
     cheap to acquire on waivers but scoring is not.
+
+    Both knobs were tuned while `_base_score` returned `z_total`. The base is now
+    VORP (see `_base_score`), which changes what they are correcting, so they are
+    due a re-tune on the new basis — they are kept at their measured values
+    rather than guessed at in the meantime.
     """
 
     name = "engine"
@@ -134,14 +139,43 @@ class RosterValuePolicy:
         cat_weights: dict[str, float] | None = None,
         survival_discount: float = 0.50,
         survival_spread: float = 6.0,
+        basis: str = "vorp",
     ):
+        if basis not in ("vorp", "z"):
+            raise ValueError(f"basis must be 'vorp' or 'z', got {basis!r}")
         self.goalie_weight = goalie_weight
         self.bench_factor = bench_factor
         self.cat_weights = cat_weights
         self.survival_discount = survival_discount
         self.survival_spread = survival_spread
+        self.basis = basis
 
     def _base_score(self, u: Universe) -> np.ndarray:
+        """What a player is worth before roster shape and market timing.
+
+        `basis="vorp"` subtracts a positional replacement level; `basis="z"` is
+        raw summed z-score. The distinction is the whole point of VORP and this
+        policy ignored it for a long time - `_base_score` returned `z_total`, so
+        a defenceman and a centre with equal z looked identical even though the
+        replacement-level defenceman is far worse. VORP was computed, displayed
+        on the board, and then left out of the decision.
+
+        Measured at n=1500 on a locked seed never used for tuning, against the
+        real 12-category league, with non-overlapping CIs in both directions:
+
+            target 2025-26   z 0.443 [.418,.468]   vorp 0.525 [.500,.551]
+            target 2024-25   z 0.294 [.271,.318]   vorp 0.379 [.355,.404]
+
+        Two target seasons, same sign, same rough magnitude - which is why this
+        is the default and the goals-weight result that turned up alongside it
+        is not: that one gained 0.29 on 2025-26 and *lost* on 2024-25, i.e. it
+        was fitted to one season.
+
+        `cat_weights` still applies on the z basis, where per-category weighting
+        is meaningful. VORP is already a scalar, so the two do not compose.
+        """
+        if self.basis == "vorp" and not self.cat_weights:
+            return u.vorp.copy()
         if not self.cat_weights:
             return u.z_total.copy()
         score = np.zeros(len(u))
