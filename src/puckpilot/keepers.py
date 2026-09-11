@@ -47,17 +47,40 @@ def resolve_keeper_ids(
 
 
 def keeper_seats(
-    player_ids: list[int], n_teams: int, rng: np.random.Generator
+    player_ids: list[int],
+    n_teams: int,
+    rng: np.random.Generator,
+    owned: dict[int, list[int]] | None = None,
 ) -> dict[int, list[int]]:
     """Deal kept players across seats as evenly as possible.
 
-    Ownership is not recorded on most keeper sheets, so this randomizes which
-    rival holds which keeper while keeping the board (the set of unavailable
-    players) exactly right.
+    Ownership is not recorded on most keeper sheets, so by default this
+    randomizes which rival holds which keeper while keeping the board (the set
+    of unavailable players) exactly right. That is fine for a simulation, where
+    only availability matters.
+
+    It is NOT fine for a live board, where our own roster drives what the engine
+    thinks we still need. Pass `owned` - seat -> player ids known to be held by
+    that seat - and those are placed exactly; everything left over is dealt
+    round-robin across the seats with the most room, so declaring only your own
+    keepers still produces a sane board.
     """
-    ids = list(player_ids)
-    rng.shuffle(ids)
+    owned = {int(s): [int(p) for p in ids] for s, ids in (owned or {}).items()}
     out: dict[int, list[int]] = {s: [] for s in range(n_teams)}
-    for i, pid in enumerate(ids):
-        out[i % n_teams].append(int(pid))
+    placed: set[int] = set()
+    for seat, ids in owned.items():
+        if not 0 <= seat < n_teams:
+            continue
+        for pid in ids:
+            if pid not in placed:
+                out[seat].append(pid)
+                placed.add(pid)
+
+    rest = [int(p) for p in player_ids if int(p) not in placed]
+    rng.shuffle(rest)
+    # Fill the emptiest seats first rather than striding from seat 0, or a
+    # declared owner would be dealt extra keepers on top of the ones they hold.
+    for pid in rest:
+        seat = min(range(n_teams), key=lambda s: (len(out[s]), s))
+        out[seat].append(pid)
     return out

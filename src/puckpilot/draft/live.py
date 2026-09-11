@@ -215,9 +215,18 @@ def build_live_board(
     train_seasons: tuple[str, ...] = ("20252026", "20242025", "20232024"),
     adp: dict[int, int] | None = None,
     progress: Callable[[str], None] = print,
+    seed: int = 0,
 ) -> DraftBoard:
-    """The one slow step, done before the draft rather than during it."""
-    from puckpilot.draft.sim import build_universe
+    """The one slow step, done before the draft rather than during it.
+
+    Keepers are the part that used to be missing, and their absence was not
+    cosmetic: without them the kept players stay on the board and top the
+    shortlist, our roster reads empty so the engine mis-states what we still
+    need, ADP is never re-based, and the slot count is the full roster rather
+    than the picks that will actually happen - which makes `next_pick_no`, and
+    therefore every survival probability, wrong.
+    """
+    from puckpilot.draft.sim import build_universe, keepers_for
 
     t0 = time.perf_counter()
     progress("Building board...")
@@ -231,6 +240,24 @@ def build_live_board(
         )
         universe = universe.with_adp(ranks)
         progress(f"  using Yahoo ADP for {sum(1 for p in universe.ids if int(p) in adp)} players")
-    board = DraftBoard(universe, league.draft_rules(), my_seat=seat)
-    progress(f"  ready in {time.perf_counter() - t0:.1f}s — {len(board.slots)} picks\n")
+
+    # Deterministic: a live board rebuilt mid-draft must not re-deal keepers.
+    keepers = keepers_for(
+        conn, universe, season, league, np.random.default_rng(seed), warn=progress
+    )
+    board = DraftBoard(universe, league.draft_rules(), my_seat=seat, keepers=keepers)
+
+    kept = sum(len(v) for v in keepers.values())
+    progress(f"  {kept} keepers off the board; {len(board.slots)} live picks remain")
+    if board.unmatched_keepers:
+        # An unplaced keeper leaves an elite player wrongly draftable - the worst
+        # board error there is, so it is stated rather than logged and forgotten.
+        progress(f"  WARNING: {len(board.unmatched_keepers)} keeper(s) could not be placed")
+    owners = league.keeper_owners_for_season(season)
+    if seat not in owners:
+        progress(
+            f"  NOTE: no declared keepers for seat {seat}; ownership is dealt evenly, "
+            "so your roster panel is a guess. Set [keepers.owners] in the league file."
+        )
+    progress(f"  ready in {time.perf_counter() - t0:.1f}s\n")
     return board

@@ -41,6 +41,17 @@ years = 3                    # seasons a player stays on contract once drafted
 [keepers.by_season]
 # "20262027" = ["Connor McDavid", "Cale Makar"]
 
+# Who keeps whom, by seat (0-based draft slot). Optional, and usually partial —
+# most keeper sheets record the pool without recording ownership. Whatever is
+# declared here is placed exactly; everything else is dealt evenly across the
+# remaining seats.
+#
+# Declaring at least YOUR OWN seat is worth doing: it is what makes the live
+# console's roster and "still need" panels yours rather than a guess. Without it
+# the board is still correct about who is unavailable, and `draft live` says so.
+# [keepers.owners.20262027]
+# "3" = ["Connor McDavid", "Cale Makar"]
+
 [transactions]
 season_acquisitions = 65     # Yahoo "max acquisitions for entire season"
 weekly_acquisitions = 3      # Yahoo "max acquisitions per week"

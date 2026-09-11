@@ -100,7 +100,21 @@ def keepers_for(
             warn(f"  keepers not found in nhl_players: {', '.join(unmatched)}")
         if missing:
             warn(f"  keepers outside the ranked universe: {', '.join(missing)}")
-    return keeper_seats([pid for pid in resolved.values() if pid in known], n_teams, rng)
+
+    # Where the league records WHO keeps whom, honour it. Availability is the
+    # same either way, but which seat holds a keeper decides whose roster the
+    # engine reasons about - and on a live board one of those seats is ours.
+    owned: dict[int, list[int]] = {}
+    for seat, owner_names in league.keeper_owners_for_season(season).items():
+        ids = [resolved.get(n) for n in owner_names]
+        unknown = [n for n in owner_names if resolved.get(n) not in known]
+        if warn and unknown:
+            warn(f"  seat {seat} keepers not on the board: {', '.join(unknown)}")
+        owned[seat] = [pid for pid in ids if pid is not None and pid in known]
+
+    return keeper_seats(
+        [pid for pid in resolved.values() if pid in known], n_teams, rng, owned=owned
+    )
 
 
 def run_draft(

@@ -42,6 +42,12 @@ class LeagueConfig:
     keeper_years: int = 3
     # season -> player names under contract going into that season's draft
     keepers_by_season: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # season -> seat index -> the names THAT seat keeps. Optional, and usually
+    # partial: most keeper sheets record the pool without recording ownership.
+    # Whatever is declared is placed exactly and the rest are dealt evenly, so
+    # declaring only your own seat is a useful thing to do - it is what makes
+    # the live board's roster and "still need" panels yours rather than random.
+    keeper_owners_by_season: dict[str, dict[int, tuple[str, ...]]] = field(default_factory=dict)
 
     # acquisition budget (Yahoo: "max acquisitions" season/week)
     season_acquisitions: int | None = None
@@ -67,6 +73,9 @@ class LeagueConfig:
 
     def keepers_for_season(self, season: str) -> tuple[str, ...]:
         return tuple(self.keepers_by_season.get(season, ()))
+
+    def keeper_owners_for_season(self, season: str) -> dict[int, tuple[str, ...]]:
+        return dict(self.keeper_owners_by_season.get(season, {}))
 
     def draft_rules(self, **overrides) -> DraftRules:
         return DraftRules(shape=self.shape, rounds=self.draft_rounds, **overrides)
@@ -121,6 +130,22 @@ def load_league(path: str | Path) -> LeagueConfig:
     by_season = {
         str(k): tuple(str(n) for n in v) for k, v in (keepers.get("by_season") or {}).items()
     }
+    owners_by_season: dict[str, dict[int, tuple[str, ...]]] = {}
+    for season, seats in (keepers.get("owners") or {}).items():
+        if not isinstance(seats, dict):
+            raise LeagueConfigError(
+                f"{p}: keepers.owners.{season} must be a table of seat -> names"
+            )
+        placed: dict[int, tuple[str, ...]] = {}
+        for seat, names in seats.items():
+            try:
+                idx = int(seat)
+            except (TypeError, ValueError) as e:
+                raise LeagueConfigError(
+                    f"{p}: keepers.owners.{season} seat {seat!r} is not an integer"
+                ) from e
+            placed[idx] = tuple(str(n) for n in names)
+        owners_by_season[str(season)] = placed
     return LeagueConfig(
         name=str(cfg.get("name", p.stem)),
         league_id=str(cfg.get("league_id", "")),
@@ -131,6 +156,7 @@ def load_league(path: str | Path) -> LeagueConfig:
         n_keepers=int(keepers.get("count", 0)),
         keeper_years=int(keepers.get("years", 3)),
         keepers_by_season=by_season,
+        keeper_owners_by_season=owners_by_season,
         season_acquisitions=tx.get("season_acquisitions"),
         weekly_acquisitions=tx.get("weekly_acquisitions"),
         min_goalie_appearances=int(lineup.get("min_goalie_appearances", 0)),
