@@ -245,7 +245,7 @@ class LiveState:
         }
 
 
-def make_handler(state: LiveState):
+def make_handler(state: LiveState, port: int = 8765):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # keep the console clean
             pass
@@ -258,19 +258,62 @@ def make_handler(state: LiveState):
             self.end_headers()
             self.wfile.write(payload)
 
+        def _route(self) -> str:
+            """Path without its query string.
+
+            Matched exactly, never by prefix: `startswith("/undo")` also accepts
+            `/undo.png`, which is enough to smuggle a state change through an
+            `<img>` tag.
+            """
+            return self.path.split("?", 1)[0].rstrip("/") or "/"
+
+        def _is_same_origin(self) -> bool:
+            """Reject cross-site requests to the mutating route.
+
+            A GET or form POST from any other page the user has open is a
+            "simple request": the browser sends it and the side effect fires
+            even though the same-origin policy hides the reply. The port is a
+            fixed default, so the target is guessable. Fetch metadata is the
+            primary check; Origin is the fallback for clients that omit it.
+            """
+            site = self.headers.get("Sec-Fetch-Site")
+            if site is not None:
+                return site in ("same-origin", "none")
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True  # curl and friends: no browser, no CSRF vector
+            return origin in (f"http://127.0.0.1:{port}", f"http://localhost:{port}")
+
         def do_GET(self):
-            if self.path.startswith("/state"):
+            route = self._route()
+            if route == "/state":
                 self._send(200, json.dumps(state.snapshot()), "application/json")
-            elif self.path.startswith("/undo"):
-                self._send(200, json.dumps({"result": state.undo()}), "application/json")
+            elif route == "/undo":
+                # Mutating routes are POST-only, so a bare navigation or an
+                # <img> src cannot rewind the board mid-draft.
+                self._send(
+                    405,
+                    json.dumps({"error": "use POST /undo"}),
+                    "application/json",
+                )
             else:
                 self._send(200, PAGE, "text/html; charset=utf-8")
+
+        def do_POST(self):
+            if self._route() != "/undo":
+                self._send(404, json.dumps({"error": "not found"}), "application/json")
+                return
+            if not self._is_same_origin():
+                self._send(403, json.dumps({"error": "cross-origin refused"}), "application/json")
+                return
+            self._send(200, json.dumps({"result": state.undo()}), "application/json")
 
     return Handler
 
 
 def serve(state: LiveState, port: int = 8765) -> ThreadingHTTPServer:
     """Start the server on a background thread; returns it so callers can stop it."""
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(state))
+    # Loopback only: the board and roster are private, and the server has no auth.
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(state, port))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server

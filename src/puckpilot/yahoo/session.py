@@ -23,9 +23,9 @@ permanent:
   which is fine while sitting at a draft and wrong for a scheduled job. Do not
   wire this into cron.
 
-Requests are issued from inside a page on a Yahoo origin via `fetch(...,
-{credentials: 'include'})` - the same call the site itself makes - so cookies are
-never extracted, decrypted, or stored anywhere by us.
+Requests are issued from inside the user's own logged-in Yahoo page, so the
+browser attaches its own session exactly as it does for any page that user
+visits. PuckPilot never extracts, decrypts, copies, or stores a cookie.
 """
 
 from __future__ import annotations

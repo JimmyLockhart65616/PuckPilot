@@ -1,7 +1,7 @@
 [project]
 name = "puckpilot"
 version = "0.1.0"
-description = "Yahoo fantasy hockey manager: draft-day analytics, automated daily lineups, waiver sniping with human-in-the-loop approvals"
+description = "Fantasy hockey analytics: category-aware valuation, draft-night recommendations, daily lineup optimisation, and waiver suggestions - validated against real seasons"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"

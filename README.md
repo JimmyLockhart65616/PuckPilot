@@ -18,8 +18,10 @@ validation, not gut feel.
 - **Daily lineup optimization** — starts the players who skate tonight, benches
   scratches, and slots the right goalies, solved as an optimization problem to
   wring the most value from every roster spot.
-- **Waiver & free-agent engine** — nightly pickup proposals you review and
-  approve, then executed through the Yahoo Fantasy API.
+- **Waiver & free-agent engine** — ranked pickup and drop proposals, scored
+  against a weekly backtest. Proposals are recorded for you to review; executing
+  them through the Yahoo Fantasy API is designed but not built, and is gated on
+  API approval.
 
 ## Why PuckPilot
 
@@ -44,27 +46,50 @@ API over OAuth 2.0** (`src/puckpilot/yahoo/client.py`, the only module permitted
 to import `yahoo_fantasy_api`). Full read/write scope is pending approval of our
 Yahoo Developer API application.
 
-While that application is pending, two read-only fallbacks exist so development
-can continue. Both are marked `DIAGNOSTIC` in their module docstrings, neither is
-required by any engine, and both are written to retire themselves:
+**Nothing in PuckPilot writes to Yahoo.** There is no add, drop, trade, lineup
+or draft-pick submission anywhere in the codebase, and no code path that sends
+anything to Yahoo other than the OAuth token exchange itself.
 
-- `yahoo/session.py` reads the same `/fantasy/v2` paths the Yahoo web app calls,
-  authenticated by the user's own logged-in browser session. It is read-only by
-  construction (no write method exists, and a test asserts none appears), covers
-  only the signed-in user's own leagues, throttles its requests, and **refuses to
-  run once OAuth returns 200** — approval switches it off automatically.
-- `draft/capture.py` and `draft/wsfeed.py` observe a draft room the user has
-  joined by hand. They never click, type, submit, or navigate, and issue no
-  requests of their own — they read what that browser already receives. Captured
-  output stays local and git-ignored, with cookies and auth headers redacted.
+Three components read Yahoo. They differ in status, so they are described
+separately rather than lumped together:
 
-`draft/farm.py` sits through public mock drafts to measure when players actually
-go. It never picks and never clicks; the seat is the user's own and is played
-exactly as it would be without the tool running. Harvest sessions are capped
-because each one occupies a seat in a room of real people.
+**`yahoo/session.py` — an interim fallback, and it retires itself.** It reads
+the same `/fantasy/v2` paths Yahoo's own web app calls, authenticated by the
+user's existing logged-in browser session. It is read-only by construction (no
+write method exists, and a test asserts none appears), covers only the
+signed-in user's own leagues, throttles its requests, and **refuses to run once
+OAuth returns 200** — approval switches it off automatically, without anyone
+having to remember. It is marked `DIAGNOSTIC` in its docstring.
 
-On draft night the engine does not draft. It ranks the board, shows the case for
-and against each option, and a human makes every pick.
+**`draft/wsfeed.py` — permanent, and passive.** This is how the draft-night
+console learns which players are gone. It is not a diagnostic and has no kill
+switch, because it is the product. It opens no connection of its own: it
+attaches to the socket the user's own draft-room session already has, reads
+what arrives, and never sends.
+
+**`draft/capture.py` — a diagnostic, kept as an instrument.** It records a
+draft room to disk so the pick feed could be built from evidence rather than
+guesswork. Output stays local and git-ignored, with cookies and auth headers
+redacted.
+
+What these do to a browser, stated precisely: **they never click, type, submit,
+or interact with a page.** The one browser action they take is opening a Yahoo
+URL you name — `capture.py --url`, and the lobby or draft room for `farm` and
+`live --yahoo` — after which everything is driven by hand. Beyond that page
+load they issue no requests of their own; they read what your browser already
+receives.
+
+`draft/farm.py` sits through public mock drafts to record the order players
+come off the board, which is what calibrates the survival model. It never picks
+and never clicks. The seat is the user's own, and Yahoo plays it exactly as it
+would if the tool were not running — including autopicking it if the user steps
+away, which is ordinary Yahoo behaviour for any idle seat. Sessions are capped,
+because each run occupies a seat in a room of real people. It records picks and
+nothing else: the advice values the room broadcasts mid-draft are Yahoo's own
+analytics, and are deliberately not captured.
+
+On draft night the engine does not draft. It ranks the board, shows the case
+for and against each option, and a human makes every pick.
 
 ## Setup
 

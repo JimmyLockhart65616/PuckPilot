@@ -72,7 +72,7 @@ def test_no_keepers_gives_a_plain_snake():
 
 
 def test_uneven_keepers_give_uneven_pick_counts():
-    """The Ajaxians case: 29 eligible keepers across 12 seats cannot be uniform,
+    """The real-league case: 29 eligible keepers across 12 seats cannot be uniform,
     so a seat keeping fewer players must end up with more live picks."""
     b = _board(keepers={0: [1, 2], 1: [11], 2: [], 3: []})
     assert b.picks_left(0) == 5  # 7 rounds - 2 keepers

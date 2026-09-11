@@ -26,6 +26,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+# Polling budget. Each pass costs two requests against an undocumented endpoint,
+# so this is capped rather than left as a function of how long the draft runs.
+# A pick takes tens of seconds; 20s spacing detects liveness with room to spare.
+DEFAULT_INTERVAL_S = 20.0
+MAX_REQUESTS = 400
+
 Progress = Callable[[str], None]
 
 
@@ -48,6 +54,7 @@ class WatchReport:
     samples: list[WatchSample] = field(default_factory=list)
     first_pick_seen_at: float | None = None
     statuses: set[str] = field(default_factory=set)
+    note: str = ""
 
     @property
     def verdict(self) -> str:
@@ -85,6 +92,8 @@ class WatchReport:
                 lines.append(
                     f"  median gap between increments: {sorted(gaps)[len(gaps) // 2]:.1f}s"
                 )
+        if self.note:
+            lines.append(f"  {self.note}")
         lines.append("")
         lines.append(f"VERDICT: {self.verdict}")
         return "\n".join(lines)
@@ -93,22 +102,39 @@ class WatchReport:
 def watch(
     session,
     league_key: str,
-    interval: float = 3.0,
+    interval: float = DEFAULT_INTERVAL_S,
     duration: float = 3600.0,
     out_path: Path | None = None,
     progress: Progress = _noop,
+    max_requests: int = MAX_REQUESTS,
 ) -> WatchReport:
-    """Poll until the draft completes, `duration` elapses, or Ctrl+C."""
+    """Poll until the draft completes, the request budget runs out, `duration`
+    elapses, or Ctrl+C.
+
+    The budget is the point. Each pass costs two requests against an
+    undocumented endpoint, and an earlier 3-second default over a 90-minute
+    draft came to roughly 3,600 of them - which is a robot by any reading, and
+    is the pattern `session.py`'s own rules forbid. A draft pick takes tens of
+    seconds, so polling far slower loses nothing and the ceiling makes the worst
+    case explicit rather than a function of how long the draft ran.
+    """
     report = WatchReport(league_key=league_key)
     started = time.time()
     last_n = -1
+    spent = 0
 
     progress(f"Watching {league_key}. Ctrl+C to stop.")
+    progress(f"  budget: {max_requests} requests, {interval:.0f}s apart")
     try:
         while time.time() - started < duration:
+            if spent + 2 > max_requests:
+                progress(f"  request budget spent ({spent}); stopping.")
+                report.note = f"stopped after {spent} requests (budget {max_requests})"
+                break
             t = time.time() - started
             status, n, err = "?", 0, None
             try:
+                spent += 2
                 status = str(session.league_meta(league_key).get("draft_status", "?"))
                 n = len(session.draft_results(league_key))
             except Exception as e:  # a blip must not end the experiment

@@ -27,6 +27,10 @@ A public mock draft contains real people, so:
   eleven players than a live one, so this is metered rather than left to loop.
 - **Mock rooms only.** `LOBBY` is the mock lobby by construction. Do not point
   this at a real league: on draft night the engine advises and a human decides.
+- **Picks only.** The room also broadcasts Yahoo's own advice signals - its ADP,
+  tiering and dropoff. Those are Yahoo's analytics product rather than an
+  observation of the draft, and the calibration does not need them, so they are
+  not recorded.
 """
 
 from __future__ import annotations
@@ -48,8 +52,6 @@ MAX_RUNS = 10
 # A mock room is idle far longer than a draft takes; give up rather than hang.
 JOIN_TIMEOUT_S = 900.0
 DRAFT_TIMEOUT_S = 3600.0
-# Yahoo's own draft-advice channel, which carries live ADP per player.
-LABELS_PREFIX = "O|draft-labels|"
 
 Progress = Callable[[str], None]
 
@@ -80,50 +82,26 @@ class MockResult:
 
 
 class MockRecorder:
-    """Collects pick frames and Yahoo's own ADP rows from one draft."""
+    """Collects the pick frames from one draft."""
 
     def __init__(self):
         self.picks: dict[int, PickFrame] = {}
-        self.adp: dict[str, dict] = {}
         self.started = datetime.now(UTC).isoformat()
 
     def ingest(self, payload: str) -> None:
-        text = str(payload)
-        frame = parse_frame(text)
+        """Record picks. Nothing else on the socket is kept.
+
+        An earlier version also lifted Yahoo's own advice signals - its ADP,
+        tiering, VOLS rank and dropoff - off a separate channel the room
+        broadcasts. That was Yahoo's analytics product rather than an
+        observation of the draft, and it is not needed: the calibration fits
+        against ADP from the player map, which covered 192 of 192 picks in the
+        2026-09-08 mock where the in-draft channel reached 26. Taking it bought
+        nothing measurable, so it is not taken.
+        """
+        frame = parse_frame(str(payload))
         if isinstance(frame, PickFrame):
             self.picks[frame.pick] = frame
-            return
-        if text.startswith(LABELS_PREFIX):
-            self._ingest_labels(text)
-
-    def _ingest_labels(self, text: str) -> None:
-        """Yahoo publishes its own ADP and tiering on this channel.
-
-        Keeping the *first* reading per player: later frames re-rank as the
-        draft progresses, and what we want is the pre-draft market view.
-        """
-        body = text.split("|", 3)[-1]
-        try:
-            rows = json.loads(body)
-        except json.JSONDecodeError:
-            return
-        for row in rows if isinstance(rows, list) else []:
-            pid = str(row.get("playerId", ""))
-            signals = row.get("signals") or {}
-            if not pid or "adpRank" not in signals:
-                continue
-            self.adp.setdefault(
-                pid,
-                {
-                    "yahoo_id": pid,
-                    "name": row.get("playerName"),
-                    "position": row.get("position"),
-                    "adp_rank": signals.get("adpRank"),
-                    "vols_rank": signals.get("volsRank"),
-                    "tier": signals.get("tier"),
-                    "dropoff": signals.get("dropoff"),
-                },
-            )
 
     def result(self, n_teams: int, completed: bool, note: str = "") -> MockResult:
         picks = [asdict(self.picks[k]) | {"pick": k} for k in sorted(self.picks)]
@@ -131,7 +109,9 @@ class MockRecorder:
         return MockResult(
             started=self.started,
             picks=picks,
-            adp_observations=list(self.adp.values()),
+            # Retained on the dataclass so harvests banked before the advice
+            # channel was dropped still load; nothing writes it now.
+            adp_observations=[],
             n_teams=n_teams,
             rounds=rounds,
             completed=completed,

@@ -7,7 +7,7 @@ undone, and inspected between them. This is that state, as a mutable object.
 
 The pick sequence is the piece that repays care. A keeper league does not run a
 clean snake: keepers occupy draft slots, so a team keeping fewer than the
-maximum gets *more* live picks than one keeping the maximum. In the Ajaxians
+maximum gets *more* live picks than one keeping the maximum. On the real
 2026-27 board only 29 of a possible 36 keeper slots are eligible, so the board
 is definitely uneven. That matters beyond bookkeeping, because
 `RosterValuePolicy.survival_discount` — the knob the draft sim credits with the

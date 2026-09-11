@@ -114,9 +114,9 @@ def observations_from(
     `adp` is the pre-draft market rank per Yahoo player id, and it must come
     from OUTSIDE this draft. Pass Yahoo's published pool ADP
     (`pool_adp(conn, league_key)`) when it is available: the in-draft
-    `draft-labels` channel only covers the handful of players Yahoo happened to
-    advise on - 26 of 192 in the 2026-09-08 mock - so relying on it alone throws
-    away seven eighths of every harvest.
+    advice values the room broadcasts mid-draft cover only a handful of players
+    - 26 of 192 in the 2026-09-08 mock - and are no longer recorded at all (see
+    `farm.MockRecorder.ingest`).
 
     There is deliberately NO fallback to draft order. Setting a player's rank to
     the pick he went at makes survival a tautology (`survived` is then exactly

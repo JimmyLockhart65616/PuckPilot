@@ -60,8 +60,8 @@ def test_flatten_descends_through_nested_containers():
 def test_first_value_wins_so_league_meta_is_not_clobbered():
     """Yahoo repeats keys across sections; settings are merged under metadata,
     and a later generic 'name' must not overwrite the league's own."""
-    out = flatten([{"name": "Ajaxians"}, {"team": [{"name": "Covie-19"}]}])
-    assert out["name"] == "Ajaxians"
+    out = flatten([{"name": "Test League"}, {"team": [{"name": "Team Alpha"}]}])
+    assert out["name"] == "Test League"
 
 
 def test_structured_settings_are_kept_whole():

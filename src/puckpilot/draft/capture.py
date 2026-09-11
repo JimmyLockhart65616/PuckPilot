@@ -12,8 +12,12 @@ Conduct rules it holds to:
   by hand and listens. It does not click, type, submit, or navigate on its own.
 - **It observes only what that user's own browser already receives.** No extra
   requests are issued, so it adds nothing to Yahoo's load.
-- **Nothing is republished.** Output is local, git-ignored, and session cookies
-  and auth headers are redacted on the way in (this repo is public).
+- **Nothing is republished.** Output is local and git-ignored. Sensitive headers
+  are redacted by name, and `scrub` additionally blanks credential-shaped values
+  anywhere else they appear - query strings, request and response bodies,
+  websocket frames in both directions, and the DOM snapshots. That is a net
+  rather than a guarantee, which is why the output stays git-ignored regardless
+  (this repo is public).
 
 `yahoo/client.py` (OAuth) remains the supported integration. Retire this the day
 scraping stops being the only way to see a draft happen.
@@ -32,8 +36,7 @@ from pathlib import Path
 from typing import Any
 
 # Redacted rather than dropped: knowing that a request *carried* a cookie is
-# useful for A3 (can we replay this feed with the session cookie?), the value is
-# not.
+# useful, the value is not.
 SENSITIVE_HEADERS = {
     "cookie",
     "set-cookie",
@@ -84,6 +87,42 @@ def _redact(headers: dict[str, str]) -> dict[str, str]:
     }
 
 
+# Headers were once the ONLY thing redacted, which left the more likely carriers
+# untouched: a crumb in a query string, a token in a JSON response body, and the
+# frames the browser SENDS to a websocket - which is exactly where a client-side
+# auth handshake appears. `scrub` runs over every string written to disk.
+SECRET_PATTERNS = (
+    re.compile(
+        r"(?i)\b(access_token|refresh_token|id_token|crumb|auth|sig|sessionid|token)"
+        r"=([^&\s\"']{6,})"
+    ),
+    re.compile(r"(?i)\b(bearer)\s+([A-Za-z0-9._\-]{12,})"),
+    # "access_token": "..."  /  'crumb':'...'
+    re.compile(
+        r"(?i)[\"']?(access_token|refresh_token|id_token|crumb|password|secret)[\"']?"
+        r"\s*:\s*[\"']([^\"']{6,})[\"']"
+    ),
+    # bare JWTs, wherever they appear
+    re.compile(r"\b(eyJ)[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*"),
+)
+
+
+def scrub(text: str) -> str:
+    """Blank out credential-shaped substrings anywhere in a captured string.
+
+    Deliberately conservative about what it keeps: the key name survives so the
+    log still shows that a token was present, only the value goes. It is a net,
+    not a guarantee - which is why captures stay git-ignored regardless.
+    """
+    if not text:
+        return text
+    out = text
+    for pattern in SECRET_PATTERNS[:3]:
+        out = pattern.sub(lambda m: f"{m.group(1)}=<redacted>", out)
+    out = SECRET_PATTERNS[3].sub("<redacted-jwt>", out)
+    return out
+
+
 def _on_allowed_host(url: str) -> bool:
     low = url.lower()
     if any(hint in low for hint in URL_ALWAYS_KEEP):
@@ -98,7 +137,7 @@ def _wants_body(content_type: str) -> bool:
 
 
 # The draft room header carries an authoritative pick counter and the most
-# recent pick: "Antonio's Pick - You're up in 1 Picks - Round 5, Pick 67" and
+# recent pick: "<manager>'s Pick - You're up in 1 Picks - Round 5, Pick 67" and
 # "Last: J. SANDERSON (D-OTT)". Both are read by regex over the page's text
 # rather than by CSS selector, because Yahoo's atomic class names are not
 # stable identifiers and guessing at them is what broke the last two attempts.
@@ -161,8 +200,10 @@ class CaptureSession:
             self.write("events", {"kind": "dom_snapshot_failed", "error": str(e)})
             return
         name = f"{seq:04d}_{int(time.time() - self.started_at):06d}.html"
-        (self.out_dir / "dom" / name).write_text(html, encoding="utf-8")
-        self.write("events", {"kind": "dom_snapshot", "file": name, "url": page.url})
+        # A rendered Yahoo page embeds its own bootstrap state, which is where a
+        # crumb or token sits in the markup rather than in a header.
+        (self.out_dir / "dom" / name).write_text(scrub(html), encoding="utf-8")
+        self.write("events", {"kind": "dom_snapshot", "file": name, "url": scrub(page.url)})
 
     def finalize(self, manifest: dict) -> None:
         manifest["counts"] = self.counts
@@ -192,10 +233,10 @@ def _attach_page(
             {
                 "kind": "request",
                 "method": request.method,
-                "url": request.url,
+                "url": scrub(request.url),
                 "resource_type": request.resource_type,
                 "headers": _redact(request.headers),
-                "post_data": (request.post_data or "")[:MAX_BODY_BYTES],
+                "post_data": scrub((request.post_data or "")[:MAX_BODY_BYTES]),
             },
         )
 
@@ -211,7 +252,7 @@ def _attach_page(
         if _wants_body(content_type):
             try:
                 raw = response.body()
-                body = raw[:MAX_BODY_BYTES].decode("utf-8", errors="replace")
+                body = scrub(raw[:MAX_BODY_BYTES].decode("utf-8", errors="replace"))
             except Exception as e:
                 body = f"<unavailable: {e}>"
         session.write(
@@ -219,7 +260,7 @@ def _attach_page(
             {
                 "kind": "response",
                 "status": response.status,
-                "url": response.url,
+                "url": scrub(response.url),
                 "resource_type": request.resource_type,
                 "content_type": content_type,
                 "headers": _redact(headers),
@@ -235,14 +276,14 @@ def _attach_page(
             "framereceived",
             lambda payload: session.write(
                 "websocket",
-                {"dir": "recv", "url": ws.url, "payload": str(payload)[:MAX_BODY_BYTES]},
+                {"dir": "recv", "url": ws.url, "payload": scrub(str(payload)[:MAX_BODY_BYTES])},
             ),
         )
         ws.on(
             "framesent",
             lambda payload: session.write(
                 "websocket",
-                {"dir": "sent", "url": ws.url, "payload": str(payload)[:MAX_BODY_BYTES]},
+                {"dir": "sent", "url": ws.url, "payload": scrub(str(payload)[:MAX_BODY_BYTES])},
             ),
         )
         ws.on(

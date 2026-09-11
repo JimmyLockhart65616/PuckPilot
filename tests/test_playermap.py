@@ -5,7 +5,7 @@ a MISSED match leaves a drafted player on our board (bad), while a WRONG match
 removes someone else (worse, and invisible). So the fallbacks are tested for
 what they refuse as much as what they accept.
 
-The awkward cases here are all real, taken from the 2026-27 Ajaxians pool.
+The awkward cases here are all real, taken from a 2026-27 league pool.
 """
 
 from __future__ import annotations

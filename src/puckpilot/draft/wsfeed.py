@@ -1,26 +1,27 @@
-"""Yahoo's draft-room websocket: the actual pick feed.
+"""The draft-night pick feed.
 
-Measured against a full 12-team, 16-round mock (2026-09-08 capture) this
-reported **192 of 192 picks, none wrong, none unmapped**. Nothing else came
-close: the header ticker managed 137/192, and no HTTP endpoint carried picks at
-all. So this is the feed, and the DOM readers become cross-checks.
+Yahoo's draft room pushes pick events to the browser over a websocket. This
+reads that stream from the page the user has open and marks players off the
+board. It is a permanent part of the draft-night console rather than a
+diagnostic: on 2026-09-18 this is how the console learns what has been taken.
 
-The protocol is line-oriented, pipe-delimited, pushed over
-`wss://...sports-aws-prod-omega.aws.oath.cloud/`:
+It is passive. It opens no connection of its own - it attaches to the socket the
+user's own session already has, reads what arrives, and never sends.
 
-    D|1|1|30            pick 1 is on the clock for seat 1, 30 second timer
-    0|1|6743|1|C|0      pick 1 was Yahoo player 6743, seat 1, position C
-    O|draft-labels|118|[{...}]   Yahoo's own advice, incl. live ADP
+Measured against a full 12-team, 16-round mock (2026-09-08 capture) it reported
+**192 of 192 picks, none wrong, none unmapped**. Nothing else came close: the
+header ticker managed 137/192, and no HTTP endpoint carried picks at all.
 
-Picks are identified by **Yahoo player id, not name**. That is why every
-name-matching attempt failed to see them, and it is also why this path is the
-robust one: no accents, no nicknames, no "Mitch" vs "Mitchell". Ids resolve
-through `yahoo_player_map`, which covered all 192 picks with nothing left over.
+`parse_frame` is the only description of what this accepts, and it is
+deliberately strict: anything whose shape it does not recognise is ignored
+rather than guessed at. Frames it does accept identify players by Yahoo player
+id rather than by name, which is why this path is robust where every
+name-matching attempt was not - no accents, no nicknames, no "Mitch" vs
+"Mitchell". Ids resolve through `yahoo_player_map`.
 
-Frames are classified structurally rather than by guessing at magic numbers: a
-pick frame has exactly six fields and a position code in field 4. The lobby also
-emits `0|2227628|3|3|32763`, which is five fields with a number where the
-position belongs, and is rejected on shape alone.
+Picks carry a sequence number, so a dropped frame is *detectable* rather than
+silently absent - `FeedState.gaps` reports it instead of the board quietly
+desyncing, which is the property the DOM readers lacked.
 """
 
 from __future__ import annotations

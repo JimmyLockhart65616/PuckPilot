@@ -60,7 +60,7 @@ def test_lobby_frame_is_rejected_on_shape():
 
 def test_unrelated_traffic_is_ignored():
     """Heartbeats, joins, chat and Yahoo's own advice share this socket."""
-    for payload in ("C|24", "J|3", "L|5", "H|S|30|0|0|0", "", "S", "O|draft-labels|118|[{}]"):
+    for payload in ("C|24", "J|3", "L|5", "H|S|30|0|0|0", "", "S", "O|other|118|[{}]"):
         assert parse_frame(payload) is None
 
 

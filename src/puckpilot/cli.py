@@ -105,7 +105,7 @@ def _cmd_yahoo_watch(args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from puckpilot.yahoo.session import YahooSession
-    from puckpilot.yahoo.watch import watch
+    from puckpilot.yahoo.watch import DEFAULT_INTERVAL_S, watch
 
     settings = Settings()
     profile = settings._resolve(Path("secrets/chrome-profile"))
@@ -118,7 +118,7 @@ def _cmd_yahoo_watch(args: argparse.Namespace) -> int:
         report = watch(
             session,
             key,
-            interval=args.interval,
+            interval=args.interval or DEFAULT_INTERVAL_S,
             duration=args.duration,
             out_path=out,
             progress=print,
@@ -610,7 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
         "league",
         help="League settings, teams and draft results via the logged-in browser session",
     )
-    yl.add_argument("--league-key", default=None, help="e.g. 477.l.29326 (default: auto-detect)")
+    yl.add_argument("--league-key", default=None, help="e.g. 465.l.12345 (default: auto-detect)")
     yl.add_argument("--picks", type=int, default=10, help="Draft picks to print")
     yl.set_defaults(func=_cmd_yahoo_league)
 
@@ -618,8 +618,13 @@ def build_parser() -> argparse.ArgumentParser:
         "watch-draft",
         help="Poll draftresults through a live draft to prove whether it updates live",
     )
-    yw.add_argument("--league-key", default=None, help="e.g. 477.l.29326 (default: auto-detect)")
-    yw.add_argument("--interval", type=float, default=3.0, help="Seconds between polls")
+    yw.add_argument("--league-key", default=None, help="e.g. 465.l.12345 (default: auto-detect)")
+    yw.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="Seconds between polls (default: watch.DEFAULT_INTERVAL_S)",
+    )
     yw.add_argument("--duration", type=float, default=5400.0, help="Give up after N seconds")
     yw.set_defaults(func=_cmd_yahoo_watch)
 
