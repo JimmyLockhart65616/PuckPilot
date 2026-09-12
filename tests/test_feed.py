@@ -268,3 +268,87 @@ def test_yahoo_feed_catches_up_after_missed_polls():
 
     feed = YahooDraftFeed(FakeSession([full]), "477.l.1", mapping)
     assert [e.player_id for e in feed.poll(b)] == ids
+
+
+# ---- replaying a draft that already happened -------------------------------
+#
+# The console had never been watched end to end, because doing so required a
+# live Yahoo room: a lobby, a browser, eleven strangers and forty minutes. That
+# is a bad way to find out the interface is wrong.
+
+
+def _replay_picks(n=6, teams=12):
+    return [
+        {"pick": i, "yahoo_id": str(i), "seat": (i - 1) % teams + 1, "position": "C"}
+        for i in range(1, n + 1)
+    ]
+
+
+def test_replay_delivers_picks_in_draft_order():
+    from puckpilot.draft.feed import ReplayFeed
+
+    board = _board()
+    ids = [int(board.u.ids[i]) for i in range(6)]
+    feed = ReplayFeed(
+        [{"pick": 6 - i, "yahoo_id": str(i), "seat": 1} for i in range(6)],
+        {str(i): ids[i] for i in range(6)},
+        interval=0.0,
+    )
+    got = []
+    while not feed.exhausted:
+        got += [e.player_id for e in feed.poll(board)]
+    assert got == list(reversed(ids)), "picks must arrive in pick order, not list order"
+
+
+def test_replay_respects_its_interval():
+    """So a replay can be watched at human speed, not just blasted through."""
+    from puckpilot.draft.feed import ReplayFeed
+
+    board = _board()
+    now = [100.0]
+    feed = ReplayFeed(
+        _replay_picks(3),
+        {"1": int(board.u.ids[0]), "2": int(board.u.ids[1]), "3": int(board.u.ids[2])},
+        interval=5.0,
+        clock=lambda: now[0],
+    )
+    assert feed.poll(board), "the first pick should land immediately"
+    assert feed.poll(board) == [], "too soon for the second"
+    now[0] += 6.0
+    assert feed.poll(board), "and it arrives once the interval has passed"
+
+
+def test_a_room_of_a_different_size_does_not_crash_the_board():
+    """The harvested mocks are 14-team rooms and this league is 12, so seat 13
+    walked off the end of `counts` with an IndexError - which on draft night,
+    with nobody at the keyboard, would have taken the console down."""
+    from puckpilot.draft.feed import ReplayFeed, apply
+
+    board = _board()  # 4 teams
+    feed = ReplayFeed(
+        [{"pick": 1, "yahoo_id": "1", "seat": 13}],
+        {"1": int(board.u.ids[0])},
+        interval=0.0,
+        n_teams=14,
+    )
+    accepted, rejected = apply(board, feed.poll(board))
+    assert accepted and not rejected, "a mismatched room should still drive the board"
+    assert accepted[0].seat == board.on_the_clock() or board.made == 1
+
+
+def test_an_out_of_range_seat_is_refused_not_raised():
+    from puckpilot.draft.board import DraftBoardError
+
+    board = _board()
+    with pytest.raises(DraftBoardError, match="outside this"):
+        board.record(int(board.u.ids[0]), seat=99)
+
+
+def test_replay_records_players_it_cannot_map():
+    """Same honesty as the live feed: the console says how far behind it is."""
+    from puckpilot.draft.feed import ReplayFeed
+
+    board = _board()
+    feed = ReplayFeed([{"pick": 1, "yahoo_id": "nobody", "seat": 1}], {}, interval=0.0)
+    assert feed.poll(board) == []
+    assert feed.status()["unmapped"] == 1

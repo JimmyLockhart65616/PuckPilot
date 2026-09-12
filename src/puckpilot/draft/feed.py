@@ -16,6 +16,7 @@ out on draft night is exactly the failure this ordering avoids.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -218,3 +219,84 @@ def apply(board: DraftBoard, events: list[PickEvent]) -> tuple[list, list[str]]:
         except DraftBoardError as e:
             rejected.append(str(e))
     return accepted, rejected
+
+
+class ReplayFeed:
+    """A draft that already happened, played back at whatever pace you like.
+
+    The draft-night console has never been watched end to end, because doing so
+    used to require a live Yahoo room: a lobby, a browser, eleven strangers and
+    forty minutes. That is a bad way to discover the interface is wrong.
+
+    This drives the same `poll(board)` the websocket does, from picks already on
+    disk - a harvested mock (`data/mocks/*.json`) or the committed fixture - so
+    the whole console can be exercised offline, deterministically, and as fast
+    or as slow as is useful.
+
+    Picks arrive in draft order regardless of which seat made them, exactly as
+    the socket delivers them. A pick the board cannot place (a player outside
+    our ranked pool) is skipped by `apply`, the same as live.
+    """
+
+    name = "replay"
+
+    def __init__(
+        self,
+        picks: list[dict],
+        yahoo_to_nhl: dict[str, int],
+        interval: float = 0.0,
+        clock=time.monotonic,
+        n_teams: int | None = None,
+    ):
+        # Rooms are whatever the lobby hands out - the harvested ones are
+        # 14-team while this league is 12. Seat numbers from a differently
+        # shaped room cannot be mapped onto our board, so when they disagree
+        # the pick lands on whoever is on the clock. The pick ORDER is what
+        # makes a replay useful; the seat attribution is not transferable.
+        self.source_teams = n_teams
+        self.yahoo_to_nhl = yahoo_to_nhl
+        self.interval = interval
+        self._clock = clock
+        self._picks = sorted(picks, key=lambda p: int(p.get("pick", 0)))
+        self._next = 0
+        self._last = None
+        self.last_error: str | None = None
+        self.unmapped: list[str] = []
+
+    @property
+    def exhausted(self) -> bool:
+        return self._next >= len(self._picks)
+
+    def poll(self, board: DraftBoard) -> list[PickEvent]:
+        if self.exhausted:
+            return []
+        now = self._clock()
+        if self.interval and self._last is not None and now - self._last < self.interval:
+            return []
+        self._last = now
+
+        row = self._picks[self._next]
+        self._next += 1
+        yahoo_id = str(row.get("yahoo_id"))
+        nhl_id = self.yahoo_to_nhl.get(yahoo_id)
+        if nhl_id is None:
+            # Recorded rather than silently dropped: the console shows how far
+            # the board is behind the room, and that has to stay honest here.
+            self.unmapped.append(yahoo_id)
+            return []
+        seat = int(row.get("seat", 0))
+        if self.source_teams and self.source_teams != board.n_teams:
+            return [PickEvent(nhl_id, None, self.name)]
+        return [PickEvent(nhl_id, max(0, seat - 1), self.name)]
+
+    def status(self) -> dict:
+        return {
+            "chosen": "replay",
+            "frames": len(self._picks),
+            "picks_detected": self._next,
+            "highest_pick": self._next,
+            "gaps": [],
+            "unmapped": len(self.unmapped),
+            "on_the_clock": None,
+            "error": self.last_error,
+        }

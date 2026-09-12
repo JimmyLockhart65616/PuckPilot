@@ -252,7 +252,31 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
     league = _league(args)
 
     adp, feed, ctx, pump_fn = None, None, None, None
-    if args.yahoo:
+    if args.replay:
+        # A draft that already happened, played back. Same poll(board) the
+        # websocket drives, so this exercises the whole console offline - no
+        # lobby, no browser, no forty minutes of waiting to find out the
+        # interface is wrong.
+        from puckpilot.draft.farm import load_all
+        from puckpilot.draft.feed import ReplayFeed
+        from puckpilot.draft.wsfeed import load_yahoo_id_map
+
+        root = Path(args.replay)
+        harvests = load_all(root if root.is_dir() else root.parent)
+        if not root.is_dir():
+            harvests = [h for h in harvests if root.name in str(root)]
+        if not harvests:
+            print(f"No harvested drafts under {root}", file=sys.stderr)
+            return 2
+        picks = harvests[0].picks
+        feed = ReplayFeed(
+            picks,
+            load_yahoo_id_map(conn),
+            interval=args.replay_interval,
+            n_teams=harvests[0].n_teams,
+        )
+        print(f"Replaying {len(picks)} picks at {args.replay_interval}s/pick.")
+    elif args.yahoo:
         # The websocket carries picks in any Yahoo draft room, mock or real, and
         # is the only source measured at 100% on the picks it can map.
         from playwright.sync_api import sync_playwright
@@ -895,6 +919,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--room",
         default="https://hockey.fantasysports.yahoo.com/hockey",
         help="Page to open when --yahoo is used",
+    )
+    live.add_argument(
+        "--replay",
+        default=None,
+        metavar="PATH",
+        help="Play back a harvested draft (data/mocks) instead of reading a live room - "
+        "exercises the whole console offline",
+    )
+    live.add_argument(
+        "--replay-interval",
+        type=float,
+        default=0.35,
+        help="Seconds per pick when replaying (0 = as fast as possible)",
     )
     live.add_argument(
         "--web",

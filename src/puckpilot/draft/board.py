@@ -275,7 +275,14 @@ class DraftBoard:
             raise DraftBoardError(f"{self.u.names[row]} is already off the board")
 
         overall = self.made
-        seat = self.slots[overall][1] if seat is None else seat
+        seat = self.slots[overall][1] if seat is None else int(seat)
+        if not 0 <= seat < self.n_teams:
+            # A seat number we cannot place used to walk off the end of
+            # `counts` with an IndexError, taking the console down. On draft
+            # night the feed is the only pick source and nobody is at the
+            # keyboard, so an unexpected seat must be a refusal `apply` can
+            # swallow, not a crash.
+            raise DraftBoardError(f"seat {seat} is outside this {self.n_teams}-team board")
         self.avail[row] = False
         self._bump(seat, row)
         pick = self._pick_at(overall, seat, row, source)
