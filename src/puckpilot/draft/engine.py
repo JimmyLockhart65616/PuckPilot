@@ -168,6 +168,32 @@ class RosterValuePolicy:
       margins, which is a worse bet against eleven humans whose tendencies we do
       not know. 1.15 wins the most categories and has the best floor.
 
+    `display_spread` is deliberately NOT `survival_spread`, because the two
+    answer different questions and the evidence for each says something
+    different:
+
+    - `survival_spread` (6.0) shapes the scoring discount. Swept in the draft
+      sim it plateaus at 3-10 and 6.0 sits in the middle. 16.0 measurably
+      drafts worse (top-3 .680 vs .752).
+    - `display_spread` (16.0) is what the drafter is shown. `draft calibrate`
+      fits it by log-loss against real harvested rooms - 4,776 observations
+      across three drafts - and lands on 16.0 with a clean interior minimum and
+      a +0.14 margin over 6.0. It gave the same answer on one draft.
+
+    The first tried explanation was that the bot field drafts too tightly:
+    spread 16 implies ~29 picks of dispersion while `AdpBot` spans 2-8. Widening
+    the bots to 12-46 was tested and moved the sim's optimum only 3.0 -> 6.0,
+    nowhere near 16, so that is not it. They simply measure different things -
+    one asks which value drafts best, the other asks what is actually true - and
+    each is right about its own question.
+
+    Which matters because every consumer of `survival()` outside `score()` is a
+    human: the card's "lasts 14%", the reasons in `explain.py`, the console
+    table. Showing a 6.0-shaped probability would put a number in front of the
+    drafter that three real drafts say is wrong by a factor of nearly three in
+    scale, and "will not last - 14%" when the truth is nearer 35% is how you
+    reach.
+
       Caveat worth carrying: `team_abbrev` now holds 2026-27 clubs for everyone,
       which is right for draft night and WRONG for backtesting an older season -
       grouping 2024-25 goalie wins by 2026-27 teams is nonsense. So 2024-25 is
@@ -185,6 +211,7 @@ class RosterValuePolicy:
         cat_weights: dict[str, float] | None = None,
         survival_discount: float = 0.30,
         survival_spread: float = 6.0,
+        display_spread: float = 16.0,
         basis: str = "vorp",
         replacement_depth: float = 0.0,
     ):
@@ -197,6 +224,7 @@ class RosterValuePolicy:
         self.cat_weights = cat_weights
         self.survival_discount = survival_discount
         self.survival_spread = survival_spread
+        self.display_spread = display_spread
         self.basis = basis
         self.replacement_depth = replacement_depth
 
@@ -235,18 +263,23 @@ class RosterValuePolicy:
             score += self.cat_weights.get(cat, 1.0) * z
         return score
 
-    def survival(self, u: Universe, ctx=None) -> np.ndarray:
+    def survival(self, u: Universe, ctx=None, spread: float | None = None) -> np.ndarray:
         """P(each player is still there at our next turn), per the ADP model.
 
         Exposed because the live console shows it: "he'll last, take the other
         guy" is the single most useful thing to put in front of a human on the
         clock. Returns all-zeros when there is no next pick (last round), which
         makes the discount vanish — nothing survives a draft that is over.
+
+        `spread` defaults to `survival_spread`, the knob the scoring uses. Human
+        facing callers pass `display_spread` instead - see that parameter for
+        why the two differ and why showing the scoring value would be a lie.
         """
         if not (ctx and ctx.get("next_pick_no") is not None):
             return np.zeros(len(u))
         taken_by_next = ctx["next_pick_no"]
-        return 1.0 / (1.0 + np.exp(-(u.adp_rank - taken_by_next) / self.survival_spread))
+        s = self.survival_spread if spread is None else spread
+        return 1.0 / (1.0 + np.exp(-(u.adp_rank - taken_by_next) / s))
 
     def score(self, u: Universe, counts, rules, ctx=None) -> np.ndarray:
         """Per-player score before availability and position eligibility.

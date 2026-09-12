@@ -64,7 +64,10 @@ def recommend(
     # ctx scores a different board than the console shows.
     ctx = board.pick_context(seat)
     score = policy.score(u, board.counts[seat], board.rules, ctx)
-    p_survive = policy.survival(u, ctx)
+    # The displayed probability is fitted to real rooms, not to the scoring
+    # knob - see RosterValuePolicy.display_spread. Everything downstream of
+    # here is human-facing, so it gets the honest number.
+    p_survive = policy.survival(u, ctx, spread=policy.display_spread)
 
     mask = board.avail.copy()
     if enforce_eligibility and picks_left > 0:

@@ -319,3 +319,43 @@ def test_depth_after_survives_an_empty_position():
     for r in rows[1:]:
         b.record(int(b.u.ids[r]))
     assert b.depth_after(keep) == 0.0
+
+
+# ---- the displayed probability is not the scoring knob ---------------------
+
+
+def test_the_shown_probability_uses_the_calibrated_spread():
+    """Every consumer of p_survive outside score() is a human. `calibrate` fits
+    the spread against real rooms and says 16.0; the sim says 6.0 drafts best.
+    Showing the 6.0 curve would put a number in front of the drafter that three
+    real drafts say is wrong by nearly 3x in scale."""
+    from puckpilot.draft.advice import recommend
+    from puckpilot.draft.engine import RosterValuePolicy
+
+    b, _ = _depth_board()
+    policy = RosterValuePolicy(survival_spread=6.0, display_spread=16.0)
+    cands = recommend(b, policy, n=8)
+    ctx = b.pick_context(0)
+
+    shown = {c.row: c.p_survive for c in cands}
+    by_display = policy.survival(b.u, ctx, spread=16.0)
+    by_scoring = policy.survival(b.u, ctx, spread=6.0)
+
+    for row, value in shown.items():
+        assert value == pytest.approx(by_display[row]), "shown value is not the calibrated one"
+    # and the two really do differ, or this test proves nothing
+    assert any(abs(by_display[r] - by_scoring[r]) > 0.02 for r in shown), (
+        "the two spreads produced identical curves; the test cannot discriminate"
+    )
+
+
+def test_survival_defaults_to_the_scoring_spread():
+    """score() must keep using the tuned knob, not the display one."""
+    import numpy as np
+
+    from puckpilot.draft.engine import RosterValuePolicy
+
+    b, _ = _depth_board()
+    policy = RosterValuePolicy(survival_spread=6.0, display_spread=16.0)
+    ctx = b.pick_context(0)
+    np.testing.assert_array_equal(policy.survival(b.u, ctx), policy.survival(b.u, ctx, spread=6.0))
