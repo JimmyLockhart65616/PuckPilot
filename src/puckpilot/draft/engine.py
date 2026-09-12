@@ -124,10 +124,20 @@ class RosterValuePolicy:
     chasing HIT/BLK is disastrous (0.130), because the peripheral categories are
     cheap to acquire on waivers but scoring is not.
 
-    Both knobs were tuned while `_base_score` returned `z_total`. The base is now
-    VORP (see `_base_score`), which changes what they are correcting, so they are
-    due a re-tune on the new basis — they are kept at their measured values
-    rather than guessed at in the meantime.
+    Both knobs were re-screened on the VORP basis, because they correct the
+    shape of the base score and the base score changed (see `_base_score`). A
+    5x5 grid found a clean interior peak:
+
+    - survival_discount 0.50 -> **0.30**. Monotone either side (0.20 and 0.40
+      both lower, 0.0 clearly worse, so market timing still earns its keep - at
+      a smaller weight). Confirmed at n=1000 on two seeds not used for the grid:
+      top-3 0.530/0.536 -> 0.640/0.665 on target 2025-26 with non-overlapping
+      CIs, and 0.387/0.400 -> 0.395/0.414 on 2024-25. Same sign in all four
+      runs; most of the magnitude is 2025-26-specific, and that is stated rather
+      than averaged away.
+    - bench_factor stays 0.70. The grid is flat across 0.40-0.70 and 0.70 sits
+      inside that plateau; 0.55 edged it on both confirmation seeds but well
+      inside overlapping CIs, which is not evidence to move a tuned constant.
     """
 
     name = "engine"
@@ -137,7 +147,7 @@ class RosterValuePolicy:
         goalie_weight: float = 1.0,
         bench_factor: float = 0.70,
         cat_weights: dict[str, float] | None = None,
-        survival_discount: float = 0.50,
+        survival_discount: float = 0.30,
         survival_spread: float = 6.0,
         basis: str = "vorp",
     ):
