@@ -61,6 +61,8 @@ PAGE = """<!doctype html>
  input{background:transparent;border:1px solid var(--line);color:var(--fg);
    padding:5px 8px;width:100%;font:inherit;border-radius:4px;margin-bottom:6px}
  .need{color:var(--warn)} code{color:var(--dim);font-size:11px}
+ .proj{display:flex;flex-wrap:wrap;gap:2px 10px;margin:6px 0 2px;font-size:12px;
+   color:var(--dim)} .proj b{color:var(--fg);font-weight:600}
  button{background:var(--card);border:1px solid var(--line);color:var(--fg);
    font:inherit;padding:4px 10px;border-radius:4px;cursor:pointer}
  button:hover{border-color:var(--warn);color:var(--warn)}
@@ -121,6 +123,10 @@ function render(s){
       '<div class="meta">'+c.position+' &middot; '+c.team+' &middot; VORP '+c.vorp.toFixed(2)+
       ' &middot; ADP '+Math.round(c.adp_rank)+
       ' &middot; lasts '+Math.round(c.p_survive*100)+'%</div>'+
+      (c.projected && c.projected.length
+        ? '<div class="proj">'+c.projected.map(
+            x=>'<span><b>'+x[1]+'</b> '+x[0]+'</span>').join('')+'</div>'
+        : '')+
       '<ul class="r">'+c.reasons.map(r=>'<li class="'+r.kind+'">'+r.text+'</li>').join('')+'</ul>';
     sh.appendChild(d);
   });
@@ -132,7 +138,7 @@ function render(s){
 
   const rows = s.board.filter(p => !filter ||
       p.name.toLowerCase().includes(filter) || p.position.toLowerCase()===filter);
-  document.getElementById('left').textContent = s.board.length;
+  document.getElementById('left').textContent = s.n_left ?? s.board.length;
   const tb = document.getElementById('board'); tb.innerHTML='';
   rows.slice(0,300).forEach((p,i)=>{
     const tr=document.createElement('tr');
@@ -161,6 +167,11 @@ tick(); setInterval(tick, 1000);
 """
 
 
+def _fmt_cat(value: float, cat) -> str:
+    """A counting stat as a whole number, a rate with enough decimals to differ."""
+    return f"{value:.3f}".lstrip("0") if getattr(cat, "rate", False) else f"{value:.0f}"
+
+
 @dataclass
 class LiveState:
     """Board plus feed, guarded so HTTP threads and the poller can share it."""
@@ -170,7 +181,15 @@ class LiveState:
     feed: object | None = None
     top: int = 3
     board_rows: int = 300
-    labels: dict[str, str] = field(default_factory=dict)
+    # The league's scored categories, in its own order. Drives both the reason
+    # text ("PPP", not "ppp") and the per-category line on each card, so a
+    # different league shows its own categories without a code change.
+    cats: tuple = ()
+
+    @property
+    def labels(self) -> dict[str, str]:
+        return {c.key: c.label for c in self.cats}
+
     lock: threading.Lock = field(default_factory=threading.Lock)
     last_pick_at: float | None = None
     note: str = ""
@@ -204,6 +223,7 @@ class LiveState:
     def snapshot(self) -> dict:
         with self.lock:
             cands = recommend(self.board, self.policy, n=max(self.board_rows, 40))
+            labels = self.labels
             shortlist = [
                 {
                     "name": c.name,
@@ -213,8 +233,19 @@ class LiveState:
                     "adp_rank": c.adp_rank,
                     "p_survive": c.p_survive,
                     "reasons": [{"kind": r.kind, "text": r.text} for r in reasons],
+                    # What he actually gets you, per category. Already computed
+                    # on every Candidate and previously thrown away - it is the
+                    # most direct answer to "why is this one better than that
+                    # one" when the two look similar on VORP.
+                    "projected": [
+                        # Rates need their decimals: SV% rounded to an integer
+                        # reads "1" and tells the drafter nothing.
+                        [c2.label, _fmt_cat(c.projected[c2.key], c2)]
+                        for c2 in self.cats
+                        if c2.key in c.projected
+                    ],
                 }
-                for c, reasons in summarize(self.board, cands, self.labels, top=self.top)
+                for c, reasons in summarize(self.board, cands, labels, top=self.top)
             ]
             board_rows = [
                 {
@@ -234,6 +265,9 @@ class LiveState:
             needs = [f"{p}x{n}" for p, n in sorted(self.board.needs(seat).items())]
             made, total = self.board.made, len(self.board.slots)
             rnd = self.board.current_round()
+            # The real number of players still available, not the 300 the table
+            # renders - it read "300 LEFT" for most of a draft.
+            n_left = int(self.board.avail.sum())
 
         status = self.feed.status() if hasattr(self.feed, "status") else {}
         return {
@@ -245,6 +279,7 @@ class LiveState:
             "picks_away": (None if nxt is None else nxt - made),
             "detected": status.get("picks_detected", made),
             "gaps": status.get("gaps", []),
+            "n_left": n_left,
             "seconds_since_pick": (
                 None if self.last_pick_at is None else time.time() - self.last_pick_at
             ),

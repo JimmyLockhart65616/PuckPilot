@@ -32,10 +32,19 @@ STRONG_CAT = 0.75
 WEAK_CAT = -0.5
 
 
+# How much a fact should weigh on the decision, lowest first. Timing leads
+# because it is the only thing that cannot be recovered later: a player who
+# will not last is a decision now, whereas a category edge keeps until the next
+# pick. Grouping all pros then all cons - which is what this used to do - buries
+# the deciding fact under agreement.
+TIMING, NEED, MARKET, QUALITY, CATEGORY, GENERIC = range(6)
+
+
 @dataclass(frozen=True)
 class Reason:
     kind: str  # "pro" | "con"
     text: str
+    weight: int = GENERIC
 
 
 def _cat_profile(board: DraftBoard, row: int, labels: dict[str, str]) -> list[tuple[str, float]]:
@@ -74,21 +83,21 @@ def explain(
 
     # --- roster fit ------------------------------------------------------
     if candidate.fills_starter:
-        pros.append(Reason("pro", f"Starts right away at {pos}"))
+        pros.append(Reason("pro", f"Starts right away at {pos}", NEED))
     else:
         slot_count = dict(board.rules.shape.slots).get(pos, 0)
         cons.append(
-            Reason("con", f"Rides the bench — {pos} starters already filled ({slot_count})")
+            Reason("con", f"Rides the bench — {pos} starters already filled ({slot_count})", NEED)
         )
 
     need = board.needs(seat).get(pos)
     if need:
-        pros.append(Reason("pro", f"You still must fill {need} more at {pos}"))
+        pros.append(Reason("pro", f"You still must fill {need} more at {pos}", NEED))
 
     cap = board.rules.caps.get(pos)
     have = counts.get(pos, 0)
     if cap and have >= cap - 1:
-        cons.append(Reason("con", f"Near the {pos} cap ({have}/{cap}) — limits later picks"))
+        cons.append(Reason("con", f"Near the {pos} cap ({have}/{cap}) — limits later picks", NEED))
 
     # --- timing: the most common reason to take someone else -------------
     if candidate.p_survive >= LIKELY_TO_LAST:
@@ -100,11 +109,16 @@ def explain(
             Reason(
                 "con",
                 f"Likely still there next turn ({candidate.p_survive:.0%}) — you could wait{tail}",
+                TIMING,
             )
         )
     elif candidate.p_survive <= WILL_NOT_LAST:
         pros.append(
-            Reason("pro", f"Will not last — {candidate.p_survive:.0%} chance he is there next turn")
+            Reason(
+                "pro",
+                f"Will not last — {candidate.p_survive:.0%} chance he is there next turn",
+                TIMING,
+            )
         )
 
     # --- value vs the room ------------------------------------------------
@@ -114,11 +128,14 @@ def explain(
             Reason(
                 "con",
                 f"Ahead of the market: ADP {candidate.adp_rank:.0f} vs pick {pick_now}",
+                MARKET,
             )
         )
     elif candidate.adp_rank and candidate.adp_rank + 12 < pick_now:
         pros.append(
-            Reason("pro", f"Value vs the room: ADP {candidate.adp_rank:.0f}, pick {pick_now}")
+            Reason(
+                "pro", f"Value vs the room: ADP {candidate.adp_rank:.0f}, pick {pick_now}", MARKET
+            )
         )
 
     # --- best left at the position ---------------------------------------
@@ -126,10 +143,14 @@ def explain(
     if same_pos:
         gap = candidate.vorp - same_pos[0].vorp
         if gap > 1.0:
-            pros.append(Reason("pro", f"Clear best {pos} left (+{gap:.1f} VORP on the next one)"))
+            pros.append(
+                Reason("pro", f"Clear best {pos} left (+{gap:.1f} VORP on the next one)", QUALITY)
+            )
         elif abs(gap) < 0.4:
             cons.append(
-                Reason("con", f"{same_pos[0].name} is a near-equal {pos} ({gap:+.1f} VORP)")
+                Reason(
+                    "con", f"{same_pos[0].name} is a near-equal {pos} ({gap:+.1f} VORP)", QUALITY
+                )
             )
 
     # --- categories -------------------------------------------------------
@@ -137,11 +158,11 @@ def explain(
     strong = [lbl for lbl, z in profile if z >= STRONG_CAT][:3]
     weak = [lbl for lbl, z in profile if z <= WEAK_CAT][-2:]
     if strong:
-        pros.append(Reason("pro", f"Carries {', '.join(strong)}"))
+        pros.append(Reason("pro", f"Carries {', '.join(strong)}", CATEGORY))
     if weak:
         # Phrasing matters here: this is a category he does NOT help, and it sits
         # in the cons column. Anything softer reads as a positive at a glance.
-        cons.append(Reason("con", f"Contributes almost nothing in {', '.join(weak)}"))
+        cons.append(Reason("con", f"Contributes almost nothing in {', '.join(weak)}", CATEGORY))
 
     # thinnest category on our roster, if he helps it
     totals = roster_category_totals(board, seat)
@@ -150,7 +171,11 @@ def explain(
         z_here = float(board.u.z_by_cat[thinnest][candidate.row])
         if z_here >= STRONG_CAT:
             pros.append(
-                Reason("pro", f"Shores up {labels.get(thinnest, thinnest)}, your thinnest category")
+                Reason(
+                    "pro",
+                    f"Shores up {labels.get(thinnest, thinnest)}, your thinnest category",
+                    CATEGORY,
+                )
             )
 
     if pos == "G":
@@ -158,7 +183,14 @@ def explain(
             Reason("con", "Goalie — rate stats are near-noise year to year; workload is the signal")
         )
 
-    return pros + cons
+    # Most decision-relevant first, pros ahead of cons at equal weight so a card
+    # still reads as a case rather than an alternating list.
+    return _order_for_test(pros + cons)
+
+
+def _order_for_test(reasons: list[Reason]) -> list[Reason]:
+    """The ordering rule, exposed so a test can pin it without a whole board."""
+    return sorted(reasons, key=lambda r: (r.weight, r.kind != "pro"))
 
 
 def summarize(

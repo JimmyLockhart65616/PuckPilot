@@ -220,19 +220,25 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
         conn, league, seat=args.seat, season=args.season, adp=adp, progress=print
     )
     if args.web:
-        return _serve_live(board, feed, ctx, args)
+        return _serve_live(board, feed, ctx, args, league)
     run_live(board, feed=feed, cfg=LiveConfig(top=args.top), pump=pump_fn)
     return 0
 
 
-def _serve_live(board, feed, ctx, args: argparse.Namespace) -> int:
+def _serve_live(board, feed, ctx, args: argparse.Namespace, league) -> int:
     """Second-screen web view, pumped from the browser the feed is attached to."""
     import webbrowser
 
     from puckpilot.draft.wsfeed import pump
     from puckpilot.web.server import LiveState, serve
 
-    state = LiveState(board=board, feed=feed, top=args.top)
+    state = LiveState(
+        board=board,
+        feed=feed,
+        top=args.shortlist,
+        board_rows=args.board_rows,
+        cats=league.all_cats,
+    )
     serve(state, port=args.port)
     url = f"http://127.0.0.1:{args.port}"
     print()
@@ -777,7 +783,19 @@ def build_parser() -> argparse.ArgumentParser:
     live = draft_sub.add_parser("live", help="Draft-night console: live recommendations")
     live.add_argument("--seat", type=int, default=0, help="Your draft slot (0-based)")
     live.add_argument("--season", default="20262027", help="Season to draft for")
-    live.add_argument("--top", type=int, default=12, help="Candidates on screen")
+    live.add_argument(
+        "--top", type=int, default=12, help="Candidates in the terminal console's table"
+    )
+    live.add_argument(
+        "--shortlist",
+        type=int,
+        default=3,
+        help="Reasoned cards in the web view (default 3 - the point is to be readable "
+        "on a 30-second clock, not exhaustive)",
+    )
+    live.add_argument(
+        "--board-rows", type=int, default=300, help="Rows in the web view's remaining board"
+    )
     live.add_argument(
         "--yahoo",
         nargs="?",

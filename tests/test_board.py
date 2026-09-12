@@ -337,3 +337,40 @@ def test_live_console_survives_a_failing_feed(monkeypatch):
     frames: list[str] = []
     live.run_live(b, feed=BrokenFeed(), cfg=live.LiveConfig(refresh=0.01), out=frames.append)
     assert any("feed error" in f for f in frames)
+
+
+# ---- reason ordering -------------------------------------------------------
+
+
+def test_reasons_lead_with_timing_not_with_agreement():
+    """Explain used to return `pros + cons`, so a card read as every argument
+    for followed by every argument against - which buries the fact that decides
+    the pick under a list of facts that do not.
+
+    Timing leads because it is the only one that cannot be recovered: a player
+    who will not last is a decision now, a category edge keeps until next turn.
+    """
+    from puckpilot.draft.explain import CATEGORY, NEED, TIMING, Reason, _order_for_test
+
+    reasons = [
+        Reason("pro", "carries BLK", CATEGORY),
+        Reason("con", "near the cap", NEED),
+        Reason("pro", "will not last", TIMING),
+        Reason("pro", "starts right away", NEED),
+    ]
+    ordered = _order_for_test(reasons)
+    assert ordered[0].text == "will not last"
+    # at equal weight a pro comes before a con, so the card still reads as a case
+    assert [r.text for r in ordered[1:3]] == ["starts right away", "near the cap"]
+    assert ordered[-1].text == "carries BLK"
+
+
+def test_a_real_shortlist_puts_survival_first():
+    from puckpilot.draft.explain import TIMING, summarize
+
+    b = _board()
+    cands = recommend(b, n=10)
+    for _cand, reasons in summarize(b, cands, top=3):
+        timing = [r for r in reasons if r.weight == TIMING]
+        if timing:
+            assert reasons[0].weight == TIMING, "a timing fact exists but is not first"

@@ -17,10 +17,16 @@ import numpy as np
 
 from puckpilot.draft.board import Candidate, DraftBoard
 from puckpilot.draft.engine import RosterValuePolicy, eligible_positions
+from puckpilot.engine.categories import CATALOG
 
 # Shown next to each name so a pick can be sanity-checked against the projection
 # it rests on, in the league's own categories.
-DISPLAY_CATS = ("goals", "assists", "points", "ppp", "sog", "hits", "blocks", "wins", "saves")
+# Every category the catalog knows, so a Candidate carries whatever its league
+# happens to score. A hardcoded list silently dropped SA and SV% - both scored
+# in the Ajaxians league - from the goalie cards. Callers filter this down to
+# their own league's categories; the pool is deliberately wider than any one
+# league's set.
+DISPLAY_CATS = tuple(sorted({c.key for c in CATALOG.values()}))
 
 
 def _fills_starter(board: DraftBoard, seat: int, position: str) -> bool:
