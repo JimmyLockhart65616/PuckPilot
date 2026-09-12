@@ -130,6 +130,46 @@ def _cmd_yahoo_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_yahoo_playermap(args: argparse.Namespace) -> int:
+    """Build the Yahoo player-key -> NHL id map, and Yahoo's own ADP with it.
+
+    Two error messages told the user to run this and it did not exist: the map
+    is what lets the draft-room websocket (which sends ids, not names) mark
+    players off the board, and `draft calibrate` refuses to fit without the ADP
+    it carries. The 400 rows on disk were written once, ad hoc.
+    """
+    from pathlib import Path
+
+    from puckpilot.data import store
+    from puckpilot.yahoo.playermap import build_map
+    from puckpilot.yahoo.session import YahooSession, YahooSessionError
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    profile = settings._resolve(Path("secrets/chrome-profile"))
+    if not profile.exists():
+        print(
+            "No logged-in profile yet. Run `ppilot draft capture --profile` "
+            "and sign into Yahoo first.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        with YahooSession(profile) as session:
+            key = args.league_key or (session.league_keys("nhl") or [None])[0]
+            if not key:
+                print("No NHL league found for this account.", file=sys.stderr)
+                return 2
+            print(f"Building the player map for {key}...")
+            report = build_map(conn, session, key, limit=args.limit, progress=print)
+    except YahooSessionError as e:
+        print(f"\n{e}", file=sys.stderr)
+        return 1
+    print()
+    print(report.text)
+    return 0
+
+
 def _cmd_draft_capture(args: argparse.Namespace) -> int:
     from pathlib import Path
 
@@ -644,6 +684,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     yw.add_argument("--duration", type=float, default=5400.0, help="Give up after N seconds")
     yw.set_defaults(func=_cmd_yahoo_watch)
+
+    ym = yahoo_sub.add_parser(
+        "playermap",
+        help="Build the Yahoo player-key -> NHL id map and Yahoo's own ADP",
+    )
+    ym.add_argument("--league-key", default=None, help="e.g. 465.l.12345 (default: auto-detect)")
+    ym.add_argument("--limit", type=int, default=600, help="How deep into Yahoo's pool to fetch")
+    ym.set_defaults(func=_cmd_yahoo_playermap)
 
     data = sub.add_parser("data", help="Local data store commands")
     data_sub = data.add_subparsers(dest="subcommand", required=True)
