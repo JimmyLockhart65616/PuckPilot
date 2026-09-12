@@ -138,13 +138,33 @@ class RosterValuePolicy:
     - bench_factor stays 0.70. The grid is flat across 0.40-0.70 and 0.70 sits
       inside that plateau; 0.55 edged it on both confirmation seeds but well
       inside overlapping CIs, which is not evidence to move a tuned constant.
+    - goalie_weight 1.0 -> **1.5**, and this one is structural rather than
+      cosmetic. VORP subtracts a positional replacement level, and with only 24
+      starting goalie slots drawn from a deep pool the replacement goalie is
+      already good, so goalie VORP compresses hard. But the goalie categories
+      are four of twelve - a third of every matchup - carried by two roster
+      spots. Positional scarcity and category weight are different quantities,
+      and VORP only knows the first.
+
+      Left uncorrected the engine conceded all four: the per-category diagnostic
+      showed SV .613 -> .289, SA .614 -> .288, W .514 -> .294 when the basis
+      moved. At 1.5 the worst category recovers from .274 to .450 and the engine
+      wins 8-9 of 12 rather than 5-6.
+
+      1.5 is not the argmax. 2.0-2.5 score a higher top-3 on 2025-26 but win
+      only five categories, trading a balanced roster for big margins in a few -
+      a worse bet against eleven humans whose tendencies we do not know. 1.5 has
+      the best or equal mean finish on both target seasons and all four
+      confirmation seeds. Out-of-sample top-3 on 2024-25 is a wash between all
+      three values; the magnitude of the gain is 2025-26-specific even though
+      the defect it repairs is not.
     """
 
     name = "engine"
 
     def __init__(
         self,
-        goalie_weight: float = 1.0,
+        goalie_weight: float = 1.5,
         bench_factor: float = 0.70,
         cat_weights: dict[str, float] | None = None,
         survival_discount: float = 0.30,

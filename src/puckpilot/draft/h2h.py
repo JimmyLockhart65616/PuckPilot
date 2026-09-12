@@ -138,3 +138,40 @@ def run_h2h_season(
         finish=finish,
         champion=champion,
     )
+
+
+def per_category_win_rate(
+    all_sk: np.ndarray,
+    all_g: np.ndarray,
+    skater_cats: tuple[Category, ...],
+    goalie_cats: tuple[Category, ...],
+    skater_keys: list[str],
+    seat: int,
+    regular_weeks: int,
+) -> dict[str, float]:
+    """Share of regular-season matchups `seat` won, per category.
+
+    A finish rate says the engine wins; it does not say WHERE. That matters for
+    a category league, because the way to win an H2H week is to take more
+    categories than one opponent - not to maximise total production. A roster
+    piling surplus into categories it already wins and conceding the rest can
+    post a fine-looking z_total and still lose 5-7 every week.
+
+    So this is the diagnostic that makes a strategy legible: a category the
+    engine wins heavily is one it understands, and one it loses heavily while
+    still spending picks on is a bug worth finding.
+    """
+    vals = category_totals(all_sk, all_g, skater_cats, goalie_cats, skater_keys)
+    n_weeks = min(regular_weeks, vals.shape[1])
+    wins = np.zeros(vals.shape[2])
+    played = 0
+    for w, pairs in enumerate(round_robin_schedule(all_sk.shape[0], n_weeks)):
+        for a, b in pairs:
+            if seat not in (a, b):
+                continue
+            opp = b if a == seat else a
+            wins += (vals[seat, w] > vals[opp, w]).astype(float)
+            played += 1
+    return {
+        c.label: float(wins[j] / max(played, 1)) for j, c in enumerate(skater_cats + goalie_cats)
+    }

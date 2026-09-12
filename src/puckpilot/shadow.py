@@ -280,20 +280,20 @@ def _per_category_win_rate(
     seat: int,
     res: H2HResult,
 ) -> dict[str, float]:
-    """Share of regular-season weeks our team beat the league median in each category."""
-    from puckpilot.draft.h2h import round_robin_schedule
-    from puckpilot.draft.replay import category_totals
+    """Share of regular-season weeks our team beat its opponent in each category.
 
-    vals = category_totals(all_sk, all_g, league.skater_cats, league.goalie_cats, skater_keys)
-    n_weeks = min(league.regular_weeks, vals.shape[1])
-    schedule = round_robin_schedule(all_sk.shape[0], n_weeks)
-    wins = np.zeros(vals.shape[2])
-    played = 0
-    for w, pairs in enumerate(schedule):
-        for a, b in pairs:
-            if seat not in (a, b):
-                continue
-            opp = b if a == seat else a
-            wins += (vals[seat, w] > vals[opp, w]).astype(float)
-            played += 1
-    return {c.label: float(wins[j] / max(played, 1)) for j, c in enumerate(league.all_cats)}
+    Thin adapter over `h2h.per_category_win_rate`, which the draft sim also uses -
+    one implementation, so a shadow season and a simulated one cannot disagree
+    about what "won the category" means.
+    """
+    from puckpilot.draft.h2h import per_category_win_rate
+
+    return per_category_win_rate(
+        all_sk,
+        all_g,
+        league.skater_cats,
+        league.goalie_cats,
+        skater_keys,
+        seat,
+        league.regular_weeks,
+    )

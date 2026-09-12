@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -17,7 +17,7 @@ from puckpilot.draft.engine import (
     RosterValuePolicy,
     Universe,
 )
-from puckpilot.draft.h2h import run_h2h_season
+from puckpilot.draft.h2h import per_category_win_rate, run_h2h_season
 from puckpilot.draft.replay import G_WIDTH, build_replay_data, replay_roster, roto_standings
 from puckpilot.engine import projections
 from puckpilot.engine.aggregate import season_aggregates
@@ -234,6 +234,9 @@ class SimReport:
     p_value: float
     passed: bool
     text: str
+    # Engine's per-category win rate; empty under roto, which has no matchups.
+    cat_win_rate: dict[str, float] = field(default_factory=dict)
+    finishes: tuple[int, ...] = ()
 
 
 def puntable_cats(league: LeagueConfig) -> list[str]:
@@ -288,6 +291,8 @@ def run_sims(
 
     engine_finishes: list[int] = []
     bot_finishes: dict[str, list[int]] = defaultdict(list)
+    cat_wins: dict[str, float] = defaultdict(float)
+    cat_n = 0
     n_weeks = max(data.n_weeks, 1)
     for s in range(n_sims):
         engine_seat = int(rng.integers(0, shape.n_teams))
@@ -327,6 +332,21 @@ def run_sims(
             )
 
         engine_finishes.append(int(finish[engine_seat]))
+        if scoring == "h2h":
+            # Where the edge comes from, not just that there is one. A roster
+            # can post a fine z_total and still lose 5-7 categories every week.
+            rates = per_category_win_rate(
+                sk,
+                g,
+                league.skater_cats,
+                league.goalie_cats,
+                skater_keys,
+                engine_seat,
+                league.regular_weeks,
+            )
+            for label, v in rates.items():
+                cat_wins[label] += v
+            cat_n += 1
         for t, bot in enumerate(bots):
             if t != engine_seat:
                 bot_finishes[bot.name].append(int(finish[t]))
@@ -368,6 +388,19 @@ def run_sims(
             f"CI [{a['ci'][0]:.3f}, {a['ci'][1]:.3f}]  "
             f"mean finish {a['mean_finish']:.2f}  (n={a['n']})"
         )
+    cat_rate = {k: v / cat_n for k, v in cat_wins.items()} if cat_n else {}
+    if cat_rate:
+        # A finish rate says the engine wins; this says where. Sorted worst
+        # first, because a category it loses while still spending picks on is
+        # the one worth looking at.
+        lines += ["", "Engine per-category win rate (worst first):"]
+        ordered = sorted(cat_rate.items(), key=lambda kv: kv[1])
+        for i in range(0, len(ordered), 6):
+            chunk = ordered[i : i + 6]
+            lines.append("  " + "   ".join(f"{lbl:<4}{v:.3f}" for lbl, v in chunk))
+        won = sum(1 for v in cat_rate.values() if v > 0.5)
+        lines.append(f"  wins {won}/{len(cat_rate)} categories on average")
+
     lines += [
         "",
         f"Best bot: {best_bot} ({b['top_rate']:.3f}); one-sided p (engine better): {p:.4f}",
@@ -383,5 +416,7 @@ def run_sims(
         best_bot=best_bot,
         p_value=p,
         passed=passed,
+        cat_win_rate=cat_rate,
+        finishes=tuple(engine_finishes),
         text="\n".join(lines),
     )
