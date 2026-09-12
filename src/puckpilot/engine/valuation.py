@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 from puckpilot.engine.categories import (
@@ -102,6 +103,23 @@ def value_players(
     return df
 
 
+def replacement_level(values: np.ndarray, depth: int) -> float:
+    """Value of the last player worth starting, given `depth` of them are wanted.
+
+    The one definition of replacement level in the codebase, so the pre-draft
+    ranking and any mid-draft re-basing cannot drift apart.
+
+    `values` must be descending. The clamp when fewer players remain than are
+    wanted is not an edge case to tolerate - it is where the scarcity signal
+    comes from. With eight defencemen left and twenty-four wanted, replacement
+    is the eighth-best, which is worse than it was when the pool was full, so
+    every defenceman still on the board is correctly worth more.
+    """
+    if depth <= 0 or not len(values):
+        return 0.0
+    return float(values[min(depth, len(values)) - 1])
+
+
 def replacement_adjust(df: pd.DataFrame, starters_by_pos: dict[str, int]) -> pd.DataFrame:
     """vorp = z_total minus the z_total of the last starter at that position."""
     df = df.copy()
@@ -110,9 +128,8 @@ def replacement_adjust(df: pd.DataFrame, starters_by_pos: dict[str, int]) -> pd.
         k = starters_by_pos.get(pos, 0)
         if k <= 0:
             continue
-        sorted_z = group["z_total"].sort_values(ascending=False)
-        repl = sorted_z.iloc[min(k, len(sorted_z)) - 1]
-        df.loc[group.index, "vorp"] = group["z_total"] - repl
+        sorted_z = group["z_total"].sort_values(ascending=False).to_numpy()
+        df.loc[group.index, "vorp"] = group["z_total"] - replacement_level(sorted_z, k)
     return df
 
 

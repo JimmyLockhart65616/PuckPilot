@@ -194,9 +194,20 @@ def test_recommend_leads_with_exactly_what_the_policy_would_pick():
         b.rules,
         b.picks_left(0),
         np.random.default_rng(0),
-        {"pick_no": b.made, "next_pick_no": b.next_pick_no(0)},
+        b.pick_context(0),
     )
     assert top[0].row == chosen
+
+
+def test_the_board_owns_the_pick_context():
+    """Both the console and a directly-called policy must score the same board.
+    They diverged the moment `recommend` started passing `avail` and the test
+    built its own dict, so ctx construction lives in one place now."""
+    b = _board()
+    ctx = b.pick_context(0)
+    assert ctx["pick_no"] == b.made
+    assert ctx["next_pick_no"] == b.next_pick_no(0)
+    assert ctx["avail"] is b.avail
 
 
 def test_recommend_never_offers_a_drafted_player():

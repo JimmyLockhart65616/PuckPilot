@@ -186,6 +186,50 @@ class DraftBoard:
     def current_round(self) -> int | None:
         return None if self.complete else self.slots[self.made][0] + 1
 
+    def supply(self) -> dict[str, int]:
+        """How many players remain at each position.
+
+        The engine does not use this - dynamic replacement was built, measured,
+        and left off because it helped in one target season and hurt in another
+        (see `RosterValuePolicy._dynamic_vorp`). So the scarcity goes to the
+        drafter as a fact instead of into the score as a weight.
+        """
+        return {
+            pos: int((self.avail & (self.u.pos == pos)).sum())
+            for pos in sorted({str(p) for p in self.u.pos})
+        }
+
+    def depth_after(self, row: int, steps: int = 3) -> float:
+        """VORP drop from this player to the `steps`-th next available at his
+        position - a real read of the cliff.
+
+        The previous signal compared against one player on an already-truncated
+        shortlist, so it could only ever say "better than the next guy on this
+        list". This looks at the actual remaining pool.
+        """
+        pos = self.u.pos[row]
+        here = self.avail & (self.u.pos == pos)
+        here[row] = False
+        if not here.any():
+            return 0.0
+        rest = np.sort(self.u.vorp[here])[::-1]
+        return float(self.u.vorp[row] - rest[min(steps, len(rest)) - 1])
+
+    def pick_context(self, seat: int | None = None) -> dict:
+        """The `ctx` a policy needs to score this board, built in ONE place.
+
+        Every key here changes what the engine picks, so a caller that builds
+        its own dict silently scores a different board. That already happened:
+        adding `avail` to `recommend` made the console disagree with the same
+        policy called directly, because the two constructed ctx separately.
+        """
+        s = self.my_seat if seat is None else seat
+        return {
+            "pick_no": self.made,
+            "next_pick_no": self.next_pick_no(s),
+            "avail": self.avail,
+        }
+
     def next_pick_no(self, seat: int | None = None, after: int | None = None) -> int | None:
         """0-based index of `seat`'s next pick after `after` (default: now).
 

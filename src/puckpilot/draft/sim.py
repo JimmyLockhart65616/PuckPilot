@@ -162,7 +162,7 @@ def run_draft(
         next_pick[picks[-1]] = None
 
     for i, seat in enumerate(order):
-        ctx = {"pick_no": i, "next_pick_no": next_pick[i]}
+        ctx = {"pick_no": i, "next_pick_no": next_pick[i], "avail": avail}
         idx = bots[seat].pick(u, avail, counts[seat], rules, remaining[seat], rng, ctx)
         avail[idx] = False
         rosters[seat].append(idx)

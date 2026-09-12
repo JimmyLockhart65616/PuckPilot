@@ -75,6 +75,7 @@ PAGE = """<!doctype html>
   <div><span class="k">feed</span> <span id="detected" class="big">0</span></div>
   <div><span class="k">last</span> <span id="age">never</span></div>
   <div id="gaps"></div>
+  <div><span class="k">left</span> <span id="supply"></span></div>
   <div style="margin-left:auto">
     <button id="undo" title="Take back the last pick the feed recorded">undo last pick</button>
     <span id="undone" class="k"></span></div>
@@ -115,6 +116,10 @@ function render(s){
   a.className = (age!==null && age < 90) ? 'live' : 'stale';
   document.getElementById('gaps').innerHTML = (s.gaps && s.gaps.length)
     ? '<span class="bad">missing picks '+s.gaps.join(',')+'</span>' : '';
+
+  document.getElementById('supply').innerHTML = (s.supply||[]).map(
+    x => '<span class="'+(x[2]?'need':'k')+'" style="margin-right:8px">'+
+         x[0]+' <b>'+x[1]+'</b></span>').join('');
 
   const sh = document.getElementById('short'); sh.innerHTML = '';
   s.shortlist.forEach((c,i)=>{
@@ -268,6 +273,12 @@ class LiveState:
             # The real number of players still available, not the 300 the table
             # renders - it read "300 LEFT" for most of a draft.
             n_left = int(self.board.avail.sum())
+            # Per-position supply, with the positions we still owe starters to
+            # marked. The engine does not weight this (see
+            # RosterValuePolicy._dynamic_vorp - measured, and left off), so it
+            # is surfaced as a fact for the drafter to apply.
+            need_pos = set(self.board.needs(seat))
+            supply = [[pos, n, pos in need_pos] for pos, n in sorted(self.board.supply().items())]
 
         status = self.feed.status() if hasattr(self.feed, "status") else {}
         return {
@@ -280,6 +291,7 @@ class LiveState:
             "detected": status.get("picks_detected", made),
             "gaps": status.get("gaps", []),
             "n_left": n_left,
+            "supply": supply,
             "seconds_since_pick": (
                 None if self.last_pick_at is None else time.time() - self.last_pick_at
             ),

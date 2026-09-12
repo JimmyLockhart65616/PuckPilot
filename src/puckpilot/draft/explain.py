@@ -38,6 +38,11 @@ WEAK_CAT = -0.5
 # pick. Grouping all pros then all cons - which is what this used to do - buries
 # the deciding fact under agreement.
 TIMING, NEED, MARKET, QUALITY, CATEGORY, GENERIC = range(6)
+# How far ahead to look for a positional cliff, and how big a drop counts.
+# Three deep because one player can be replaced; a gap that survives three
+# is the position actually running out.
+CLIFF_STEPS = 3
+CLIFF_VORP = 1.5
 
 
 @dataclass(frozen=True)
@@ -138,18 +143,31 @@ def explain(
             )
         )
 
-    # --- best left at the position ---------------------------------------
+    # --- depth left at the position ---------------------------------------
+    # Read against the real remaining pool, not against one player on an
+    # already-truncated shortlist: the old version could only say "better than
+    # the next name on this list", which is not the same question as "what will
+    # still be here if I wait".
+    left = board.supply().get(pos, 0)
+    cliff = board.depth_after(candidate.row, steps=CLIFF_STEPS)
+    if cliff >= CLIFF_VORP:
+        pros.append(
+            Reason(
+                "pro",
+                f"Last {pos} before a {cliff:.1f} VORP cliff - {left} left at the position",
+                QUALITY,
+            )
+        )
     same_pos = [c for c in (alternatives or []) if c.position == pos and c is not candidate]
     if same_pos:
         gap = candidate.vorp - same_pos[0].vorp
-        if gap > 1.0:
-            pros.append(
-                Reason("pro", f"Clear best {pos} left (+{gap:.1f} VORP on the next one)", QUALITY)
-            )
-        elif abs(gap) < 0.4:
+        if cliff < CLIFF_VORP and abs(gap) < 0.4:
             cons.append(
                 Reason(
-                    "con", f"{same_pos[0].name} is a near-equal {pos} ({gap:+.1f} VORP)", QUALITY
+                    "con",
+                    f"{same_pos[0].name} is a near-equal {pos} ({gap:+.1f} VORP), "
+                    f"{left} left at the position",
+                    QUALITY,
                 )
             )
 

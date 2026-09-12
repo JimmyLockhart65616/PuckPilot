@@ -193,3 +193,129 @@ def test_a_non_integer_seat_is_refused_with_a_usable_message(tmp_path):
     )
     with pytest.raises(LeagueConfigError, match="not an integer"):
         load_league(p)
+
+
+# ---- dynamic positional replacement ----------------------------------------
+#
+# VORP's replacement level was computed once, pre-draft, and frozen. After a run
+# on a position that is simply wrong: with eight defencemen left, the ninth-best
+# D is not worth what the pre-draft table said. These pin the re-basing and the
+# edges where it could go wrong quietly.
+
+
+def _depth_board(n_per_pos=12):
+    from puckpilot.draft.engine import DraftRules
+
+    rules = DraftRules(shape=SHAPE, rounds=7, caps={"C": 9, "L": 9, "R": 9, "D": 9, "G": 9})
+    return DraftBoard(_universe(), rules, my_seat=0), rules
+
+
+def test_depth_zero_reproduces_the_frozen_vorp_exactly():
+    """The disable switch has to be exact, not approximately equal - it is what
+    makes every earlier measurement still comparable."""
+    import numpy as np
+
+    from puckpilot.draft.engine import RosterValuePolicy
+
+    b, rules = _depth_board()
+    p = RosterValuePolicy(replacement_depth=0.0)
+    # the precise claim: the BASE score is the frozen array, untouched
+    np.testing.assert_array_equal(p._base_score(b.u, rules, b.avail), b.u.vorp)
+    # and it stays so once players come off the board
+    b.record(int(b.u.ids[0]))
+    np.testing.assert_array_equal(p._base_score(b.u, rules, b.avail), b.u.vorp)
+
+
+def test_a_policy_with_no_avail_falls_back_to_the_frozen_vorp():
+    """Bots and any caller that has not been updated must keep working."""
+    import numpy as np
+
+    from puckpilot.draft.engine import RosterValuePolicy
+
+    b, rules = _depth_board()
+    p = RosterValuePolicy(replacement_depth=0.5)
+    np.testing.assert_array_equal(p._base_score(b.u, rules, None), b.u.vorp)
+    np.testing.assert_array_equal(p._base_score(b.u), b.u.vorp)
+
+
+def test_depleting_a_position_raises_the_value_of_what_is_left():
+    """The whole point. Take the best defencemen off the board and the ones
+    remaining must score HIGHER than they did, because replacement fell."""
+    from puckpilot.draft.engine import RosterValuePolicy
+
+    b, rules = _depth_board()
+    p = RosterValuePolicy(replacement_depth=0.5, survival_discount=0.0)
+    d_rows = [r for r in range(len(b.u.ids)) if str(b.u.pos[r]) == "D"]
+    survivor = d_rows[-1]
+
+    before = p.score(b.u, {}, rules, b.pick_context(0))[survivor]
+    for r in d_rows[:-2]:
+        b.record(int(b.u.ids[r]))
+    after = p.score(b.u, {}, rules, b.pick_context(0))[survivor]
+    assert after > before, f"scarcity did not raise value: {before:.3f} -> {after:.3f}"
+
+
+def test_a_position_with_nobody_left_does_not_blow_up():
+    from puckpilot.draft.engine import RosterValuePolicy
+
+    b, rules = _depth_board()
+    for r in [r for r in range(len(b.u.ids)) if str(b.u.pos[r]) == "G"]:
+        b.record(int(b.u.ids[r]))
+    out = RosterValuePolicy(replacement_depth=0.5).score(b.u, {}, rules, b.pick_context(0))
+    assert np.isfinite(out).all()
+
+
+def test_a_negative_depth_is_refused():
+    from puckpilot.draft.engine import RosterValuePolicy
+
+    with pytest.raises(ValueError, match="replacement_depth"):
+        RosterValuePolicy(replacement_depth=-1.0)
+
+
+def test_replacement_level_clamps_to_what_is_actually_there():
+    """The clamp IS the scarcity signal, not an edge case to tolerate."""
+    from puckpilot.engine.valuation import replacement_level
+
+    vals = np.array([10.0, 8.0, 6.0])
+    assert replacement_level(vals, 2) == 8.0
+    assert replacement_level(vals, 99) == 6.0, "must fall back to the worst available"
+    assert replacement_level(vals, 0) == 0.0
+    assert replacement_level(np.array([]), 5) == 0.0
+
+
+# ---- positional state shown to the drafter ---------------------------------
+
+
+def test_supply_counts_who_is_actually_left_per_position():
+    b, _ = _depth_board()
+    before = b.supply()
+    assert before["D"] == 8 and before["G"] == 8
+    d_rows = [r for r in range(len(b.u.ids)) if str(b.u.pos[r]) == "D"]
+    for r in d_rows[:5]:
+        b.record(int(b.u.ids[r]))
+    after = b.supply()
+    assert after["D"] == 3, "supply must track the board, not the pre-draft pool"
+    assert after["G"] == 8, "an untouched position must not move"
+
+
+def test_depth_after_reads_the_real_pool_not_a_shortlist():
+    """The old cliff signal compared against one player on an already-truncated
+    shortlist, so it could only say 'better than the next name on this list'."""
+    b, _ = _depth_board()
+    rows = [r for r in range(len(b.u.ids)) if str(b.u.pos[r]) == "D"]
+    top = max(rows, key=lambda r: b.u.vorp[r])
+    gap = b.depth_after(top, steps=3)
+    assert gap > 0, "the best D must be worth more than the 3rd-next D"
+    # and it grows as the position is stripped from underneath him
+    for r in sorted(rows, key=lambda r: -b.u.vorp[r])[1:4]:
+        b.record(int(b.u.ids[r]))
+    assert b.depth_after(top, steps=3) > gap
+
+
+def test_depth_after_survives_an_empty_position():
+    b, _ = _depth_board()
+    rows = [r for r in range(len(b.u.ids)) if str(b.u.pos[r]) == "G"]
+    keep = rows[0]
+    for r in rows[1:]:
+        b.record(int(b.u.ids[r]))
+    assert b.depth_after(keep) == 0.0

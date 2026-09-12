@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from puckpilot.engine.valuation import DEFAULT_SHAPE, LeagueShape
+from puckpilot.engine.valuation import DEFAULT_SHAPE, LeagueShape, replacement_level
 
 
 @dataclass(frozen=True)
@@ -170,17 +170,21 @@ class RosterValuePolicy:
         survival_discount: float = 0.30,
         survival_spread: float = 6.0,
         basis: str = "vorp",
+        replacement_depth: float = 0.0,
     ):
         if basis not in ("vorp", "z"):
             raise ValueError(f"basis must be 'vorp' or 'z', got {basis!r}")
+        if replacement_depth < 0:
+            raise ValueError(f"replacement_depth must be >= 0, got {replacement_depth!r}")
         self.goalie_weight = goalie_weight
         self.bench_factor = bench_factor
         self.cat_weights = cat_weights
         self.survival_discount = survival_discount
         self.survival_spread = survival_spread
         self.basis = basis
+        self.replacement_depth = replacement_depth
 
-    def _base_score(self, u: Universe) -> np.ndarray:
+    def _base_score(self, u: Universe, rules=None, avail=None) -> np.ndarray:
         """What a player is worth before roster shape and market timing.
 
         `basis="vorp"` subtracts a positional replacement level; `basis="z"` is
@@ -205,7 +209,9 @@ class RosterValuePolicy:
         is meaningful. VORP is already a scalar, so the two do not compose.
         """
         if self.basis == "vorp" and not self.cat_weights:
-            return u.vorp.copy()
+            if avail is None or not self.replacement_depth or rules is None:
+                return u.vorp.copy()
+            return self._dynamic_vorp(u, rules, avail)
         if not self.cat_weights:
             return u.z_total.copy()
         score = np.zeros(len(u))
@@ -236,7 +242,7 @@ class RosterValuePolicy:
         util_used = sum(max(0, counts.get(p, 0) - s) for p, s in slots.items() if p != "G")
         util_open = util_used < rules.shape.util_slots
 
-        score = self._base_score(u)
+        score = self._base_score(u, rules, ctx.get("avail") if ctx else None)
         goalie_mask = u.pos == "G"
         score[goalie_mask] *= self.goalie_weight
         for pos, slot_count in slots.items():
@@ -256,6 +262,73 @@ class RosterValuePolicy:
             factor = 1.0 - self.survival_discount * self.survival(u, ctx)
             score = np.where(score > 0, score * factor, score)
         return score
+
+    def _dynamic_vorp(self, u: Universe, rules: DraftRules, avail: np.ndarray) -> np.ndarray:
+        """VORP re-based against the players who are actually still on the board.
+
+        The frozen `u.vorp` prices every player against the pool as it looked
+        before the draft started. After a run on a position that is simply
+        wrong: with eight defencemen left, the ninth-best D is not worth what
+        the pre-draft table said.
+
+        **This is OFF by default (`replacement_depth=0.0`) and the measurements
+        below are why.** It is kept because the mechanism is real and clearly
+        helps under some conditions, but it did not earn the default.
+
+        Depth is a FIXED fraction of the league's starting slots at the
+        position, not a countdown of how many are still to be taken. That
+        distinction is the whole design, and the obvious alternative was
+        measured and is worse in both directions:
+
+            replacement depth            2025-26         2024-25
+            static (frozen)              0.743 / 0.702   0.440 / 0.383
+            fixed fraction (this)        0.713 / 0.727   0.510 / 0.498
+            `slots - already_drafted`    0.568 / 0.537   0.347 / 0.337
+
+        Tracking the D replacement level as the position empties shows why. A
+        fixed depth falls monotonically (-3.56 at 0 drafted to -8.79 at 80), so
+        the defencemen still on the board correctly gain value as the position
+        thins. `slots - already_drafted` is flat at -6.10 from 24 through 48 -
+        the meat of the draft - because the depth shrinks as fast as the pool
+        does, leaving no gradient at all. It also asks the wrong question: "how
+        many are left to be taken" is about timing, which `survival_discount`
+        already handles, and the two fight.
+
+        Why it is off. The pre-registered rule was: ship only if the sign is
+        consistent across both target seasons and both selection seeds. It is
+        not. n=800, depth 0.0 vs 0.5:
+
+            target 2025-26   0.746 / 0.704   ->   0.642 / 0.656    worse
+            target 2024-25   0.419 / 0.384   ->   0.557 / 0.566    much better
+
+        Both seeds agree within each season, so this is not noise - the two
+        seasons genuinely disagree. The obvious explanation was tested and
+        refuted: 2024-25 has no real keeper list and falls back to simulated
+        keepers, but re-running 2025-26 with simulated keepers still prefers
+        static (0.755 / 0.710 vs 0.709 / 0.672), so it is not the keeper
+        structure. No further explanation was found, and a mechanism that helps
+        by +0.14 in one season and hurts by -0.09 in another for reasons nobody
+        can name is not one to hand a live draft.
+
+        What the drafter gets instead is the same information as a fact rather
+        than a weight: the board shows how many startable players remain at each
+        position and where the cliff is, and a human applies it. Set
+        `replacement_depth=0.5` to turn the scoring effect on.
+        """
+        base = u.z_total.copy()
+        starters = rules.shape.starters_by_pos()
+        for pos, slots_at_pos in starters.items():
+            at_pos = u.pos == pos
+            here = avail & at_pos
+            n = int(here.sum())
+            if not n:
+                continue
+            depth = int(round(slots_at_pos * self.replacement_depth))
+            if depth <= 0:
+                continue
+            vals = np.sort(u.z_total[here])[::-1]
+            base[at_pos] -= replacement_level(vals, depth)
+        return base
 
     def pick(self, u, avail, counts, rules, picks_left, rng, ctx=None) -> int:
         return _pick_best(u, avail, counts, rules, picks_left, self.score(u, counts, rules, ctx))

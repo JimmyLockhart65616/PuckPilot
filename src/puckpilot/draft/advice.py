@@ -59,10 +59,10 @@ def recommend(
     u = board.u
 
     picks_left = board.picks_left(seat)
-    ctx = {
-        "pick_no": board.made,
-        "next_pick_no": board.next_pick_no(seat),
-    }
+    # Built by the board, not here: `avail` lets the policy re-base replacement
+    # level against who is actually left, and a caller that assembles its own
+    # ctx scores a different board than the console shows.
+    ctx = board.pick_context(seat)
     score = policy.score(u, board.counts[seat], board.rules, ctx)
     p_survive = policy.survival(u, ctx)
 
