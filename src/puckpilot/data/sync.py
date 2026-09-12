@@ -201,6 +201,49 @@ def sync_player_bios(
     return len(seen)
 
 
+def sync_current_rosters(
+    conn: sqlite3.Connection,
+    nhl: NhlClient,
+    season: str,
+    *,
+    delay: float = POLITE_DELAY_S,
+    progress: Progress = _noop,
+) -> dict[str, int]:
+    """Point `nhl_players.team_abbrev` at who each player actually plays for.
+
+    MoneyPuck is the player-discovery mechanism and it is synced per season with
+    INSERT OR REPLACE, so whichever season ran last decided every player's team.
+    That left 436 players who appeared in 2025-26 carrying their 2022-23 club.
+
+    It is not cosmetic. `projections._team_win_rate_by_goalie` groups on this
+    column and `GOALIE_TEAM_WIN_BLEND` is 0.5, so half of every goalie's
+    projected wins - a scored category - came from the wrong team's record.
+    Re-projected with correct teams the mean absolute change was 2.24 wins and
+    the largest was 13.19.
+
+    32 requests, one per club, same shape as `sync_player_bios`.
+    """
+    teams = current_team_abbrevs(nhl)
+    seen = changed = 0
+    for team in teams:
+        try:
+            data = nhl.roster(team, season)
+        except NhlApiError:
+            progress(f"  {team}: no roster for {season}")
+            continue
+        for group in ROSTER_GROUPS:
+            for p in data.get(group, []):
+                pid = p.get("id")
+                if pid is None:
+                    continue
+                seen += 1
+                changed += store.update_player_team(conn, int(pid), team)
+        time.sleep(delay)
+    conn.commit()
+    progress(f"  {len(teams)} rosters, {seen} players, {changed} team(s) corrected")
+    return {"teams": len(teams), "players": seen, "changed": changed}
+
+
 def sync_players_and_logs(
     conn: sqlite3.Connection,
     nhl: NhlClient,

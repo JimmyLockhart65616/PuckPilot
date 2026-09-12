@@ -151,20 +151,36 @@ class RosterValuePolicy:
       moved. At 1.5 the worst category recovers from .274 to .450 and the engine
       wins 8-9 of 12 rather than 5-6.
 
-      1.5 is not the argmax. 2.0-2.5 score a higher top-3 on 2025-26 but win
-      only five categories, trading a balanced roster for big margins in a few -
-      a worse bet against eleven humans whose tendencies we do not know. 1.5 has
-      the best or equal mean finish on both target seasons and all four
-      confirmation seeds. Out-of-sample top-3 on 2024-25 is a wash between all
-      three values; the magnitude of the gain is 2025-26-specific even though
-      the defect it repairs is not.
+      **Re-tuned 1.5 -> 1.15 after the roster fix.** The 1.5 was measured on a
+      player table where 484 of 1289 carried the wrong club, and
+      `projections._team_win_rate_by_goalie` groups on exactly that column at a
+      0.5 blend - so it was correcting goalie projections that were themselves
+      wrong by a mean of 2.24 wins and up to 13. With teams correct the goalies
+      need less of a thumb on the scale. n=1000, two confirmation seeds, target
+      2025-26:
+
+          gw 1.00   top-3 .736 / .763   wins 7/12   worst W   .408 / .423
+          gw 1.15   top-3 .755 / .745   wins 8-9    worst HIT .442 / .450
+          gw 1.50   top-3 .783 / .823   wins 6-7    worst HIT .426 / .426
+
+      1.15 is not the argmax and that is deliberate, for the same reason 1.5 was
+      not: 1.50 buys a higher finish rate by winning fewer categories by wider
+      margins, which is a worse bet against eleven humans whose tendencies we do
+      not know. 1.15 wins the most categories and has the best floor.
+
+      Caveat worth carrying: `team_abbrev` now holds 2026-27 clubs for everyone,
+      which is right for draft night and WRONG for backtesting an older season -
+      grouping 2024-25 goalie wins by 2026-27 teams is nonsense. So 2024-25 is
+      no longer a usable out-of-sample control for anything goalie-shaped, and
+      this re-tune was confirmed on 2025-26 only. Per-season team history would
+      fix it and does not exist.
     """
 
     name = "engine"
 
     def __init__(
         self,
-        goalie_weight: float = 1.5,
+        goalie_weight: float = 1.15,
         bench_factor: float = 0.70,
         cat_weights: dict[str, float] | None = None,
         survival_discount: float = 0.30,

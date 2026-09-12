@@ -155,6 +155,22 @@ def upsert_player(
     )
 
 
+def update_player_team(conn: sqlite3.Connection, player_id: int, team_abbrev: str) -> int:
+    """Set a player's team WITHOUT touching name or position.
+
+    `upsert_player` is INSERT OR REPLACE, so calling it per season means the
+    last season processed wins - which is how `team_abbrev` ended up holding
+    2022-23 teams for 436 players who played in 2025-26. A team change needs a
+    targeted write, not a whole-row replace.
+    """
+    cur = conn.execute(
+        "UPDATE nhl_players SET team_abbrev = ? WHERE player_id = ? AND"
+        " (team_abbrev IS NULL OR team_abbrev != ?)",
+        (team_abbrev, player_id, team_abbrev),
+    )
+    return cur.rowcount
+
+
 def upsert_schedule_game(
     conn: sqlite3.Connection,
     *,

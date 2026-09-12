@@ -130,6 +130,22 @@ def _cmd_yahoo_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_data_rosters(args: argparse.Namespace) -> int:
+    """Repoint nhl_players.team_abbrev at who each player actually plays for."""
+    from puckpilot.data import store, sync
+    from puckpilot.data.nhl import NhlClient
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    print(f"Syncing {args.season} rosters from the NHL API (32 requests)...")
+    result = sync.sync_current_rosters(conn, NhlClient(), args.season, progress=print)
+    print()
+    print(f"{result['changed']} of {result['players']} players had the wrong team.")
+    if result["changed"]:
+        print("Re-run `ppilot rank` - goalie win projections blend on team strength.")
+    return 0
+
+
 def _cmd_yahoo_playermap(args: argparse.Namespace) -> int:
     """Build the Yahoo player-key -> NHL id map, and Yahoo's own ADP with it.
 
@@ -718,6 +734,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sync per-game boxscores only (hits/blocks); use for the one-time backfill",
     )
     sync.set_defaults(func=_cmd_data_sync)
+
+    rosters = data_sub.add_parser(
+        "rosters",
+        help="Repoint player teams at the current season's NHL rosters",
+    )
+    rosters.add_argument(
+        "--season",
+        default="20262027",
+        help="Season whose rosters are authoritative (default 20262027)",
+    )
+    rosters.set_defaults(func=_cmd_data_rosters)
 
     rank = sub.add_parser("rank", help="Project and rank players by category value")
     rank.add_argument("--season", default="20262027", help="Target season (default 20262027)")

@@ -195,3 +195,68 @@ def test_unpublished_season_is_skipped(tmp_path):
     report = sync.sync_players_and_logs(conn, FakeNhl(), UnpublishedMp(), ["20262027"], delay=0)
     assert report["20262027"]["players"] == 0
     assert conn.execute("SELECT COUNT(*) c FROM nhl_players").fetchone()["c"] == 0
+
+
+# ---- current rosters -------------------------------------------------------
+#
+# `upsert_player` is INSERT OR REPLACE and is called once per synced season, so
+# whichever season ran last decided every player's team. That left 484 of 1289
+# players carrying a club they no longer play for - and it is not cosmetic,
+# because projections blend goalie wins on team strength at 0.5.
+
+
+class RosterNhl:
+    """Two clubs, and a player who moved between them."""
+
+    def __init__(self):
+        self.roster_calls = []
+
+    def standings_now(self):
+        return {
+            "standings": [{"teamAbbrev": {"default": "DAL"}}, {"teamAbbrev": {"default": "COL"}}]
+        }
+
+    def roster(self, team_abbrev, season):
+        self.roster_calls.append((team_abbrev, season))
+        if team_abbrev == "DAL":
+            return {"forwards": [{"id": 1}], "defensemen": [], "goalies": [{"id": 3}]}
+        return {"forwards": [{"id": 2}], "defensemen": [], "goalies": []}
+
+
+def test_sync_current_rosters_moves_a_traded_player(db):
+    store.upsert_player(db, 1, "Moved Winger", "R", "COL")  # stale: now on DAL
+    store.upsert_player(db, 2, "Stayed Centre", "C", "COL")
+    store.upsert_player(db, 3, "Moved Goalie", "G", "ANA")
+
+    result = sync.sync_current_rosters(db, RosterNhl(), "20262027", delay=0)
+
+    teams = dict(db.execute("SELECT player_id, team_abbrev FROM nhl_players"))
+    assert teams[1] == "DAL", "a traded player must follow his new club"
+    assert teams[2] == "COL", "a player who did not move must not churn"
+    assert teams[3] == "DAL"
+    assert result["changed"] == 2, "only the two who actually moved count as changed"
+    assert result["players"] == 3
+
+
+def test_updating_a_team_does_not_clobber_name_or_position(db):
+    """The whole reason this is not `upsert_player`: a whole-row replace is what
+    caused the staleness in the first place."""
+    store.upsert_player(db, 1, "Moved Winger", "R", "COL")
+    store.update_player_team(db, 1, "DAL")
+    row = tuple(list(db.execute("SELECT full_name, position, team_abbrev FROM nhl_players"))[0])
+    assert row == ("Moved Winger", "R", "DAL")
+
+
+def test_a_club_with_no_roster_for_that_season_is_skipped(db):
+    """Defunct franchises and expansion clubs must not abort the sync."""
+    from puckpilot.data.nhl import NhlApiError
+
+    class Missing(RosterNhl):
+        def roster(self, team_abbrev, season):
+            if team_abbrev == "COL":
+                raise NhlApiError("404")
+            return super().roster(team_abbrev, season)
+
+    store.upsert_player(db, 1, "Moved Winger", "R", "COL")
+    result = sync.sync_current_rosters(db, Missing(), "20262027", delay=0)
+    assert result["teams"] == 2 and result["changed"] == 1
