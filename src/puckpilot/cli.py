@@ -309,7 +309,14 @@ def _cmd_draft_farm(args: argparse.Namespace) -> int:
     out_root = settings._resolve(Path("data/mocks"))
     ymap = load_yahoo_id_map(conn)
     say(f"{len(ymap)} Yahoo ids mapped; harvesting to {out_root}")
-    say("Read-only: this records what the room broadcasts and never picks for you.")
+    say("This records what the room broadcasts. It never picks for you.")
+
+    # Optional local helper: joining a lobby is a click, and the published tool
+    # does not make it. If a user has written one it lives outside this repo.
+    try:
+        from puckpilot.local.join import join_a_mock
+    except ImportError:
+        join_a_mock = None
 
     if args.from_capture:
         # Replaying a recording costs nobody a seat, so no browser and no cap.
@@ -346,7 +353,11 @@ def _cmd_draft_farm(args: argparse.Namespace) -> int:
                 say(f"[{run}/{runs}] opening the mock lobby")
                 with contextlib.suppress(Exception):
                     page.goto(LOBBY, wait_until="domcontentloaded")
-                say("  join a mock draft in the browser; recording starts automatically")
+                if join_a_mock is None:
+                    say("  join a mock draft in the browser; recording starts automatically")
+                elif not join_a_mock(page, say):
+                    say("  no room to join right now; moving on")
+                    continue
                 result = run_one(
                     ctx,
                     conn,
@@ -743,7 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     farm = draft_sub.add_parser(
         "farm",
-        help="Sit through Yahoo mock drafts (read-only) and harvest ADP / pool-coverage data",
+        help="Sit through Yahoo mock drafts and harvest pool-coverage / survival data",
     )
     farm.add_argument(
         "--runs",
@@ -757,7 +768,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         metavar="SECONDS",
-        help="How long to hold the lobby open waiting for you to join a mock "
+        help="How long to wait for a draft to start before giving up on a room "
         "(default: farm.JOIN_TIMEOUT_S, 15 min)",
     )
     farm.add_argument(

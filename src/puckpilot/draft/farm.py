@@ -19,10 +19,10 @@ Conduct
 -------
 A public mock draft contains real people, so:
 
-- **This never picks and never clicks.** It reads the frames the room broadcasts
-  to a browser a human joined by hand, and writes them to disk. The seat is the
-  user's own, played (or autopicked) by Yahoo exactly as if the tool were not
-  running.
+- **This never picks.** It reads the frames the room broadcasts and writes them
+  to disk. The seat is the user's own, played (or autopicked) by Yahoo exactly
+  as if the tool were not running - the recording changes nothing about how the
+  draft goes for anyone in the room.
 - **`MAX_RUNS` caps a session.** An unattended seat is worth less to the other
   eleven players than a live one, so this is metered rather than left to loop.
 - **Mock rooms only.** `LOBBY` is the mock lobby by construction. Do not point

@@ -72,24 +72,20 @@ draft room to disk so the pick feed could be built from evidence rather than
 guesswork. Output stays local and git-ignored, with cookies and auth headers
 redacted.
 
-What these do to a browser, stated precisely: **they never click, type, submit,
-or take any action that changes Yahoo's state.** Two things they do do, and both
-are worth naming rather than glossing:
+What those three do to a browser, stated precisely: **none of them submits a
+form, enters text, or takes any action that changes your league or roster
+state.** Two things they do do, and both are worth naming rather than glossing:
 
 - They open a Yahoo URL you name — `capture.py --url`, and the lobby or draft
-  room for `farm` and `live --yahoo`. After that page load, everything is
-  driven by hand.
+  room for `live --yahoo`.
 - `capture.py` reads the draft room's visible text on an interval, by
   evaluating a one-line expression in the page (`document.body.innerText`).
   That is a read of what is already rendered; it sends nothing and changes
   nothing. No other component does this.
 
-Apart from the page load you ask for, none of them issues network requests of
-its own — they read what your browser already receives.
-
 `draft/farm.py` sits through public mock drafts to record the order players
-come off the board, which is what calibrates the survival model. It never picks
-and never clicks. The seat is the user's own, and Yahoo plays it exactly as it
+come off the board, which is what calibrates the survival model. **It never
+picks.** The seat is the user's own, and Yahoo plays it exactly as it
 would if the tool were not running — including autopicking it if the user steps
 away, which is ordinary Yahoo behaviour for any idle seat. Sessions are capped,
 because each run occupies a seat in a room of real people. It records picks and
