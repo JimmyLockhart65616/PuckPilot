@@ -13,6 +13,8 @@ pick after that is arithmetic.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from puckpilot.draft.board import Candidate, DraftBoard
@@ -27,6 +29,15 @@ from puckpilot.engine.categories import CATALOG
 # their own league's categories; the pool is deliberately wider than any one
 # league's set.
 DISPLAY_CATS = tuple(sorted({c.key for c in CATALOG.values()}))
+
+
+def _opt(v) -> float | None:
+    """NaN and missing both mean "we do not know", and must not read as zero."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
 
 
 def _fills_starter(board: DraftBoard, seat: int, position: str) -> bool:
@@ -107,6 +118,8 @@ def recommend(
                 p_survive=float(p_survive[r]),
                 fills_starter=_fills_starter(board, seat, str(u.pos[r])),
                 projected=projected,
+                age=_opt(record.get("age")),
+                train_gp=_opt(record.get("train_gp")),
             )
         )
     return out
@@ -146,3 +159,112 @@ def format_board(board: DraftBoard, candidates: list[Candidate], width: int = 96
             f"{'starter' if c.fills_starter else 'bench'}"
         )
     return "\n".join(lines)[: width * 400]
+
+
+# A projection standing on less than about three-quarters of a season is thin
+# enough that the market's read is probably better than ours; past 32 the age
+# curve is fading a player the market may still be paying a name premium for.
+THIN_EVIDENCE_GP = 60.0
+FADING_AGE = 32.0
+# How far apart the two boards must be before it counts as a disagreement.
+# Without this the "room rates them higher" side fills with the room's best
+# remaining player at each position - ours #2 against room #1 is not a
+# disagreement, it is two boards agreeing.
+MIN_RANK_GAP = 5
+
+
+@dataclass(frozen=True)
+class Gap:
+    """One disagreement between our board and the room's."""
+
+    name: str
+    position: str
+    team: str
+    our_rank: int  # among available players AT HIS POSITION
+    market_rank: int
+    vorp: float
+    flag: str  # "" | "thin history" | "fading?"
+
+
+def _position_ranks(values: np.ndarray, mask: np.ndarray) -> dict[int, int]:
+    """1-based rank within `mask`, best first. Ties broken stably."""
+    rows = np.flatnonzero(mask)
+    order = rows[np.argsort(values[rows], kind="stable")]
+    return {int(r): i + 1 for i, r in enumerate(order)}
+
+
+def market_disagreement(board: DraftBoard, n: int = 5) -> tuple[list[Gap], list[Gap]]:
+    """Where our board and the room disagree, ranked WITHIN position.
+
+    Returns (room_is_sleeping_on, room_rates_above_us).
+
+    Ranking within position is not a refinement, it is the whole thing working.
+    Replacement level differs enormously by position - the 28th-best centre sits
+    around z -0.9 while the 48th-best defenceman is near -6 - so an overall
+    rank-vs-ADP comparison measures that structural offset and almost nothing
+    else. Done naively this panel leads with Brayden Point, our #214 against ADP
+    60, which is not a disagreement about Brayden Point. Asked within position
+    it becomes "we have him 4th-best D left, the room has him 11th", which is
+    both true and directly actionable.
+
+    Deliberately does not go through `recommend()`: that returns the top rows by
+    score, and a player the market rates far above us is by construction below
+    that cut. The panel has to see the whole board.
+    """
+    u = board.u
+    avail = board.avail
+    has_market = getattr(u, "has_market", None)
+    if has_market is None:
+        has_market = u.adp_rank < len(u)
+    live = avail & has_market
+    if not live.any():
+        return [], []
+
+    ours: dict[int, int] = {}
+    theirs: dict[int, int] = {}
+    for pos in {str(p) for p in u.pos}:
+        at_pos = live & (u.pos == pos)
+        if not at_pos.any():
+            continue
+        ours |= _position_ranks(-u.vorp, at_pos)
+        theirs |= _position_ranks(u.adp_rank, at_pos)
+
+    def _flag(row: int) -> str:
+        rec = u.frame.iloc[row]
+        gp, age = rec.get("train_gp"), rec.get("age")
+        # Evidence first: a 26-year-old with 20 NHL games is the same problem as
+        # a 20-year-old with 20, and age alone would call only one of them out.
+        if gp is not None and gp == gp and float(gp) < THIN_EVIDENCE_GP:
+            return "thin history"
+        if age is not None and age == age and float(age) >= FADING_AGE:
+            return "fading?"
+        return ""
+
+    def _gap(row: int) -> Gap:
+        rec = u.frame.iloc[row]
+        return Gap(
+            name=str(u.names[row]),
+            position=str(u.pos[row]),
+            team=str(rec.get("team") or "?"),
+            our_rank=ours[row],
+            market_rank=theirs[row],
+            vorp=float(u.vorp[row]),
+            flag=_flag(row),
+        )
+
+    rows = list(ours)
+    # Our side additionally requires the player to be startable: a bargain at a
+    # position where the 6th-best left is sub-replacement is not a bargain.
+    sleeping = sorted(
+        (r for r in rows if u.vorp[r] > 0 and theirs[r] - ours[r] >= MIN_RANK_GAP),
+        key=lambda r: (ours[r] - theirs[r], ours[r]),
+    )
+    # Sorted by how SOON the room takes him, not by the size of the gap. A
+    # player the room reaches for at #9 is a decision you face in a few minutes;
+    # one it takes at #47 is an argument you will never have to have. The gap
+    # only breaks ties.
+    rated = sorted(
+        (r for r in rows if ours[r] - theirs[r] >= MIN_RANK_GAP),
+        key=lambda r: (theirs[r], theirs[r] - ours[r]),
+    )
+    return [_gap(r) for r in sleeping[:n]], [_gap(r) for r in rated[:n]]

@@ -95,6 +95,13 @@ def blend_counting(
 
     out = rate.mul(proj_gp, axis=0)
     out.insert(0, "proj_gp", proj_gp)
+    # How much NHL evidence this projection actually stands on. Computed here
+    # anyway as the min-GP gate, and previously discarded - but it is the honest
+    # answer to "how far should I trust this number", and it is the quantity
+    # that separates a genuine disagreement with the market from a player we
+    # simply cannot see. A 20-year-old with 12 games and a 26-year-old with 12
+    # games are the same epistemic problem; age alone would not say so.
+    out.insert(1, "train_gp", gp_total[keep].round(0))
     return out
 
 
@@ -225,4 +232,7 @@ def project(
     ages = player_ages(conn, target_season)
     skaters = _apply_age(project_skaters(sk_frames, target_games, weights), ages)
     goalies = project_goalies(g_frames, target_games, weights, ages=ages)
+    # Age is consumed by `_apply_age` and then thrown away, so nothing
+    # downstream can tell a fading veteran from an unproven youngster. Carry it.
+    meta = meta.join(ages.rename("age"), how="left")
     return skaters.join(meta, how="left"), goalies.join(meta, how="left")

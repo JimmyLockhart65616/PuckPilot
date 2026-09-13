@@ -244,6 +244,12 @@ def build_live_board(
             dtype=float,
         )
         universe = universe.with_adp(ranks)
+        # Who the market actually prices, captured HERE and not inferred later:
+        # un-priced players are given a sentinel rank past the end, and
+        # `effective_adp` re-ranks everyone into 1..n when keepers come off,
+        # erasing the sentinel. After that there is no way to tell a genuinely
+        # cheap player from one the market never mentioned.
+        universe.has_market = np.array([int(pid) in adp for pid in universe.ids], dtype=bool)
         progress(f"  using Yahoo ADP for {sum(1 for p in universe.ids if int(p) in adp)} players")
 
     # Deterministic: a live board rebuilt mid-draft must not re-deal keepers.

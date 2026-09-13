@@ -74,6 +74,12 @@ class Candidate:
     p_survive: float  # P(still there at our next pick)
     fills_starter: bool
     projected: dict[str, float] = field(default_factory=dict)
+    # How much NHL evidence the projection stands on, and how old he is. Both
+    # are computed in `projections` and were thrown away before reaching here,
+    # which left nothing able to tell a fading veteran from a player we simply
+    # cannot see yet - opposite problems that look identical in a rank gap.
+    age: float | None = None
+    train_gp: float | None = None
 
 
 class DraftBoard:

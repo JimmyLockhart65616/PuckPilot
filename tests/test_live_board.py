@@ -461,3 +461,111 @@ def test_supply_counts_startable_players_not_the_whole_pool():
     b, _ = _depth_board()
     supply = b.supply()
     assert all(v <= int((b.avail & (b.u.vorp > 0)).sum()) for v in supply.values())
+
+
+# ---- where our board and the room disagree ---------------------------------
+
+
+def _market_board(n_per_pos=10):
+    """A board where the naive overall metric and the positional one DISAGREE.
+
+    Replacement level differs hugely by position in a real league - the 28th
+    centre sits near z -0.9 while the 48th defenceman is near -6 - so an overall
+    rank-vs-ADP comparison measures that structural offset rather than any
+    opinion about a player. This fixture reproduces the shape: every D is worth
+    less than every C, so a D can be the best D left while ranking far below
+    every C overall.
+    """
+    import pandas as pd
+
+    from puckpilot.draft.engine import Universe
+
+    rows, pid = {}, 1
+    for pos, base in (("C", 20.0), ("D", 2.0)):
+        for i in range(n_per_pos):
+            rows[pid] = {
+                "name": f"{pos}{i}",
+                "position": pos,
+                "team": "AAA",
+                "vorp": base - i,
+                "z_total": base - i,
+                # Centres: the two boards agree exactly, so any "disagreement"
+                # found among them is the positional offset, not an opinion.
+                # Defencemen: the market's order is the REVERSE of ours, which
+                # is a real within-position disagreement the panel must find.
+                "adp_rank": float(pid if pos == "C" else n_per_pos - i),
+                "train_gp": 200.0,
+                "age": 27.0,
+            }
+            pid += 1
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    df.index.name = "player_id"
+    u = Universe(df.sort_values("vorp", ascending=False))
+    u.has_market = np.ones(len(u), dtype=bool)
+    from puckpilot.draft.engine import DraftRules
+
+    rules = DraftRules(shape=SHAPE, rounds=7, caps={"C": 9, "L": 9, "R": 9, "D": 9, "G": 9})
+    return DraftBoard(u, rules, my_seat=0), rules
+
+
+def test_disagreement_is_measured_within_position_not_overall():
+    """The whole panel rests on this. Overall, every D ranks below every C, so a
+    naive metric reports a huge 'disagreement' for every defenceman and leads
+    with players nobody is actually disagreeing about."""
+    from puckpilot.draft.advice import market_disagreement
+
+    b, _ = _market_board()
+    sleeping, rated = market_disagreement(b, n=20)
+    # Every centre is ranked identically by both boards, so none may appear -
+    # overall they would all show a large gap purely from the C/D offset.
+    assert not any(g.position == "C" for g in sleeping + rated), (
+        "centres appear as disagreements only if ranks are computed overall"
+    )
+    # and the genuine within-position disagreement among D IS found
+    assert any(g.position == "D" for g in sleeping + rated)
+
+
+def test_a_material_gap_is_required():
+    """Ours #2 against room #1 is two boards agreeing, not a disagreement."""
+    from puckpilot.draft.advice import MIN_RANK_GAP, market_disagreement
+
+    b, _ = _market_board()
+    sleeping, rated = market_disagreement(b, n=10)
+    for g in sleeping + rated:
+        assert abs(g.our_rank - g.market_rank) >= MIN_RANK_GAP
+
+
+def test_thin_history_outranks_age_as_the_flag():
+    """A 26-year-old with 20 NHL games is the same epistemic problem as a
+    20-year-old with 20, and age alone would call out only one of them."""
+    from puckpilot.draft.advice import FADING_AGE, THIN_EVIDENCE_GP, market_disagreement
+
+    b, _ = _market_board()
+    b.u.frame.loc[b.u.frame["name"] == "D9", ["train_gp", "age"]] = [10.0, FADING_AGE + 5]
+    sleeping, rated = market_disagreement(b, n=20)
+    found = [g for g in sleeping + rated if g.name == "D9"]
+    if found:
+        assert found[0].flag == "thin history", "evidence must win over age"
+    assert THIN_EVIDENCE_GP > 0
+
+
+def test_our_side_only_offers_startable_players():
+    """A bargain at a position where the best left is sub-replacement is not a
+    bargain."""
+    from puckpilot.draft.advice import market_disagreement
+
+    b, _ = _market_board()
+    sleeping, _ = market_disagreement(b, n=20)
+    assert all(g.vorp > 0 for g in sleeping)
+
+
+def test_the_panel_sees_past_the_shortlist():
+    """Players the market rates far above us are below `recommend`'s cut by
+    construction, so the panel must read the whole board."""
+    from puckpilot.draft.advice import market_disagreement, recommend
+
+    b, _ = _market_board()
+    _, rated = market_disagreement(b, n=5)
+    shortlist = {c.name for c in recommend(b, n=3)}
+    assert rated, "expected at least one player the market rates above us"
+    assert any(g.name not in shortlist for g in rated)

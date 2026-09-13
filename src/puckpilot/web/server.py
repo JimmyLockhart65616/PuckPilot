@@ -19,10 +19,10 @@ from __future__ import annotations
 import json
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from puckpilot.draft.advice import recommend
+from puckpilot.draft.advice import market_disagreement, recommend
 from puckpilot.draft.board import DraftBoard
 from puckpilot.draft.engine import RosterValuePolicy
 from puckpilot.draft.explain import summarize
@@ -63,6 +63,12 @@ PAGE = """<!doctype html>
  .need{color:var(--warn)} code{color:var(--dim);font-size:11px}
  .proj{display:flex;flex-wrap:wrap;gap:2px 10px;margin:6px 0 2px;font-size:12px;
    color:var(--dim)} .proj b{color:var(--fg);font-weight:600}
+ .gaps{margin-bottom:4px}
+ .gap{border-left:2px solid var(--line);padding:3px 0 3px 8px;margin-bottom:6px;font-size:13px}
+ .gap .meta{font-size:11.5px;margin-top:1px}
+ .gp{color:var(--dim);font-size:11px;margin-right:2px}
+ b.us{color:var(--hot)} b.them{color:var(--warn)}
+ .thin{color:var(--warn)} .fade{color:var(--dim)}
  button{background:var(--card);border:1px solid var(--line);color:var(--fg);
    font:inherit;padding:4px 10px;border-radius:4px;cursor:pointer}
  button:hover{border-color:var(--warn);color:var(--warn)}
@@ -87,6 +93,12 @@ PAGE = """<!doctype html>
     <div class="k" style="margin-top:10px">YOUR ROSTER</div>
     <div class="card"><div id="roster" class="meta"></div>
       <div id="needs" class="need" style="margin-top:6px"></div></div>
+  </div>
+  <div class="col" style="flex:0.8;min-width:265px">
+    <div class="k">THE ROOM IS SLEEPING ON</div>
+    <div id="sleeping" class="gaps"></div>
+    <div class="k" style="margin-top:10px">THE ROOM RATES THESE ABOVE US</div>
+    <div id="rated" class="gaps"></div>
   </div>
   <div class="col">
     <div class="k">BOARD &mdash; <span id="left">0</span> LEFT</div>
@@ -152,6 +164,22 @@ function render(s){
       '</td><td class="num">'+Math.round(p.p_survive*100)+'%</td>';
     tb.appendChild(tr);
   });
+  const gapRow = (g, mine) =>
+    '<div class="gap"><span class="gp">'+g.position+'</span> '+g.name+
+    '<div class="meta">we have him <b class="'+(mine?'us':'them')+'">#'+g.our_rank+
+    '</b> at '+g.position+', the room has him <b>#'+g.market_rank+'</b>'+
+    (g.flag ? ' &middot; <span class="'+(g.flag==='thin history'?'thin':'fade')+'">'+
+      g.flag+(g.flag==='thin history' ? ' &mdash; we may be wrong'
+                                      : ' &mdash; we may be right')+'</span>' : '')+
+    '</div></div>';
+  const gaps = s.market_gaps || {sleeping:[], rated:[]};
+  document.getElementById('sleeping').innerHTML = gaps.sleeping.length
+    ? gaps.sleeping.map(g => gapRow(g, true)).join('')
+    : '<div class="meta">nothing startable left that the room is undervaluing</div>';
+  document.getElementById('rated').innerHTML = gaps.rated.length
+    ? gaps.rated.map(g => gapRow(g, false)).join('')
+    : '<div class="meta">no material disagreement</div>';
+
   document.getElementById('diag').textContent = s.diagnostics;
 }
 document.getElementById('undo').addEventListener('click', async () => {
@@ -277,6 +305,7 @@ class LiveState:
             # marked. The engine does not weight this (see
             # RosterValuePolicy._dynamic_vorp - measured, and left off), so it
             # is surfaced as a fact for the drafter to apply.
+            sleeping, rated = market_disagreement(self.board, n=5)
             need_pos = set(self.board.needs(seat))
             supply = [[pos, n, pos in need_pos] for pos, n in sorted(self.board.supply().items())]
 
@@ -292,6 +321,10 @@ class LiveState:
             "gaps": status.get("gaps", []),
             "n_left": n_left,
             "supply": supply,
+            "market_gaps": {
+                "sleeping": [asdict(g) for g in sleeping],
+                "rated": [asdict(g) for g in rated],
+            },
             "seconds_since_pick": (
                 None if self.last_pick_at is None else time.time() - self.last_pick_at
             ),
