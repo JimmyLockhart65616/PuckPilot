@@ -40,6 +40,27 @@ class UnknownPlayerError(DraftBoardError):
     """
 
 
+# A projection standing on less than about three-quarters of a season is thin
+# enough that the market's read is probably better than ours; past 32 the age
+# curve is fading a player the market may still be paying a name premium for.
+THIN_EVIDENCE_GP = 60.0
+FADING_AGE = 32.0
+THIN_HISTORY = "thin history"
+FADING = "fading?"
+# How far apart the two boards must be before it counts as a disagreement.
+# Without this, "the room rates him higher" fires for the room's best remaining
+# player at every position - ours #2 against room #1 is not a disagreement, it
+# is two boards agreeing.
+MIN_RANK_GAP = 5
+
+
+def _rank_within(values: np.ndarray, mask: np.ndarray) -> dict[int, int]:
+    """1-based rank of each masked row by ascending `values`. Ties break stably."""
+    rows = np.flatnonzero(mask)
+    order = rows[np.argsort(values[rows], kind="stable")]
+    return {int(r): i + 1 for i, r in enumerate(order)}
+
+
 @dataclass(frozen=True)
 class Pick:
     """One player off the board."""
@@ -107,6 +128,12 @@ class DraftBoard:
 
         self._row_of: dict[int, int] = {int(pid): i for i, pid in enumerate(universe.ids)}
         self.avail = np.ones(len(universe), dtype=bool)
+        # Bumped on every change to `avail`, so cached per-board rankings can
+        # tell "nothing has happened" from "undo then a different pick", which
+        # a pick COUNT cannot: both leave `made` where it was.
+        self._rev = 0
+        self._ranks: tuple[dict[int, int], dict[int, int]] | None = None
+        self._ranks_at = -1
         self.counts: list[dict[str, int]] = [{} for _ in range(self.n_teams)]
         self.picks: list[Pick] = []
         self.keeper_picks: list[Pick] = []
@@ -122,6 +149,7 @@ class DraftBoard:
                     self.unmatched_keepers.append(int(pid))
                     continue
                 self.avail[row] = False
+                self._rev += 1
                 self._bump(seat, row)
                 self.keeper_picks.append(self._pick_at(-1, seat, row, "keeper"))
 
@@ -235,6 +263,96 @@ class DraftBoard:
         rest = np.sort(self.u.vorp[here])[::-1]
         return float(self.u.vorp[row] - rest[min(steps, len(rest)) - 1])
 
+    def position_ranks(self) -> tuple[dict[int, int], dict[int, int]]:
+        """Rank of every market-priced available player WITHIN his position, on
+        our board and on the room's. 1-based, best first.
+
+        Within position is not a refinement, it is the whole measurement.
+        Replacement level differs enormously by position - the 28th-best centre
+        sits around z -0.9 while the 48th-best defenceman is near -6 - so an
+        overall rank-vs-ADP comparison measures that structural offset and
+        almost nothing else. Done naively it leads with Brayden Point, our #214
+        against ADP 60, which is not a disagreement about Brayden Point.
+
+        Lives on the board because two things read it: the disagreement panel
+        and the per-player reasons. A card saying "the room rates him higher"
+        while the panel says the opposite would be worse than either alone.
+
+        Memoized on the board revision, since ranks only move when the
+        available set does.
+        """
+        if self._ranks_at == self._rev and self._ranks is not None:
+            return self._ranks
+
+        u = self.u
+        has_market = getattr(u, "has_market", None)
+        if has_market is None:
+            # Without a captured market flag, an unpriced player carries a
+            # sentinel rank past the end of the board.
+            has_market = u.adp_rank < len(u)
+        live = self.avail & has_market
+
+        ours: dict[int, int] = {}
+        theirs: dict[int, int] = {}
+        for pos in {str(p) for p in u.pos}:
+            at_pos = live & (u.pos == pos)
+            if not at_pos.any():
+                continue
+            ours |= _rank_within(-u.vorp, at_pos)
+            theirs |= _rank_within(u.adp_rank, at_pos)
+        self._ranks = (ours, theirs)
+        self._ranks_at = self._rev
+        return self._ranks
+
+    def evidence_flag(self, row: int) -> str:
+        """Why a disagreement about this player might be OUR fault, or theirs.
+
+        Two opposite problems look identical in a rank gap: a player we cannot
+        see yet, and one the market has not finished paying a name premium for.
+        Evidence is checked first, because a 26-year-old with 20 NHL games is
+        the same problem as a 20-year-old with 20 and age alone would call out
+        only one of them.
+
+        Returns "" when neither applies.
+        """
+        rec = self.u.frame.iloc[row]
+        gp, age = rec.get("train_gp"), rec.get("age")
+        if gp is not None and gp == gp and float(gp) < THIN_EVIDENCE_GP:
+            return THIN_HISTORY
+        if age is not None and age == age and float(age) >= FADING_AGE:
+            return FADING
+        return ""
+
+    def blocked(self, seat: int | None = None) -> dict[str, str]:
+        """Positions the roster rules will not let `seat` draft right now, and why.
+
+        "cap" - already holding the maximum at that position.
+        "min" - so few picks remain that every one of them is owed to a
+        position we must still fill.
+
+        The board panel shows these players anyway, tagged. A closed position
+        is a fact about our roster, not about the player: hiding the best
+        winger left because our wings are full is how a drafter loses track of
+        what the room still has to choose from, and it is exactly the row you
+        want to see when deciding whether to trade or to punt a slot.
+        """
+        s = self.my_seat if seat is None else seat
+        picks_left = self.picks_left(s)
+        if picks_left <= 0:
+            return {}
+        counts = self.counts[s]
+        allowed = eligible_positions(counts, self.rules, picks_left)
+        out: dict[str, str] = {}
+        for pos in sorted({str(p) for p in self.u.pos}):
+            if pos in allowed:
+                continue
+            cap = self.rules.caps.get(pos)
+            if cap is not None and counts.get(pos, 0) >= cap:
+                out[pos] = "cap"
+            elif any(m - counts.get(p, 0) > 0 for p, m in self.rules.mins.items()):
+                out[pos] = "min"
+        return out
+
     def pick_context(self, seat: int | None = None) -> dict:
         """The `ctx` a policy needs to score this board, built in ONE place.
 
@@ -307,6 +425,7 @@ class DraftBoard:
             # swallow, not a crash.
             raise DraftBoardError(f"seat {seat} is outside this {self.n_teams}-team board")
         self.avail[row] = False
+        self._rev += 1
         self._bump(seat, row)
         pick = self._pick_at(overall, seat, row, source)
         self.picks.append(pick)
@@ -356,6 +475,7 @@ class DraftBoard:
             # and nothing else, so there is nothing to give back.
             return pick
         self.avail[pick.row] = True
+        self._rev += 1
         pos = pick.position
         self.counts[pick.seat][pos] = max(0, self.counts[pick.seat].get(pos, 0) - 1)
         return pick

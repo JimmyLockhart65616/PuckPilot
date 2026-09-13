@@ -21,12 +21,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from puckpilot.draft.board import Candidate, DraftBoard
+from puckpilot.draft.advice import LIKELY_TO_LAST, WILL_NOT_LAST
+from puckpilot.draft.board import FADING, MIN_RANK_GAP, THIN_HISTORY, Candidate, DraftBoard
 
-# Above this, waiting is usually right: the room is unlikely to take him.
-LIKELY_TO_LAST = 0.65
-# Below this, he is going before our next turn if we do not act.
-WILL_NOT_LAST = 0.35
 # Category z above/below which a player is notably strong/weak.
 STRONG_CAT = 0.75
 WEAK_CAT = -0.5
@@ -43,6 +40,15 @@ TIMING, NEED, MARKET, QUALITY, CATEGORY, GENERIC = range(6)
 # is the position actually running out.
 CLIFF_STEPS = 3
 CLIFF_VORP = 1.5
+# How far past his market price a player must already have slid before it is
+# worth saying out loud.
+SLID_PICKS = 12
+# What an evidence flag means for THIS argument. The panel shows the bare flag;
+# a card has room to say which side it cuts for, and they cut opposite ways.
+FLAG_CLAUSE = {
+    THIN_HISTORY: "we have little to go on, so they may be right",
+    FADING: "though our age curve is already fading him",
+}
 
 
 @dataclass(frozen=True)
@@ -77,12 +83,19 @@ def explain(
     candidate: Candidate,
     labels: dict[str, str] | None = None,
     alternatives: list[Candidate] | None = None,
+    seat: int | None = None,
 ) -> list[Reason]:
-    """Pros and cons for one candidate, most decision-relevant first."""
+    """Pros and cons for one candidate, most decision-relevant first.
+
+    `seat` defaults to the board's own, which is what the console wants. It is a
+    parameter because two managers in the same room share one board: the picks
+    are universal, but "what do I still need" is a per-seat question, and every
+    roster-fit reason below is answered against this seat.
+    """
     labels = labels or {}
     pros: list[Reason] = []
     cons: list[Reason] = []
-    seat = board.my_seat
+    seat = board.my_seat if seat is None else seat
     counts = board.counts[seat]
     pos = candidate.position
 
@@ -126,20 +139,51 @@ def explain(
             )
         )
 
-    # --- value vs the room ------------------------------------------------
-    pick_now = board.made + 1
-    if candidate.adp_rank and candidate.adp_rank > pick_now + 12:
-        cons.append(
-            Reason(
-                "con",
-                f"Ahead of the market: ADP {candidate.adp_rank:.0f} vs pick {pick_now}",
-                MARKET,
+    # --- how we read him against the room ---------------------------------
+    # Position-relative, and deliberately the same measurement the disagreement
+    # panel makes, so a card and the panel cannot contradict each other.
+    #
+    # What this replaced: a con reading "Ahead of the market: ADP 200 vs pick
+    # 141" fired for exactly the sleeper profile, so a player we rate well above
+    # the room was argued AGAINST for being cheap, while the matching pro fired
+    # for a faller. The real cost it was reaching for - that you could have
+    # waited - is the timing fact above, and stated better there: survival is a
+    # fitted logistic against our NEXT pick, where that con was a fixed
+    # threshold against the CURRENT one. The two disagree exactly when our next
+    # turn is close, which is when the answer matters.
+    ours, theirs = board.position_ranks()
+    our_rank, market_rank = ours.get(candidate.row), theirs.get(candidate.row)
+    if our_rank is not None and market_rank is not None:
+        if market_rank - our_rank >= MIN_RANK_GAP and candidate.vorp > 0:
+            pros.append(
+                Reason(
+                    "pro",
+                    f"We rate him the #{our_rank} {pos} left; the room has him #{market_rank}",
+                    MARKET,
+                )
             )
-        )
-    elif candidate.adp_rank and candidate.adp_rank + 12 < pick_now:
+        elif our_rank - market_rank >= MIN_RANK_GAP:
+            clause = FLAG_CLAUSE.get(board.evidence_flag(candidate.row), "")
+            tail = f" — {clause}" if clause else ""
+            cons.append(
+                Reason(
+                    "con",
+                    f"The room rates him above us: their #{market_rank} {pos}, "
+                    f"ours #{our_rank}{tail}",
+                    MARKET,
+                )
+            )
+
+    # Separately: he has already slid past where the room prices him. A fact
+    # about tonight's room rather than about our board, so it stands on its own.
+    pick_now = board.made + 1
+    if candidate.adp_rank and candidate.adp_rank + SLID_PICKS < pick_now:
         pros.append(
             Reason(
-                "pro", f"Value vs the room: ADP {candidate.adp_rank:.0f}, pick {pick_now}", MARKET
+                "pro",
+                f"Has slid — the room's price was pick {candidate.adp_rank:.0f}, "
+                f"you are at {pick_now}",
+                MARKET,
             )
         )
 
@@ -216,7 +260,8 @@ def summarize(
     candidates: list[Candidate],
     labels: dict[str, str] | None = None,
     top: int = 3,
+    seat: int | None = None,
 ) -> list[tuple[Candidate, list[Reason]]]:
     """The shortlist a human actually decides from."""
     shortlist = candidates[:top]
-    return [(c, explain(board, c, labels, alternatives=candidates)) for c in shortlist]
+    return [(c, explain(board, c, labels, alternatives=candidates, seat=seat)) for c in shortlist]

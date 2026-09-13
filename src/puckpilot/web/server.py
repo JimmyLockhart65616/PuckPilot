@@ -17,187 +17,19 @@ so a stalled feed is visible rather than silently frozen.
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from puckpilot.draft.advice import market_disagreement, recommend
 from puckpilot.draft.board import DraftBoard
 from puckpilot.draft.engine import RosterValuePolicy
 from puckpilot.draft.explain import summarize
-
-PAGE = """<!doctype html>
-<meta charset="utf-8"><title>PuckPilot draft</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
- :root{--bg:#0f1216;--fg:#e8edf2;--dim:#8b98a5;--line:#252b33;--hot:#4ade80;
-       --warn:#fbbf24;--bad:#f87171;--card:#161b22}
- @media(prefers-color-scheme:light){:root{--bg:#fff;--fg:#111;--dim:#666;
-       --line:#e3e6ea;--card:#f7f8fa}}
- *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);
-   font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:14px}
- h1{font-size:14px;margin:0 0 8px;font-weight:600;color:var(--dim)}
- .bar{display:flex;gap:20px;flex-wrap:wrap;align-items:baseline;
-   border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:14px}
- .k{color:var(--dim);font-size:12px} .big{font-size:19px;font-weight:700}
- .live{color:var(--hot)} .stale{color:var(--warn)} .bad{color:var(--bad)}
- .mine{color:var(--hot);font-weight:700}
- .cols{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap}
- .col{flex:1;min-width:300px}
- .card{background:var(--card);border:1px solid var(--line);border-radius:6px;
-   padding:10px 12px;margin-bottom:10px}
- .nm{font-size:16px;font-weight:700} .meta{color:var(--dim);font-size:12px}
- ul.r{list-style:none;padding:0;margin:6px 0 0} ul.r li{padding:1px 0;font-size:12.5px}
- .pro::before{content:"+ ";color:var(--hot);font-weight:700}
- .con::before{content:"\\2212 ";color:var(--warn);font-weight:700}
- table{border-collapse:collapse;width:100%}
- th{text-align:left;color:var(--dim);font-weight:500;font-size:11px;
-   border-bottom:1px solid var(--line);padding:3px 6px 3px 0;position:sticky;top:0;
-   background:var(--bg)}
- td{padding:2px 6px 2px 0;border-bottom:1px solid var(--line);font-size:12.5px}
- .num{text-align:right}
- .scroll{max-height:70vh;overflow:auto}
- input{background:transparent;border:1px solid var(--line);color:var(--fg);
-   padding:5px 8px;width:100%;font:inherit;border-radius:4px;margin-bottom:6px}
- .need{color:var(--warn)} code{color:var(--dim);font-size:11px}
- .proj{display:flex;flex-wrap:wrap;gap:2px 10px;margin:6px 0 2px;font-size:12px;
-   color:var(--dim)} .proj b{color:var(--fg);font-weight:600}
- .gaps{margin-bottom:4px}
- .gap{border-left:2px solid var(--line);padding:3px 0 3px 8px;margin-bottom:6px;font-size:13px}
- .gap .meta{font-size:11.5px;margin-top:1px}
- .gp{color:var(--dim);font-size:11px;margin-right:2px}
- b.us{color:var(--hot)} b.them{color:var(--warn)}
- .thin{color:var(--warn)} .fade{color:var(--dim)}
- button{background:var(--card);border:1px solid var(--line);color:var(--fg);
-   font:inherit;padding:4px 10px;border-radius:4px;cursor:pointer}
- button:hover{border-color:var(--warn);color:var(--warn)}
-</style>
-<h1>PuckPilot</h1>
-<div class="bar">
-  <div><span class="k">round</span> <span id="round" class="big">-</span></div>
-  <div><span class="k">pick</span> <span id="pick" class="big">-</span></div>
-  <div><span id="turn"></span></div>
-  <div><span class="k">feed</span> <span id="detected" class="big">0</span></div>
-  <div><span class="k">last</span> <span id="age">never</span></div>
-  <div id="gaps"></div>
-  <div><span class="k">left</span> <span id="supply"></span></div>
-  <div style="margin-left:auto">
-    <button id="undo" title="Take back the last pick the feed recorded">undo last pick</button>
-    <span id="undone" class="k"></span></div>
-</div>
-<div class="cols">
-  <div class="col" style="flex:1.15">
-    <div class="k">TAKE ONE OF THESE</div>
-    <div id="short"></div>
-    <div class="k" style="margin-top:10px">YOUR ROSTER</div>
-    <div class="card"><div id="roster" class="meta"></div>
-      <div id="needs" class="need" style="margin-top:6px"></div></div>
-  </div>
-  <div class="col" style="flex:0.8;min-width:265px">
-    <div class="k">THE ROOM IS SLEEPING ON</div>
-    <div id="sleeping" class="gaps"></div>
-    <div class="k" style="margin-top:10px">THE ROOM RATES THESE ABOVE US</div>
-    <div id="rated" class="gaps"></div>
-  </div>
-  <div class="col">
-    <div class="k">BOARD &mdash; <span id="left">0</span> LEFT</div>
-    <input id="filter" placeholder="filter by name or position...">
-    <div class="scroll"><table>
-      <thead><tr><th>#</th><th>player</th><th>pos</th><th>tm</th>
-        <th class="num">vorp</th><th class="num">adp</th><th class="num">lasts</th></tr></thead>
-      <tbody id="board"></tbody></table></div>
-  </div>
-</div>
-<p><code id="diag"></code></p>
-<script>
-let filter = "";
-document.getElementById('filter').addEventListener('input', e => {
-  filter = e.target.value.toLowerCase(); render(window.__s);
-});
-function render(s){
-  if(!s) return;
-  document.getElementById('round').textContent = s.round ?? '-';
-  document.getElementById('pick').textContent = (s.made+1)+'/'+s.total;
-  document.getElementById('detected').textContent = s.detected;
-  document.getElementById('turn').innerHTML = s.my_turn
-    ? '<span class="mine">&#9654; YOUR PICK</span>'
-    : '<span class="k">seat '+s.on_clock+' &middot; you are up in '+s.picks_away+'</span>';
-  const age = s.seconds_since_pick, a = document.getElementById('age');
-  a.textContent = age===null ? 'never' : age.toFixed(0)+'s';
-  a.className = (age!==null && age < 90) ? 'live' : 'stale';
-  document.getElementById('gaps').innerHTML = (s.gaps && s.gaps.length)
-    ? '<span class="bad">missing picks '+s.gaps.join(',')+'</span>' : '';
-
-  document.getElementById('supply').innerHTML = (s.supply||[]).map(
-    x => '<span class="'+(x[2]?'need':'k')+'" style="margin-right:8px">'+
-         x[0]+' <b>'+x[1]+'</b></span>').join('');
-
-  const sh = document.getElementById('short'); sh.innerHTML = '';
-  s.shortlist.forEach((c,i)=>{
-    const d = document.createElement('div'); d.className='card';
-    d.innerHTML = '<div class="nm">'+(i+1)+'. '+c.name+'</div>'+
-      '<div class="meta">'+c.position+' &middot; '+c.team+' &middot; VORP '+c.vorp.toFixed(2)+
-      ' &middot; ADP '+Math.round(c.adp_rank)+
-      ' &middot; lasts '+Math.round(c.p_survive*100)+'%</div>'+
-      (c.projected && c.projected.length
-        ? '<div class="proj">'+c.projected.map(
-            x=>'<span><b>'+x[1]+'</b> '+x[0]+'</span>').join('')+'</div>'
-        : '')+
-      '<ul class="r">'+c.reasons.map(r=>'<li class="'+r.kind+'">'+r.text+'</li>').join('')+'</ul>';
-    sh.appendChild(d);
-  });
-
-  document.getElementById('roster').innerHTML = s.roster.length
-    ? s.roster.map(p=>'<b>'+p.position+'</b> '+p.name).join(' &middot; ') : '(empty)';
-  document.getElementById('needs').textContent = s.needs.length
-    ? 'still need: '+s.needs.join(', ') : 'roster minimums met';
-
-  const rows = s.board.filter(p => !filter ||
-      p.name.toLowerCase().includes(filter) || p.position.toLowerCase()===filter);
-  document.getElementById('left').textContent = s.n_left ?? s.board.length;
-  const tb = document.getElementById('board'); tb.innerHTML='';
-  rows.slice(0,300).forEach((p,i)=>{
-    const tr=document.createElement('tr');
-    tr.innerHTML='<td>'+(i+1)+'</td><td>'+p.name+'</td><td>'+p.position+'</td><td>'+p.team+
-      '</td><td class="num">'+p.vorp.toFixed(2)+'</td><td class="num">'+Math.round(p.adp_rank)+
-      '</td><td class="num">'+Math.round(p.p_survive*100)+'%</td>';
-    tb.appendChild(tr);
-  });
-  const gapRow = (g, mine) =>
-    '<div class="gap"><span class="gp">'+g.position+'</span> '+g.name+
-    '<div class="meta">we have him <b class="'+(mine?'us':'them')+'">#'+g.our_rank+
-    '</b> at '+g.position+', the room has him <b>#'+g.market_rank+'</b>'+
-    (g.flag ? ' &middot; <span class="'+(g.flag==='thin history'?'thin':'fade')+'">'+
-      g.flag+(g.flag==='thin history' ? ' &mdash; we may be wrong'
-                                      : ' &mdash; we may be right')+'</span>' : '')+
-    '</div></div>';
-  const gaps = s.market_gaps || {sleeping:[], rated:[]};
-  document.getElementById('sleeping').innerHTML = gaps.sleeping.length
-    ? gaps.sleeping.map(g => gapRow(g, true)).join('')
-    : '<div class="meta">nothing startable left that the room is undervaluing</div>';
-  document.getElementById('rated').innerHTML = gaps.rated.length
-    ? gaps.rated.map(g => gapRow(g, false)).join('')
-    : '<div class="meta">no material disagreement</div>';
-
-  document.getElementById('diag').textContent = s.diagnostics;
-}
-document.getElementById('undo').addEventListener('click', async () => {
-  const note = document.getElementById('undone');
-  try {
-    const r = await fetch('/undo', {method:'POST'});
-    note.textContent = (await r.json()).result || '';
-  } catch(e) { note.textContent = 'undo failed'; }
-  tick();
-});
-async function tick(){
-  try { window.__s = await (await fetch('/state')).json(); render(window.__s); }
-  catch(e){ document.getElementById('gaps').innerHTML =
-      '<span class="bad">server unreachable</span>'; }
-}
-tick(); setInterval(tick, 1000);
-</script>
-"""
+from puckpilot.web.access import Access
+from puckpilot.web.page import PAGE
 
 
 def _fmt_cat(value: float, cat) -> str:
@@ -253,9 +85,32 @@ class LiveState:
             pick = self.board.undo()
         return f"undid {pick.name}" if pick else "nothing to undo"
 
-    def snapshot(self) -> dict:
+    def snapshot(self, seat: int | None = None) -> dict:
+        """The whole view for one seat.
+
+        Two managers in the same room share one board - the picks are universal -
+        but everything advisory here is answered against `seat`: the shortlist is
+        roster-aware, and so is the board ordering, because `recommend` ranks on
+        what the engine would actually take for *that* roster. So this is
+        computed per seat rather than split into a shared half; the board rows
+        are the bulk of the payload and they are not in fact shared.
+        """
+        seat = self.board.my_seat if seat is None else seat
         with self.lock:
-            cands = recommend(self.board, self.policy, n=max(self.board_rows, 40))
+            # Two questions, two lists. The shortlist answers "what do I take
+            # now", so it obeys the roster rules. The board answers "what is
+            # left", and must not: masking it hid every capped and every
+            # non-needed position regardless of value, which is the one panel
+            # whose whole job is to show the room's remaining supply.
+            cands = recommend(self.board, self.policy, n=max(self.top * 8, 40), seat=seat)
+            full = recommend(
+                self.board,
+                self.policy,
+                n=self.board_rows,
+                seat=seat,
+                enforce_eligibility=False,
+            )
+            blocked = self.board.blocked(seat)
             labels = self.labels
             shortlist = [
                 {
@@ -278,7 +133,7 @@ class LiveState:
                         if c2.key in c.projected
                     ],
                 }
-                for c, reasons in summarize(self.board, cands, labels, top=self.top)
+                for c, reasons in summarize(self.board, cands, labels, top=self.top, seat=seat)
             ]
             board_rows = [
                 {
@@ -288,10 +143,12 @@ class LiveState:
                     "vorp": c.vorp,
                     "adp_rank": c.adp_rank,
                     "p_survive": c.p_survive,
+                    # Why the rules would refuse him right now, if they would.
+                    # Shown rather than hidden - see DraftBoard.blocked.
+                    "blocked": blocked.get(c.position, ""),
                 }
-                for c in cands[: self.board_rows]
+                for c in full
             ]
-            seat = self.board.my_seat
             on_clock = self.board.on_the_clock()
             nxt = self.board.next_pick_no(seat)
             roster = [{"name": p.name, "position": p.position} for p in self.board.roster(seat)]
@@ -305,12 +162,13 @@ class LiveState:
             # marked. The engine does not weight this (see
             # RosterValuePolicy._dynamic_vorp - measured, and left off), so it
             # is surfaced as a fact for the drafter to apply.
-            sleeping, rated = market_disagreement(self.board, n=5)
+            sleeping, rated = market_disagreement(self.board, n=5, seat=seat)
             need_pos = set(self.board.needs(seat))
             supply = [[pos, n, pos in need_pos] for pos, n in sorted(self.board.supply().items())]
 
         status = self.feed.status() if hasattr(self.feed, "status") else {}
         return {
+            "seat": seat,
             "round": rnd,
             "made": made,
             "total": total,
@@ -339,7 +197,9 @@ class LiveState:
         }
 
 
-def make_handler(state: LiveState):
+def make_handler(state: LiveState, access: Access | None = None):
+    access = access or Access()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # keep the console clean
             pass
@@ -361,6 +221,52 @@ def make_handler(state: LiveState):
             """
             return self.path.split("?", 1)[0].rstrip("/") or "/"
 
+        def _token(self) -> str:
+            """Access token from the query string or a header.
+
+            The query string is what a shared link can actually carry; the header
+            is for curl and for the console's own pushes.
+            """
+            header = self.headers.get("X-PuckPilot-Key")
+            if header:
+                return header
+            q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            return (q.get("k") or [""])[0]
+
+        def _role(self) -> str | None:
+            """ "owner", "guest", or None when the token does not match."""
+            if not access.shared:
+                return "owner"  # loopback-only: _is_same_origin is the guard
+            given = self._token()
+            # compare_digest raises on non-ASCII str, and the key arrives in a
+            # query string anyone can type. A crash is a 500 with a traceback in
+            # the log; a wrong key is a 403. It has to be the 403.
+            if not given.isascii():
+                return None
+            if access.owner and secrets.compare_digest(given, access.owner):
+                return "owner"
+            if access.guest and secrets.compare_digest(given, access.guest):
+                return "guest"
+            return None
+
+        def _seat(self) -> tuple[int | None, str | None]:
+            """(seat, error). Absent means the board's own seat."""
+            q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            raw = (q.get("seat") or [None])[0]
+            if raw is None:
+                return state.board.my_seat, None
+            try:
+                seat = int(raw)
+            except (TypeError, ValueError):
+                return None, f"seat must be an integer, got {raw!r}"
+            n = state.board.n_teams
+            if not 0 <= seat < n:
+                return None, f"seat {seat} outside 0..{n - 1}"
+            return seat, None
+
+        def _refuse(self, code: int, msg: str) -> None:
+            self._send(code, json.dumps({"error": msg}), "application/json")
+
         def _is_same_origin(self) -> bool:
             """Reject cross-site requests to the mutating route.
 
@@ -378,6 +284,11 @@ def make_handler(state: LiveState):
             # Read the port off the listening socket rather than trusting the
             # value passed in: serve(port=0) lets the OS choose, and comparing
             # against the literal 0 rejected every legitimate request.
+            if access.shared:
+                # The hostname is public now and a proxy rewrites Host, so the
+                # pin cannot mean anything. The token is the guard instead; the
+                # cross-site check below still runs.
+                return self.headers.get("Sec-Fetch-Site") != "cross-site"
             bound = self.server.server_address[1]
             host = (self.headers.get("Host") or "").lower()
             if host and host not in (
@@ -396,41 +307,67 @@ def make_handler(state: LiveState):
 
         def do_GET(self):
             route = self._route()
+            role = self._role()
             if route == "/state":
                 # Guarded as well: /state is the entire board, roster and needs,
                 # which is exactly what a rebinding attack would want to read.
                 if not self._is_same_origin():
-                    self._send(
-                        403, json.dumps({"error": "cross-origin refused"}), "application/json"
-                    )
+                    self._refuse(403, "cross-origin refused")
                     return
-                self._send(200, json.dumps(state.snapshot()), "application/json")
+                if role is None:
+                    self._refuse(403, "a valid access key is required")
+                    return
+                seat, err = self._seat()
+                if err:
+                    self._refuse(400, err)
+                    return
+                payload = state.snapshot(seat)
+                # The page hides its undo button on this; the POST is gated
+                # independently, so a forged value buys nothing.
+                payload["can_undo"] = role == "owner"
+                self._send(200, json.dumps(payload), "application/json")
             elif route == "/undo":
                 # Mutating routes are POST-only, so a bare navigation or an
                 # <img> src cannot rewind the board mid-draft.
-                self._send(
-                    405,
-                    json.dumps({"error": "use POST /undo"}),
-                    "application/json",
-                )
+                self._refuse(405, "use POST /undo")
             else:
+                if role is None:
+                    self._refuse(403, "a valid access key is required")
+                    return
                 self._send(200, PAGE, "text/html; charset=utf-8")
 
         def do_POST(self):
             if self._route() != "/undo":
-                self._send(404, json.dumps({"error": "not found"}), "application/json")
+                self._refuse(404, "not found")
                 return
             if not self._is_same_origin():
-                self._send(403, json.dumps({"error": "cross-origin refused"}), "application/json")
+                self._refuse(403, "cross-origin refused")
+                return
+            # Owner only. A guest rewinding the shared board mid-draft is the
+            # one destructive thing this view can do.
+            if self._role() != "owner":
+                self._refuse(403, "undo is owner-only")
                 return
             self._send(200, json.dumps({"result": state.undo()}), "application/json")
 
     return Handler
 
 
-def serve(state: LiveState, port: int = 8765) -> ThreadingHTTPServer:
-    """Start the server on a background thread; returns it so callers can stop it."""
-    # Loopback only: the board and roster are private, and the server has no auth.
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(state))
+def serve(
+    state: LiveState,
+    port: int = 8765,
+    access: Access | None = None,
+    host: str | None = None,
+) -> ThreadingHTTPServer:
+    """Start the server on a background thread; returns it so callers can stop it.
+
+    Loopback-only by default: the board and roster are private and there is no
+    auth, so nothing off this machine may reach it. Passing `access` is what
+    opens it up, and it binds every interface only in that case - the tokens,
+    not the bind address, are then the guard.
+    """
+    if host is None:
+        host = "0.0.0.0" if (access and access.shared) else "127.0.0.1"  # noqa: S104
+    server = ThreadingHTTPServer((host, port), make_handler(state, access))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server

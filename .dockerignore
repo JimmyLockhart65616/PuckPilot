@@ -1,0 +1,17 @@
+# Deny by default. The relay image needs five Python files; everything else in
+# this repo is either irrelevant to it or must never leave the machine.
+#
+# This matters more than a normal .dockerignore. `az acr build` uploads the
+# build context to a registry in the cloud, and this repo root contains
+# `secrets/chrome-profile/` - a logged-in Yahoo browser session, ~500 MB of
+# cookies and tokens - plus `data/captures/`, which is over a gigabyte of
+# recordings of a real draft room. Neither belongs in a container build, let
+# alone in a registry. An allow-list is the only form that stays safe when
+# someone later edits the Dockerfile.
+*
+!src
+
+# Nothing under src/ is sensitive (it is the public package), but keep the
+# image clean anyway.
+**/__pycache__
+**/*.pyc

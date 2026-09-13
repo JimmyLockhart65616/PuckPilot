@@ -527,7 +527,8 @@ def test_disagreement_is_measured_within_position_not_overall():
 
 def test_a_material_gap_is_required():
     """Ours #2 against room #1 is two boards agreeing, not a disagreement."""
-    from puckpilot.draft.advice import MIN_RANK_GAP, market_disagreement
+    from puckpilot.draft.advice import market_disagreement
+    from puckpilot.draft.board import MIN_RANK_GAP
 
     b, _ = _market_board()
     sleeping, rated = market_disagreement(b, n=10)
@@ -538,7 +539,8 @@ def test_a_material_gap_is_required():
 def test_thin_history_outranks_age_as_the_flag():
     """A 26-year-old with 20 NHL games is the same epistemic problem as a
     20-year-old with 20, and age alone would call out only one of them."""
-    from puckpilot.draft.advice import FADING_AGE, THIN_EVIDENCE_GP, market_disagreement
+    from puckpilot.draft.advice import market_disagreement
+    from puckpilot.draft.board import FADING_AGE, THIN_EVIDENCE_GP
 
     b, _ = _market_board()
     b.u.frame.loc[b.u.frame["name"] == "D9", ["train_gp", "age"]] = [10.0, FADING_AGE + 5]
@@ -569,3 +571,99 @@ def test_the_panel_sees_past_the_shortlist():
     shortlist = {c.name for c in recommend(b, n=3)}
     assert rated, "expected at least one player the market rates above us"
     assert any(g.name not in shortlist for g in rated)
+
+
+# ---- the card must say the same thing the panel says ------------------------
+
+
+def _card(board, name):
+    """Reasons for one player by name, read off the whole board."""
+    from puckpilot.draft.advice import recommend
+    from puckpilot.draft.explain import explain
+
+    cands = recommend(board, n=200, enforce_eligibility=False)
+    (c,) = [c for c in cands if c.name == name]
+    return c, explain(board, c, alternatives=cands)
+
+
+def _market_reasons(reasons):
+    from puckpilot.draft.explain import MARKET
+
+    return [r for r in reasons if r.weight == MARKET]
+
+
+def test_a_sleeper_reads_as_value_not_as_a_reach():
+    """The bug this pins: the market con fired for exactly the sleeper profile.
+
+    D0 is the best defenceman on our board and the tenth on the room's. Taking
+    him is the whole point of the tool, and the card used to argue against it
+    for being cheap - "Ahead of the market: ADP 10 vs pick 1" - while the
+    matching pro was reserved for a player the room rated ABOVE us.
+    """
+    b, _ = _market_board()
+    _, reasons = _card(b, "D0")
+    market = _market_reasons(reasons)
+    assert market, "a 9-place disagreement must be said out loud"
+    assert all(r.kind == "pro" for r in market), [r.text for r in market]
+    assert "#1 D left" in market[0].text and "#10" in market[0].text
+
+
+def test_the_room_rating_him_higher_is_the_con():
+    """The other half: we are the ones who might be wrong, and it is a con."""
+    b, _ = _market_board()
+    _, reasons = _card(b, "D9")
+    market = _market_reasons(reasons)
+    assert market and all(r.kind == "con" for r in market), [r.text for r in market]
+    assert "rates him above us" in market[0].text
+
+
+def test_the_card_and_the_panel_cannot_drift_apart():
+    """Both read `board.position_ranks()`, so the numbers must be identical."""
+    from puckpilot.draft.advice import market_disagreement
+
+    b, _ = _market_board()
+    sleeping, rated = market_disagreement(b, n=20)
+    for gap in sleeping + rated:
+        _, reasons = _card(b, gap.name)
+        text = " ".join(r.text for r in _market_reasons(reasons))
+        assert f"#{gap.our_rank}" in text and f"#{gap.market_rank}" in text, (gap, text)
+
+
+def test_timing_carries_the_wait_argument_alone():
+    """The deleted con duplicated timing, worse: it thresholded against the
+    CURRENT pick where survival is fitted against our NEXT one."""
+    from puckpilot.draft.explain import TIMING
+
+    b, _ = _market_board()
+    _, reasons = _card(b, "D0")
+    waits = [r for r in reasons if r.weight == TIMING and r.kind == "con"]
+    assert len(waits) <= 1
+    assert all("could wait" in r.text for r in waits)
+
+
+def test_ranks_do_not_go_stale_across_an_undo():
+    """Undo then a DIFFERENT pick leaves `made` where it was, so a cache keyed
+    on the pick count would serve ranks for a player who is back on the board."""
+    b, _ = _market_board()
+    b.record(int(b.u.ids[0]))
+    before = dict(b.position_ranks()[0])
+    b.undo()
+    b.record(int(b.u.ids[1]))
+    after = b.position_ranks()[0]
+    assert before != after, "a different board must produce different ranks"
+
+
+def test_the_panel_labels_a_disagreement_we_cannot_act_on():
+    """ "The room is sleeping on this goalie" while our goalie slots are capped
+    is a mixed message unlabelled. The panel still shows him - it is an
+    argument about whether closing the position was right - but it says so."""
+    from puckpilot.draft.advice import market_disagreement
+
+    b, rules = _market_board()
+    rules.caps["D"] = 1
+    b.record(int(next(pid for pid, p in zip(b.u.ids, b.u.pos, strict=True) if p == "D")), seat=0)
+    assert b.blocked(0).get("D") == "cap"
+    sleeping, rated = market_disagreement(b, n=20, seat=0)
+    defencemen = [g for g in sleeping + rated if g.position == "D"]
+    assert defencemen, "the panel must not hide a closed position"
+    assert all(g.blocked == "cap" for g in defencemen)

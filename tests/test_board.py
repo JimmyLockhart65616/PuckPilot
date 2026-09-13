@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from puckpilot.draft.advice import recommend, survivors
+from puckpilot.draft.advice import can_wait_on, recommend
 from puckpilot.draft.board import DraftBoard, DraftBoardError
 from puckpilot.draft.engine import DraftRules, RosterValuePolicy, Universe
 from puckpilot.engine.valuation import LeagueShape
@@ -229,11 +229,11 @@ def test_recommend_respects_forced_minimums_when_picks_run_short():
     assert {c.position for c in recommend(b, n=10)} == {"G"}
 
 
-def test_survivors_flags_players_the_room_will_leave():
+def test_can_wait_on_flags_players_the_room_will_leave():
     b = _board()
     cands = recommend(b, n=10)
     assert all(0.0 <= c.p_survive <= 1.0 for c in cands)
-    assert set(survivors(b, cands, threshold=0.0)) == {c.name for c in cands}
+    assert set(can_wait_on(b, cands, threshold=0.0)) == {c.name for c in cands}
 
 
 def test_last_pick_of_the_draft_discounts_nobody():

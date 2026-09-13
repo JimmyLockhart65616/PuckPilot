@@ -104,6 +104,33 @@ cp .env.example .env        # then add your Yahoo app credentials
 ppilot league show          # first run walks you through Yahoo OAuth
 ```
 
+## Sharing the draft view
+
+Two managers in the same league draft from the same room, so they can share one
+board: the picks are universal, and only the roster and the shortlist differ by
+seat. One person runs the console; the other opens a link and needs no install,
+no database and no Yahoo session of their own.
+
+```bash
+# loopback only (the default, unchanged)
+ppilot draft live --seat 3 --web
+
+# reachable on the local network, behind generated owner/guest keys
+ppilot draft live --seat 3 --web --share --seats 3,7
+
+# ...and pushed to a relay, so the link works from anywhere
+ppilot draft live --seat 3 --web --seats 3,7 --publish https://<relay-host>
+```
+
+Guests may read any seat but cannot undo, which is the only destructive control
+on the view. `?seat=` selects a view, it is not an isolation boundary.
+
+The **feed never moves**. It reads the draft room's own websocket through the
+browser on the drafter's machine, so the board is always computed there; the
+relay (`deploy/relay/`) holds nothing but the last snapshot pushed to it and
+imports no part of the engine. That also means the drafter's machine is a single
+point of failure — hosting buys a stable URL, not resilience.
+
 ## Testing
 
 ```bash

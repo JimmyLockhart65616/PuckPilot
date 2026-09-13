@@ -305,11 +305,58 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_seats(raw: str | None, default: int) -> list[int]:
+    """`--seats 4,7` -> [4, 7]. Empty means just the console's own seat."""
+    if not raw:
+        return [default]
+    out = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if part:
+            out.append(int(part))
+    return out or [default]
+
+
+def _push_snapshots(url: str, key: str, state, seats: list[int]) -> str:
+    """POST one snapshot per seat to the relay. Returns "" on success.
+
+    Never raises: a relay that is down, redeploying, or unreachable must not
+    take the local console with it. The drafter on this machine keeps working
+    off the loopback view either way.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps({"seats": {str(s): state.snapshot(s) for s in seats}}).encode("utf-8")
+    req = urllib.request.Request(
+        url.rstrip("/") + "/push",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json", "X-PuckPilot-Key": key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+        return ""
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        return f"{e.__class__.__name__}: {e}"
+
+
 def _serve_live(board, feed, ctx, args: argparse.Namespace, league) -> int:
-    """Second-screen web view, pumped from the browser the feed is attached to."""
+    """Second-screen web view, pumped from the browser the feed is attached to.
+
+    Three ways to reach it, in increasing order of exposure: loopback only (the
+    default, and unchanged); `--share`, which binds every interface behind two
+    generated tokens; and `--publish`, which additionally pushes each seat's
+    snapshot to a relay so a second manager can watch from anywhere. The feed
+    itself never moves - it is attached to the browser on this desk.
+    """
+    import os
     import webbrowser
 
     from puckpilot.draft.wsfeed import pump
+    from puckpilot.web.access import Access
     from puckpilot.web.server import LiveState, serve
 
     state = LiveState(
@@ -319,21 +366,51 @@ def _serve_live(board, feed, ctx, args: argparse.Namespace, league) -> int:
         board_rows=args.board_rows,
         cats=league.all_cats,
     )
-    serve(state, port=args.port)
-    url = f"http://127.0.0.1:{args.port}"
+    seats = _parse_seats(getattr(args, "seats", None), args.seat)
+    for seat in seats:
+        if not 0 <= seat < board.n_teams:
+            print(f"seat {seat} outside 0..{board.n_teams - 1}", file=sys.stderr)
+            return 2
+
+    publish = getattr(args, "publish", None)
+    push_key = getattr(args, "publish_key", None) or os.environ.get("PUCKPILOT_OWNER_KEY", "")
+    if publish and not push_key:
+        print(
+            "--publish needs an owner key: pass --publish-key or set PUCKPILOT_OWNER_KEY.",
+            file=sys.stderr,
+        )
+        return 2
+
+    access = Access.generate() if getattr(args, "share", False) else None
+    serve(state, port=args.port, access=access)
+
+    local = f"http://127.0.0.1:{args.port}"
     print()
-    print(f"  Draft view: {url}")
+    if access is None:
+        print(f"  Draft view: {local}")
+    else:
+        print(f"  Yours:  {local}/?seat={args.seat}&k={access.owner}")
+        for seat in seats:
+            if seat != args.seat:
+                print(f"  Guest:  http://<this-machine>:{args.port}/?seat={seat}&k={access.guest}")
+        print()
+        print("  Guests can read any seat but cannot undo. Keys last for this run only.")
+    if publish:
+        print(f"  Relay:  {publish}  (seats {', '.join(str(s) for s in seats)})")
     print("  Ctrl+C to stop.")
     print()
     if not args.no_open:
-        webbrowser.open(url)
+        webbrowser.open(f"{local}/?seat={args.seat}" + (f"&k={access.owner}" if access else ""))
 
     # The web view must outlive anything the browser does - tabs opening and
     # closing, navigations, the draft room replacing the lobby. Nothing in here
     # is allowed to end the process except Ctrl+C.
     strikes = 0
+    last_push = 0.0
+    push_fails = 0
     try:
         while True:
+            landed = 0
             try:
                 landed = state.pump()
                 if landed:
@@ -343,6 +420,19 @@ def _serve_live(board, feed, ctx, args: argparse.Namespace, league) -> int:
                 strikes += 1
                 if strikes in (1, 10, 50):
                     print(f"  feed poll failed ({e.__class__.__name__}); still serving", flush=True)
+            if publish:
+                # On change, plus a slow heartbeat so "seconds since last pick"
+                # does not freeze on the relay between picks.
+                now = time.time()
+                if landed or now - last_push > 10:
+                    err = _push_snapshots(publish, push_key, state, seats)
+                    last_push = now
+                    if err:
+                        push_fails += 1
+                        if push_fails in (1, 10, 100):
+                            print(f"  relay push failed ({err}); still serving", flush=True)
+                    else:
+                        push_fails = 0
             if ctx is None:
                 time.sleep(args.interval)
             else:
@@ -940,6 +1030,32 @@ def build_parser() -> argparse.ArgumentParser:
         "of the terminal console",
     )
     live.add_argument("--port", type=int, default=8765, help="Port for --web")
+    live.add_argument(
+        "--share",
+        action="store_true",
+        help="Bind every interface behind generated owner/guest keys, so a second "
+        "manager in the same draft can open the view. Guests read any seat but "
+        "cannot undo. Without this the view stays loopback-only.",
+    )
+    live.add_argument(
+        "--seats",
+        default=None,
+        metavar="N,N",
+        help="Seats to serve views for (default: just --seat). Everyone in the room "
+        "shares one board; only the roster and shortlist differ by seat.",
+    )
+    live.add_argument(
+        "--publish",
+        default=None,
+        metavar="URL",
+        help="Also push each seat's snapshot to a relay at this URL, so the view "
+        "is reachable from anywhere. The feed stays on this machine.",
+    )
+    live.add_argument(
+        "--publish-key",
+        default=None,
+        help="Owner key for --publish (default: PUCKPILOT_OWNER_KEY)",
+    )
     live.add_argument("--no-open", action="store_true", help="Do not open a browser tab")
     live.add_argument(
         "--interval", type=float, default=1.0, help="Seconds between feed polls with --web"

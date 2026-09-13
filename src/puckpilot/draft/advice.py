@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from puckpilot.draft.board import Candidate, DraftBoard
+from puckpilot.draft.board import MIN_RANK_GAP, Candidate, DraftBoard
 from puckpilot.draft.engine import RosterValuePolicy, eligible_positions
 from puckpilot.engine.categories import CATALOG
 
@@ -125,8 +125,25 @@ def recommend(
     return out
 
 
-def survivors(board: DraftBoard, candidates: list[Candidate], threshold: float = 0.6) -> list[str]:
-    """Names likely still there next turn — the ones NOT to spend this pick on."""
+# Above this, waiting is usually right: the room is unlikely to take him.
+# Below WILL_NOT_LAST he is going before our next turn if we do not act.
+# Both live here, next to where p_survive is computed, so the console, the
+# reasons and this list can never disagree about what "lasts" means.
+LIKELY_TO_LAST = 0.65
+WILL_NOT_LAST = 0.35
+
+
+def can_wait_on(
+    board: DraftBoard, candidates: list[Candidate], threshold: float = LIKELY_TO_LAST
+) -> list[str]:
+    """Names the room is likely to leave for us — the sleepers on this list.
+
+    Named for what it is FOR. As `survivors` it was captioned "the ones NOT to
+    spend this pick on", which is true of the pick in front of you and quietly
+    wrong about the player: these are the ones you can still have later, which
+    is the opposite of a do-not-draft list. On a clock that phrasing is the
+    difference between passing on a player and forgetting him.
+    """
     return [c.name for c in candidates if c.p_survive >= threshold]
 
 
@@ -161,18 +178,6 @@ def format_board(board: DraftBoard, candidates: list[Candidate], width: int = 96
     return "\n".join(lines)[: width * 400]
 
 
-# A projection standing on less than about three-quarters of a season is thin
-# enough that the market's read is probably better than ours; past 32 the age
-# curve is fading a player the market may still be paying a name premium for.
-THIN_EVIDENCE_GP = 60.0
-FADING_AGE = 32.0
-# How far apart the two boards must be before it counts as a disagreement.
-# Without this the "room rates them higher" side fills with the room's best
-# remaining player at each position - ours #2 against room #1 is not a
-# disagreement, it is two boards agreeing.
-MIN_RANK_GAP = 5
-
-
 @dataclass(frozen=True)
 class Gap:
     """One disagreement between our board and the room's."""
@@ -184,61 +189,34 @@ class Gap:
     market_rank: int
     vorp: float
     flag: str  # "" | "thin history" | "fading?"
+    # Why the roster rules would refuse him right now, if they would. The panel
+    # still shows him - a disagreement with the room is worth knowing about a
+    # position we have closed, not least because it is an argument for not
+    # having closed it - but unlabelled it reads as a recommendation we cannot
+    # act on.
+    blocked: str = ""  # "" | "cap" | "min"
 
 
-def _position_ranks(values: np.ndarray, mask: np.ndarray) -> dict[int, int]:
-    """1-based rank within `mask`, best first. Ties broken stably."""
-    rows = np.flatnonzero(mask)
-    order = rows[np.argsort(values[rows], kind="stable")]
-    return {int(r): i + 1 for i, r in enumerate(order)}
-
-
-def market_disagreement(board: DraftBoard, n: int = 5) -> tuple[list[Gap], list[Gap]]:
+def market_disagreement(
+    board: DraftBoard, n: int = 5, seat: int | None = None
+) -> tuple[list[Gap], list[Gap]]:
     """Where our board and the room disagree, ranked WITHIN position.
 
     Returns (room_is_sleeping_on, room_rates_above_us).
 
-    Ranking within position is not a refinement, it is the whole thing working.
-    Replacement level differs enormously by position - the 28th-best centre sits
-    around z -0.9 while the 48th-best defenceman is near -6 - so an overall
-    rank-vs-ADP comparison measures that structural offset and almost nothing
-    else. Done naively this panel leads with Brayden Point, our #214 against ADP
-    60, which is not a disagreement about Brayden Point. Asked within position
-    it becomes "we have him 4th-best D left, the room has him 11th", which is
-    both true and directly actionable.
+    The ranking itself is `board.position_ranks()` - shared with the per-player
+    reasons rather than computed twice, so a card and this panel cannot drift
+    apart. See that method for why within-position is the whole measurement.
 
     Deliberately does not go through `recommend()`: that returns the top rows by
     score, and a player the market rates far above us is by construction below
     that cut. The panel has to see the whole board.
     """
     u = board.u
-    avail = board.avail
-    has_market = getattr(u, "has_market", None)
-    if has_market is None:
-        has_market = u.adp_rank < len(u)
-    live = avail & has_market
-    if not live.any():
+    ours, theirs = board.position_ranks()
+    if not ours:
         return [], []
-
-    ours: dict[int, int] = {}
-    theirs: dict[int, int] = {}
-    for pos in {str(p) for p in u.pos}:
-        at_pos = live & (u.pos == pos)
-        if not at_pos.any():
-            continue
-        ours |= _position_ranks(-u.vorp, at_pos)
-        theirs |= _position_ranks(u.adp_rank, at_pos)
-
-    def _flag(row: int) -> str:
-        rec = u.frame.iloc[row]
-        gp, age = rec.get("train_gp"), rec.get("age")
-        # Evidence first: a 26-year-old with 20 NHL games is the same problem as
-        # a 20-year-old with 20, and age alone would call only one of them out.
-        if gp is not None and gp == gp and float(gp) < THIN_EVIDENCE_GP:
-            return "thin history"
-        if age is not None and age == age and float(age) >= FADING_AGE:
-            return "fading?"
-        return ""
+    blocked = board.blocked(seat)
 
     def _gap(row: int) -> Gap:
         rec = u.frame.iloc[row]
@@ -249,7 +227,8 @@ def market_disagreement(board: DraftBoard, n: int = 5) -> tuple[list[Gap], list[
             our_rank=ours[row],
             market_rank=theirs[row],
             vorp=float(u.vorp[row]),
-            flag=_flag(row),
+            flag=board.evidence_flag(row),
+            blocked=blocked.get(str(u.pos[row]), ""),
         )
 
     rows = list(ours)

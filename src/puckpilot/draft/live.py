@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from puckpilot.draft.advice import recommend
+from puckpilot.draft.advice import can_wait_on, recommend
 from puckpilot.draft.board import DraftBoard
 from puckpilot.draft.engine import RosterValuePolicy
 from puckpilot.draft.feed import apply
@@ -86,8 +86,9 @@ def render(board: DraftBoard, cands, cfg: LiveConfig, status: str = "") -> str:
     lines.append("")
 
     if cfg.show_survivors and cands:
-        # The single most useful thing on a clock: who you can afford to wait on.
-        likely = [c.name for c in cands[: cfg.top] if c.p_survive >= 0.65]
+        # The single most useful thing on a clock: who you can afford to wait
+        # on. One definition of "lasts", shared with the reasons on each card.
+        likely = can_wait_on(board, cands[: cfg.top])
         if likely:
             lines.append("Likely still there next turn: " + ", ".join(likely[:5]))
 
