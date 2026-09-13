@@ -667,3 +667,127 @@ def test_the_panel_labels_a_disagreement_we_cannot_act_on():
     defencemen = [g for g in sleeping + rated if g.position == "D"]
     assert defencemen, "the panel must not hide a closed position"
     assert all(g.blocked == "cap" for g in defencemen)
+
+
+# ---- market-implied rows: on the board, never in the recommendation --------
+
+
+def _mixed_source_board():
+    """A handful of real (projected) players plus two market-implied ones -
+    same shape `build_market_frame` would hand back, concatenated the way
+    `build_live_board` will."""
+    import pandas as pd
+
+    from puckpilot.draft.engine import DraftRules, Universe
+
+    rows, pid = {}, 1
+    for i in range(6):
+        rows[pid] = {
+            "name": f"Real L{i}",
+            "position": "L",
+            "team": "AAA",
+            "vorp": 10.0 - i,
+            "z_total": 10.0 - i,
+            "adp_rank": float(pid * 5),
+            "source": "projected",
+            "train_gp": 400.0,
+        }
+        pid += 1
+    rows[pid] = {
+        "name": "Market Rookie",
+        "position": "L",
+        "team": "BOS",
+        "vorp": 6.5,  # would rank mid-pack among the real L's above by VORP alone
+        "z_total": 6.5,
+        "adp_rank": 80.0,
+        "source": "market",
+        "train_gp": 0.0,
+    }
+    market_row_1 = pid
+    pid += 1
+    rows[pid] = {
+        "name": "Market Defenceman",
+        "position": "D",
+        "team": "NYR",
+        "vorp": 1.0,
+        "z_total": 1.0,
+        "adp_rank": 200.0,
+        "source": "market",
+        "train_gp": 0.0,
+    }
+    market_row_2 = pid
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    df.index.name = "player_id"
+    u = Universe(df.sort_values("vorp", ascending=False))
+    u.has_market = np.ones(len(u), dtype=bool)
+    rules = DraftRules(shape=SHAPE, rounds=7, caps={"C": 9, "L": 9, "R": 9, "D": 9, "G": 9})
+    return DraftBoard(u, rules, my_seat=0), market_row_1, market_row_2
+
+
+def test_recommend_never_surfaces_a_market_row():
+    """A market-implied VORP is a display fact, not a recommendation - the
+    engine must never rank on a number it did not compute itself."""
+    from puckpilot.draft.advice import recommend
+
+    b, _, _ = _mixed_source_board()
+    cands = recommend(b, n=20, enforce_eligibility=False)
+    assert cands and all(c.source == "projected" for c in cands)
+    assert "Market Rookie" not in {c.name for c in cands}
+
+
+def test_market_watchlist_returns_only_market_rows_soonest_first():
+    from puckpilot.draft.advice import market_watchlist
+
+    b, _, _ = _mixed_source_board()
+    watch = market_watchlist(b, n=10)
+    assert {c.name for c in watch} == {"Market Rookie", "Market Defenceman"}
+    assert [c.name for c in watch] == ["Market Rookie", "Market Defenceman"]  # adp 80 < 200
+    assert all(c.source == "market" for c in watch)
+
+
+def test_market_watchlist_is_empty_with_no_market_rows():
+    from puckpilot.draft.advice import market_watchlist
+    from puckpilot.draft.board import DraftBoard
+    from puckpilot.draft.engine import DraftRules
+
+    b = DraftBoard(
+        _universe(),
+        DraftRules(shape=SHAPE, rounds=7, caps={"C": 9, "L": 9, "R": 9, "D": 9, "G": 9}),
+        my_seat=0,
+    )
+    assert market_watchlist(b) == []
+
+
+def test_market_watchlist_drops_a_player_once_drafted():
+    from puckpilot.draft.advice import market_watchlist
+
+    b, market_row_1, _ = _mixed_source_board()
+    b.record(market_row_1, seat=0)
+    watch = market_watchlist(b, n=10)
+    assert "Market Rookie" not in {c.name for c in watch}
+
+
+def test_market_disagreement_excludes_market_rows_from_both_buckets():
+    """Ours == theirs by construction for a market-implied player - it can
+    never be a real disagreement, only a phantom near-tie."""
+    from puckpilot.draft.advice import market_disagreement
+
+    b, _, _ = _mixed_source_board()
+    sleeping, rated = market_disagreement(b, n=20)
+    names = {g.name for g in sleeping + rated}
+    assert "Market Rookie" not in names and "Market Defenceman" not in names
+
+
+def test_explain_gives_a_market_candidate_an_honest_card():
+    """None of the normal reasoning applies to a number we did not compute -
+    say what it is instead of running the usual machinery on zeros."""
+    from puckpilot.draft.advice import market_watchlist
+    from puckpilot.draft.explain import explain
+
+    b, _, _ = _mixed_source_board()
+    (candidate,) = [c for c in market_watchlist(b, n=10) if c.name == "Market Rookie"]
+    reasons = explain(b, candidate)
+    assert len(reasons) == 1
+    assert reasons[0].kind == "con"
+    assert "market" in reasons[0].text.lower()
+    assert "80" in reasons[0].text

@@ -101,6 +101,11 @@ class Candidate:
     # cannot see yet - opposite problems that look identical in a rank gap.
     age: float | None = None
     train_gp: float | None = None
+    # "projected" (a real VORP from real game logs) or "market" (implied from
+    # the room's own price - see `draft.market`). A market number must never
+    # look like an opinion we hold; every consumer of `Candidate` checks this
+    # before treating `vorp`/`score` as ours.
+    source: str = "projected"
 
 
 class DraftBoard:

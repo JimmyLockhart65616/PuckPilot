@@ -81,6 +81,11 @@ def recommend(
     p_survive = policy.survival(u, ctx, spread=policy.display_spread)
 
     mask = board.avail.copy()
+    # Market-implied rows exist so the board can RECORD a pick of a player we
+    # have no projection for (see `draft.market`) - they are not a recommendation.
+    # `market_watchlist` is the panel for them; this stays exactly the ranking
+    # the sim was measured against.
+    mask &= u.source != "market"
     if enforce_eligibility and picks_left > 0:
         allowed = eligible_positions(board.counts[seat], board.rules, picks_left)
         pos_ok = np.isin(u.pos, list(allowed))
@@ -120,6 +125,56 @@ def recommend(
                 projected=projected,
                 age=_opt(record.get("age")),
                 train_gp=_opt(record.get("train_gp")),
+                source=str(u.source[r]),
+            )
+        )
+    return out
+
+
+def market_watchlist(board: DraftBoard, seat: int | None = None, n: int = 10) -> list[Candidate]:
+    """Available market-priced players we have no projection for, soonest-gone
+    first — the third panel, separate from `recommend` on purpose.
+
+    Not a ranking: `vorp` here is read off the room's own price (see
+    `draft.market`), so sorting by it would just be sorting by ADP a second
+    time under a misleading label. Soonest ADP first is the one order that
+    earns its place on a draft-night screen — it is the same question
+    `can_wait_on` answers for real projections, asked of the players we have no
+    projection for at all.
+    """
+    seat = board.my_seat if seat is None else seat
+    u = board.u
+    mask = board.avail & (u.source == "market")
+    if not mask.any():
+        return []
+
+    ctx = board.pick_context(seat)
+    policy = RosterValuePolicy()
+    p_survive = policy.survival(u, ctx, spread=policy.display_spread)
+
+    rows = np.flatnonzero(mask)
+    top = rows[np.argsort(u.adp_rank[rows], kind="stable")[:n]]
+    frame = u.frame
+    out = []
+    for row in top:
+        r = int(row)
+        record = frame.iloc[r]
+        out.append(
+            Candidate(
+                row=r,
+                player_id=int(u.ids[r]),
+                name=str(u.names[r]),
+                position=str(u.pos[r]),
+                team=str(record.get("team") or "?"),
+                vorp=float(u.vorp[r]),
+                z_total=float(u.z_total[r]),
+                score=float(u.vorp[r]),
+                adp_rank=float(u.adp_rank[r]),
+                p_survive=float(p_survive[r]),
+                fills_starter=_fills_starter(board, seat, str(u.pos[r])),
+                age=_opt(record.get("age")),
+                train_gp=_opt(record.get("train_gp")),
+                source="market",
             )
         )
     return out
@@ -231,7 +286,10 @@ def market_disagreement(
             blocked=blocked.get(str(u.pos[row]), ""),
         )
 
-    rows = list(ours)
+    # A market-implied row's own value IS the room's price - by construction
+    # ours == theirs for it, so it can never be a real disagreement and would
+    # only ever show up as a phantom near-tie at the edge of both lists.
+    rows = [r for r in ours if str(u.source[r]) != "market"]
     # Our side additionally requires the player to be startable: a bargain at a
     # position where the 6th-best left is sub-replacement is not a bargain.
     sleeping = sorted(

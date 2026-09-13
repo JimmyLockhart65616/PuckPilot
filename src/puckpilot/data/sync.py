@@ -209,7 +209,8 @@ def sync_current_rosters(
     delay: float = POLITE_DELAY_S,
     progress: Progress = _noop,
 ) -> dict[str, int]:
-    """Point `nhl_players.team_abbrev` at who each player actually plays for.
+    """Point `nhl_players.team_abbrev` at who each player actually plays for,
+    and give a name to anyone on a roster who has never been synced at all.
 
     MoneyPuck is the player-discovery mechanism and it is synced per season with
     INSERT OR REPLACE, so whichever season ran last decided every player's team.
@@ -221,10 +222,22 @@ def sync_current_rosters(
     Re-projected with correct teams the mean absolute change was 2.24 wins and
     the largest was 13.19.
 
+    The roster response also lists pre-debut players - drafted, camp-invited,
+    not yet in a boxscore - with name, position and birth date. MoneyPuck
+    never sees them (it discovers players from game stats, so zero games means
+    zero rows), and until now neither did we: `update_player_team` is a pure
+    UPDATE, so a rookie with no `nhl_players` row matched nothing and every
+    field of him beyond a bare Yahoo ADP was silently dropped - unnameable and
+    unmappable, not just unprojectable. `insert_player_if_missing` gives him a
+    row without touching anyone who already has one - that guard is load
+    bearing, see `update_player_team`. He still cannot be projected (no game
+    logs to blend), but `playermap._resolve` can now find him by name and
+    `draft.market` can price him against the market instead of dropping him.
+
     32 requests, one per club, same shape as `sync_player_bios`.
     """
     teams = current_team_abbrevs(nhl)
-    seen = changed = 0
+    seen = changed = new = 0
     for team in teams:
         try:
             data = nhl.roster(team, season)
@@ -237,11 +250,39 @@ def sync_current_rosters(
                 if pid is None:
                     continue
                 seen += 1
-                changed += store.update_player_team(conn, int(pid), team)
+                if store.insert_player_if_missing(
+                    conn, int(pid), _roster_name(p), p.get("positionCode"), team
+                ):
+                    new += 1
+                    changed += 1
+                    # The same payload carries birth date - free once we are
+                    # already reading it, and it is what lets a market-priced
+                    # rookie get an age instead of a permanent "unknown".
+                    if p.get("birthDate"):
+                        store.upsert_player_bio(
+                            conn,
+                            player_id=int(pid),
+                            birth_date=p.get("birthDate"),
+                            height_in=p.get("heightInInches"),
+                            weight_lb=p.get("weightInPounds"),
+                            shoots=p.get("shootsCatches"),
+                        )
+                else:
+                    changed += store.update_player_team(conn, int(pid), team)
         time.sleep(delay)
     conn.commit()
-    progress(f"  {len(teams)} rosters, {seen} players, {changed} team(s) corrected")
-    return {"teams": len(teams), "players": seen, "changed": changed}
+    progress(
+        f"  {len(teams)} rosters, {seen} players, {changed} corrected ({new} newly seen)"
+    )
+    return {"teams": len(teams), "players": seen, "changed": changed, "new": new}
+
+
+def _roster_name(p: dict) -> str:
+    """`{"firstName": {"default": "Gavin"}, "lastName": {"default": "McKenna"}}`
+    -> "Gavin McKenna", same nested-locale shape the NHL API uses everywhere."""
+    first = (p.get("firstName") or {}).get("default", "")
+    last = (p.get("lastName") or {}).get("default", "")
+    return f"{first} {last}".strip() or f"Player {p.get('id')}"
 
 
 def sync_players_and_logs(

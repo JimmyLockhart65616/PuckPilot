@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from puckpilot.draft.advice import market_disagreement, recommend
+from puckpilot.draft.advice import market_disagreement, market_watchlist, recommend
 from puckpilot.draft.board import DraftBoard
 from puckpilot.draft.engine import RosterValuePolicy
 from puckpilot.draft.explain import summarize
@@ -165,6 +165,19 @@ class LiveState:
             sleeping, rated = market_disagreement(self.board, n=5, seat=seat)
             need_pos = set(self.board.needs(seat))
             supply = [[pos, n, pos in need_pos] for pos, n in sorted(self.board.supply().items())]
+            # Priced from the room, not from us (see draft.market) - a third,
+            # clearly separate list rather than folded into the board, where a
+            # market number could be mistaken for a VORP we computed.
+            watchlist = [
+                {
+                    "name": c.name,
+                    "position": c.position,
+                    "team": c.team,
+                    "adp_rank": c.adp_rank,
+                    "age": c.age,
+                }
+                for c in market_watchlist(self.board, seat, n=10)
+            ]
 
         status = self.feed.status() if hasattr(self.feed, "status") else {}
         return {
@@ -183,6 +196,7 @@ class LiveState:
                 "sleeping": [asdict(g) for g in sleeping],
                 "rated": [asdict(g) for g in rated],
             },
+            "market_watchlist": watchlist,
             "seconds_since_pick": (
                 None if self.last_pick_at is None else time.time() - self.last_pick_at
             ),

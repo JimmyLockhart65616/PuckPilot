@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from puckpilot.data import store
-from puckpilot.yahoo.playermap import _nhl_index, _resolve, _team
+from puckpilot.yahoo.playermap import _nhl_index, _resolve, _team, reresolve_unmatched
 
 
 @pytest.fixture
@@ -98,3 +98,65 @@ def test_team_aliases_normalize_yahoo_abbreviations():
     assert _team("TB") == "TBL"
     assert _team("EDM") == "EDM"
     assert _team(None) == ""
+
+
+# ---- re-resolving previously-unmatched rows, without asking Yahoo again ----
+
+
+def _map_row(db, key, name, team, nhl_id=None, adp=100):
+    db.execute(
+        "INSERT INTO yahoo_player_map"
+        " (player_key, league_key, full_name, team_abbrev, positions, nhl_player_id, adp_rank)"
+        " VALUES (?, 'L.1', ?, ?, 'C', ?, ?)",
+        (key, name, team, nhl_id, adp),
+    )
+
+
+def test_a_rookie_synced_after_the_fact_resolves_on_reresolve(db):
+    """The exact bug this exists to fix: McKenna failed to match when the
+    Yahoo pool was first fetched because `nhl_players` had no row for him yet.
+    A roster sync since then gave him one; re-resolving must pick it up
+    without going back to Yahoo."""
+    _map_row(db, "477.p.1", "Gavin McKenna", "TOR")
+    db.commit()
+
+    before = reresolve_unmatched(db)
+    assert before.matched == 0 and before.unmatched == ["Gavin McKenna"]
+
+    store.upsert_player(db, 999, "Gavin McKenna", "L", "TOR")
+    after = reresolve_unmatched(db)
+    assert after.matched == 1
+    row = db.execute(
+        "SELECT nhl_player_id FROM yahoo_player_map WHERE player_key = '477.p.1'"
+    ).fetchone()
+    assert row[0] == 999
+
+
+def test_reresolve_never_touches_adp_or_positions(db):
+    """Only `nhl_player_id` may change here - `adp_rank` and `positions` were
+    not re-fetched, so nothing here may act as if they were."""
+    _map_row(db, "477.p.1", "Connor McDavid", "EDM", adp=1)
+    store.upsert_player(db, 1, "Connor McDavid", "C", "EDM")
+
+    reresolve_unmatched(db)
+
+    row = db.execute(
+        "SELECT positions, adp_rank FROM yahoo_player_map WHERE player_key = '477.p.1'"
+    ).fetchone()
+    assert tuple(row) == ("C", 1)
+
+
+def test_reresolve_does_not_double_assign_an_nhl_id(db):
+    """An id another Yahoo row already claims - in this league or any other -
+    must not be handed out a second time."""
+    _map_row(db, "477.p.1", "Sebastian Aho", "CAR", nhl_id=7)
+    _map_row(db, "477.p.2", "Sebastian Aho", "CAR")  # unresolved twin, same name+team
+    store.upsert_player(db, 7, "Sebastian Aho", "C", "CAR")
+
+    report = reresolve_unmatched(db)
+
+    assert report.matched == 0
+    row = db.execute(
+        "SELECT nhl_player_id FROM yahoo_player_map WHERE player_key = '477.p.2'"
+    ).fetchone()
+    assert row[0] is None

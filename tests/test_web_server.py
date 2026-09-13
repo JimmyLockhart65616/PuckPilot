@@ -418,3 +418,53 @@ def test_a_non_ascii_key_is_a_refusal_not_a_traceback():
     srv = _real_server(access)
     code, _body = _request(srv, "/state?k=" + quote("ké" * 8))
     assert code == 403
+
+
+# ---- market watchlist: a third, separate list -------------------------------
+
+
+def _server_with_market_row():
+    import numpy as np
+
+    srv = _real_server()
+    board = srv.state.board
+    frame = board.u.frame.copy()
+    frame["source"] = "projected"
+    frame.loc[999] = {
+        "name": "Market Rookie",
+        "position": "L",
+        "team": "BOS",
+        "vorp": 3.0,
+        "z_total": 3.0,
+        "adp_rank": 55.0,
+        "goals": float("nan"),
+        "source": "market",
+    }
+    from puckpilot.draft.engine import Universe
+
+    new_u = Universe(frame)
+    new_u.has_market = np.ones(len(new_u), dtype=bool)
+    board.u = new_u
+    board._row_of = {int(pid): i for i, pid in enumerate(new_u.ids)}
+    board.avail = np.ones(len(new_u), dtype=bool)
+    return srv
+
+
+def test_market_watchlist_appears_in_the_snapshot():
+    srv = _server_with_market_row()
+    snap = srv.state.snapshot(0)
+    names = {p["name"] for p in snap["market_watchlist"]}
+    assert names == {"Market Rookie"}
+
+
+def test_market_row_never_appears_in_the_shortlist_or_board():
+    srv = _server_with_market_row()
+    snap = srv.state.snapshot(0)
+    assert "Market Rookie" not in {row["name"] for row in snap["shortlist"]}
+    assert "Market Rookie" not in {row["name"] for row in snap["board"]}
+
+
+def test_an_empty_watchlist_is_an_empty_list_not_missing():
+    srv = _real_server()
+    snap = srv.state.snapshot(0)
+    assert snap["market_watchlist"] == []

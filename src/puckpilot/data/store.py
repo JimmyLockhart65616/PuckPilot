@@ -171,6 +171,30 @@ def update_player_team(conn: sqlite3.Connection, player_id: int, team_abbrev: st
     return cur.rowcount
 
 
+def insert_player_if_missing(
+    conn: sqlite3.Connection,
+    player_id: int,
+    full_name: str,
+    position: str | None,
+    team_abbrev: str | None,
+) -> bool:
+    """Add a player `nhl_players` has never heard of, without touching a row
+    that already exists there - `INSERT OR IGNORE`, not `upsert_player`'s
+    whole-row replace, for the same reason `update_player_team` exists.
+
+    This is what makes a pre-debut roster player nameable: MoneyPuck is the
+    normal discovery mechanism but only lists players with >=1 NHL game, so a
+    rookie who has not played yet has no row until something else creates one.
+    Returns whether a row was actually inserted.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO nhl_players (player_id, full_name, position, team_abbrev)"
+        " VALUES (?, ?, ?, ?)",
+        (player_id, full_name, position, team_abbrev),
+    )
+    return cur.rowcount > 0
+
+
 def upsert_schedule_game(
     conn: sqlite3.Connection,
     *,

@@ -56,6 +56,16 @@ class Universe:
         self.z_by_cat = {
             c.removeprefix("z_"): ranked[c].fillna(0.0).to_numpy(dtype=float) for c in z_cols
         }
+        # "projected" (a real VORP from real game logs) or "market" (implied
+        # from Yahoo ADP + mock consensus for a player with no NHL history at
+        # all - see `draft.market`). Read from the frame rather than set after
+        # construction like `has_market`, so it can never be forgotten for a
+        # row appended post-hoc and can never drift out of sync with row order.
+        self.source = (
+            ranked["source"].fillna("projected").to_numpy()
+            if "source" in ranked
+            else np.full(len(ranked), "projected", dtype=object)
+        )
 
     def __len__(self) -> int:
         return len(self.ids)

@@ -26,10 +26,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 
-from puckpilot.draft.advice import can_wait_on, recommend
+from puckpilot.draft.advice import can_wait_on, market_watchlist, recommend
 from puckpilot.draft.board import DraftBoard
-from puckpilot.draft.engine import RosterValuePolicy
+from puckpilot.draft.engine import RosterValuePolicy, Universe
 from puckpilot.draft.feed import apply
 
 HELP = """\
@@ -91,6 +92,14 @@ def render(board: DraftBoard, cands, cfg: LiveConfig, status: str = "") -> str:
         likely = can_wait_on(board, cands[: cfg.top])
         if likely:
             lines.append("Likely still there next turn: " + ", ".join(likely[:5]))
+
+    # Priced from the room, not from us - see draft.market. Never part of the
+    # ranked shortlist above; shown separately so a real pick of one of these
+    # can still be recognized instead of landing as an unknown player.
+    watch = market_watchlist(board, seat, n=5)
+    if watch:
+        named = ", ".join(f"{c.name} (~{c.adp_rank:.0f})" for c in watch)
+        lines.append(f"Market only, no projection: {named}")
 
     roster = board.roster(seat)
     if roster:
@@ -208,6 +217,36 @@ def run_live(
     return board
 
 
+def attach_market_frame(
+    universe: Universe, market_frame: pd.DataFrame, adp: dict[int, int] | None
+) -> Universe:
+    """Concat `market_frame` onto `universe` and rebuild, or hand `universe`
+    back unchanged if there is nothing to add.
+
+    Pulled out of `build_live_board` so the one part of this feature with any
+    real mechanics - reconciling a `with_adp`-only array update against the
+    frame it never touched, and recomputing `has_market` after a sort scrambles
+    row order - can be tested against a small synthetic `Universe` rather than
+    only through a live database.
+    """
+    if market_frame.empty:
+        return universe
+    # `.frame` was never touched by `with_adp` - only the array was - so the
+    # real ADP must be re-stamped onto it before it becomes the base of a new
+    # Universe, or every existing player's ADP would silently revert to the
+    # pre-market proxy.
+    combined = pd.concat(
+        [universe.frame.assign(adp_rank=universe.adp_rank), market_frame]
+    ).sort_values("vorp", ascending=False)
+    out = Universe(combined)
+    # Positional concatenation of the old `has_market` array would be wrong
+    # here: `sort_values` just reordered every row, so membership has to be
+    # recomputed by id, not carried along by position.
+    market_priced = (set(adp) if adp else set()) | set(market_frame.index)
+    out.has_market = np.array([int(pid) in market_priced for pid in out.ids], dtype=bool)
+    return out
+
+
 def build_live_board(
     conn,
     league,
@@ -215,6 +254,8 @@ def build_live_board(
     season: str = "20262027",
     train_seasons: tuple[str, ...] = ("20252026", "20242025", "20232024"),
     adp: dict[int, int] | None = None,
+    league_key: str | None = None,
+    mock_glob: str = "data/mocks/*.json",
     progress: Callable[[str], None] = print,
     seed: int = 0,
 ) -> DraftBoard:
@@ -226,6 +267,13 @@ def build_live_board(
     need, ADP is never re-based, and the slot count is the full roster rather
     than the picks that will actually happen - which makes `next_pick_no`, and
     therefore every survival probability, wrong.
+
+    `league_key` additionally pulls in market-implied rows for players with a
+    Yahoo ADP but no NHL history at all (rookies, mainly) - see `draft.market`.
+    Without it those players are simply invisible: not just unranked, but
+    absent from the board, so a real pick of one of them cannot be recorded and
+    the pick clock drifts exactly the way an unknown player used to. Requires
+    `adp` too, since the market curve is fit against real Yahoo ADP.
     """
     from puckpilot.draft.sim import build_universe, keepers_for
 
@@ -252,6 +300,14 @@ def build_live_board(
         # cheap player from one the market never mentioned.
         universe.has_market = np.array([int(pid) in adp for pid in universe.ids], dtype=bool)
         progress(f"  using Yahoo ADP for {sum(1 for p in universe.ids if int(p) in adp)} players")
+
+        if league_key:
+            from puckpilot.draft.market import build_market_frame
+
+            market_frame = build_market_frame(
+                conn, league_key, universe, mock_glob=mock_glob, progress=progress
+            )
+            universe = attach_market_frame(universe, market_frame, adp)
 
     # Deterministic: a live board rebuilt mid-draft must not re-deal keepers.
     keepers = keepers_for(

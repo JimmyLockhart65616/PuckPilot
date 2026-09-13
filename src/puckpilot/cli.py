@@ -153,15 +153,38 @@ def _cmd_yahoo_playermap(args: argparse.Namespace) -> int:
     is what lets the draft-room websocket (which sends ids, not names) mark
     players off the board, and `draft calibrate` refuses to fit without the ADP
     it carries. The 400 rows on disk were written once, ad hoc.
-    """
-    from pathlib import Path
 
+    `--reresolve-only` skips Yahoo entirely and re-tries every already-fetched
+    row that has no NHL id against `nhl_players` as it stands now. Worth
+    running on its own after `data sync` picks up new rookies - no browser
+    session needed for information Yahoo was never asked to give again.
+    """
     from puckpilot.data import store
-    from puckpilot.yahoo.playermap import build_map
-    from puckpilot.yahoo.session import YahooSession, YahooSessionError
 
     settings = Settings()
     conn = store.connect(settings.resolved_db_path)
+
+    if args.reresolve_only:
+        from puckpilot.yahoo.playermap import reresolve_unmatched
+
+        report = reresolve_unmatched(conn, progress=print)
+        print()
+        print(f"Re-resolved {report.matched}/{report.total} previously-unmatched players.")
+        if report.fallbacks:
+            print("  via fallback matching, verify these:")
+            for f in report.fallbacks[:15]:
+                print(f"    {f}")
+        if report.unmatched:
+            shown = ", ".join(report.unmatched[:12])
+            more = f" (+{len(report.unmatched) - 12} more)" if len(report.unmatched) > 12 else ""
+            print(f"  still unmatched: {shown}{more}")
+        return 0
+
+    from pathlib import Path
+
+    from puckpilot.yahoo.playermap import build_map
+    from puckpilot.yahoo.session import YahooSession, YahooSessionError
+
     profile = settings._resolve(Path("secrets/chrome-profile"))
     if not profile.exists():
         print(
@@ -251,7 +274,7 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
     conn = store.connect(settings.resolved_db_path)
     league = _league(args)
 
-    adp, feed, ctx, pump_fn = None, None, None, None
+    adp, feed, ctx, pump_fn, league_key = None, None, None, None, None
     if args.replay:
         # A draft that already happened, played back. Same poll(board) the
         # websocket drives, so this exercises the whole console offline - no
@@ -291,13 +314,19 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
         with contextlib.suppress(Exception):
             page.goto(args.room, wait_until="domcontentloaded")
         feed = WebsocketFeed(ctx, load_yahoo_id_map(conn))
-        key = args.yahoo if "." in str(args.yahoo) else None
-        adp = load_adp(conn, key) if key else None
+        league_key = args.yahoo if "." in str(args.yahoo) else None
+        adp = load_adp(conn, league_key) if league_key else None
         pump_fn = partial(pump, ctx)
         print(f"Websocket feed armed ({len(feed.yahoo_to_nhl)} ids). Join your draft room.")
 
     board = build_live_board(
-        conn, league, seat=args.seat, season=args.season, adp=adp, progress=print
+        conn,
+        league,
+        seat=args.seat,
+        season=args.season,
+        adp=adp,
+        league_key=league_key,
+        progress=print,
     )
     if args.web:
         return _serve_live(board, feed, ctx, args, league)
@@ -821,6 +850,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ym.add_argument("--league-key", default=None, help="e.g. 465.l.12345 (default: auto-detect)")
     ym.add_argument("--limit", type=int, default=600, help="How deep into Yahoo's pool to fetch")
+    ym.add_argument(
+        "--reresolve-only",
+        action="store_true",
+        help="Skip Yahoo; re-match already-fetched unmatched rows against nhl_players now",
+    )
     ym.set_defaults(func=_cmd_yahoo_playermap)
 
     data = sub.add_parser("data", help="Local data store commands")

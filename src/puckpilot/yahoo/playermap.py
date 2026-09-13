@@ -254,6 +254,58 @@ def build_map(
     return report
 
 
+def reresolve_unmatched(conn: sqlite3.Connection, progress: Progress = _noop) -> MapReport:
+    """Re-try every `yahoo_player_map` row with no NHL id, against `nhl_players`
+    as it stands right now - without asking Yahoo for anything.
+
+    `build_map` resolves once, against whatever `nhl_players` contained at that
+    moment. A name that failed then is not stuck failing forever: `data sync`
+    (roster sync in particular, which inserts pre-debut players `nhl_players`
+    has never held) can make a previously-unmatched name resolvable later, and
+    re-running the *whole* Yahoo fetch just to pick that up means another
+    browser session for zero new information from Yahoo's side. This only
+    touches `nhl_player_id`, never `adp_rank` or `positions` - the fetched
+    fields are not being re-fetched, so nothing here may overwrite them.
+
+    Across every league key at once. A resolved NHL id already claimed by
+    another mapped row (any league) is skipped, same non-double-assignment
+    guard as `build_map`.
+    """
+    idx = _nhl_index(conn)
+    claimed = {
+        int(r[0])
+        for r in conn.execute(
+            "SELECT DISTINCT nhl_player_id FROM yahoo_player_map WHERE nhl_player_id IS NOT NULL"
+        )
+    }
+    rows = conn.execute(
+        "SELECT player_key, full_name, team_abbrev FROM yahoo_player_map"
+        " WHERE nhl_player_id IS NULL"
+    ).fetchall()
+
+    report = MapReport(total=len(rows))
+    updates = []
+    for key, name, team in rows:
+        nhl_id, how = _resolve(idx, name, team or "")
+        if how == "ambiguous":
+            report.ambiguous.append(name)
+        if nhl_id is not None and nhl_id in claimed:
+            nhl_id = None  # already spoken for by a different Yahoo entry
+        if nhl_id is None:
+            report.unmatched.append(name)
+            continue
+        if how not in ("exact",):
+            report.fallbacks.append(f"{name} -> {idx.names[nhl_id]} ({how})")
+        claimed.add(nhl_id)
+        report.matched += 1
+        updates.append((nhl_id, key))
+
+    conn.executemany("UPDATE yahoo_player_map SET nhl_player_id = ? WHERE player_key = ?", updates)
+    conn.commit()
+    progress(f"  re-resolved {report.matched}/{report.total} previously-unmatched players")
+    return report
+
+
 def load_map(conn: sqlite3.Connection, league_key: str) -> dict[str, int]:
     """player_key -> nhl_player_id, for the keys that resolved."""
     return {

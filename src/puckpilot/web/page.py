@@ -53,6 +53,8 @@ PAGE = """<!doctype html>
  tr.blocked td{opacity:.55}
  .blk{color:var(--warn);font-size:10px;border:1px solid var(--line);
    border-radius:3px;padding:0 3px;margin-left:4px;vertical-align:1px}
+ .mkt{color:var(--dim);font-size:10px;border:1px solid var(--line);
+   border-radius:3px;padding:0 3px}
  button{background:var(--card);border:1px solid var(--line);color:var(--fg);
    font:inherit;padding:4px 10px;border-radius:4px;cursor:pointer}
  button:hover{border-color:var(--warn);color:var(--warn)}
@@ -83,6 +85,8 @@ PAGE = """<!doctype html>
     <div id="sleeping" class="gaps"></div>
     <div class="k" style="margin-top:10px">THE ROOM RATES THESE ABOVE US</div>
     <div id="rated" class="gaps"></div>
+    <div class="k" style="margin-top:10px">MARKET ONLY &mdash; NO PROJECTION</div>
+    <div id="marketonly" class="gaps"></div>
   </div>
   <div class="col">
     <div class="k">BOARD &mdash; <span id="left">0</span> LEFT</div>
@@ -183,6 +187,18 @@ function render(s){
   document.getElementById('rated').innerHTML = gaps.rated.length
     ? gaps.rated.map(g => gapRow(g, false)).join('')
     : '<div class="meta">no material disagreement</div>';
+
+  // Priced from the room, not from us - no VORP shown, ever: a market number
+  // must never look like an opinion we hold. See draft.market.
+  const watch = s.market_watchlist || [];
+  document.getElementById('marketonly').innerHTML = watch.length
+    ? watch.map(p =>
+        '<div class="gap"><span class="gp">'+p.position+'</span> '+p.name+
+        '<div class="meta">'+p.team+' &middot; consensus pick <b>~'+Math.round(p.adp_rank)+
+        '</b>'+(p.age != null ? ' &middot; age '+p.age.toFixed(1) : '')+
+        ' &middot; <span class="mkt">MKT</span></div></div>'
+      ).join('')
+    : '<div class="meta">nothing left with no projection at all</div>';
 
   document.getElementById('diag').textContent = s.diagnostics;
 }

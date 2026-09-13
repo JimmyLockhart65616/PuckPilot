@@ -247,6 +247,67 @@ def test_updating_a_team_does_not_clobber_name_or_position(db):
     assert row == ("Moved Winger", "R", "DAL")
 
 
+class RosterWithRookie(RosterNhl):
+    """The same two clubs, plus one player DAL's roster lists who has never
+    been synced before - no `nhl_players` row, the shape a pre-debut rookie
+    takes: MoneyPuck only discovers players from game stats, and he has none."""
+
+    def roster(self, team_abbrev, season):
+        data = super().roster(team_abbrev, season)
+        if team_abbrev == "DAL":
+            data = {
+                **data,
+                "forwards": [
+                    *data["forwards"],
+                    {
+                        "id": 99,
+                        "firstName": {"default": "Rookie"},
+                        "lastName": {"default": "Prospect"},
+                        "positionCode": "L",
+                        "birthDate": "2007-01-01",
+                    },
+                ],
+            }
+        return data
+
+
+def test_sync_current_rosters_adds_a_player_never_seen_before(db):
+    """`update_player_team` is a pure UPDATE, so a rookie who matches no row
+    used to vanish - unnameable, unmappable, not merely unprojectable."""
+    store.upsert_player(db, 1, "Moved Winger", "R", "COL")
+    store.upsert_player(db, 2, "Stayed Centre", "C", "COL")
+    store.upsert_player(db, 3, "Moved Goalie", "G", "ANA")
+
+    result = sync.sync_current_rosters(db, RosterWithRookie(), "20262027", delay=0)
+
+    row = db.execute(
+        "SELECT full_name, position, team_abbrev FROM nhl_players WHERE player_id = 99"
+    ).fetchone()
+    assert tuple(row) == ("Rookie Prospect", "L", "DAL")
+    assert result["new"] == 1
+    # Free from the same payload, and it is what lets a market-priced rookie
+    # carry an age instead of a permanent "unknown".
+    bio = db.execute("SELECT birth_date FROM nhl_player_bio WHERE player_id = 99").fetchone()
+    assert tuple(bio) == ("2007-01-01",)
+
+
+def test_an_existing_player_is_never_reinserted_by_roster_sync(db):
+    """`insert_player_if_missing` must not touch a row that already exists -
+    that whole-row-replace mistake is what made `team_abbrev` stale in the
+    first place, see `update_player_team`."""
+    store.upsert_player(db, 1, "Moved Winger", "R", "COL")
+    store.upsert_player(db, 2, "Stayed Centre", "C", "COL")
+    store.upsert_player(db, 3, "Moved Goalie", "G", "ANA")
+
+    result = sync.sync_current_rosters(db, RosterWithRookie(), "20262027", delay=0)
+
+    row = db.execute(
+        "SELECT full_name, position, team_abbrev FROM nhl_players WHERE player_id = 1"
+    ).fetchone()
+    assert tuple(row) == ("Moved Winger", "R", "DAL"), "name and position survive; only team moves"
+    assert result["new"] == 1, "only the genuinely new player (99) counts as new"
+
+
 def test_a_club_with_no_roster_for_that_season_is_skipped(db):
     """Defunct franchises and expansion clubs must not abort the sync."""
     from puckpilot.data.nhl import NhlApiError
@@ -259,4 +320,7 @@ def test_a_club_with_no_roster_for_that_season_is_skipped(db):
 
     store.upsert_player(db, 1, "Moved Winger", "R", "COL")
     result = sync.sync_current_rosters(db, Missing(), "20262027", delay=0)
-    assert result["teams"] == 2 and result["changed"] == 1
+    # id 1 moves (COL -> DAL) and id 3 (DAL's goalie) is new, never upserted
+    # above - both count as "changed" now that a rookie is inserted rather
+    # than silently dropped by a pure UPDATE matching no row.
+    assert result["teams"] == 2 and result["changed"] == 2 and result["new"] == 1
