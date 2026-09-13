@@ -25,6 +25,15 @@ az group create -n "$RG" -l "$LOC" -o none
 echo "==> container registry $ACR"
 az acr create -n "$ACR" -g "$RG" --sku Basic --admin-enabled true -o none
 
+# The context is the repo root, and `az acr build` uploads it to a cloud
+# registry. `.dockerignore` at the root is deny-by-default for exactly that
+# reason - without it this line ships secrets/chrome-profile (a logged-in Yahoo
+# session) and data/captures (>1 GB of draft-room recordings) to ACR.
+if ! head -n 20 .dockerignore 2>/dev/null | grep -qx '\*'; then
+  echo "refusing to build: .dockerignore is missing or does not deny by default" >&2
+  exit 1
+fi
+
 echo "==> build image (in ACR - no local docker needed)"
 az acr build --registry "$ACR" --image "puckpilot-relay:$IMAGE_TAG" \
   --file deploy/relay/Dockerfile . -o none

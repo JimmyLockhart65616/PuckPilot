@@ -154,3 +154,31 @@ def test_the_relay_starts_without_the_engine_installed():
     r = subprocess.run([sys.executable, "-c", PROBE], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "ok" in r.stdout
+
+
+def test_the_build_context_denies_by_default():
+    """`.dockerignore` is a security control here, not tidiness.
+
+    `az acr build` uploads the build context to a cloud registry, and this repo
+    root holds `secrets/chrome-profile/` - a logged-in Yahoo session, hundreds of
+    megabytes of cookies and tokens - alongside `data/captures/`, over a gigabyte
+    of real draft-room recordings. Without an allow-list all of it ships to ACR.
+
+    Pinned as deny-by-default rather than as a list of excluded paths: a new
+    sensitive directory then needs no change here to stay out.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    ignore = root / ".dockerignore"
+    assert ignore.is_file(), ".dockerignore is missing; the build context would carry secrets"
+
+    lines = [
+        line.strip()
+        for line in ignore.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert lines and lines[0] == "*", "the first rule must exclude everything"
+
+    allowed = {line[1:].rstrip("/") for line in lines if line.startswith("!")}
+    assert allowed == {"src"}, f"only src/ may be re-included, got {sorted(allowed)}"
