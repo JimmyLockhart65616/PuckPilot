@@ -22,7 +22,7 @@ from typing import Protocol
 
 import numpy as np
 
-from puckpilot.draft.board import DraftBoard, DraftBoardError
+from puckpilot.draft.board import DraftBoard, DraftBoardError, UnknownPlayerError
 from puckpilot.keepers import _norm
 
 
@@ -216,6 +216,13 @@ def apply(board: DraftBoard, events: list[PickEvent]) -> tuple[list, list[str]]:
     for event in events:
         try:
             accepted.append(board.record(event.player_id, event.seat, event.source))
+        except UnknownPlayerError as e:
+            # The pick really happened - the room took someone off a board that
+            # does not contain them. Consume the slot so our clock stays with
+            # the room's; `next_pick_no` drives every survival probability on
+            # screen. Still reported, so the console can say how blind it is.
+            board.record_unknown(event.seat)
+            rejected.append(f"{e} (slot consumed)")
         except DraftBoardError as e:
             rejected.append(str(e))
     return accepted, rejected

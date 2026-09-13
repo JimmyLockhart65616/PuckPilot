@@ -230,7 +230,12 @@ def build_live_board(
 
     t0 = time.perf_counter()
     progress("Building board...")
-    universe = build_universe(conn, season, train_seasons, league)
+    # Anyone the market prices goes on the board even if our own ranking would
+    # have cut him: the room can draft him, and a pick we cannot record is a
+    # pick our clock does not see.
+    universe = build_universe(
+        conn, season, train_seasons, league, market_ids=set(adp) if adp else None
+    )
     if adp:
         # Real Yahoo ADP beats the prior-season-value proxy, and survival_discount
         # reads directly off it.

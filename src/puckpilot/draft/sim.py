@@ -24,7 +24,26 @@ from puckpilot.engine.aggregate import season_aggregates
 from puckpilot.engine.valuation import rank_players
 from puckpilot.league import DEFAULT_LEAGUE, LeagueConfig
 
+# How deep the draftable pool goes. A pure truncation applied AFTER
+# `rank_players`, so raising it cannot change a single VORP or z - `value_players`
+# sizes its pool from `shape.skater_pool_size` and `replacement_adjust` runs over
+# the whole projected frame. 350 was leaving 103 of Yahoo's 385 priced players
+# off the board entirely, with real projections and real VORP: Stankoven at ADP
+# 119, Malkin 128, Duchene 141, Misa 175. Those are exactly the mid-round names
+# a drafter forgets, and they were absent for free.
 UNIVERSE_SIZE = 350
+
+
+def universe_size(league: LeagueConfig) -> int:
+    """Pool depth, derived from the league rather than a constant.
+
+    Three times the roster spots in the league: deep enough that the tail of a
+    draft still has a board, without carrying the whole 1,122-player frame.
+    Floored at UNIVERSE_SIZE so no league's pool shrinks from what was measured.
+    """
+    return max(UNIVERSE_SIZE, league.shape.n_teams * league.shape.roster_size * 3)
+
+
 # peripheral categories a punt strategy might concede (scoring cats never are)
 PUNTABLE_KEYS = {"plus_minus", "pim", "sog", "hits", "blocks", "ppp"}
 
@@ -177,6 +196,7 @@ def build_universe(
     target_season: str,
     train_seasons: tuple[str, ...],
     league: LeagueConfig = DEFAULT_LEAGUE,
+    market_ids: set[int] | None = None,
 ) -> Universe:
     """Projection-ranked pool with pseudo-ADP.
 
@@ -197,7 +217,16 @@ def build_universe(
     )
     ranked = ranked.join(adp, how="left")
     ranked["adp_rank"] = ranked["adp_rank"].fillna(999.0)
-    return Universe(ranked.head(UNIVERSE_SIZE))
+
+    keep = ranked.head(universe_size(league))
+    if market_ids:
+        # Anyone the market prices belongs on the board whatever we think of
+        # him: the room can draft him, and a player we cannot record is a pick
+        # our clock does not see.
+        extra = ranked.loc[[i for i in ranked.index if i in market_ids and i not in keep.index]]
+        if not extra.empty:
+            keep = pd.concat([keep, extra]).sort_values("vorp", ascending=False)
+    return Universe(keep)
 
 
 def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:

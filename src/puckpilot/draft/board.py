@@ -31,6 +31,15 @@ class DraftBoardError(RuntimeError):
     pass
 
 
+class UnknownPlayerError(DraftBoardError):
+    """The room drafted someone our board has never heard of.
+
+    Distinct from every other refusal because it is the only one where the pick
+    REALLY HAPPENED. A duplicate poll must not advance the clock; a player we
+    cannot rank must, or our count of picks made falls behind the room's.
+    """
+
+
 @dataclass(frozen=True)
 class Pick:
     """One player off the board."""
@@ -194,8 +203,13 @@ class DraftBoard:
         (see `RosterValuePolicy._dynamic_vorp`). So the scarcity goes to the
         drafter as a fact instead of into the score as a weight.
         """
+        # Counted above replacement, not raw. The pool is deliberately deeper
+        # than the draft is long, so a raw count reads "D 340 left" and means
+        # nothing; what a drafter wants is how many STARTABLE ones remain, and
+        # that number is immune to how deep the pool happens to go.
+        startable = self.avail & (self.u.vorp > 0)
         return {
-            pos: int((self.avail & (self.u.pos == pos)).sum())
+            pos: int((startable & (self.u.pos == pos)).sum())
             for pos in sorted({str(p) for p in self.u.pos})
         }
 
@@ -249,8 +263,11 @@ class DraftBoard:
         return sum(1 for i in range(self.made, len(self.slots)) if self.slots[i][1] == seat)
 
     def roster(self, seat: int | None = None) -> list[Pick]:
+        """Players on a seat's roster. Placeholders for picks we could not rank
+        are excluded - they consumed a slot, but we do not know who they were,
+        and callers index the universe by `row`."""
         seat = self.my_seat if seat is None else seat
-        return [p for p in self.keeper_picks + self.picks if p.seat == seat]
+        return [p for p in self.keeper_picks + self.picks if p.seat == seat and p.row >= 0]
 
     def needs(self, seat: int | None = None) -> dict[str, int]:
         """Unmet roster minimums — what still has to be filled to be legal."""
@@ -270,7 +287,7 @@ class DraftBoard:
             raise DraftBoardError("draft is already complete")
         row = self._row_of.get(int(player_id))
         if row is None:
-            raise DraftBoardError(f"player {player_id} is not in the ranked universe")
+            raise UnknownPlayerError(f"player {player_id} is not in the ranked universe")
         if not self.avail[row]:
             raise DraftBoardError(f"{self.u.names[row]} is already off the board")
 
@@ -289,11 +306,49 @@ class DraftBoard:
         self.picks.append(pick)
         return pick
 
+    def record_unknown(self, seat: int | None = None, label: str = "") -> Pick:
+        """Consume a pick for a player we cannot rank.
+
+        The room took someone off a board that does not contain them, and that
+        pick is real whether we can price him or not. Refusing it used to leave
+        `made` behind the room, and `made` is the index into `slots` that
+        produces `on_the_clock`, `current_round` and `next_pick_no` - and
+        `survival()` is a logistic in `adp_rank - next_pick_no`. So a silently
+        dropped pick does not merely lose a name: it makes every "lasts N%" on
+        screen and every timing reason wrong, for the rest of the draft, and
+        the error accumulates. With 11 of the top-163 Yahoo-priced players
+        currently off our board, a full room drifts 15-20 picks.
+
+        Availability and position counts are deliberately untouched: we do not
+        know who he was, so we cannot claim to know what position was filled.
+        """
+        if self.complete:
+            raise DraftBoardError("draft is already complete")
+        overall = self.made
+        seat = self.slots[overall][1] if seat is None else int(seat)
+        if not 0 <= seat < self.n_teams:
+            seat = self.slots[overall][1]
+        pick = Pick(
+            overall=overall,
+            seat=seat,
+            row=-1,
+            player_id=0,
+            name=label or "(not on our board)",
+            position="?",
+            source="unknown",
+        )
+        self.picks.append(pick)
+        return pick
+
     def undo(self) -> Pick | None:
         """Take back the last pick. A mistyped name mid-draft is not a crisis."""
         if not self.picks:
             return None
         pick = self.picks.pop()
+        if pick.row < 0:
+            # A placeholder for a player we could not rank: it consumed a slot
+            # and nothing else, so there is nothing to give back.
+            return pick
         self.avail[pick.row] = True
         pos = pick.position
         self.counts[pick.seat][pos] = max(0, self.counts[pick.seat].get(pos, 0) - 1)

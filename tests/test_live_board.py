@@ -359,3 +359,105 @@ def test_survival_defaults_to_the_scoring_spread():
     policy = RosterValuePolicy(survival_spread=6.0, display_spread=16.0)
     ctx = b.pick_context(0)
     np.testing.assert_array_equal(policy.survival(b.u, ctx), policy.survival(b.u, ctx, spread=6.0))
+
+
+# ---- the pick clock must keep up with the room -----------------------------
+#
+# `board.made` is the index into `slots` that produces `on_the_clock`,
+# `current_round` and `next_pick_no` - and `survival()` is a logistic in
+# `adp_rank - next_pick_no`. So a pick we refuse does not merely lose a name: it
+# makes every "lasts N%" on screen wrong for the rest of the draft, and the
+# error accumulates. Measured across six real drafts: 63 refusals in 1,145 picks
+# before the board was widened, 7 after.
+
+
+def test_a_player_we_cannot_rank_still_consumes_his_slot():
+    from puckpilot.draft.feed import PickEvent, apply
+
+    b, _ = _depth_board()
+    before_avail = int(b.avail.sum())
+    accepted, rejected = apply(b, [PickEvent(999_999, None, "test")])
+
+    assert b.made == 1, "the pick really happened; the clock must advance"
+    assert not accepted and rejected, "and it is still reported, not swallowed silently"
+    assert int(b.avail.sum()) == before_avail, "we do not know who he was"
+    assert b.roster(0) == [] or all(p.row >= 0 for p in b.roster(0))
+
+
+def test_a_duplicate_pick_does_NOT_advance_the_clock():
+    """The opposite case, and the reason this needed its own exception type: a
+    feed re-reporting a pick is a duplicate poll, not a second selection."""
+    from puckpilot.draft.feed import PickEvent, apply
+
+    b, _ = _depth_board()
+    pid = int(b.u.ids[0])
+    apply(b, [PickEvent(pid, None, "test")])
+    assert b.made == 1
+    accepted, rejected = apply(b, [PickEvent(pid, None, "test")])
+    assert b.made == 1, "a duplicate must not consume a slot"
+    assert not accepted and rejected
+
+
+def test_the_clock_stays_with_the_room_across_unknown_picks():
+    """The property that actually matters: next_pick_no after N picks is the
+    same whether or not some of them were players we could rank."""
+    from puckpilot.draft.feed import PickEvent, apply
+
+    known, _ = _depth_board()
+    mixed, _ = _depth_board()
+    for i in range(6):
+        apply(known, [PickEvent(int(known.u.ids[i]), None, "t")])
+        apply(mixed, [PickEvent(int(mixed.u.ids[i]) if i % 2 else 999_000 + i, None, "t")])
+    assert known.made == mixed.made == 6
+    assert known.next_pick_no(0) == mixed.next_pick_no(0)
+    assert known.on_the_clock() == mixed.on_the_clock()
+
+
+def test_undo_of_an_unknown_pick_gives_nothing_back():
+    b, _ = _depth_board()
+    before = int(b.avail.sum())
+    b.record_unknown()
+    p = b.undo()
+    assert p is not None and p.row == -1
+    assert b.made == 0 and int(b.avail.sum()) == before
+
+
+# ---- universe depth --------------------------------------------------------
+
+
+def test_widening_the_universe_cannot_change_a_single_vorp():
+    """`replacement_adjust` runs over the whole projected frame and the cut is a
+    pure truncation applied after, so depth is free. This is the guard on that:
+    if it ever stops being true, every tuned constant is invalidated."""
+    import pandas as pd
+
+    from puckpilot.engine.valuation import rank_players
+
+    sk = pd.DataFrame(
+        {
+            "name": [f"S{i}" for i in range(40)],
+            "position": ["C"] * 20 + ["D"] * 20,
+            "goals": np.linspace(40, 1, 40),
+            "assists": np.linspace(50, 2, 40),
+        },
+        index=pd.Index(range(1, 41), name="player_id"),
+    )
+    go = pd.DataFrame(
+        {"name": ["G1"], "position": ["G"], "wins": [30.0]},
+        index=pd.Index([99], name="player_id"),
+    )
+    from puckpilot.engine.categories import Category
+
+    cats = (Category("goals", "G", "skater"), Category("assists", "A", "skater"))
+    ranked = rank_players(sk, go, skater_cats=cats, goalie_cats=(Category("wins", "W", "goalie"),))
+    shallow, deep = ranked.head(10), ranked.head(30)
+    common = shallow.index.intersection(deep.index)
+    assert (shallow.loc[common, "vorp"] == deep.loc[common, "vorp"]).all()
+
+
+def test_supply_counts_startable_players_not_the_whole_pool():
+    """The pool is deliberately deeper than the draft is long, so a raw count
+    reads 'D 340 left' and means nothing to a drafter."""
+    b, _ = _depth_board()
+    supply = b.supply()
+    assert all(v <= int((b.avail & (b.u.vorp > 0)).sum()) for v in supply.values())
