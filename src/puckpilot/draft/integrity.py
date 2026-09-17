@@ -186,6 +186,7 @@ def snapshot_violations(
     # A row's id is what a one-click "taken" acts on, so it must name exactly the
     # player the row shows - a namesake would strike the wrong man off the board.
     row_of = getattr(board, "_row_of", {})
+    elig_sets = u.eligibility()[0] if hasattr(u, "eligibility") else None
     for kind, items, market in (
         ("board", rows, False),
         ("market watchlist", snap.get("market_watchlist") or [], True),
@@ -203,6 +204,25 @@ def snapshot_violations(
                 bad(f"{kind} row id {item['id']} is {u.names[r]!r}, the row says {shown!r}")
             elif is_market(r) != market:
                 bad(f"{kind} row id {item['id']} has the wrong source")
+            elif "eligible" in item and elig_sets is not None:
+                shown = set(str(item["eligible"] or "").split("/")) - {""}
+                if shown != set(elig_sets[r]):
+                    bad(
+                        f"{kind} row {item.get('name')!r} shows eligibility {item['eligible']!r}, "
+                        f"board has {'/'.join(sorted(elig_sets[r]))!r}"
+                    )
+
+    # Every row that states eligibility must include its own position in it: a
+    # card reading "D" for a player filed at C is a roster panel lying.
+    for kind, items in (
+        ("shortlist", shortlist),
+        ("board", rows),
+        ("market watchlist", snap.get("market_watchlist") or []),
+    ):
+        for item in items:
+            if "eligible" in item and item.get("position") not in str(item["eligible"]).split("/"):
+                who, pos = item.get("name"), item.get("position")
+                bad(f"{kind} row {who!r} at {pos!r} is not in its own eligibility")
 
     # ---- recent picks and drift, where the view reports them -----------------
     if "recent" in snap:

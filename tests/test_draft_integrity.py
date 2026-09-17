@@ -164,6 +164,28 @@ def _drafted_name(board):
             "malformed",
         ),
         ("duplicated board row", lambda s, b: s["board"].append(dict(s["board"][0])), "repeats"),
+        (
+            "eligibility widened",
+            lambda s, b: s["board"][3].update(eligible=s["board"][3]["position"] + "/G"),
+            "shows eligibility",
+        ),
+        (
+            "card eligibility without its own position",
+            lambda s, b: s["shortlist"][0].update(
+                eligible="G" if s["shortlist"][0]["position"] != "G" else "C"
+            ),
+            "not in its own eligibility",
+        ),
+        (
+            "row id pointing at a drafted player",
+            lambda s, b: s["board"][4].update(id=next(p.player_id for p in b.picks if p.row >= 0)),
+            "already drafted",
+        ),
+        (
+            "recent picks reordered",
+            lambda s, b: s["recent"].reverse() if len(s["recent"]) > 1 else s["recent"].clear(),
+            "recent picks",
+        ),
     ],
 )
 def test_the_checker_catches(mid_draft, label, mutate, expect):
