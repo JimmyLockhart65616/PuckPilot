@@ -159,3 +159,14 @@ def test_the_eligibility_label_leads_with_the_primary_position():
     assert eligible_label(u, c) == "C"
     v = u.with_eligibility({int(u.ids[c]): frozenset({"R", "C", "L"})})
     assert eligible_label(v, c) == "C/L/R"
+
+
+def test_a_label_never_shows_a_position_yahoo_does_not_allow():
+    """Necas: C in the NHL's data, RW-only on Yahoo. "C/R" would offer the
+    drafter a centre slot he cannot use."""
+    from puckpilot.draft.advice import eligible_label
+
+    u = _universe()
+    c = next(r for r in range(len(u)) if u.pos[r] == "C")
+    v = u.with_eligibility({int(u.ids[c]): frozenset({"R"})})
+    assert eligible_label(v, c) == "R, valued C"

@@ -365,6 +365,12 @@ def position_corrections(conn: sqlite3.Connection, league_key: str | None = None
     a winger's, so he is valued against the wrong pool - and can never fill the
     C slot the roster accounting gives him. The correction is Yahoo's first
     listed position. Anyone Yahoo allows at his NHL position is left alone.
+
+    Measured 2026-09-16 as `build_universe(position_overrides=...)` and NOT
+    wired into the board: n=1000 over two seeds, top-3 fell 0.739 -> 0.718 and
+    0.740 -> 0.708 on target 2025-26 while rising 0.310 -> 0.393 and 0.323 ->
+    0.409 on 2024-25. Seasons opposite in sign, so it failed the pre-registered
+    gate. `draft preflight` names the affected players instead.
     """
     from puckpilot.draft.eligibility import YAHOO_TO_POS
 
