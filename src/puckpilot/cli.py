@@ -485,9 +485,16 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
         from puckpilot.draft.wsfeed import load_yahoo_id_map
 
         root = Path(args.replay)
-        harvests = load_all(root if root.is_dir() else root.parent)
-        if not root.is_dir():
-            harvests = [h for h in harvests if root.name in str(root)]
+        if root.is_file():
+            # One named harvest. The old filter compared the path with itself,
+            # so naming a file replayed whichever harvest sorted first.
+            import json
+
+            from puckpilot.draft.farm import MockResult
+
+            harvests = [MockResult(**json.loads(root.read_text(encoding="utf-8")))]
+        else:
+            harvests = load_all(root)
         if not harvests:
             print(f"No harvested drafts under {root}", file=sys.stderr)
             return 2
@@ -498,6 +505,7 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
             interval=args.replay_interval,
             n_teams=harvests[0].n_teams,
             yahoo_names=load_yahoo_names(conn),
+            drop=_parse_drop(args.replay_drop),
         )
         print(f"Replaying {len(picks)} picks at {args.replay_interval}s/pick.")
     elif args.yahoo:
@@ -570,6 +578,15 @@ def _cmd_draft_preflight(args: argparse.Namespace) -> int:
     )
     print(report.text)
     return 1 if report.failed else 0
+
+
+def _parse_drop(raw: str | None) -> tuple[int, int] | None:
+    """`--replay-drop 20:10` -> (20, 10): the feed goes dead after 20 room
+    picks and misses the next 10, while the room keeps drafting."""
+    if not raw:
+        return None
+    start, _, count = str(raw).partition(":")
+    return int(start), int(count or 1)
 
 
 def _parse_seats(raw: str | None, default: int) -> list[int]:
@@ -1339,6 +1356,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.35,
         help="Seconds per pick when replaying (0 = as fast as possible)",
+    )
+    live.add_argument(
+        "--replay-drop",
+        default=None,
+        metavar="START:COUNT",
+        help="Failure drill: the replayed feed goes silent after START room picks and "
+        "misses COUNT of them while the room keeps drafting. Recover by hand.",
     )
     live.add_argument(
         "--web",

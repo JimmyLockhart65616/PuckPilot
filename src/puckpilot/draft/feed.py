@@ -309,6 +309,7 @@ class ReplayFeed:
         clock=time.monotonic,
         n_teams: int | None = None,
         yahoo_names: dict[str, str] | None = None,
+        drop: tuple[int, int] | None = None,
     ):
         # Rooms are whatever the lobby hands out - the harvested ones are
         # 14-team while this league is 12. Seat numbers from a differently
@@ -318,10 +319,17 @@ class ReplayFeed:
         self.source_teams = n_teams
         self.yahoo_to_nhl = yahoo_to_nhl
         self.yahoo_names = yahoo_names or {}
-        # Test hook for the failure drill: while paused, poll() delivers
-        # nothing, exactly as a dead socket would.
+        # The failure drill: while paused, poll() delivers nothing, exactly as
+        # a dead socket would, while the room keeps drafting. `drop=(start,
+        # count)` pauses after `start` room picks for the next `count`.
         self.paused = False
         self.missed = 0
+        self.drop = drop
+        # Room picks that are live on OUR board. A harvested mock has no
+        # keepers, so its pick of a player our league keeps never happened in
+        # our room and must not count toward how far the room has got.
+        self.room_picks = 0
+        self.skipped_keepers = 0
         self.interval = interval
         self._clock = clock
         self._picks = sorted(picks, key=lambda p: int(p.get("pick", 0)))
@@ -344,14 +352,22 @@ class ReplayFeed:
 
         row = self._picks[self._next]
         self._next += 1
+        yahoo_id = str(row.get("yahoo_id"))
+        nhl_id = self.yahoo_to_nhl.get(yahoo_id)
+        kept = {p.player_id for p in getattr(board, "keeper_picks", [])}
+        if nhl_id is not None and nhl_id in kept:
+            self.skipped_keepers += 1
+            return []
+        self.room_picks += 1
+        if self.drop is not None:
+            start, count = self.drop
+            self.paused = start < self.room_picks <= start + count
         if self.paused:
             # The room keeps drafting while the socket is dead: the pick
             # happens (`room_picks` moves) but this feed never delivers it,
             # which is exactly what the drill has to recover from by hand.
             self.missed += 1
             return []
-        yahoo_id = str(row.get("yahoo_id"))
-        nhl_id = self.yahoo_to_nhl.get(yahoo_id)
         seat = int(row.get("seat", 0))
         # Seat numbers from a differently shaped room mean nothing here, and
         # nor do its pick numbers, which count no keeper slots.
@@ -377,9 +393,11 @@ class ReplayFeed:
         return {
             "chosen": "replay",
             "frames": len(self._picks),
-            "picks_detected": self._next - self.missed,
-            "highest_pick": self._next,
-            "room_picks": self._next,
+            "picks_detected": self.room_picks - self.missed,
+            "highest_pick": self.room_picks,
+            "room_picks": self.room_picks,
+            "missed": self.missed,
+            "skipped_keepers": self.skipped_keepers,
             "gaps": [],
             "unmapped": len(self.unmapped),
             "unmapped_names": [

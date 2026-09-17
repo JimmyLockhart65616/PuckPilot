@@ -415,3 +415,41 @@ def test_an_unidentified_pick_in_a_keeper_slot_consumes_nothing():
     _, rejected = apply(b, [PickEvent(None, 0, "feed", pick_no=25)])
     assert b.made == 0
     assert "keeper slot" in rejected[0]
+
+
+def test_a_replay_skips_mock_picks_of_players_our_league_keeps():
+    """A harvested mock has no keepers. Its pick of a player we keep never
+    happened in our room, so it must not count toward how far the room got -
+    or the drift indicator reads a keeper-sized lie."""
+    from puckpilot.draft.feed import ReplayFeed
+
+    board = _board(keepers={1: [1]})
+    picks = [
+        {"pick": 1, "yahoo_id": "y1", "seat": 1},  # kept on our board
+        {"pick": 2, "yahoo_id": "y2", "seat": 2},
+    ]
+    feed = ReplayFeed(picks, {"y1": 1, "y2": 2}, interval=0.0)
+    apply(board, feed.poll(board))
+    apply(board, feed.poll(board))
+    assert feed.status()["room_picks"] == 1 and feed.skipped_keepers == 1
+    assert board.made == 1 and board.drift(feed.status()["room_picks"]) == 0
+
+
+def test_a_replay_drop_goes_silent_while_the_room_keeps_drafting():
+    from puckpilot.draft.feed import ReplayFeed
+
+    board = _board()
+    ids = [int(x) for x in board.u.ids[:6]]
+    picks = [{"pick": i + 1, "yahoo_id": f"y{i}", "seat": 1} for i in range(6)]
+    feed = ReplayFeed(picks, {f"y{i}": pid for i, pid in enumerate(ids)}, drop=(2, 3))
+    for _ in range(5):
+        apply(board, feed.poll(board))
+    status = feed.status()
+    assert status["room_picks"] == 5 and status["missed"] == 3
+    assert board.made == 2 and board.drift(status["room_picks"]) == 3
+    # recovered by hand: the three missed picks entered, drift clears
+    for pid in ids[2:5]:
+        board.record(pid)
+    assert board.drift(feed.status()["room_picks"]) == 0
+    apply(board, feed.poll(board))  # the feed is back
+    assert board.made == 6 and board.drift(feed.status()["room_picks"]) == 0
