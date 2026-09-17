@@ -777,6 +777,8 @@ def _cmd_draft_e2e(args: argparse.Namespace) -> int:
             every=args.every,
             names=names,
             expect_build=expect,
+            browser_every=args.browser,
+            stale_check=args.stale_check,
         )
         res = harness.run(polls, name, source, **kw)
         results.append(res)
@@ -1130,6 +1132,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--expect-build",
         action="store_true",
         help="Fail unless the relay's /healthz build matches this checkout",
+    )
+    e2e.add_argument(
+        "--browser",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Also open the guest link in headless Chrome (temporary profile) and check "
+        "the rendered page every N picks",
+    )
+    e2e.add_argument(
+        "--stale-check",
+        action="store_true",
+        help="With --browser: after the draft, stop pushing and require NOT LIVE",
     )
     e2e.add_argument("--verbose", action="store_true", help="Show board-building output")
     e2e.set_defaults(func=_cmd_draft_e2e)

@@ -243,6 +243,53 @@ def test_same_player_tolerates_spelling_not_substitution(a, b, same):
     assert e2e.same_player(a, b) is same
 
 
+# ---- a real browser on the guest link ------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def chrome():
+    """Skip where no Chrome is installed (CI) rather than fail."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        pw = sync_playwright().start()
+        try:
+            pw.chromium.launch(headless=True, channel="chrome").close()
+        finally:
+            pw.stop()
+    except Exception as e:  # playwright missing, or no Chrome channel
+        pytest.skip(f"headless Chrome unavailable: {e.__class__.__name__}")
+
+
+def test_the_guests_real_browser_follows_the_draft(chrome, relay):
+    board = draftkit.board()
+    harness = e2e.Harness(
+        board, relay, cats=draftkit.CATS, seats=(0,), every=4, board_rows=30, browser_every=12
+    )
+    result = harness.run(draftkit_polls(board, seed=6), "browser", "sim")
+    assert result.passed, result.summary()
+    assert result.browser_checks >= len(board.slots) // 12
+
+
+def test_the_guests_real_browser_is_told_when_the_console_dies(chrome, relay, monkeypatch):
+    from puckpilot.web import relay as relay_mod
+
+    monkeypatch.setattr(relay_mod, "STALE_AFTER_S", 6.0)
+    board = draftkit.board()
+    harness = e2e.Harness(
+        board,
+        relay,
+        cats=draftkit.CATS,
+        seats=(0,),
+        every=20,
+        board_rows=20,
+        browser_every=40,
+        stale_check=True,
+    )
+    result = harness.run(draftkit_polls(board, seed=6), "stale", "sim")
+    assert result.passed, result.summary()
+
+
 # ---- the console's push, directly -------------------------------------------------
 
 

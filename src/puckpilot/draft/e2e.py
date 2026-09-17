@@ -100,6 +100,7 @@ class E2EResult:
     room_picks: int | None = None
     checks: int = 0
     pushes: int = 0
+    browser_checks: int = 0
     violations: list[str] = field(default_factory=list)
     drift: list[str] = field(default_factory=list)
     unmapped: int = 0
@@ -128,7 +129,8 @@ class E2EResult:
         verdict = "PASS" if self.passed else f"FAIL ({len(self.violations)} violations)"
         lines = [
             f"{verdict}  {self.name} [{self.source}]  {self.picks}/{self.total} picks{room}, "
-            f"{self.checks} checks, {self.pushes} pushes, {self.names_checked} names matched, "
+            f"{self.checks} checks, {self.pushes} pushes, {self.browser_checks} browser checks, "
+            f"{self.names_checked} names matched, "
             f"{self.unknown} unrankable, {self.unmapped} unmapped, {self.seconds:.0f}s",
             f"      hops (median/max): {hops}",
         ]
@@ -236,6 +238,83 @@ def same_player(a: str, b: str) -> bool:
     return ratio >= SAME_PLAYER_RATIO and surname >= SAME_PLAYER_RATIO
 
 
+# ---- the guest's actual browser ---------------------------------------------------
+
+
+class BrowserProbe:
+    """A real headless browser on the guest link, polling like the second manager.
+
+    The Node test runs the page's script against payloads; this runs the page
+    itself, over the real network path, with the browser's own fetch, JSON
+    parser and DOM. A fresh temporary profile every time - never the logged-in
+    Yahoo profile, which a live console may be using.
+    """
+
+    def __init__(self, url: str, channel: str = "chrome"):
+        from playwright.sync_api import sync_playwright
+
+        self.url = url
+        self.errors: list[str] = []
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(headless=True, channel=channel)
+        self.page = self._browser.new_page()
+        self.page.on("pageerror", lambda e: self.errors.append(f"page error: {e}"))
+        self.page.on("console", self._console)
+        self.page.on("response", self._response)
+        self.page.goto(url, wait_until="domcontentloaded")
+
+    def _console(self, msg) -> None:
+        # A failed request is logged twice by the browser - once here without
+        # its URL - so it is recorded from the response instead.
+        if msg.type == "error" and not msg.text.startswith("Failed to load resource"):
+            self.errors.append(f"console: {msg.text}")
+
+    def _response(self, response) -> None:
+        from urllib.parse import urlparse
+
+        # Path only: the query string carries the guest key.
+        path = urlparse(response.url).path
+        # The browser asks for a favicon on its own, without the key the page
+        # carries, and the relay rightly refuses it.
+        if response.status >= 400 and path != "/favicon.ico":
+            self.errors.append(f"HTTP {response.status} on {path}")
+
+    def shows_pick(self, made: int, total: int, timeout_s: float = 12.0) -> str:
+        """ "" if the page caught up to `made`, else what it shows instead."""
+        want = f"{made}/{total}" if total and made >= total else f"{made + 1}/{total}"
+        try:
+            self.page.wait_for_function(
+                "w => document.getElementById('pick').textContent === w",
+                arg=want,
+                timeout=timeout_s * 1000,
+            )
+        except Exception:
+            shown = self.page.text_content("#pick")
+            banner = (self.page.text_content("#banner") or "").strip()
+            return f"browser shows pick {shown!r}, expected {want!r} (banner: {banner[:100]!r})"
+        text = self.page.inner_text("body")
+        for tell in ("undefined", "NaN"):
+            if tell in text:
+                return f"browser page contains {tell!r}"
+        if not self.page.is_hidden("#banner"):
+            return f"browser shows a banner: {self.page.text_content('#banner')!r}"
+        return ""
+
+    def says_not_live(self, timeout_s: float) -> bool:
+        try:
+            self.page.wait_for_function(
+                "() => document.getElementById('banner').textContent.includes('NOT LIVE')",
+                timeout=timeout_s * 1000,
+            )
+            return True
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        self._browser.close()
+        self._pw.stop()
+
+
 # ---- the run ----------------------------------------------------------------------
 
 
@@ -253,6 +332,8 @@ class Harness:
         board_rows: int = 300,
         names: dict[int, YahooRow] | None = None,
         expect_build: str | None = None,
+        browser_every: int = 0,
+        stale_check: bool = False,
         progress: Progress = print,
     ):
         self.board = board
@@ -261,6 +342,10 @@ class Harness:
         self.every = max(1, every)
         self.names = names or {}
         self.expect_build = expect_build
+        # 0 = no browser. Otherwise a real headless browser on the guest link is
+        # checked every N picks and at the end.
+        self.browser_every = browser_every
+        self.stale_check = stale_check
         self.progress = progress
         self.state = LiveState(board=board, feed=None, top=top, board_rows=board_rows, cats=cats)
 
@@ -350,6 +435,14 @@ class Harness:
         if _http(f"{url}/undo?k={self.relay.owner}", "POST", b"")[0] == 200:
             result.violations.append("relay accepted an undo")
 
+    def _look(self, result: E2EResult, probe: BrowserProbe) -> None:
+        t = time.perf_counter()
+        problem = probe.shows_pick(self.board.made, len(self.board.slots))
+        result.time("browser", (time.perf_counter() - t) * 1000)
+        result.browser_checks += 1
+        if problem:
+            result.violations.append(f"guest browser at pick {self.board.made}: {problem}")
+
     # -- the draft ----------------------------------------------------------------
 
     def run(
@@ -368,9 +461,13 @@ class Harness:
         t0 = time.perf_counter()
         local = serve(self.state, port=0)
         local_url = f"http://127.0.0.1:{local.server_address[1]}"
+        probe = None
         try:
             self._boundary(result)
             self._verify(result, local_url)
+            if self.browser_every:
+                probe = BrowserProbe(f"{self.relay.url}/?seat={self.seats[0]}&k={self.relay.guest}")
+                self._look(result, probe)
             for poll in polls:
                 if board.complete:
                     break
@@ -403,9 +500,26 @@ class Harness:
                         )
                 if board.made % self.every == 0 or board.complete:
                     self._verify(result, local_url)
+                    if probe and board.made % self.browser_every == 0:
+                        self._look(result, probe)
             if board.made % self.every:
                 self._verify(result, local_url)
+            if probe:
+                self._look(result, probe)
+                if self.stale_check:
+                    # Stop pushing, as a console that died would. The guest
+                    # must be told within a few heartbeats.
+                    from puckpilot.web.relay import STALE_AFTER_S
+
+                    if not probe.says_not_live(STALE_AFTER_S + 20):
+                        result.violations.append(
+                            "browser never said NOT LIVE after the console stopped pushing"
+                        )
+                    result.browser_checks += 1
+                result.violations += probe.errors
         finally:
+            if probe:
+                probe.close()
             local.shutdown()
             local.server_close()
 
