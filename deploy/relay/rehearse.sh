@@ -31,6 +31,9 @@ fi
 
 PROD_IMAGE=$(az containerapp show -n "$PROD_APP" -g "$RG" --query "properties.template.containers[0].image" -o tsv)
 ENV_ID=$(az containerapp show -n "$PROD_APP" -g "$RG" --query "properties.environmentId" -o tsv)
+# The name, not the id: Git Bash rewrites a leading "/subscriptions/..." into a
+# Windows path before az sees it. The environment is in the same group anyway.
+ENV_NAME=${ENV_ID##*/}
 REGISTRY=${PROD_IMAGE%%/*}
 ACR=${REGISTRY%%.*}
 SHA=$(git rev-parse --short=12 HEAD)
@@ -63,7 +66,7 @@ if az containerapp show -n "$APP" -g "$RG" -o none 2>/dev/null; then
     --revision-suffix "r$(date +%s)" -o none
 else
   echo "==> creating $APP in the production environment"
-  az containerapp create -n "$APP" -g "$RG" --environment "$ENV_ID" \
+  az containerapp create -n "$APP" -g "$RG" --environment "$ENV_NAME" \
     --image "$REGISTRY/puckpilot-relay:$TAG" \
     --registry-server "$REGISTRY" \
     --target-port 8080 --ingress external \
