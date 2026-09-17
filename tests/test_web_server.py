@@ -468,3 +468,214 @@ def test_an_empty_watchlist_is_an_empty_list_not_missing():
     srv = _real_server()
     snap = srv.state.snapshot(0)
     assert snap["market_watchlist"] == []
+
+
+# ---- the second pick source: taken / unknown / kept -------------------------
+#
+# The same threat model as /undo, applied to every new route: nothing reachable
+# by GET, nothing cross-site, nothing by a guest. Plus the behaviour that makes
+# them usable on a clock - a refusal reads as a sentence, never a traceback.
+
+
+def _post(srv, path, key=None):
+    headers = {"Sec-Fetch-Site": "same-origin"}
+    if key:
+        headers["X-PuckPilot-Key"] = key
+    status, body = _request(srv, path, method="POST", headers=headers)
+    return status, (json.loads(body) if body else {})
+
+
+def test_new_mutating_routes_refuse_a_bare_get():
+    srv = _real_server()
+    try:
+        pid = int(srv.state.board.u.ids[0])
+        for path in (f"/taken?player={pid}", "/unknown", f"/kept?player={pid}&by=1", "/unkept"):
+            status, _ = _request(srv, path)
+            assert status == 405, path
+        assert srv.state.board.made == 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_new_mutating_routes_refuse_cross_site_and_rebound_hosts():
+    srv = _real_server()
+    try:
+        pid = int(srv.state.board.u.ids[0])
+        for headers in (
+            {"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"},
+            {"Host": "evil.example.com", "Sec-Fetch-Site": "same-origin"},
+        ):
+            for path in (f"/taken?player={pid}", "/unknown"):
+                status, _ = _request(srv, path, method="POST", headers=headers)
+                assert status == 403, (path, headers)
+        assert srv.state.board.made == 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_guest_cannot_enter_picks():
+    srv = _real_server(access=_access())
+    try:
+        pid = int(srv.state.board.u.ids[0])
+        for path in (f"/taken?player={pid}", "/unknown", f"/kept?player={pid}&by=1"):
+            status, body = _post(srv, path, key="guest-key")
+            assert status == 403 and "owner-only" in body["error"], path
+        assert srv.state.board.made == 0
+        status, body = _post(srv, f"/taken?player={pid}", key="owner-key")
+        assert status == 200 and body["ok"] and srv.state.board.made == 1
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_taken_by_id_records_for_the_seat_on_the_clock():
+    srv = _real_server()
+    board = srv.state.board
+    try:
+        pid = int(board.u.ids[3])
+        status, body = _post(srv, f"/taken?player={pid}")
+        assert status == 200 and body["ok"]
+        assert board.made == 1 and board.picks[0].player_id == pid
+        assert board.picks[0].seat == 0 and board.picks[0].source == "manual"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_taken_by_name_with_an_explicit_seat():
+    srv = _real_server()
+    board = srv.state.board
+    try:
+        status, body = _post(srv, "/taken?player=Player%20DA&by=2")
+        assert body["ok"], body
+        assert board.picks[0].name == "Player DA" and board.picks[0].seat == 2
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_taking_the_same_player_twice_is_an_answer_not_an_error():
+    srv = _real_server()
+    try:
+        pid = int(srv.state.board.u.ids[0])
+        _post(srv, f"/taken?player={pid}")
+        status, body = _post(srv, f"/taken?player={pid}")
+        assert status == 200 and body["ok"] is False
+        assert "already off the board" in body["result"]
+        assert srv.state.board.made == 1
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_an_ambiguous_name_lists_the_candidates_instead_of_guessing():
+    srv = _real_server()
+    try:
+        status, body = _post(srv, "/taken?player=player")
+        assert body["ok"] is False and "several players" in body["result"]
+        assert srv.state.board.made == 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_bad_drafting_seat_is_a_400():
+    srv = _real_server()
+    try:
+        for by in ("99", "-1", "x"):
+            status, _ = _post(srv, f"/unknown?by={by}")
+            assert status == 400, by
+        assert srv.state.board.made == 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_unknown_advances_the_clock_and_undo_takes_it_back():
+    srv = _real_server()
+    board = srv.state.board
+    try:
+        status, body = _post(srv, "/unknown")
+        assert body["ok"] and board.made == 1 and board.picks[0].row == -1
+        _post(srv, "/undo")
+        assert board.made == 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_kept_removes_a_player_without_using_a_pick_and_needs_a_seat():
+    srv = _real_server()
+    board = srv.state.board
+    try:
+        pid = int(board.u.ids[1])
+        status, _ = _post(srv, f"/kept?player={pid}")
+        assert status == 400
+        status, body = _post(srv, f"/kept?player={pid}&by=2")
+        assert body["ok"], body
+        assert board.made == 0 and not board.avail[board._row_of[pid]]
+        assert [p.player_id for p in board.roster(2)] == [pid]
+        status, body = _post(srv, f"/unkept?player={pid}")
+        assert body["ok"] and board.avail[board._row_of[pid]]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+class _StubFeed:
+    name = "websocket"
+    last_error = None
+
+    def __init__(self, room_picks, unmapped=()):
+        self.room = room_picks
+        self.unmapped = list(unmapped)
+
+    def poll(self, board):
+        return []
+
+    def status(self):
+        return {
+            "chosen": "websocket",
+            "room_picks": self.room,
+            "highest_pick": self.room,
+            "unmapped": len(self.unmapped),
+            "unmapped_names": self.unmapped,
+            "gaps": [],
+        }
+
+
+def test_the_snapshot_says_how_far_behind_the_room_the_board_is():
+    """A feed that simply stopped hearing the room has no gaps at all, and is
+    still wrong about every survival probability on screen."""
+    srv = _real_server()
+    srv.state.feed = _StubFeed(room_picks=5, unmapped=["Ivan Demidov (not on our board)"])
+    try:
+        snap = srv.state.snapshot(0)
+        assert snap["drift"] == 5 and snap["room_picks"] == 5
+        assert snap["unmapped_names"] == ["Ivan Demidov (not on our board)"]
+        for _ in range(5):
+            srv.state.unknown()
+        assert srv.state.snapshot(0)["drift"] == 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_board_rows_carry_the_player_id_the_row_control_posts():
+    srv = _real_server()
+    try:
+        snap = srv.state.snapshot(0)
+        assert all(isinstance(r["id"], int) for r in snap["board"])
+        assert snap["recent"] == [] and snap["warnings"] == []
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_the_page_has_every_hand_entry_control():
+    from puckpilot.web.server import PAGE
+
+    for marker in ('id="btn-taken"', 'id="btn-unknown"', 'id="btn-kept"', "post('/taken'"):
+        assert marker in PAGE, marker

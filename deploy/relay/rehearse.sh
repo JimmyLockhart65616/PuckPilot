@@ -58,36 +58,39 @@ OWNER_KEY=$($PY -c "import secrets;print(secrets.token_urlsafe(24))")
 GUEST_KEY=$($PY -c "import secrets;print(secrets.token_urlsafe(24))")
 
 trap cleanup EXIT
+# Always a fresh app. Reusing one looked cheaper and was wrong: new secrets do
+# not reach a running revision until it restarts, and with the relay code
+# unchanged the build check passed against the old revision holding the old
+# keys - every push then came back 403.
 if az containerapp show -n "$APP" -g "$RG" -o none 2>/dev/null; then
-  echo "==> $APP exists; updating image and keys"
-  az containerapp secret set -n "$APP" -g "$RG" \
-    --secrets "owner-key=$OWNER_KEY" "guest-key=$GUEST_KEY" -o none
-  az containerapp update -n "$APP" -g "$RG" --image "$REGISTRY/puckpilot-relay:$TAG" \
-    --revision-suffix "r$(date +%s)" -o none
-else
-  echo "==> creating $APP in the production environment"
-  az containerapp create -n "$APP" -g "$RG" --environment "$ENV_NAME" \
-    --image "$REGISTRY/puckpilot-relay:$TAG" \
-    --registry-server "$REGISTRY" \
-    --target-port 8080 --ingress external \
-    --cpu 0.25 --memory 0.5Gi \
-    --min-replicas 1 --max-replicas 1 \
-    --secrets "owner-key=$OWNER_KEY" "guest-key=$GUEST_KEY" \
-    --env-vars "PUCKPILOT_OWNER_KEY=secretref:owner-key" "PUCKPILOT_GUEST_KEY=secretref:guest-key" \
-    -o none
+  echo "==> removing the previous $APP"
+  az containerapp delete -n "$APP" -g "$RG" --yes -o none
 fi
+echo "==> creating $APP in the production environment"
+az containerapp create -n "$APP" -g "$RG" --environment "$ENV_NAME" \
+  --image "$REGISTRY/puckpilot-relay:$TAG" \
+  --registry-server "$REGISTRY" \
+  --target-port 8080 --ingress external \
+  --cpu 0.25 --memory 0.5Gi \
+  --min-replicas 1 --max-replicas 1 \
+  --secrets "owner-key=$OWNER_KEY" "guest-key=$GUEST_KEY" \
+  --env-vars "PUCKPILOT_OWNER_KEY=secretref:owner-key" "PUCKPILOT_GUEST_KEY=secretref:guest-key" \
+  -o none
 
 FQDN=$(az containerapp show -n "$APP" -g "$RG" --query properties.configuration.ingress.fqdn -o tsv)
-echo "==> waiting for https://$FQDN/healthz to report $EXPECT"
-GOT=""
+echo "==> waiting for https://$FQDN to serve build $EXPECT and accept this run's guest key"
+GOT="" KEYED=""
 for _ in $(seq 1 90); do
   GOT=$(curl -fsS "https://$FQDN/healthz" 2>/dev/null \
         | $PY -c "import json,sys; print(json.load(sys.stdin).get('build',''))" 2>/dev/null || true)
-  [ "$GOT" = "$EXPECT" ] && break
+  # The key goes in a header, not the URL, so it never reaches a log line.
+  KEYED=$(curl -s -o /dev/null -w "%{http_code}" -H "X-PuckPilot-Key: $GUEST_KEY" \
+          "https://$FQDN/state" 2>/dev/null || true)
+  [ "$GOT" = "$EXPECT" ] && [ "$KEYED" = "200" ] && break
   sleep 5
 done
-if [ "$GOT" != "$EXPECT" ]; then
-  echo "rehearsal relay never came up on build $EXPECT (got '${GOT:-nothing}')" >&2
+if [ "$GOT" != "$EXPECT" ] || [ "$KEYED" != "200" ]; then
+  echo "rehearsal relay not ready: build '${GOT:-nothing}' (want $EXPECT), guest key HTTP ${KEYED:-none}" >&2
   exit 1
 fi
 

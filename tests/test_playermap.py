@@ -160,3 +160,53 @@ def test_reresolve_does_not_double_assign_an_nhl_id(db):
         "SELECT nhl_player_id FROM yahoo_player_map WHERE player_key = '477.p.2'"
     ).fetchone()
     assert row[0] is None
+
+
+# ---- which league's ADP the live board uses ---------------------------------
+#
+# Without ADP the board silently ran on a proxy. Every way of not getting it is
+# now named, with the keys that do exist listed - a typo is the likeliest cause.
+
+
+def _adp_row(db, key, league, nhl_id, rank):
+    db.execute(
+        "INSERT INTO yahoo_player_map (player_key, league_key, full_name, nhl_player_id,"
+        " adp_rank) VALUES (?, ?, ?, ?, ?)",
+        (key, league, f"Player {key}", nhl_id, rank),
+    )
+
+
+def test_an_explicit_adp_key_wins(db):
+    from puckpilot.yahoo.playermap import resolve_adp_key
+
+    _adp_row(db, "477.p.1", "477.l.1", 1, 1)
+    _adp_row(db, "477.p.2", "477.l.2", 2, 1)
+    key, notes = resolve_adp_key(db, "477.l.2", None)
+    assert key == "477.l.2" and notes == []
+
+
+def test_a_bare_yahoo_flag_uses_the_only_mapped_league_and_says_so(db):
+    from puckpilot.yahoo.playermap import resolve_adp_key
+
+    _adp_row(db, "477.p.1", "477.l.1", 1, 1)
+    key, notes = resolve_adp_key(db, None, "auto")
+    assert key == "477.l.1"
+    assert "only mapped league" in notes[0]
+
+
+def test_a_mistyped_key_warns_and_lists_the_real_ones(db):
+    from puckpilot.yahoo.playermap import resolve_adp_key
+
+    _adp_row(db, "477.p.1", "477.l.1", 1, 1)
+    key, notes = resolve_adp_key(db, "477.l.9", None)
+    assert key is None
+    assert notes[0].startswith("WARNING") and "477.l.1" in notes[0]
+
+
+def test_several_leagues_and_no_key_is_a_warning_not_a_guess(db):
+    from puckpilot.yahoo.playermap import resolve_adp_key
+
+    _adp_row(db, "477.p.1", "477.l.1", 1, 1)
+    _adp_row(db, "477.p.2", "477.l.2", 2, 1)
+    key, notes = resolve_adp_key(db, None, "auto")
+    assert key is None and notes[0].startswith("WARNING")

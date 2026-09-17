@@ -102,6 +102,13 @@ class RelayState:
                     "seconds_since_pick": None,
                     "relay_age": None,
                     "stale": False,
+                    "drift": 0,
+                    "room_picks": 0,
+                    "unmapped_names": [],
+                    "warnings": [],
+                    "adp_source": None,
+                    "recent": [],
+                    "feed_name": None,
                     "diagnostics": "no snapshot pushed yet",
                 }
             if seat is None or seat not in self.seats:

@@ -273,12 +273,20 @@ def sync_current_rosters(
                     # accented letters. See store.is_lossy_copy.
                     renamed += store.repair_player_name(conn, int(pid), _roster_name(p))
         time.sleep(delay)
+    # Recorded so `draft preflight` can say whether this has run for the season
+    # being drafted. It is a separate command, easy to forget, and its absence
+    # once corrupted goalie win projections by up to 13 wins - silently.
+    if seen:
+        store.set_meta(conn, ROSTERS_META.format(season=season), f"{len(teams)} teams, {seen}")
     conn.commit()
     progress(
         f"  {len(teams)} rosters, {seen} players, {changed} corrected ({new} newly seen), "
         f"{renamed} names repaired"
     )
     return {"teams": len(teams), "players": seen, "changed": changed, "new": new, "renamed": renamed}
+
+
+ROSTERS_META = "rosters:{season}"
 
 
 def _roster_name(p: dict) -> str:

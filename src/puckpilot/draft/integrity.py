@@ -182,6 +182,44 @@ def snapshot_violations(
     if snap.get("supply") != want_supply:
         bad("supply does not match the board")
 
+    # ---- ids, where rows carry them -----------------------------------------
+    # A row's id is what a one-click "taken" acts on, so it must name exactly the
+    # player the row shows - a namesake would strike the wrong man off the board.
+    row_of = getattr(board, "_row_of", {})
+    for kind, items, market in (
+        ("board", rows, False),
+        ("market watchlist", snap.get("market_watchlist") or [], True),
+    ):
+        for item in items:
+            if "id" not in item:
+                continue
+            r = row_of.get(int(item["id"])) if item["id"] is not None else None
+            if r is None:
+                bad(f"{kind} row {item.get('name')!r} carries id {item['id']!r} not on the board")
+            elif not board.avail[r]:
+                bad(f"{kind} row id {item['id']} ({item.get('name')!r}) is already drafted")
+            elif str(u.names[r]) != item.get("name") or str(u.pos[r]) != item.get("position"):
+                shown = item.get("name")
+                bad(f"{kind} row id {item['id']} is {u.names[r]!r}, the row says {shown!r}")
+            elif is_market(r) != market:
+                bad(f"{kind} row id {item['id']} has the wrong source")
+
+    # ---- recent picks and drift, where the view reports them -----------------
+    if "recent" in snap:
+        tail = board.picks[-len(snap["recent"]) :] if snap["recent"] else []
+        want_recent = [[p.overall + 1, p.seat, p.name, p.source] for p in reversed(tail)]
+        got_recent = [
+            [p.get("pick"), p.get("seat"), p.get("name"), p.get("source")] for p in snap["recent"]
+        ]
+        if got_recent != want_recent:
+            bad("recent picks do not match the board's last picks")
+        if board.picks and not snap["recent"]:
+            bad("recent picks is empty after picks were made")
+    if snap.get("room_picks") and hasattr(board, "drift"):
+        want_drift = board.drift(snap["room_picks"])
+        if snap.get("drift") != want_drift:
+            bad(f"drift {snap.get('drift')!r}, board says {want_drift!r}")
+
     # ---- the room panels ----------------------------------------------------
     for p in snap.get("market_watchlist") or []:
         check_row("market watchlist", p, market_expected=True)

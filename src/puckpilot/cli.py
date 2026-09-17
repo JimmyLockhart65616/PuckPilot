@@ -209,6 +209,194 @@ def _cmd_yahoo_playermap(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_yahoo_keepers(args: argparse.Namespace) -> int:
+    """Keeper contracts reconstructed from the league's Yahoo draft history.
+
+    Prints; never writes the league file, which is private and hand-kept.
+    """
+    from pathlib import Path
+
+    from puckpilot.data import store
+    from puckpilot.keepers import _norm
+    from puckpilot.yahoo.keeperhistory import derive_contracts, fetch_history
+    from puckpilot.yahoo.session import YahooSession, YahooSessionError
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    league = _league(args)
+    profile = settings._resolve(Path("secrets/chrome-profile"))
+    try:
+        with YahooSession(profile) as session:
+            key = args.league_key or (session.league_keys("nhl") or [None])[0]
+            if not key:
+                print("No NHL league found for this account.", file=sys.stderr)
+                return 2
+            print(f"Reading keeper history for {key}...")
+            history, current, _meta = fetch_history(
+                session, key, depth=league.keeper_years + 1, progress=print
+            )
+    except YahooSessionError as e:
+        print(f"\n{e}", file=sys.stderr)
+        return 1
+    if not history:
+        print("No previous seasons found - nothing to reconstruct contracts from.")
+        return 1
+
+    report = derive_contracts(
+        history,
+        current,
+        n_keepers=league.n_keepers,
+        keeper_years=league.keeper_years,
+        roster_rounds=league.shape.roster_size,
+    )
+
+    # Our view of each candidate: projected VORP for the season being drafted
+    # and Yahoo's ADP rank, both through the player map (Yahoo ids are stable
+    # across seasons, so a bare id finds a player in this season's map).
+    bare_to_nhl: dict[str, int] = {}
+    bare_adp: dict[str, int] = {}
+    for pkey, nhl_id, rank in conn.execute(
+        "SELECT player_key, nhl_player_id, adp_rank FROM yahoo_player_map"
+    ):
+        b = str(pkey).rsplit(".", 1)[-1]
+        if nhl_id is not None:
+            bare_to_nhl[b] = int(nhl_id)
+        if rank is not None:
+            bare_adp[b] = int(rank)
+    vorp: dict[int, float] = {}
+    try:
+        from puckpilot.draft.sim import build_universe
+
+        u = build_universe(conn, args.season, tuple(TRAIN_SEASONS), league)
+        vorp = {int(p): float(v) for p, v in zip(u.ids, u.vorp, strict=True)}
+    except Exception as e:  # projections are a nicety here, not the point
+        print(f"  (no projections: {e.__class__.__name__}: {e})")
+
+    def label(b: str) -> str:
+        name = report.names.get(b, f"yahoo {b}")
+        bits = []
+        if bare_to_nhl.get(b) in vorp:
+            bits.append(f"VORP {vorp[bare_to_nhl[b]]:+.1f}")
+        if b in bare_adp:
+            bits.append(f"ADP {bare_adp[b]}")
+        return f"{name} ({', '.join(bits)})" if bits else name
+
+    # Seats: Yahoo's own draft order once it is set, else --order.
+    order = [s.strip().lower() for s in (args.order or "").split(",") if s.strip()]
+    seat_of: dict[str, int] = {}
+    for team in current.values():
+        pos = team.get("draft_position")
+        if str(pos or "").isdigit():
+            seat_of[str(team.get("guid"))] = int(pos) - 1
+    for m in report.managers:
+        if m.guid in seat_of or not order:
+            continue
+        for i, want in enumerate(order):
+            if want in (m.nickname.lower(), m.team_name.lower(), str(m.current_team_key).lower()):
+                seat_of[m.guid] = i
+
+    season_label = f"{args.season[:4]}-{args.season[6:]}"
+    print()
+    print(f"Keeper contracts going into {season_label}, from {', '.join(report.seasons)}")
+    print(f"({league.n_keepers} keepers/team, a contract runs {league.keeper_years} keeps)")
+    print(
+        "Keeper rounds found per season: "
+        + ", ".join(f"{k} last {n}" for k, n in report.keeper_rounds.items())
+    )
+    for m in report.managers:
+        seat = seat_of.get(m.guid)
+        print()
+        print(
+            f"{m.nickname} - {m.team_name} ({m.current_team_key or 'not in this season'})"
+            f"  seat {seat if seat is not None else '?'}"
+        )
+        cont = ", ".join(f"{label(b)} kept {n}x" for b, n in m.continuing) or "none"
+        print(f"  continuing: {cont}")
+        if m.expired:
+            print(f"  expired:    {', '.join(report.names.get(b, b) for b in m.expired)}")
+        slots = m.open_slots(league.n_keepers)
+        if slots:
+            ranked = sorted(
+                m.candidates,
+                key=lambda b: -vorp.get(bare_to_nhl.get(b, -1), float("-inf")),
+            )
+            top = ", ".join(label(b) for b in ranked[: args.candidates])
+            print(f"  {slots} open slot(s); first-year keep candidates by our VORP: {top}")
+    if report.lapsed:
+        print()
+        print(
+            "Kept last season but on no roster at its end: "
+            + ", ".join(report.names.get(b, b) for b in report.lapsed)
+        )
+
+    # Cross-check against the league file, by normalized name.
+    listed = {_norm(n.split("(")[0]): n for n in league.keepers_for_season(args.season)}
+    continuing = {
+        _norm(report.names.get(b, "")): report.names.get(b, b)
+        for m in report.managers
+        for b, _n in m.continuing
+    }
+    print()
+    print(f"Against keepers.by_season.{args.season} ({len(listed)} listed):")
+    missing = [continuing[k] for k in continuing if k not in listed]
+    extra = [listed[k] for k in listed if k not in continuing]
+    print(f"  continuing contracts missing from the file: {', '.join(missing) or 'none'}")
+    print(f"  listed but not a continuing contract:       {', '.join(extra) or 'none'}")
+    print("  (a listed name that is not continuing may be a declared first-year keep - check)")
+
+    print()
+    print("Suggested TOML - continuing contracts only; add first-year keeps as declared:")
+    print(f"[keepers.owners.{args.season}]")
+    for m in sorted(report.managers, key=lambda m: seat_of.get(m.guid, 99)):
+        seat = seat_of.get(m.guid)
+        names = ", ".join(f'"{report.names.get(b, b)}"' for b, _n in m.continuing)
+        prefix = f'"{seat}"' if seat is not None else "# seat ?"
+        print(f"{prefix} = [{names}]  # {m.nickname}")
+
+    # Saved for `draft preflight`, which runs offline: it can then name the
+    # likely first-year keeps that are still shown as available.
+    import datetime
+    import json
+
+    def player(b: str) -> dict:
+        nhl = bare_to_nhl.get(b)
+        return {
+            "name": report.names.get(b, b),
+            "nhl_id": nhl,
+            "vorp": vorp.get(nhl) if nhl is not None else None,
+            "adp": bare_adp.get(b),
+        }
+
+    saved = {
+        "season": args.season,
+        "league_key": key,
+        "derived_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "from": report.seasons,
+        "keeper_rounds": report.keeper_rounds,
+        "managers": [
+            {
+                "nickname": m.nickname,
+                "team_name": m.team_name,
+                "team_key": m.current_team_key,
+                "seat": seat_of.get(m.guid),
+                "continuing": [{**player(b), "times_kept": n} for b, n in m.continuing],
+                "expired": [player(b) for b in m.expired],
+                "open_slots": m.open_slots(league.n_keepers),
+                "candidates": sorted(
+                    (player(b) for b in m.candidates),
+                    key=lambda p: p["adp"] if p["adp"] is not None else 10_000,
+                )[:10],
+            }
+            for m in report.managers
+        ],
+    }
+    out = settings._resolve(Path("data")) / f"keepers-{args.season}.json"
+    out.write_text(json.dumps(saved, indent=1), encoding="utf-8")
+    print()
+    print(f"Saved for `ppilot draft preflight`: {out}")
+    return 0
+
+
 def _cmd_draft_capture(args: argparse.Namespace) -> int:
     from pathlib import Path
 
@@ -274,7 +462,19 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
     conn = store.connect(settings.resolved_db_path)
     league = _league(args)
 
+    from puckpilot.draft.wsfeed import load_yahoo_names
+    from puckpilot.yahoo.playermap import load_adp, resolve_adp_key
+
     adp, feed, ctx, pump_fn, league_key = None, None, None, None, None
+    # The ADP source is named on its own, not inferred from whether --yahoo
+    # happened to carry a dot: a bare --yahoo used to build the board on the
+    # proxy ADP and say nothing. Replays use it too, so a rehearsal runs on
+    # the same survival numbers the real draft will.
+    if args.yahoo or args.adp_league_key or args.replay:
+        league_key, notes = resolve_adp_key(conn, args.adp_league_key, args.yahoo)
+        for note in notes:
+            print(note, file=sys.stderr if note.startswith("WARNING") else sys.stdout)
+        adp = load_adp(conn, league_key) if league_key else None
     if args.replay:
         # A draft that already happened, played back. Same poll(board) the
         # websocket drives, so this exercises the whole console offline - no
@@ -285,9 +485,16 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
         from puckpilot.draft.wsfeed import load_yahoo_id_map
 
         root = Path(args.replay)
-        harvests = load_all(root if root.is_dir() else root.parent)
-        if not root.is_dir():
-            harvests = [h for h in harvests if root.name in str(root)]
+        if root.is_file():
+            # One named harvest. The old filter compared the path with itself,
+            # so naming a file replayed whichever harvest sorted first.
+            import json
+
+            from puckpilot.draft.farm import MockResult
+
+            harvests = [MockResult(**json.loads(root.read_text(encoding="utf-8")))]
+        else:
+            harvests = load_all(root)
         if not harvests:
             print(f"No harvested drafts under {root}", file=sys.stderr)
             return 2
@@ -297,6 +504,8 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
             load_yahoo_id_map(conn),
             interval=args.replay_interval,
             n_teams=harvests[0].n_teams,
+            yahoo_names=load_yahoo_names(conn),
+            drop=_parse_drop(args.replay_drop),
         )
         print(f"Replaying {len(picks)} picks at {args.replay_interval}s/pick.")
     elif args.yahoo:
@@ -305,7 +514,6 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
         from playwright.sync_api import sync_playwright
 
         from puckpilot.draft.wsfeed import WebsocketFeed, load_yahoo_id_map, pump
-        from puckpilot.yahoo.playermap import load_adp
 
         profile = settings._resolve(Path("secrets/chrome-profile"))
         pw = sync_playwright().start()
@@ -313,9 +521,7 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         with contextlib.suppress(Exception):
             page.goto(args.room, wait_until="domcontentloaded")
-        feed = WebsocketFeed(ctx, load_yahoo_id_map(conn))
-        league_key = args.yahoo if "." in str(args.yahoo) else None
-        adp = load_adp(conn, league_key) if league_key else None
+        feed = WebsocketFeed(ctx, load_yahoo_id_map(conn), load_yahoo_names(conn))
         pump_fn = partial(pump, ctx)
         print(f"Websocket feed armed ({len(feed.yahoo_to_nhl)} ids). Join your draft room.")
 
@@ -332,6 +538,55 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
         return _serve_live(board, feed, ctx, args, league)
     run_live(board, feed=feed, cfg=LiveConfig(top=args.top), pump=pump_fn)
     return 0
+
+
+def _cmd_draft_preflight(args: argparse.Namespace) -> int:
+    """Everything that would silently corrupt the draft-night board, in one
+    command that exits non-zero on any of it."""
+    from pathlib import Path
+
+    from puckpilot.data import store
+    from puckpilot.preflight import run_preflight
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    # Load the file directly: the CLI's usual path falls back to generic
+    # settings with one stderr line, which is exactly what this must catch.
+    path = Path(args.league) if getattr(args, "league", None) else settings.resolved_league_path
+
+    prober = None
+    if not args.offline:
+        from puckpilot.yahoo.probe import probe
+
+        def prober():
+            return probe(settings)
+
+    import json
+
+    saved = settings._resolve(Path("data")) / f"keepers-{args.season}.json"
+    history = json.loads(saved.read_text(encoding="utf-8")) if saved.is_file() else None
+
+    report, _board = run_preflight(
+        conn,
+        path,
+        seat=args.seat,
+        season=args.season,
+        adp_league_key=args.adp_league_key,
+        prober=prober,
+        progress=print if args.verbose else (lambda _m: None),
+        keeper_history=history,
+    )
+    print(report.text)
+    return 1 if report.failed else 0
+
+
+def _parse_drop(raw: str | None) -> tuple[int, int] | None:
+    """`--replay-drop 20:10` -> (20, 10): the feed goes dead after 20 room
+    picks and misses the next 10, while the room keeps drafting."""
+    if not raw:
+        return None
+    start, _, count = str(raw).partition(":")
+    return int(start), int(count or 1)
 
 
 def _parse_seats(raw: str | None, default: int) -> list[int]:
@@ -780,7 +1035,12 @@ def _cmd_draft_e2e(args: argparse.Namespace) -> int:
             browser_every=args.browser,
             stale_check=args.stale_check,
         )
-        res = harness.run(polls, name, source, **kw)
+        try:
+            res = harness.run(polls, name, source, **kw)
+        except Exception as e:
+            # One broken draft must not hide the rest of the run's results.
+            res = e2e.E2EResult(name=name, source=source)
+            res.violations.append(f"harness crashed: {e.__class__.__name__}: {e}")
         results.append(res)
         say(res.summary())
 
@@ -807,7 +1067,8 @@ def _cmd_draft_e2e(args: argparse.Namespace) -> int:
                 feed = ReplayFeed(h.picks, idmap, interval=0, n_teams=h.n_teams)
                 polls = e2e.replay_polls(feed, len(h.picks) + 5)
                 run(board, polls, f"room {h.started[:16]}", "harvest", cats=league.all_cats,
-                    room_picks=len(h.picks), unmapped=lambda f=feed: f.unmapped)  # fmt: skip
+                    room_picks=len(h.picks), unmapped=lambda f=feed: f.unmapped,
+                    feed=feed)  # fmt: skip
 
         if "capture" in sources:
             dirs = sorted(p.parent for p in Path(args.captures).glob("*/websocket.jsonl"))
@@ -829,7 +1090,7 @@ def _cmd_draft_e2e(args: argparse.Namespace) -> int:
                 )  # fmt: skip
                 run(board, e2e.frame_polls(frames, feed), f"capture {d.name}", "capture",
                     cats=league.all_cats, room_picks=room_picks,
-                    unmapped=lambda f=feed: f.state.unmapped)  # fmt: skip
+                    unmapped=lambda f=feed: f.state.unmapped, feed=feed)  # fmt: skip
     finally:
         relay.close()
 
@@ -989,6 +1250,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip Yahoo; re-match already-fetched unmatched rows against nhl_players now",
     )
     ym.set_defaults(func=_cmd_yahoo_playermap)
+
+    yk = yahoo_sub.add_parser(
+        "keepers",
+        help="Reconstruct keeper contracts from the league's Yahoo draft history (prints only)",
+    )
+    yk.add_argument("--league-key", default=None, help="e.g. 477.l.12345 (default: auto-detect)")
+    yk.add_argument("--season", default="20262027", help="Season the keepers are for")
+    yk.add_argument(
+        "--order",
+        default=None,
+        metavar="A,B,...",
+        help="Draft order as manager nicknames or team keys, first pick first - used for "
+        "seat numbers until Yahoo sets draft positions itself",
+    )
+    yk.add_argument(
+        "--candidates", type=int, default=4, help="First-year keep candidates to list per team"
+    )
+    yk.set_defaults(func=_cmd_yahoo_keepers)
 
     data = sub.add_parser("data", help="Local data store commands")
     data_sub = data.add_subparsers(dest="subcommand", required=True)
@@ -1188,6 +1467,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cal.set_defaults(func=_cmd_draft_calibrate)
 
+    pre = draft_sub.add_parser(
+        "preflight",
+        help="Check everything that would silently corrupt the draft-night board; "
+        "exits non-zero on any FAIL",
+    )
+    pre.add_argument("--seat", type=int, required=True, help="Your draft slot (0-based)")
+    pre.add_argument("--season", default="20262027", help="Season being drafted")
+    pre.add_argument(
+        "--adp-league-key",
+        default=None,
+        metavar="KEY",
+        help="League key whose Yahoo ADP the board uses (default: the only mapped league)",
+    )
+    pre.add_argument(
+        "--offline", action="store_true", help="Skip the Yahoo OAuth probe (the only network call)"
+    )
+    pre.add_argument("--verbose", action="store_true", help="Also print the board build log")
+    pre.set_defaults(func=_cmd_draft_preflight)
+
     live = draft_sub.add_parser("live", help="Draft-night console: live recommendations")
     live.add_argument("--seat", type=int, default=0, help="Your draft slot (0-based)")
     live.add_argument("--season", default="20262027", help="Season to draft for")
@@ -1214,6 +1512,14 @@ def build_parser() -> argparse.ArgumentParser:
         "and a built player map). Optionally name a league key for real ADP.",
     )
     live.add_argument(
+        "--adp-league-key",
+        default=None,
+        metavar="KEY",
+        help="League key whose Yahoo ADP to use (default: the key given to --yahoo, "
+        "else the only league in the player map). Without ADP the board runs on a "
+        "proxy, and says so.",
+    )
+    live.add_argument(
         "--room",
         default="https://hockey.fantasysports.yahoo.com/hockey",
         help="Page to open when --yahoo is used",
@@ -1230,6 +1536,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.35,
         help="Seconds per pick when replaying (0 = as fast as possible)",
+    )
+    live.add_argument(
+        "--replay-drop",
+        default=None,
+        metavar="START:COUNT",
+        help="Failure drill: the replayed feed goes silent after START room picks and "
+        "misses COUNT of them while the room keeps drafting. Recover by hand.",
     )
     live.add_argument(
         "--web",

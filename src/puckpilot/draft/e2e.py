@@ -261,7 +261,13 @@ class BrowserProbe:
         self.page.on("pageerror", lambda e: self.errors.append(f"page error: {e}"))
         self.page.on("console", self._console)
         self.page.on("response", self._response)
-        self.page.goto(url, wait_until="domcontentloaded")
+        response = self.page.goto(url, wait_until="domcontentloaded")
+        if response is None or response.status != 200:
+            status = None if response is None else response.status
+            self.close()
+            # A 403 here is a JSON refusal, not the page: every later look
+            # would wait for elements that do not exist.
+            raise RuntimeError(f"the guest link answered HTTP {status}, not the page")
 
     def _console(self, msg) -> None:
         # A failed request is logged twice by the browser - once here without
@@ -289,8 +295,11 @@ class BrowserProbe:
                 timeout=timeout_s * 1000,
             )
         except Exception:
-            shown = self.page.text_content("#pick")
-            banner = (self.page.text_content("#banner") or "").strip()
+            try:
+                shown = self.page.locator("#pick").text_content(timeout=2000)
+                banner = (self.page.locator("#banner").text_content(timeout=2000) or "").strip()
+            except Exception as e:
+                return f"browser page has no pick counter ({e.__class__.__name__})"
             return f"browser shows pick {shown!r}, expected {want!r} (banner: {banner[:100]!r})"
         text = self.page.inner_text("body")
         for tell in ("undefined", "NaN"):
@@ -364,6 +373,13 @@ class Harness:
             result.violations += integrity.snapshot_violations(
                 board, snap, seat, state.policy, top=state.top, board_rows=state.board_rows
             )
+            # Verified right after every pick the feed delivered was applied, so
+            # the board must be exactly level with the room here.
+            if snap.get("room_picks") and snap.get("drift"):
+                result.violations.append(
+                    f"seat {seat} at pick {board.made}: board is {snap['drift']} pick(s) "
+                    f"behind the room ({snap['room_picks']} made there)"
+                )
             t = time.perf_counter()
             status, text = _http(f"{local_url}/state?seat={seat}")
             result.time("local_http", (time.perf_counter() - t) * 1000)
@@ -437,7 +453,10 @@ class Harness:
 
     def _look(self, result: E2EResult, probe: BrowserProbe) -> None:
         t = time.perf_counter()
-        problem = probe.shows_pick(self.board.made, len(self.board.slots))
+        try:
+            problem = probe.shows_pick(self.board.made, len(self.board.slots))
+        except Exception as e:
+            problem = f"browser check failed: {e.__class__.__name__}: {e}"
         result.time("browser", (time.perf_counter() - t) * 1000)
         result.browser_checks += 1
         if problem:
@@ -452,12 +471,17 @@ class Harness:
         source: str,
         room_picks: int | None = None,
         unmapped: Callable[[], list[str]] | None = None,
+        feed=None,
     ) -> E2EResult:
         from puckpilot.web.server import serve
 
         result = E2EResult(name=name, source=source, room_picks=room_picks)
         board = self.board
         result.total = len(board.slots)
+        # The feed is attached for its status only - picks still arrive through
+        # `polls` - so the snapshot's drift and unmapped names describe the room
+        # this draft came from. Nothing here pumps it.
+        self.state.feed = feed
         t0 = time.perf_counter()
         local = serve(self.state, port=0)
         local_url = f"http://127.0.0.1:{local.server_address[1]}"
@@ -466,8 +490,13 @@ class Harness:
             self._boundary(result)
             self._verify(result, local_url)
             if self.browser_every:
-                probe = BrowserProbe(f"{self.relay.url}/?seat={self.seats[0]}&k={self.relay.guest}")
-                self._look(result, probe)
+                try:
+                    probe = BrowserProbe(
+                        f"{self.relay.url}/?seat={self.seats[0]}&k={self.relay.guest}"
+                    )
+                    self._look(result, probe)
+                except Exception as e:
+                    result.violations.append(f"guest browser: {e.__class__.__name__}: {e}")
             for poll in polls:
                 if board.complete:
                     break

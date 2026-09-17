@@ -108,7 +108,9 @@ def run_mock(
     t0 = time.perf_counter()
     universe = build_universe(conn, target_season, train_seasons, league)
     keepers = keepers_for(conn, universe, target_season, league, rng, warn=progress)
-    board = DraftBoard(universe, rules, my_seat=seat, keepers=keepers)
+    board = DraftBoard(
+        universe, rules, my_seat=seat, keepers=keepers, keeper_placement=league.keeper_placement
+    )
     progress(f"  ready in {time.perf_counter() - t0:.1f}s — {len(board.slots)} live picks\n")
     if board.unmatched_keepers:
         progress(f"  WARNING: {len(board.unmatched_keepers)} keepers could not be placed\n")

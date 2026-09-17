@@ -58,9 +58,18 @@ PAGE = """<!doctype html>
  button{background:var(--card);border:1px solid var(--line);color:var(--fg);
    font:inherit;padding:4px 10px;border-radius:4px;cursor:pointer}
  button:hover{border-color:var(--warn);color:var(--warn)}
+ .warnbar{border:1px solid var(--warn);color:var(--warn);border-radius:6px;padding:6px 10px;
+   margin-bottom:10px;font-size:12.5px}
+ .warnbar div{padding:1px 0}
+ .drift{font-weight:700} .entry{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+ .entry input{width:auto;flex:1;min-width:140px;margin:0}
+ .entry input.seatin{flex:0;min-width:64px;width:64px}
+ td.act{width:1%;white-space:nowrap} td.act button{padding:0 6px;font-size:11px}
+ .src{color:var(--dim);font-size:10.5px}
 </style>
 <h1>PuckPilot <span id="seatno" class="k"></span></h1>
 <div id="banner" class="card" hidden></div>
+<div id="warnings" class="warnbar" hidden></div>
 <div class="bar">
   <div><span class="k">round</span> <span id="round" class="big">-</span></div>
   <div><span class="k">pick</span> <span id="pick" class="big">-</span></div>
@@ -68,6 +77,7 @@ PAGE = """<!doctype html>
   <div><span class="k">feed</span> <span id="detected" class="big">0</span></div>
   <div><span class="k">last</span> <span id="age">never</span></div>
   <div id="relay" class="k"></div>
+  <div><span id="drift" class="drift"></span></div>
   <div id="gaps"></div>
   <div><span class="k">left</span> <span id="supply"></span></div>
   <div style="margin-left:auto">
@@ -98,6 +108,13 @@ PAGE = """<!doctype html>
       (usually a rookie) with no season projection of ours. Priced from the
       room, never from us &mdash; the <span class="mkt">MKT</span> tag marks
       that it is their opinion, not ours.</li>
+    <li><b>behind the room</b> &mdash; picks the room has made that this board has
+      not recorded. Anything above 0 means every "lasts %" is for a pick that is
+      already gone: enter the missing picks by hand (or <b>unknown pick +1</b>).</li>
+    <li><b>taken / unknown / kept</b> &mdash; the hand-entry controls. <b>taken</b>
+      uses a pick; <b>kept</b> does not (a keeper nobody declared); the <b>x</b>
+      on a board row marks exactly that player taken by the seat on the clock.
+      <b>undo</b> takes back the last pick however it was entered.</li>
     <li><b>needs</b> &mdash; starting roster slots you still have to fill.</li>
     <li><b>left / supply</b> &mdash; players remaining, overall and by
       position &mdash; a position marked orange is running thin.</li>
@@ -111,6 +128,29 @@ PAGE = """<!doctype html>
   <div class="col" style="flex:1.15">
     <div class="k">TAKE ONE OF THESE</div>
     <div id="short"></div>
+    <div id="entrybox" hidden>
+      <div class="k" style="margin-top:10px">
+        ENTER A PICK BY HAND &mdash; when the feed misses one</div>
+      <div class="card">
+        <div class="entry">
+          <input id="who" placeholder="player name (or a board row's x)">
+          <input id="by" class="seatin" placeholder="seat"
+            title="blank = the seat on the clock">
+        </div>
+        <div class="entry" style="margin-top:6px">
+          <button id="btn-taken" title="Drafted: uses the pick on the clock">taken</button>
+          <button id="btn-unknown"
+            title="The room took someone we cannot identify: advances the clock one pick"
+            >unknown pick +1</button>
+          <button id="btn-kept"
+            title="A keeper nobody declared: off the board WITHOUT using a pick. Needs a seat."
+            >kept (no pick)</button>
+        </div>
+        <div id="entrynote" class="meta" style="margin-top:6px"></div>
+      </div>
+    </div>
+    <div class="k" style="margin-top:10px">RECENT PICKS</div>
+    <div class="card"><div id="recent" class="meta">(none yet)</div></div>
     <div class="k" style="margin-top:10px">YOUR ROSTER</div>
     <div class="card"><div id="roster" class="meta"></div>
       <div id="needs" class="need" style="margin-top:6px"></div></div>
@@ -128,7 +168,8 @@ PAGE = """<!doctype html>
     <input id="filter" placeholder="filter by name or position...">
     <div class="scroll"><table>
       <thead><tr><th>#</th><th>player</th><th>pos</th><th>tm</th>
-        <th class="num">vorp</th><th class="num">adp</th><th class="num">lasts</th></tr></thead>
+        <th class="num">vorp</th><th class="num">adp</th><th class="num">lasts</th>
+        <th></th></tr></thead>
       <tbody id="board"></tbody></table></div>
   </div>
 </div>
@@ -147,12 +188,26 @@ function q(base){
   return s ? base + '?' + s : base;
 }
 let filter = "";
+const ESC = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+function esc(t){ return String(t ?? '').replace(/[&<>"']/g, c => ESC[c]); }
+async function post(route, params){
+  // View params (seat, k) ride along exactly as for /state; the pick's own
+  // seat is `by`, never `seat` - see server._drafting_seat.
+  const u = new URL(q(route), location.href);
+  for (const [k, v] of Object.entries(params || {}))
+    if (v !== '' && v != null) u.searchParams.set(k, v);
+  const note = document.getElementById('entrynote');
+  try {
+    const r = await fetch(u.pathname + u.search, {method:'POST'});
+    const j = await r.json();
+    note.textContent = j.result || j.error || '';
+    note.className = 'meta ' + ((j.ok === false || j.error) ? 'bad' : 'live');
+  } catch(e) { note.textContent = route + ' failed'; note.className = 'meta bad'; }
+  tick();
+}
 document.getElementById('filter').addEventListener('input', e => {
   filter = e.target.value.toLowerCase(); render(window.__s);
 });
-function esc(t){
-  return String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-}
 function banner(lines){
   const b = document.getElementById('banner');
   b.innerHTML = lines.join('<br>'); b.hidden = !lines.length;
@@ -173,6 +228,24 @@ function render(s){
   document.getElementById('relay').innerHTML = (s.relay_age == null) ? ''
     : 'relay <span class="'+(s.stale?'bad':'live')+'">'+Math.round(s.relay_age)+'s</span>';
   document.getElementById('undo').hidden = !s.can_undo;
+  // Every board-changing control is owner-only; can_undo is the one flag both
+  // the console and the relay already set, so it gates all of them.
+  document.getElementById('entrybox').hidden = !s.can_undo;
+  const warns = (s.warnings || []);
+  const wb = document.getElementById('warnings');
+  wb.hidden = !warns.length;
+  wb.innerHTML = warns.map(w => '<div>&#9888; ' + esc(w) + '</div>').join('');
+  const dr = document.getElementById('drift');
+  if (s.drift > 0) {
+    dr.className = 'drift bad';
+    dr.textContent = s.drift + ' pick' + (s.drift === 1 ? '' : 's') + ' behind the room';
+  } else if (s.room_picks) {
+    dr.className = 'drift live'; dr.textContent = 'in step with the room';
+  } else { dr.className = 'k'; dr.textContent = ''; }
+  document.getElementById('recent').innerHTML = (s.recent && s.recent.length)
+    ? s.recent.map(p => '#' + p.pick + ' <b>' + esc(p.name) + '</b> ' + esc(p.position) +
+        ' &middot; seat ' + p.seat + ' <span class="src">' + esc(p.source) + '</span>').join('<br>')
+    : '(none yet)';
   document.getElementById('seatno').textContent = (s.seat == null ? '' : 'seat ' + s.seat);
   document.getElementById('round').textContent = s.round ?? '-';
   const done = s.total > 0 && s.made >= s.total;
@@ -187,8 +260,12 @@ function render(s){
   const age = s.seconds_since_pick, a = document.getElementById('age');
   a.textContent = age===null ? 'never' : age.toFixed(0)+'s';
   a.className = (age!==null && age < 90) ? 'live' : 'stale';
-  document.getElementById('gaps').innerHTML = (s.gaps && s.gaps.length)
-    ? '<span class="bad">missing picks '+s.gaps.join(',')+'</span>' : '';
+  const um = (s.unmapped_names || []);
+  document.getElementById('gaps').innerHTML = ((s.gaps && s.gaps.length)
+    ? '<span class="bad">missing picks ' + s.gaps.join(',') + '</span> ' : '') +
+    (um.length ? '<span class="stale" title="The room took these. They are not on ' +
+      'our board, and each used a pick.">not on our board: ' +
+      um.map(esc).join(', ') + '</span>' : '');
 
   document.getElementById('supply').innerHTML = (s.supply||[]).map(
     x => '<span class="'+(x[2]?'need':'k')+'" style="margin-right:8px">'+
@@ -227,7 +304,10 @@ function render(s){
     if (p.blocked) tr.className = 'blocked';
     tr.innerHTML='<td>'+(i+1)+'</td><td>'+p.name+tag+'</td><td>'+p.position+'</td><td>'+p.team+
       '</td><td class="num">'+p.vorp.toFixed(2)+'</td><td class="num">'+Math.round(p.adp_rank)+
-      '</td><td class="num">'+Math.round(p.p_survive*100)+'%</td>';
+      '</td><td class="num">'+Math.round(p.p_survive*100)+'%</td>'+
+      '<td class="act">' + (s.can_undo && p.id != null
+        ? '<button data-id="' + p.id + '" title="Mark ' + esc(p.name) +
+          ' taken by the seat on the clock">x</button>' : '') + '</td>';
     tb.appendChild(tr);
   });
   const gapRow = (g, mine) =>
@@ -261,6 +341,21 @@ function render(s){
 
   document.getElementById('diag').textContent = s.diagnostics;
 }
+document.getElementById('board').addEventListener('click', e => {
+  const b = e.target.closest('button[data-id]');
+  if (b) post('/taken', {player: b.dataset.id});
+});
+const byVal = () => document.getElementById('by').value.trim();
+const whoVal = () => document.getElementById('who').value.trim();
+document.getElementById('btn-taken').addEventListener('click', () =>
+  post('/taken', {player: whoVal(), by: byVal()}));
+document.getElementById('btn-unknown').addEventListener('click', () =>
+  post('/unknown', {by: byVal()}));
+document.getElementById('btn-kept').addEventListener('click', () =>
+  post('/kept', {player: whoVal(), by: byVal()}));
+document.getElementById('who').addEventListener('keydown', e => {
+  if (e.key === 'Enter') post('/taken', {player: whoVal(), by: byVal()});
+});
 document.getElementById('legend-btn').addEventListener('click', () => {
   document.getElementById('legend').hidden = !document.getElementById('legend').hidden;
 });

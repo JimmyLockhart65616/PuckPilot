@@ -125,21 +125,43 @@ def draftkit_polls(board, seed):
         yield feed.poll
 
 
-def test_unmapped_room_picks_are_drift_not_silence(relay):
+def test_unmapped_room_picks_use_their_slot_and_keep_the_board_with_the_room(relay):
+    """A prospect the map does not know is still a pick. It used to leave the
+    board one pick behind the room for the rest of the draft; now it consumes
+    its slot, and the view names it and reports no drift at any pick."""
     board, frames, idmap, names = _room_board()
     for yahoo_id in list(idmap)[40:43]:  # three prospects the map does not know
         del idmap[yahoo_id]
     feed = WebsocketFeed(e2e._NoContext(), idmap)
-    harness = e2e.Harness(board, relay, seats=(3,), every=50, board_rows=30, names=names)
+    harness = e2e.Harness(board, relay, seats=(3,), every=10, board_rows=30, names=names)
     result = harness.run(
         e2e.frame_polls(frames, feed),
         "fixture",
         "capture",
         room_picks=192,
         unmapped=lambda: feed.state.unmapped,
+        feed=feed,
     )
-    assert result.unmapped == 3
-    assert result.drift and "3 pick(s) behind the room" in result.drift[0]
+    assert result.passed, result.summary()
+    assert result.unmapped == 3 and result.unknown == 3
+    assert result.drift == [] and board.made == 192
+    assert len(harness.state.snapshot(3)["unmapped_names"]) == 3
+
+
+def test_a_board_that_falls_behind_the_room_fails_the_run(relay):
+    """The drift the view reports is checked at every verified pick: a feed that
+    drops picks must turn the run red, not just the page amber."""
+    board, frames, idmap, names = _room_board()
+    feed = WebsocketFeed(e2e._NoContext(), idmap)
+
+    def dropping():
+        for i, poll in enumerate(e2e.frame_polls(frames, feed)):
+            events = poll(board)
+            yield (lambda b, ev=events: []) if i == 101 and events else (lambda b, ev=events: ev)
+
+    harness = e2e.Harness(board, relay, seats=(3,), every=10, board_rows=30, names=names)
+    result = harness.run(dropping(), "fixture", "capture", room_picks=192, feed=feed)
+    assert any("behind the room" in v for v in result.violations), result.summary()
 
 
 # ---- the harness can fail ---------------------------------------------------------

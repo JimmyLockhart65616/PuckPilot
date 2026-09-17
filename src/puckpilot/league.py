@@ -48,6 +48,10 @@ class LeagueConfig:
     # declaring only your own seat is a useful thing to do - it is what makes
     # the live board's roster and "still need" panels yours rather than random.
     keeper_owners_by_season: dict[str, dict[int, tuple[str, ...]]] = field(default_factory=dict)
+    # Which draft rounds a kept player occupies: "last" (keepers fill each
+    # seat's final rounds - keeping is free) or "first" (a keeper costs an
+    # early pick). Decides the live pick order; see DraftBoard._live_slots.
+    keeper_placement: str = "last"
 
     # acquisition budget (Yahoo: "max acquisitions" season/week)
     season_acquisitions: int | None = None
@@ -146,6 +150,11 @@ def load_league(path: str | Path) -> LeagueConfig:
                 ) from e
             placed[idx] = tuple(str(n) for n in names)
         owners_by_season[str(season)] = placed
+    placement = str(keepers.get("placement", "last")).lower()
+    if placement not in ("first", "last"):
+        raise LeagueConfigError(
+            f"{p}: keepers.placement must be 'first' or 'last', got {placement!r}"
+        )
     return LeagueConfig(
         name=str(cfg.get("name", p.stem)),
         league_id=str(cfg.get("league_id", "")),
@@ -157,6 +166,7 @@ def load_league(path: str | Path) -> LeagueConfig:
         keeper_years=int(keepers.get("years", 3)),
         keepers_by_season=by_season,
         keeper_owners_by_season=owners_by_season,
+        keeper_placement=placement,
         season_acquisitions=tx.get("season_acquisitions"),
         weekly_acquisitions=tx.get("weekly_acquisitions"),
         min_goalie_appearances=int(lineup.get("min_goalie_appearances", 0)),
