@@ -679,3 +679,32 @@ def test_the_page_has_every_hand_entry_control():
 
     for marker in ('id="btn-taken"', 'id="btn-unknown"', 'id="btn-kept"', "post('/taken'"):
         assert marker in PAGE, marker
+
+
+def test_an_unidentified_pick_counts_as_landed_and_resets_the_clock():
+    """It consumes a slot, so the relay must be pushed and "last pick" reset -
+    counting only accepted picks left the shared view a heartbeat behind."""
+    from puckpilot.draft.feed import PickEvent
+
+    class OneUnmapped:
+        name = "websocket"
+
+        def __init__(self):
+            self.sent = False
+
+        def poll(self, board):
+            if self.sent:
+                return []
+            self.sent = True
+            return [PickEvent(None, 0, "websocket", label="Prospect (not on our board)")]
+
+    srv = _real_server()
+    srv.state.feed = OneUnmapped()
+    try:
+        assert srv.state.pump() == 1
+        assert srv.state.last_pick_at is not None
+        assert "slot consumed" in srv.state.note
+        assert srv.state.board.made == 1
+    finally:
+        srv.shutdown()
+        srv.server_close()

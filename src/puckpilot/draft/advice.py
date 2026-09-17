@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from puckpilot.draft.board import MIN_RANK_GAP, Candidate, DraftBoard
-from puckpilot.draft.engine import RosterValuePolicy, eligible_positions
+from puckpilot.draft.engine import RosterValuePolicy
 from puckpilot.engine.categories import CATALOG
 
 # Shown next to each name so a pick can be sanity-checked against the projection
@@ -38,6 +38,14 @@ def _opt(v) -> float | None:
     except (TypeError, ValueError):
         return None
     return None if f != f else f
+
+
+def eligible_label(u, row: int) -> str:
+    """Primary position first, then any others Yahoo allows: "C/L"."""
+    sets, _ = u.eligibility()
+    primary = str(u.pos[row])
+    rest = [p for p in "CLRDG" if p in sets[row] and p != primary]
+    return "/".join([primary, *rest])
 
 
 def _fills_starter(board: DraftBoard, seat: int, position: str) -> bool:
@@ -87,8 +95,11 @@ def recommend(
     # the sim was measured against.
     mask &= u.source != "market"
     if enforce_eligibility and picks_left > 0:
-        allowed = eligible_positions(board.counts[seat], board.rules, picks_left)
-        pos_ok = np.isin(u.pos, list(allowed))
+        # The policy's own rule mask, so a multi-position policy's shortlist
+        # obeys the same forcing rule its pick() does.
+        pos_ok = policy.allowed_mask(
+            u, np.ones(len(u), dtype=bool), board.counts[seat], board.rules, picks_left, ctx
+        )
         # Mirrors _pick_best: if the roster rules leave nothing, rules yield
         # rather than the board going empty.
         if (mask & pos_ok).any():
@@ -98,6 +109,7 @@ def recommend(
 
     rows = np.flatnonzero(mask)
     top = rows[np.argsort(-score[rows], kind="stable")[:n]]
+    starts = policy._starts_multi(u, board.rules, ctx)
 
     frame = u.frame
     out: list[Candidate] = []
@@ -121,11 +133,16 @@ def recommend(
                 score=float(score[r]),
                 adp_rank=float(u.adp_rank[r]),
                 p_survive=float(p_survive[r]),
-                fills_starter=_fills_starter(board, seat, str(u.pos[r])),
+                fills_starter=(
+                    bool(starts[r])
+                    if starts is not None
+                    else _fills_starter(board, seat, str(u.pos[r]))
+                ),
                 projected=projected,
                 age=_opt(record.get("age")),
                 train_gp=_opt(record.get("train_gp")),
                 source=str(u.source[r]),
+                eligible=eligible_label(u, r),
             )
         )
     return out
@@ -175,6 +192,7 @@ def market_watchlist(board: DraftBoard, seat: int | None = None, n: int = 10) ->
                 age=_opt(record.get("age")),
                 train_gp=_opt(record.get("train_gp")),
                 source="market",
+                eligible=eligible_label(u, r),
             )
         )
     return out

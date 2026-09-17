@@ -107,6 +107,47 @@ class Universe:
         u.adp_rank = adp_rank
         return u
 
+    # Multi-position eligibility, attached by `with_eligibility`. None means
+    # every player is eligible at his primary position only.
+    elig_sets: list[frozenset[str]] | None = None
+    elig: dict[str, np.ndarray] | None = None
+
+    def with_eligibility(self, by_player: dict[int, frozenset[str]]) -> Universe:
+        """Shallow view carrying each player's full position eligibility.
+
+        For roster ACCOUNTING only (who starts, what is still needed) - `pos`,
+        and therefore VORP's replacement level, stays on the primary position.
+        A player the map does not know keeps his primary. A goalie is only ever
+        a goalie, and an eligibility with no skater position for a skater is
+        treated as noise rather than trusted.
+        """
+        from puckpilot.draft.eligibility import SKATER_POSITIONS
+
+        sets: list[frozenset[str]] = []
+        for pid, primary in zip(self.ids, self.pos, strict=True):
+            primary = str(primary)
+            got = by_player.get(int(pid))
+            if primary == "G" or not got:
+                sets.append(frozenset({primary}))
+            elif got & SKATER_POSITIONS:
+                sets.append(frozenset(got - {"G"}))
+            else:
+                sets.append(frozenset({primary}))
+        u = copy.copy(self)
+        u.elig_sets = sets
+        u.elig = {
+            p: np.array([p in s for s in sets], dtype=bool) for p in ("C", "L", "R", "D", "G")
+        }
+        return u
+
+    def eligibility(self) -> tuple[list[frozenset[str]], dict[str, np.ndarray]]:
+        """(per-row sets, per-position masks), falling back to primary positions."""
+        if self.elig_sets is not None and self.elig is not None:
+            return self.elig_sets, self.elig
+        sets = [frozenset({str(p)}) for p in self.pos]
+        masks = {p: self.pos == p for p in ("C", "L", "R", "D", "G")}
+        return sets, masks
+
 
 def _pick_best(
     u: Universe,
@@ -260,6 +301,7 @@ class RosterValuePolicy:
         display_position_bias: dict[str, float] | None = None,
         basis: str = "vorp",
         replacement_depth: float = 0.0,
+        multi_position: bool = False,
     ):
         if basis not in ("vorp", "z"):
             raise ValueError(f"basis must be 'vorp' or 'z', got {basis!r}")
@@ -278,6 +320,27 @@ class RosterValuePolicy:
         )
         self.basis = basis
         self.replacement_depth = replacement_depth
+        # Roster accounting over Yahoo's multi-position eligibility instead of
+        # one primary position each: a C/LW with the centres full but a wing
+        # open still starts. Needs `ctx["roster_rows"]` and a universe with
+        # eligibility attached; without either it is exactly the old path
+        # (pinned by tests/test_eligibility.py).
+        #
+        # OFF by default, measured 2026-09-16. Both arms replayed every team's
+        # lineups over Yahoo eligibility, so only the engine's own accounting
+        # differed; n=1000, pre-registered rule "mean finish better in >=3 of 4
+        # runs, top-3 never down more than 0.02":
+        #
+        #     target 2025-26  seed 8675309  off 0.739 / 2.647   on 0.728 / 2.739
+        #     target 2025-26  seed 20261    off 0.740 / 2.657   on 0.734 / 2.748
+        #     target 2024-25  seed 8675309  off 0.310 / 6.006   on 0.332 / 5.819
+        #     target 2024-25  seed 20261    off 0.323 / 5.885   on 0.334 / 5.682
+        #
+        # 2 of 4: the seasons disagree in sign, each consistently across seeds -
+        # the same shape as `replacement_depth`. Kept for the next league, not
+        # handed to a live draft. The eligibility itself still reaches the
+        # drafter: every board row and card shows it ("C/L").
+        self.multi_position = multi_position
 
     def _base_score(self, u: Universe, rules=None, avail=None) -> np.ndarray:
         """What a player is worth before roster shape and market timing.
@@ -359,16 +422,20 @@ class RosterValuePolicy:
         score = self._base_score(u, rules, ctx.get("avail") if ctx else None)
         goalie_mask = u.pos == "G"
         score[goalie_mask] *= self.goalie_weight
-        for pos, slot_count in slots.items():
-            if counts.get(pos, 0) < slot_count:
-                continue  # starting slot open -> full value
-            if pos != "G" and util_open:
-                continue  # overflows into an open util slot
-            benched = u.pos == pos
-            # scale positive value only: a bad player doesn't get better by sitting
-            score[benched] = np.where(
-                score[benched] > 0, score[benched] * self.bench_factor, score[benched]
-            )
+        starts = self._starts_multi(u, rules, ctx)
+        if starts is not None:
+            score = np.where(~starts & (score > 0), score * self.bench_factor, score)
+        else:
+            for pos, slot_count in slots.items():
+                if counts.get(pos, 0) < slot_count:
+                    continue  # starting slot open -> full value
+                if pos != "G" and util_open:
+                    continue  # overflows into an open util slot
+                benched = u.pos == pos
+                # scale positive value only: a bad player doesn't get better by sitting
+                score[benched] = np.where(
+                    score[benched] > 0, score[benched] * self.bench_factor, score[benched]
+                )
 
         if self.survival_discount and ctx and ctx.get("next_pick_no") is not None:
             # discount players the ADP-following room will likely leave for our
@@ -376,6 +443,55 @@ class RosterValuePolicy:
             factor = 1.0 - self.survival_discount * self.survival(u, ctx)
             score = np.where(score > 0, score * factor, score)
         return score
+
+    def _multi_ready(self, u: Universe, ctx) -> bool:
+        return bool(self.multi_position and ctx and ctx.get("roster_rows") is not None)
+
+    def _starts_multi(self, u: Universe, rules, ctx) -> np.ndarray | None:
+        """Would each player START on this roster, under full eligibility?
+
+        None when multi-position accounting is off, so the caller keeps the
+        per-position-count path. With single-position players the two agree
+        exactly (pinned by a test) - the matching only differs once a player
+        can fill more than one slot type.
+        """
+        if not self._multi_ready(u, ctx):
+            return None
+        from puckpilot.draft.eligibility import open_positions, slot_units
+
+        sets, masks = u.eligibility()
+        units = slot_units(rules.shape.slots, rules.shape.util_slots)
+        roster = [sets[int(r)] for r in ctx["roster_rows"]]
+        starts = np.zeros(len(u), dtype=bool)
+        for pos in open_positions(roster, units, masks):
+            starts |= masks[pos]
+        return starts
+
+    def allowed_mask(self, u: Universe, avail, counts, rules, picks_left, ctx=None) -> np.ndarray:
+        """Players the roster rules let this seat take now.
+
+        Caps stay on primary position (they exist to stop hoarding, and a
+        count is what hoarding is). The forcing rule - once picks left only
+        just cover the starting slots still empty, take someone who fills one
+        - reads eligibility when multi-position accounting is on.
+        """
+        if not self._multi_ready(u, ctx):
+            allowed = eligible_positions(counts, rules, picks_left)
+            return avail & np.isin(u.pos, list(allowed))
+        from puckpilot.draft.eligibility import open_positions, slot_units, unfilled_starting_slots
+
+        sets, masks = u.eligibility()
+        roster = [sets[int(r)] for r in ctx["roster_rows"]]
+        caps_ok = [p for p, cap in rules.caps.items() if counts.get(p, 0) < cap]
+        mask = avail & np.isin(u.pos, caps_ok)
+        # Minimums as slot units: the same quantity `eligible_positions` sums.
+        units = slot_units(rules.mins.items(), 0)
+        if unfilled_starting_slots(roster, units) >= picks_left:
+            fills = np.zeros(len(u), dtype=bool)
+            for pos in open_positions(roster, units, masks):
+                fills |= masks[pos]
+            mask &= fills
+        return mask
 
     def _dynamic_vorp(self, u: Universe, rules: DraftRules, avail: np.ndarray) -> np.ndarray:
         """VORP re-based against the players who are actually still on the board.
@@ -445,7 +561,13 @@ class RosterValuePolicy:
         return base
 
     def pick(self, u, avail, counts, rules, picks_left, rng, ctx=None) -> int:
-        return _pick_best(u, avail, counts, rules, picks_left, self.score(u, counts, rules, ctx))
+        score = self.score(u, counts, rules, ctx)
+        if not self._multi_ready(u, ctx):
+            return _pick_best(u, avail, counts, rules, picks_left, score)
+        mask = self.allowed_mask(u, avail, counts, rules, picks_left, ctx)
+        if not mask.any():
+            mask = avail
+        return int(np.argmax(np.where(mask, score, -np.inf)))
 
 
 class AdpBot:

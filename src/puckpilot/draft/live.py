@@ -420,6 +420,13 @@ def build_live_board(
                 conn, league_key, universe, mock_glob=mock_glob, progress=progress
             )
             universe = attach_market_frame(universe, market_frame, adp)
+
+        # Yahoo's own position eligibility, after the market rows are in so
+        # they get it too. Shown on every row; used for roster accounting only
+        # when the policy runs multi-position.
+        from puckpilot.yahoo.playermap import load_eligibility
+
+        universe = universe.with_eligibility(load_eligibility(conn, league_key))
     else:
         # This used to be silence: `--yahoo` given bare, or a key with a typo,
         # built a board on the proxy and said nothing at all.
