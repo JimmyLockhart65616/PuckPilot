@@ -234,6 +234,37 @@ def check_keeper_history(league, season: str, saved: dict | None) -> Check:
     listed = {_norm(split_qualifier(n)[0]) for n in league.keepers_for_season(season)}
     lines: list[str] = []
     status = PASS
+    declared = saved.get("declared") or []
+    if declared:
+        # The league has declared its keepers: that list is the truth and the
+        # contract forecast below no longer applies. Any difference is a FAIL -
+        # a declared keeper left off the file is a kept player shown available.
+        names = {_norm(r["name"]): r["name"] for r in declared}
+        missing = [v for k, v in names.items() if k not in listed]
+        extra = [
+            n
+            for n in league.keepers_for_season(season)
+            if _norm(split_qualifier(n)[0]) not in names
+        ]
+        if missing:
+            lines.append("declared in Yahoo but not in the keeper list: " + ", ".join(missing))
+        if extra:
+            lines.append("in the keeper list but not declared in Yahoo: " + ", ".join(extra))
+        by_seat: dict[int, set[str]] = {}
+        for r in declared:
+            if r.get("seat") is not None:
+                by_seat.setdefault(int(r["seat"]), set()).add(_norm(r["name"]))
+        owners = league.keeper_owners_for_season(season)
+        for seat, want in sorted(by_seat.items()):
+            have = {_norm(split_qualifier(n)[0]) for n in owners.get(seat, ())}
+            if have != want:
+                lines.append(f"seat {seat}: owners in the file differ from Yahoo's declaration")
+        return Check(
+            name,
+            FAIL if lines else PASS,
+            f"{len(declared)} keepers declared in Yahoo (saved {saved.get('derived_at')})",
+            lines,
+        )
     continuing_norms: set[str] = set()
     for m in saved.get("managers", []):
         for p in m.get("continuing", []):

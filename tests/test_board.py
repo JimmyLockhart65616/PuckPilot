@@ -531,3 +531,34 @@ def test_console_health_says_when_the_board_is_behind_the_room():
     for _ in range(4):
         b.record_unknown()
     assert not any("BEHIND" in line for line in feed_health(b, Quiet()))
+
+
+# ---- traded picks and the room's clock ------------------------------------------
+
+
+def test_a_traded_pick_moves_one_slot_and_keepers_still_take_the_last_picks():
+    """The real case: seat 3 owns seat 1's round-3 pick; seat 1 owns seat 3's
+    round-5 pick. Keepers must still come off each seat's LAST picks."""
+    trades = {(2, 1): 3, (4, 3): 1}  # 0-based (round, pick in round) -> seat
+    keepers = {s: [1 + 10 * s] for s in range(4)}
+    b = _board(keepers=keepers, keeper_placement="last", pick_owners=trades)
+    assert b.slots[9][1] == 3 and b.slot_numbers[9] == 10  # round 3, 2nd pick
+    assert b.slots[19][1] == 1 and b.slot_numbers[19] == 20  # round 5, 4th pick
+    assert b.picks_left(3) == b.picks_left(1) == 6  # 7 picks each, one kept
+    # everyone's keeper came off their last pick: the final round is empty
+    assert all(rnd < 6 for rnd, _ in b.slots)
+
+
+def test_no_trades_is_the_old_sequence_exactly():
+    for placement in ("first", "last"):
+        keepers = {0: [1, 2], 1: [11], 2: [], 3: [31, 32]}
+        a = _board(keepers=keepers, keeper_placement=placement)
+        b = _board(keepers=keepers, keeper_placement=placement, pick_owners={})
+        assert a.slots == b.slots and a.slot_numbers == b.slot_numbers
+
+
+def test_the_room_clock_disagreeing_with_the_board_is_named():
+    b = _board()
+    assert b.clock_disagreement(1, 0) is None
+    msg = b.clock_disagreement(2, 3)
+    assert msg and "seat 3" in msg and "expects seat 1" in msg

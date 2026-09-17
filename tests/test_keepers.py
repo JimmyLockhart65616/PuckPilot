@@ -134,3 +134,10 @@ def test_an_ambiguous_pool_name_is_warned_and_not_placed(db):
     placed = sorted(p for v in seats.values() for p in v)
     assert placed == [5]
     assert any("NOT placed" in w for w in warnings)
+
+
+def test_an_id_qualifier_resolves_a_name_the_upstream_data_spelled_wrong(db):
+    store.upsert_player(db, 9, "Tim Sttzle", "C", "OTT")  # MoneyPuck's lossy copy
+    res = resolve_keepers(db, ("Tim Stutzle", "Tim Stutzle (9)"))
+    assert res.unmatched == ["Tim Stutzle"]
+    assert res.resolved == {"Tim Stutzle (9)": 9}

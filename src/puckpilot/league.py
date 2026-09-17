@@ -52,6 +52,12 @@ class LeagueConfig:
     # seat's final rounds - keeping is free) or "first" (a keeper costs an
     # early pick). Decides the live pick order; see DraftBoard._live_slots.
     keeper_placement: str = "last"
+    # season -> ((round, pick within round, seat), ...), all as the league
+    # writes them: round and pick 1-based, seat 0-based. Picks that changed
+    # hands, so the board's clock follows the room's and not a plain snake.
+    traded_picks_by_season: dict[str, tuple[tuple[int, int, int], ...]] = field(
+        default_factory=dict
+    )
 
     # acquisition budget (Yahoo: "max acquisitions" season/week)
     season_acquisitions: int | None = None
@@ -80,6 +86,13 @@ class LeagueConfig:
 
     def keeper_owners_for_season(self, season: str) -> dict[int, tuple[str, ...]]:
         return dict(self.keeper_owners_by_season.get(season, {}))
+
+    def pick_owners_for_season(self, season: str) -> dict[tuple[int, int], int]:
+        """(round, pick) 0-based -> seat, the shape `DraftBoard` takes."""
+        return {
+            (rnd - 1, pick - 1): seat
+            for rnd, pick, seat in self.traded_picks_by_season.get(season, ())
+        }
 
     def draft_rules(self, **overrides) -> DraftRules:
         return DraftRules(shape=self.shape, rounds=self.draft_rounds, **overrides)
@@ -125,6 +138,7 @@ def load_league(path: str | Path) -> LeagueConfig:
     schedule = cfg.get("schedule", {})
     keepers = cfg.get("keepers", {})
     tx = cfg.get("transactions", {})
+    draft = cfg.get("draft", {})
     lineup = cfg.get("lineup", {})
 
     scoring_type = str(scoring.get("type", "h2h")).lower()
@@ -155,6 +169,25 @@ def load_league(path: str | Path) -> LeagueConfig:
         raise LeagueConfigError(
             f"{p}: keepers.placement must be 'first' or 'last', got {placement!r}"
         )
+    traded: dict[str, tuple[tuple[int, int, int], ...]] = {}
+    n_teams = int(cfg.get("roster", {}).get("teams", 12))
+    for season, picks in (draft.get("traded_picks") or {}).items():
+        rows = []
+        for t in picks:
+            try:
+                rnd, pick, seat = int(t["round"]), int(t["pick"]), int(t["seat"])
+            except (KeyError, TypeError, ValueError) as e:
+                raise LeagueConfigError(
+                    f"{p}: draft.traded_picks.{season} entries need round, pick and seat, "
+                    "e.g. { round = 7, pick = 10, seat = 3 }"
+                ) from e
+            if rnd < 1 or not 1 <= pick <= n_teams or not 0 <= seat < n_teams:
+                raise LeagueConfigError(
+                    f"{p}: draft.traded_picks.{season}: round {rnd} pick {pick} seat {seat} "
+                    f"is outside a {n_teams}-team draft (round/pick from 1, seat from 0)"
+                )
+            rows.append((rnd, pick, seat))
+        traded[str(season)] = tuple(rows)
     return LeagueConfig(
         name=str(cfg.get("name", p.stem)),
         league_id=str(cfg.get("league_id", "")),
@@ -167,6 +200,7 @@ def load_league(path: str | Path) -> LeagueConfig:
         keepers_by_season=by_season,
         keeper_owners_by_season=owners_by_season,
         keeper_placement=placement,
+        traded_picks_by_season=traded,
         season_acquisitions=tx.get("season_acquisitions"),
         weekly_acquisitions=tx.get("weekly_acquisitions"),
         min_goalie_appearances=int(lineup.get("min_goalie_appearances", 0)),

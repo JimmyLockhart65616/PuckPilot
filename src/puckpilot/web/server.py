@@ -135,7 +135,14 @@ class LiveState:
         status = self.feed.status() if hasattr(self.feed, "status") else {}
         room = int(status.get("room_picks") or status.get("highest_pick") or 0)
         drift = self.board.drift(room) if room else 0
+        clock = status.get("on_the_clock") or {}
+        order = (
+            self.board.clock_disagreement(int(clock["pick"]), int(clock["seat"]) - 1)
+            if clock.get("pick") and clock.get("seat")
+            else None
+        )
         return {
+            "order_problem": order,
             "room_picks": room,
             "drift": drift,
             "unmapped_names": list(status.get("unmapped_names") or []),
@@ -278,7 +285,8 @@ class LiveState:
             # Build-time facts that change what every number means - a proxy
             # ADP, an undeclared keeper list - shown on the screen being used,
             # not left in the scrollback of the terminal that built the board.
-            "warnings": list(getattr(self.board, "warnings", []) or []),
+            "warnings": list(getattr(self.board, "warnings", []) or [])
+            + ([health["order_problem"]] if health["order_problem"] else []),
             "adp_source": getattr(self.board, "adp_source", "unknown"),
             "recent": recent,
             "round": rnd,

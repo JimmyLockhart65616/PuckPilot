@@ -235,6 +235,9 @@ def _cmd_yahoo_keepers(args: argparse.Namespace) -> int:
             history, current, _meta = fetch_history(
                 session, key, depth=league.keeper_years + 1, progress=print
             )
+            # What the league has actually declared, once it has: the source of
+            # truth, where the contract history is only a forecast of it.
+            declared = session.keepers(key)
     except YahooSessionError as e:
         print(f"\n{e}", file=sys.stderr)
         return 1
@@ -344,14 +347,59 @@ def _cmd_yahoo_keepers(args: argparse.Namespace) -> int:
     print(f"  listed but not a continuing contract:       {', '.join(extra) or 'none'}")
     print("  (a listed name that is not continuing may be a declared first-year keep - check)")
 
+    # Declared keepers, when the league has set them, replace the forecast.
+    guid_of_team = {k: str(t.get("guid")) for k, t in current.items()}
+    nick_of_team = {k: str(t.get("nickname")) for k, t in current.items()}
+    declared_rows = [
+        {
+            "name": str(p.get("full") or ""),
+            "nhl_id": bare_to_nhl.get(str(p.get("player_key", "")).rsplit(".", 1)[-1]),
+            "owner_team_key": p.get("owner_team_key"),
+            "owner": nick_of_team.get(str(p.get("owner_team_key")), "?"),
+            "seat": seat_of.get(guid_of_team.get(str(p.get("owner_team_key")), "")),
+        }
+        for p in declared
+    ]
     print()
-    print("Suggested TOML - continuing contracts only; add first-year keeps as declared:")
-    print(f"[keepers.owners.{args.season}]")
-    for m in sorted(report.managers, key=lambda m: seat_of.get(m.guid, 99)):
-        seat = seat_of.get(m.guid)
-        names = ", ".join(f'"{report.names.get(b, b)}"' for b, _n in m.continuing)
-        prefix = f'"{seat}"' if seat is not None else "# seat ?"
-        print(f"{prefix} = [{names}]  # {m.nickname}")
+    if declared_rows:
+        print(f"DECLARED in Yahoo ({len(declared_rows)} keepers) - this is the list to use:")
+        by_owner: dict[str, list[dict]] = {}
+        for r in declared_rows:
+            by_owner.setdefault(f"{r['owner']} (seat {r['seat']})", []).append(r)
+        for owner, rows in sorted(by_owner.items()):
+            print(f"  {owner}: {', '.join(r['name'] for r in rows)}")
+        declared_norm = {_norm(r["name"]) for r in declared_rows}
+        print(f"Against keepers.by_season.{args.season}:")
+        print(
+            "  declared but missing from the file: "
+            + (
+                ", ".join(r["name"] for r in declared_rows if _norm(r["name"]) not in listed)
+                or "none"
+            )
+        )
+        print(
+            "  in the file but not declared:       "
+            + (", ".join(v for k, v in listed.items() if k not in declared_norm) or "none")
+        )
+        print()
+        print("Suggested TOML (declared keepers):")
+        print(f"[keepers.owners.{args.season}]")
+        for rows in sorted(
+            by_owner.values(), key=lambda rs: 99 if rs[0]["seat"] is None else rs[0]["seat"]
+        ):
+            seat = rows[0]["seat"]
+            names = ", ".join(f'"{r["name"]}"' for r in rows)
+            prefix = f'"{seat}"' if seat is not None else "# seat ?"
+            print(f"{prefix} = [{names}]  # {rows[0]['owner']}")
+    else:
+        print("No keepers declared in Yahoo yet.")
+        print("Suggested TOML - continuing contracts only; add first-year keeps as declared:")
+        print(f"[keepers.owners.{args.season}]")
+        for m in sorted(report.managers, key=lambda m: seat_of.get(m.guid, 99)):
+            seat = seat_of.get(m.guid)
+            names = ", ".join(f'"{report.names.get(b, b)}"' for b, _n in m.continuing)
+            prefix = f'"{seat}"' if seat is not None else "# seat ?"
+            print(f"{prefix} = [{names}]  # {m.nickname}")
 
     # Saved for `draft preflight`, which runs offline: it can then name the
     # likely first-year keeps that are still shown as available.
@@ -373,6 +421,7 @@ def _cmd_yahoo_keepers(args: argparse.Namespace) -> int:
         "derived_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "from": report.seasons,
         "keeper_rounds": report.keeper_rounds,
+        "declared": declared_rows,
         "managers": [
             {
                 "nickname": m.nickname,

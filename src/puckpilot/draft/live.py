@@ -89,6 +89,11 @@ def feed_health(board: DraftBoard, feed) -> list[str]:
         return [*lines, f"feed status failed: {e.__class__.__name__}"]
     room = int(st.get("room_picks") or st.get("highest_pick") or 0)
     drift = board.drift(room) if room else 0
+    clock = st.get("on_the_clock") or {}
+    if clock.get("pick") and clock.get("seat"):
+        problem = board.clock_disagreement(int(clock["pick"]), int(clock["seat"]) - 1)
+        if problem:
+            lines.append("!! " + problem)
     if drift > 0:
         lines.append(
             f"!! BOARD IS {drift} PICK{'S' if drift != 1 else ''} BEHIND THE ROOM "
@@ -443,6 +448,7 @@ def build_live_board(
         my_seat=seat,
         keepers=keepers,
         keeper_placement=league.keeper_placement,
+        pick_owners=league.pick_owners_for_season(season),
     )
     board.adp_source = "yahoo" if adp else "proxy"
 
