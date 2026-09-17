@@ -65,6 +65,30 @@ def wire_violations(snap: dict) -> list[str]:
     return []
 
 
+def eligibility_problem(label: str, position: str, allowed) -> str:
+    """ "" if a row's eligibility label tells the truth, else what is wrong.
+
+    The label is what a drafter reads to decide which slot a player fills, so it
+    must name exactly the positions the roster accounting allows. It leads with
+    the row's own position when that is allowed ("C/L"); when it is not - the
+    NHL files Martin Necas at C, Yahoo allows RW only - it reads "R, valued C",
+    because "C/R" offered a centre slot the league will not let him fill.
+    """
+    allowed = set(allowed)
+    head, sep, tail = label.partition(", valued ")
+    shown = set(head.split("/")) - {""}
+    if shown != allowed:
+        return f"shows eligibility {label!r}, the board allows {'/'.join(sorted(allowed))!r}"
+    if position in allowed:
+        if sep:
+            return f"label {label!r} says 'valued' although {position} is allowed"
+        if head.split("/")[0] != position:
+            return f"label {label!r} does not lead with its position {position!r}"
+    elif tail != position:
+        return f"label {label!r} hides that it is valued at {position!r}"
+    return ""
+
+
 def snapshot_violations(
     board: DraftBoard,
     snap: dict,
@@ -205,24 +229,11 @@ def snapshot_violations(
             elif is_market(r) != market:
                 bad(f"{kind} row id {item['id']} has the wrong source")
             elif "eligible" in item and elig_sets is not None:
-                shown = set(str(item["eligible"] or "").split("/")) - {""}
-                if shown != set(elig_sets[r]):
-                    bad(
-                        f"{kind} row {item.get('name')!r} shows eligibility {item['eligible']!r}, "
-                        f"board has {'/'.join(sorted(elig_sets[r]))!r}"
-                    )
-
-    # Every row that states eligibility must include its own position in it: a
-    # card reading "D" for a player filed at C is a roster panel lying.
-    for kind, items in (
-        ("shortlist", shortlist),
-        ("board", rows),
-        ("market watchlist", snap.get("market_watchlist") or []),
-    ):
-        for item in items:
-            if "eligible" in item and item.get("position") not in str(item["eligible"]).split("/"):
-                who, pos = item.get("name"), item.get("position")
-                bad(f"{kind} row {who!r} at {pos!r} is not in its own eligibility")
+                problem = eligibility_problem(
+                    str(item["eligible"] or ""), str(u.pos[r]), elig_sets[r]
+                )
+                if problem:
+                    bad(f"{kind} row {item.get('name')!r}: {problem}")
 
     # ---- recent picks and drift, where the view reports them -----------------
     if "recent" in snap:

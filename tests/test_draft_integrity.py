@@ -170,13 +170,6 @@ def _drafted_name(board):
             "shows eligibility",
         ),
         (
-            "card eligibility without its own position",
-            lambda s, b: s["shortlist"][0].update(
-                eligible="G" if s["shortlist"][0]["position"] != "G" else "C"
-            ),
-            "not in its own eligibility",
-        ),
-        (
             "row id pointing at a drafted player",
             lambda s, b: s["board"][4].update(id=next(p.player_id for p in b.picks if p.row >= 0)),
             "already drafted",
@@ -212,3 +205,21 @@ def test_relay_comparison_ignores_only_what_may_legitimately_differ(mid_draft):
 
     errored = {"error": "no snapshot for seat 3", "seats": ["0"]}
     assert "relay answered an error" in integrity.relay_violations(local, errored)[0]
+
+
+@pytest.mark.parametrize(
+    "label, position, allowed, ok",
+    [
+        ("C", "C", {"C"}, True),
+        ("C/L/R", "C", {"C", "L", "R"}, True),
+        ("R, valued C", "C", {"R"}, True),  # Necas: C in the NHL data, RW-only on Yahoo
+        ("L/R, valued C", "C", {"L", "R"}, True),
+        ("C/R", "C", {"R"}, False),  # the label that offered a slot he cannot fill
+        ("R", "C", {"R"}, False),  # hides what he is valued at
+        ("L/C", "C", {"C", "L"}, False),  # does not lead with its own position
+        ("C, valued C", "C", {"C"}, False),
+        ("C/L", "C", {"C"}, False),  # claims a position the board does not allow
+    ],
+)
+def test_an_eligibility_label_must_tell_the_truth(label, position, allowed, ok):
+    assert (integrity.eligibility_problem(label, position, allowed) == "") is ok
