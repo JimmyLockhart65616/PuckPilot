@@ -105,31 +105,54 @@ def keepers_for(
     the config lists none. Keepers outside the universe are reported, never
     dropped quietly — a missing keeper leaves an elite player wrongly available.
     """
-    from puckpilot.keepers import keeper_seats, resolve_keeper_ids
+    from puckpilot.keepers import keeper_seats, resolve_keepers
 
     n_teams = league.shape.n_teams
     names = league.keepers_for_season(season)
     if not names:
         return simulate_keepers(u, n_teams, league.n_keepers, rng)
-    resolved, unmatched = resolve_keeper_ids(conn, names)
+    res = resolve_keepers(conn, names)
+    resolved = res.resolved
     known = set(u.ids.tolist())
     missing = [n for n, pid in resolved.items() if pid not in known]
-    if warn and (unmatched or missing):
-        if unmatched:
-            warn(f"  keepers not found in nhl_players: {', '.join(unmatched)}")
+    if warn and (res.unmatched or res.ambiguous or missing):
+        if res.unmatched:
+            warn(f"  keepers not found in nhl_players: {', '.join(res.unmatched)}")
+        for entry, cands in res.ambiguous.items():
+            warn(
+                f"  keeper {entry!r} matches {len(cands)} players ({'; '.join(cands)}) - "
+                'NOT placed; qualify it in the league file, e.g. "Name (TEAM)"'
+            )
         if missing:
             warn(f"  keepers outside the ranked universe: {', '.join(missing)}")
 
     # Where the league records WHO keeps whom, honour it. Availability is the
     # same either way, but which seat holds a keeper decides whose roster the
     # engine reasons about - and on a live board one of those seats is ours.
+    #
+    # Owner names are resolved to ids on their own, not looked up by the exact
+    # spelling used in `by_season`: "JT Miller" under an owner and "J.T. Miller"
+    # in the pool are one player, and a string lookup sent him to a random seat.
+    kept_ids = set(resolved.values())
     owned: dict[int, list[int]] = {}
     for seat, owner_names in league.keeper_owners_for_season(season).items():
-        ids = [resolved.get(n) for n in owner_names]
-        unknown = [n for n in owner_names if resolved.get(n) not in known]
-        if warn and unknown:
-            warn(f"  seat {seat} keepers not on the board: {', '.join(unknown)}")
-        owned[seat] = [pid for pid in ids if pid is not None and pid in known]
+        mine = resolve_keepers(conn, tuple(owner_names))
+        bad = mine.unmatched + list(mine.ambiguous)
+        # An owner may only claim someone the pool lists as kept: placing a
+        # player the pool omits would take a draftable player off the board on
+        # the strength of a second, contradictory list.
+        outside = [n for n, pid in mine.resolved.items() if pid not in kept_ids]
+        off_board = [n for n, pid in mine.resolved.items() if pid in kept_ids and pid not in known]
+        if warn and bad:
+            warn(f"  seat {seat} keepers not resolvable: {', '.join(bad)}")
+        if warn and outside:
+            warn(
+                f"  seat {seat} keepers missing from keepers.by_season.{season} "
+                f"(not placed): {', '.join(outside)}"
+            )
+        if warn and off_board:
+            warn(f"  seat {seat} keepers not on the board: {', '.join(off_board)}")
+        owned[seat] = [pid for pid in mine.resolved.values() if pid in kept_ids and pid in known]
 
     return keeper_seats(
         [pid for pid in resolved.values() if pid in known], n_teams, rng, owned=owned

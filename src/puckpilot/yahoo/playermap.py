@@ -330,6 +330,55 @@ def load_adp(conn: sqlite3.Connection, league_key: str) -> dict[int, int]:
     }
 
 
+def mapped_league_keys(conn: sqlite3.Connection) -> list[tuple[str, int, str]]:
+    """(league_key, rows with an ADP, last updated) for every league in the map."""
+    return [
+        (str(r[0]), int(r[1]), str(r[2]))
+        for r in conn.execute(
+            "SELECT league_key, SUM(adp_rank IS NOT NULL AND nhl_player_id IS NOT NULL),"
+            " MAX(updated_at) FROM yahoo_player_map GROUP BY league_key ORDER BY league_key"
+        )
+    ]
+
+
+def resolve_adp_key(
+    conn: sqlite3.Connection, explicit: str | None, yahoo_arg: str | None
+) -> tuple[str | None, list[str]]:
+    """Which league's Yahoo ADP the board should use, and what to say about it.
+
+    Every survival probability on screen and the survival discount in the
+    score are computed off ADP. Without it the board falls back to a proxy
+    (last season's actual value order) - and it used to do that silently:
+    `--yahoo` given bare, or a key with a typo, simply produced no ADP and no
+    message. So every way of not getting ADP is named here, and the keys that
+    DO exist are listed, because a typo is the likeliest cause.
+
+    An explicit key wins; then a key given to `--yahoo`; then, if the map holds
+    exactly one league, that one.
+    """
+    notes: list[str] = []
+    keys = mapped_league_keys(conn)
+    listing = ", ".join(f"{k} ({n} priced, updated {u})" for k, n, u in keys) or "none"
+    key = explicit or (yahoo_arg if yahoo_arg and "." in str(yahoo_arg) else None)
+    if key is None:
+        if len(keys) == 1:
+            key = keys[0][0]
+            notes.append(f"using Yahoo ADP from the only mapped league, {key}")
+        else:
+            notes.append(
+                "WARNING: no ADP league key given and the player map does not name exactly "
+                f"one league (mapped: {listing}). Pass --adp-league-key."
+            )
+            return None, notes
+    if not load_adp(conn, key):
+        notes.append(
+            f"WARNING: no Yahoo ADP for league key {key!r} - mapped keys: {listing}. "
+            "Run `ppilot yahoo playermap --league-key <key>`, or fix the key."
+        )
+        return None, notes
+    return key, notes
+
+
 def pool_adp(conn: sqlite3.Connection, league_key: str | None = None) -> dict[str, float]:
     """Bare Yahoo player id -> ADP rank, over the whole fetched pool.
 

@@ -251,11 +251,19 @@ def test_yahoo_feed_survives_a_network_failure():
 
 def test_yahoo_feed_records_players_it_cannot_map():
     """A drafted prospect outside our NHL data is noted, not silently skipped -
-    otherwise the board quietly disagrees with Yahoo."""
+    otherwise the board quietly disagrees with Yahoo. And the pick still
+    consumes its slot, or the clock falls a pick behind the room."""
+    from puckpilot.draft.feed import apply
+
     picks = [{"pick": 1, "team_key": "t.1", "player_key": "477.p.9999"}]
     b, feed, _ = _yahoo_feed([picks], mapping={})
-    assert feed.poll(b) == []
+    feed.key_names = {"477.p.9999": "Ivan Demidov"}
+    events = feed.poll(b)
+    assert [(e.player_id, e.pick_no) for e in events] == [(None, 1)]
+    assert "Ivan Demidov" in events[0].label
     assert feed.unmapped == ["477.p.9999"]
+    apply(b, events)
+    assert b.made == 1 and b.picks[0].row == -1 and "Ivan Demidov" in b.picks[0].name
 
 
 def test_yahoo_feed_catches_up_after_missed_polls():
@@ -346,9 +354,64 @@ def test_an_out_of_range_seat_is_refused_not_raised():
 
 def test_replay_records_players_it_cannot_map():
     """Same honesty as the live feed: the console says how far behind it is."""
-    from puckpilot.draft.feed import ReplayFeed
+    from puckpilot.draft.feed import ReplayFeed, apply
 
     board = _board()
     feed = ReplayFeed([{"pick": 1, "yahoo_id": "nobody", "seat": 1}], {}, interval=0.0)
-    assert feed.poll(board) == []
+    events = feed.poll(board)
+    assert [e.player_id for e in events] == [None]
     assert feed.status()["unmapped"] == 1
+    apply(board, events)
+    assert board.made == 1, "an unmapped pick still happened; the clock must move"
+
+
+# ---- reconciling a hand-driven board with a recovered feed ------------------
+#
+# Manual entry and the feed now share one board, so the question these answer
+# is whether the two ever count the same pick twice - the error that leaves the
+# clock a pick off for the rest of the draft, silently.
+
+
+def test_an_unidentified_pick_consumes_its_slot():
+    b = _board()
+    accepted, rejected = apply(b, [PickEvent(None, 1, "feed", label="Prospect X", pick_no=1)])
+    assert accepted == [] and b.made == 1
+    assert b.picks[0].name == "Prospect X" and b.picks[0].seat == 1
+    assert rejected and "slot consumed" in rejected[0]
+
+
+def test_a_recovered_feed_names_a_pick_advanced_by_hand():
+    """The drill: the socket dies, the drafter presses 'unknown pick', the feed
+    comes back and delivers who it was."""
+    b = _board()
+    b.record_unknown(label="(entered by hand)")
+    pid = int(b.u.ids[2])
+    accepted, _ = apply(b, [PickEvent(pid, 0, "feed", pick_no=1)])
+    assert b.made == 1, "the same slot must not be counted twice"
+    assert accepted[0].player_id == pid
+    assert not b.avail[b._row_of[pid]]
+
+
+def test_a_feed_redelivering_a_hand_entered_pick_is_rejected_not_double_counted():
+    b = _board()
+    pid = int(b.u.ids[0])
+    b.record(pid, source="manual")
+    accepted, rejected = apply(b, [PickEvent(pid, 0, "feed", pick_no=1)])
+    assert accepted == [] and b.made == 1
+    assert "already off the board" in rejected[0]
+
+
+def test_an_unidentified_pick_already_entered_by_hand_is_not_counted_again():
+    b = _board()
+    b.record_unknown()
+    _, rejected = apply(b, [PickEvent(None, 0, "feed", pick_no=1)])
+    assert b.made == 1
+    assert "already on the board" in rejected[0]
+
+
+def test_an_unidentified_pick_in_a_keeper_slot_consumes_nothing():
+    b = _board(keepers={0: [1]}, keeper_placement="last")
+    # room pick 25 is seat 0's round-7 keeper on this board (see test_board)
+    _, rejected = apply(b, [PickEvent(None, 0, "feed", pick_no=25)])
+    assert b.made == 0
+    assert "keeper slot" in rejected[0]

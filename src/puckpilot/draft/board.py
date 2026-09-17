@@ -18,6 +18,7 @@ recommendation, so the live slot sequence is modelled explicitly.
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -52,6 +53,8 @@ FADING = "fading?"
 # player at every position - ours #2 against room #1 is not a disagreement, it
 # is two boards agreeing.
 MIN_RANK_GAP = 5
+# Which draft rounds a kept player occupies - see `DraftBoard._live_slots`.
+KEEPER_PLACEMENTS = ("first", "last")
 
 
 def _rank_within(values: np.ndarray, mask: np.ndarray) -> dict[int, int]:
@@ -123,13 +126,19 @@ class DraftBoard:
         keepers: dict[int, list[int]] | None = None,
         keeper_rounds: dict[int, list[int]] | None = None,
         roster_rounds: int | None = None,
+        keeper_placement: str = "last",
     ):
         self.u = universe
         self.rules = rules
         self.n_teams = rules.shape.n_teams
         if not 0 <= my_seat < self.n_teams:
             raise DraftBoardError(f"seat {my_seat} outside 0..{self.n_teams - 1}")
+        if keeper_placement not in KEEPER_PLACEMENTS:
+            raise DraftBoardError(
+                f"keeper_placement must be one of {KEEPER_PLACEMENTS}, got {keeper_placement!r}"
+            )
         self.my_seat = my_seat
+        self.keeper_placement = keeper_placement
 
         self._row_of: dict[int, int] = {int(pid): i for i, pid in enumerate(universe.ids)}
         self.avail = np.ones(len(universe), dtype=bool)
@@ -143,6 +152,10 @@ class DraftBoard:
         self.picks: list[Pick] = []
         self.keeper_picks: list[Pick] = []
         self.unmatched_keepers: list[int] = []
+        # Set by whoever built the board (see `live.build_live_board`): where
+        # ADP came from, and the build-time facts the drafter must be shown.
+        self.adp_source = "unknown"
+        self.warnings: list[str] = []
 
         keepers = keepers or {}
         for seat, pids in keepers.items():
@@ -164,43 +177,62 @@ class DraftBoard:
         if keepers:
             self.u = self.u.with_adp(effective_adp(self.u.adp_rank, self.avail))
 
-        self.slots = self._live_slots(
-            roster_rounds if roster_rounds is not None else rules.shape.roster_size,
-            {s: len(p) for s, p in keepers.items()},
-            keeper_rounds,
+        self._roster_rounds = (
+            roster_rounds if roster_rounds is not None else rules.shape.roster_size
         )
+        self._keeper_rounds = keeper_rounds
+        # Counted from the declaration, not from what placed: an unplaceable
+        # keeper still occupies his owner's draft slot in the real room.
+        self._keeper_counts = {s: len(p) for s, p in keepers.items()}
+        self.slots, self.slot_numbers = self._live_slots()
 
     # ---- construction helpers -------------------------------------------------
 
-    def _live_slots(
-        self,
-        roster_rounds: int,
-        keeper_counts: dict[int, int],
-        keeper_rounds: dict[int, list[int]] | None,
-    ) -> list[tuple[int, int]]:
-        """The (round, seat) slots that will actually be picked, in order.
+    def _live_slots(self) -> tuple[list[tuple[int, int]], list[int]]:
+        """The (round, seat) slots that will actually be picked, in order, and
+        each one's number in the room's own count (1-based, keeper slots
+        included).
 
         Yahoo assigns each keeper to a draft round, and that round is then not
-        picked. Which round is a league-mechanics detail we do not know until the
-        commissioner sets it, so the default assumption is stated rather than
-        hidden: keepers consume a seat's *earliest* rounds, which is what Yahoo
-        does when keepers are slotted by value. Pass `keeper_rounds` to override
-        once the real assignment is known.
+        picked. Which rounds is league configuration (`[keepers] placement`):
+
+        - "last": keepers fill each seat's final rounds, so the live draft is a
+          plain snake from pick 1 until the keeper rounds arrive. This is what
+          a league does when keeping is free, and it is the sequence the draft
+          sim was tuned against.
+        - "first": keepers consume each seat's earliest rounds, which is what a
+          league does when a keeper costs a high pick.
+
+        Getting it wrong is not cosmetic. With one real league's keepers under
+        the wrong placement, the board opened with seat 5 on the clock and put
+        seat 3's first pick at #16 instead of #4 - every survival probability
+        and every "your pick" banner off from the first pick. Pass
+        `keeper_rounds` to pin the exact rounds once the commissioner has set
+        them.
+
+        The room numbers keeper slots as picks, so `slot_numbers` is what
+        reconciles a feed's pick number with a count of live picks.
         """
+        n_rounds = self._roster_rounds
         consumed: dict[int, set[int]] = {}
         for seat in range(self.n_teams):
-            if keeper_rounds and seat in keeper_rounds:
-                consumed[seat] = set(keeper_rounds[seat])
+            k = self._keeper_counts.get(seat, 0)
+            if self._keeper_rounds and seat in self._keeper_rounds:
+                consumed[seat] = set(self._keeper_rounds[seat])
+            elif self.keeper_placement == "last":
+                consumed[seat] = set(range(max(0, n_rounds - k), n_rounds))
             else:
-                consumed[seat] = set(range(keeper_counts.get(seat, 0)))
+                consumed[seat] = set(range(k))
 
-        order = snake_order(self.n_teams, roster_rounds)
+        order = snake_order(self.n_teams, n_rounds)
         slots: list[tuple[int, int]] = []
+        numbers: list[int] = []
         for i, seat in enumerate(order):
             rnd = i // self.n_teams
             if rnd not in consumed[seat]:
                 slots.append((rnd, seat))
-        return slots
+                numbers.append(i + 1)
+        return slots, numbers
 
     def _bump(self, seat: int, row: int) -> None:
         pos = str(self.u.pos[row])
@@ -391,6 +423,35 @@ class DraftBoard:
         seat = self.my_seat if seat is None else seat
         return sum(1 for i in range(self.made, len(self.slots)) if self.slots[i][1] == seat)
 
+    # ---- reconciling with the room ---------------------------------------------
+
+    def live_picks_through(self, room_pick_no: int) -> int:
+        """How many LIVE picks the room has made once it reaches its pick
+        `room_pick_no` (1-based, the room's own numbering, keeper slots
+        included)."""
+        return bisect.bisect_right(self.slot_numbers, int(room_pick_no))
+
+    def slot_for_room_pick(self, room_pick_no: int) -> int | None:
+        """Index into `slots` of the room's pick `room_pick_no`, or None when
+        that number is a keeper slot on this board."""
+        i = bisect.bisect_left(self.slot_numbers, int(room_pick_no))
+        if i < len(self.slot_numbers) and self.slot_numbers[i] == int(room_pick_no):
+            return i
+        return None
+
+    def drift(self, room_picks_made: int) -> int:
+        """Live picks the room has made that this board has not recorded.
+
+        Positive means the board is BEHIND the room - the dangerous direction,
+        because `next_pick_no` and therefore every "lasts N%" on screen is then
+        computed for a pick that has already happened. Negative means picks were
+        entered by hand ahead of a lagging feed, which is harmless.
+
+        Takes the room's count of picks, not the feed's count of frames: a
+        dropped frame is exactly the failure this exists to reveal.
+        """
+        return self.live_picks_through(room_picks_made) - self.made
+
     def roster(self, seat: int | None = None) -> list[Pick]:
         """Players on a seat's roster. Placeholders for picks we could not rank
         are excluded - they consumed a slot, but we do not know who they were,
@@ -468,6 +529,84 @@ class DraftBoard:
             source="unknown",
         )
         self.picks.append(pick)
+        return pick
+
+    def fill_placeholder(self, index: int, player_id: int, source: str = "feed") -> Pick:
+        """Name a pick that was recorded as unknown, without consuming a slot.
+
+        The case this exists for: the feed stalls, the drafter advances the
+        clock by hand with "unknown pick", and the feed then recovers and
+        delivers who that pick actually was. Recording him as a NEW pick would
+        count the same slot twice and leave the board one pick ahead of the room
+        for the rest of the draft.
+        """
+        if not 0 <= index < len(self.picks) or self.picks[index].row >= 0:
+            raise DraftBoardError(f"pick {index + 1} is not an unknown placeholder")
+        row = self._row_of.get(int(player_id))
+        if row is None:
+            raise UnknownPlayerError(f"player {player_id} is not in the ranked universe")
+        if not self.avail[row]:
+            raise DraftBoardError(f"{self.u.names[row]} is already off the board")
+        old = self.picks[index]
+        self.avail[row] = False
+        self._rev += 1
+        self._bump(old.seat, row)
+        pick = self._pick_at(old.overall, old.seat, row, source)
+        self.picks[index] = pick
+        return pick
+
+    def add_keeper(self, player_id: int, seat: int) -> Pick:
+        """A keeper nobody declared, found mid-draft: off the board, onto that
+        seat's roster, and WITHOUT consuming a live pick.
+
+        This is different from "taken". A kept player is not a pick in the
+        rounds being drafted now, so recording him as one would advance the
+        clock past a pick that has not happened. The seat's keeper count grows,
+        so its live slots are recomputed - but only the picks still ahead can
+        move; the ones already made are history and are left exactly as they
+        were.
+        """
+        row = self._row_of.get(int(player_id))
+        if row is None:
+            raise UnknownPlayerError(f"player {player_id} is not in the ranked universe")
+        if not self.avail[row]:
+            raise DraftBoardError(f"{self.u.names[row]} is already off the board")
+        seat = int(seat)
+        if not 0 <= seat < self.n_teams:
+            raise DraftBoardError(f"seat {seat} is outside this {self.n_teams}-team board")
+
+        self._keeper_counts[seat] = self._keeper_counts.get(seat, 0) + 1
+        slots, numbers = self._live_slots()
+        if slots[: self.made] != self.slots[: self.made]:
+            # Too late in the draft for his slot to move without rewriting
+            # picks that already happened; the availability still matters.
+            self._keeper_counts[seat] -= 1
+        else:
+            self.slots, self.slot_numbers = slots, numbers
+        self.avail[row] = False
+        self._rev += 1
+        self._bump(seat, row)
+        pick = self._pick_at(-1, seat, row, "keeper")
+        self.keeper_picks.append(pick)
+        return pick
+
+    def remove_keeper(self, player_id: int) -> Pick | None:
+        """Undo `add_keeper` (or a declared keeper that turns out not to be
+        kept): back on the board, off that seat's roster."""
+        pick = next((p for p in self.keeper_picks if p.player_id == int(player_id)), None)
+        if pick is None:
+            return None
+        self.keeper_picks.remove(pick)
+        seat = pick.seat
+        self._keeper_counts[seat] = max(0, self._keeper_counts.get(seat, 0) - 1)
+        slots, numbers = self._live_slots()
+        if slots[: self.made] == self.slots[: self.made]:
+            self.slots, self.slot_numbers = slots, numbers
+        else:
+            self._keeper_counts[seat] += 1
+        self.avail[pick.row] = True
+        self._rev += 1
+        self.counts[seat][pick.position] = max(0, self.counts[seat].get(pick.position, 0) - 1)
         return pick
 
     def undo(self) -> Pick | None:

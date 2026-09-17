@@ -123,7 +123,10 @@ def test_unmappable_players_are_recorded_not_silently_dropped(capture, db):
         pass
 
     feed = replay(capture["frames"], {})  # nothing maps
-    assert feed.poll(Board()) == []
+    events = feed.poll(Board())
+    # Every pick is still emitted - unidentified - so each consumes its slot.
+    assert len(events) == 192 and all(e.player_id is None for e in events)
+    assert [e.pick_no for e in events] == list(range(1, 193))
     assert len(feed.state.unmapped) == 192
     assert feed.status()["unmapped"] == 192
 

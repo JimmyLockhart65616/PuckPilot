@@ -89,6 +89,25 @@ def load_yahoo_id_map(conn: sqlite3.Connection, league_key: str | None = None) -
     return out
 
 
+def load_yahoo_names(conn: sqlite3.Connection) -> dict[str, str]:
+    """Bare Yahoo player id -> the name Yahoo gave him, INCLUDING players who
+    never resolved to an NHL id.
+
+    Those are exactly the ones the console has to name: "unmapped: 1" is a
+    counter nobody can act on at the clock, "unmapped: Ivan Demidov" is a
+    player the drafter can see is gone.
+    """
+    return {
+        str(key).rsplit(".", 1)[-1]: str(name)
+        for key, name in conn.execute("SELECT player_key, full_name FROM yahoo_player_map")
+    }
+
+
+def unmapped_label(yahoo_id: str, names: dict[str, str] | None) -> str:
+    name = (names or {}).get(str(yahoo_id))
+    return f"{name} (not on our board)" if name else f"Yahoo player {yahoo_id} (unmapped)"
+
+
 @dataclass
 class FeedState:
     """What the feed has observed, for display and for gap detection."""
@@ -121,9 +140,12 @@ class WebsocketFeed:
 
     name = "websocket"
 
-    def __init__(self, context, yahoo_to_nhl: dict[str, int]):
+    def __init__(
+        self, context, yahoo_to_nhl: dict[str, int], yahoo_names: dict[str, str] | None = None
+    ):
         self.context = context
         self.yahoo_to_nhl = yahoo_to_nhl
+        self.yahoo_names = yahoo_names or {}
         self.state = FeedState()
         self.last_error: str | None = None
         self._emitted: set[int] = set()
@@ -173,14 +195,42 @@ class WebsocketFeed:
         events = []
         for fr in frames:
             nhl_id = self.yahoo_to_nhl.get(fr.yahoo_id)
-            if nhl_id is None:
-                # A player outside our pool (deep prospect). Recorded, so the
-                # console can say the board is behind rather than desync quietly.
-                self.state.unmapped.append(fr.yahoo_id)
-                continue
             # Yahoo numbers seats from 1; the board from 0.
-            events.append(PickEvent(nhl_id, max(0, fr.seat - 1), self.name))
+            seat = max(0, fr.seat - 1)
+            if nhl_id is None:
+                # A player outside our pool (deep prospect). The pick still
+                # happened: it used to be dropped here with `continue`, so
+                # `board.made` never advanced and every pick after it was
+                # scored against a clock one slot behind the room. Emitted as
+                # an unidentified pick instead, which consumes the slot.
+                with self._lock:
+                    self.state.unmapped.append(fr.yahoo_id)
+                events.append(
+                    PickEvent(
+                        None,
+                        seat,
+                        self.name,
+                        label=unmapped_label(fr.yahoo_id, self.yahoo_names),
+                        pick_no=fr.pick,
+                    )
+                )
+                continue
+            events.append(PickEvent(nhl_id, seat, self.name, pick_no=fr.pick))
         return events
+
+    def unmapped_names(self) -> list[str]:
+        with self._lock:
+            ids = list(self.state.unmapped)
+        return [unmapped_label(i, self.yahoo_names) for i in ids]
+
+    def room_picks_made(self) -> int:
+        """How far the ROOM has got, from the best evidence on the socket: the
+        highest pick number seen, or the pick now on the clock minus one if
+        that is further along (a pick frame can be dropped; the clock frame
+        that follows it still says where the room is)."""
+        with self._lock:
+            clock = self.state.on_the_clock
+            return max(self.state.highest_pick, (clock.pick - 1) if clock else 0)
 
     def status(self) -> dict:
         with self._lock:
@@ -191,6 +241,13 @@ class WebsocketFeed:
                 "highest_pick": self.state.highest_pick,
                 "gaps": self.state.gaps[:10],
                 "unmapped": len(self.state.unmapped),
+                "unmapped_names": [
+                    unmapped_label(i, self.yahoo_names) for i in self.state.unmapped[-10:]
+                ],
+                "room_picks": max(
+                    self.state.highest_pick,
+                    (self.state.on_the_clock.pick - 1) if self.state.on_the_clock else 0,
+                ),
                 "on_the_clock": (
                     None
                     if self.state.on_the_clock is None
@@ -225,7 +282,9 @@ def pump(context, seconds: float) -> None:
     time.sleep(seconds)
 
 
-def replay(payloads, yahoo_to_nhl: dict[str, int]) -> WebsocketFeed:
+def replay(
+    payloads, yahoo_to_nhl: dict[str, int], yahoo_names: dict[str, str] | None = None
+) -> WebsocketFeed:
     """Drive a feed from recorded frames, with no browser involved.
 
     This is what turns one captured draft into a permanent regression test.
@@ -237,7 +296,7 @@ def replay(payloads, yahoo_to_nhl: dict[str, int]) -> WebsocketFeed:
         def on(self, *_a, **_k):
             return None
 
-    feed = WebsocketFeed(_NullContext(), yahoo_to_nhl)
+    feed = WebsocketFeed(_NullContext(), yahoo_to_nhl, yahoo_names)
     for payload in payloads:
         feed.ingest(str(payload))
     return feed

@@ -6,12 +6,18 @@ dependency install, a container, or a build step to come up.
 The engine does not pick here. It shows a shortlist with the reasoning on both
 sides, the full remaining board, the roster, and what the roster still needs —
 and a human decides. Picks arrive on their own from the websocket feed, which
-measured 190/190 against a real draft, so there is no manual pick entry to keep
-in sync.
+measured 190/190 against a real draft.
+
+That record is the reason a second pick source exists rather than the reason
+to omit one: a feed that works every time fails silently the one time it does
+not. So the owner can also enter picks by hand - taken, unknown, kept - and the
+feed and the hand share one board without counting a pick twice (see
+`feed.apply`).
 
 The page is the proof as much as the product: it shows how many picks the feed
-has seen, whether any pick numbers are missing, and how long since the last one,
-so a stalled feed is visible rather than silently frozen.
+has seen, whether any pick numbers are missing, how long since the last one,
+and how many picks the board is BEHIND the room - so a stalled feed is visible
+rather than silently frozen.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from puckpilot.draft import entry
 from puckpilot.draft.advice import market_disagreement, market_watchlist, recommend
 from puckpilot.draft.board import DraftBoard
 from puckpilot.draft.engine import RosterValuePolicy
@@ -79,11 +86,53 @@ class LiveState:
         return len(accepted)
 
     def undo(self) -> str:
-        """Recovery hatch: the feed is the only pick source, so a bad frame
-        needs a way back without restarting the console mid-draft."""
+        """Recovery hatch for a bad frame or a mis-entered pick, without
+        restarting the console mid-draft."""
         with self.lock:
             pick = self.board.undo()
         return f"undid {pick.name}" if pick else "nothing to undo"
+
+    # ---- the second pick source (see draft.entry) -------------------------------
+
+    def taken(self, player: str, seat: int | None = None) -> tuple[bool, str]:
+        with self.lock:
+            ok, msg = entry.mark_taken(self.board, player, seat)
+        if ok:
+            self.last_pick_at = time.time()
+        return ok, msg
+
+    def unknown(self, seat: int | None = None) -> tuple[bool, str]:
+        with self.lock:
+            ok, msg = entry.mark_unknown(self.board, seat)
+        if ok:
+            self.last_pick_at = time.time()
+        return ok, msg
+
+    def kept(self, player: str, seat: int | None) -> tuple[bool, str]:
+        with self.lock:
+            return entry.mark_kept(self.board, player, seat)
+
+    def unkept(self, player: str) -> tuple[bool, str]:
+        with self.lock:
+            return entry.unmark_kept(self.board, player)
+
+    def health(self) -> dict:
+        """Everything that says whether the board can be trusted right now.
+
+        Drift is the headline. The feed's own gap list only catches a missing
+        pick BELOW the highest one it saw; a board that simply stopped hearing
+        the room (socket dead, tab navigated away) has no gaps at all and is
+        still wrong about every survival probability on screen.
+        """
+        status = self.feed.status() if hasattr(self.feed, "status") else {}
+        room = int(status.get("room_picks") or status.get("highest_pick") or 0)
+        drift = self.board.drift(room) if room else 0
+        return {
+            "room_picks": room,
+            "drift": drift,
+            "unmapped_names": list(status.get("unmapped_names") or []),
+            "feed_error": status.get("error") or getattr(self.feed, "last_error", None),
+        }
 
     def snapshot(self, seat: int | None = None) -> dict:
         """The whole view for one seat.
@@ -137,6 +186,10 @@ class LiveState:
             ]
             board_rows = [
                 {
+                    # The id rides along so a row's "taken" control names
+                    # exactly this player - never a second name lookup that
+                    # could land on a namesake.
+                    "id": c.player_id,
                     "name": c.name,
                     "position": c.position,
                     "team": c.team,
@@ -168,8 +221,22 @@ class LiveState:
             # Priced from the room, not from us (see draft.market) - a third,
             # clearly separate list rather than folded into the board, where a
             # market number could be mistaken for a VORP we computed.
+            # The last few picks, with who entered them. When the feed and a
+            # human share the board, "was that the feed or me" is the first
+            # question before any undo.
+            recent = [
+                {
+                    "pick": p.overall + 1,
+                    "seat": p.seat,
+                    "name": p.name,
+                    "position": p.position,
+                    "source": p.source,
+                }
+                for p in self.board.picks[-8:]
+            ][::-1]
             watchlist = [
                 {
+                    "id": c.player_id,
                     "name": c.name,
                     "position": c.position,
                     "team": c.team,
@@ -180,8 +247,21 @@ class LiveState:
             ]
 
         status = self.feed.status() if hasattr(self.feed, "status") else {}
+        health = self.health()
         return {
             "seat": seat,
+            # Positive = the board has missed picks the room already made, so
+            # every "lasts N%" below is for a pick that is already gone.
+            "drift": health["drift"],
+            "room_picks": health["room_picks"],
+            "unmapped_names": health["unmapped_names"],
+            "feed_name": getattr(self.feed, "name", None),
+            # Build-time facts that change what every number means - a proxy
+            # ADP, an undeclared keeper list - shown on the screen being used,
+            # not left in the scrollback of the terminal that built the board.
+            "warnings": list(getattr(self.board, "warnings", []) or []),
+            "adp_source": getattr(self.board, "adp_source", "unknown"),
+            "recent": recent,
             "round": rnd,
             "made": made,
             "total": total,
@@ -206,7 +286,9 @@ class LiveState:
             "needs": needs,
             "diagnostics": (
                 f"feed={status.get('chosen', 'none')} frames={status.get('frames', 0)} "
-                f"unmapped={status.get('unmapped', 0)}" + (f"  |  {self.note}" if self.note else "")
+                f"unmapped={status.get('unmapped', 0)}"
+                + (f"  |  feed error: {health['feed_error']}" if health["feed_error"] else "")
+                + (f"  |  {self.note}" if self.note else "")
             ),
         }
 
@@ -340,31 +422,82 @@ def make_handler(state: LiveState, access: Access | None = None):
                 # independently, so a forged value buys nothing.
                 payload["can_undo"] = role == "owner"
                 self._send(200, json.dumps(payload), "application/json")
-            elif route == "/undo":
+            elif route in MUTATING_ROUTES:
                 # Mutating routes are POST-only, so a bare navigation or an
                 # <img> src cannot rewind the board mid-draft.
-                self._refuse(405, "use POST /undo")
+                self._refuse(405, f"use POST {route}")
             else:
                 if role is None:
                     self._refuse(403, "a valid access key is required")
                     return
                 self._send(200, PAGE, "text/html; charset=utf-8")
 
+        def _param(self, name: str) -> str:
+            q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            return (q.get(name) or [""])[0]
+
+        def _drafting_seat(self) -> tuple[int | None, str | None]:
+            """The seat a pick is attributed to (`by=`), not the view (`seat=`).
+
+            Two parameters because they mean different things: the page always
+            carries `seat=` for the view it is showing, and a pick entered from
+            seat 3's screen is usually some OTHER seat's pick. Absent means the
+            seat on the clock.
+            """
+            raw = self._param("by")
+            if raw == "":
+                return None, None
+            try:
+                seat = int(raw)
+            except ValueError:
+                return None, f"by must be a seat number, got {raw!r}"
+            if not 0 <= seat < state.board.n_teams:
+                return None, f"seat {seat} outside 0..{state.board.n_teams - 1}"
+            return seat, None
+
         def do_POST(self):
-            if self._route() != "/undo":
+            route = self._route()
+            if route not in MUTATING_ROUTES:
                 self._refuse(404, "not found")
                 return
             if not self._is_same_origin():
                 self._refuse(403, "cross-origin refused")
                 return
-            # Owner only. A guest rewinding the shared board mid-draft is the
-            # one destructive thing this view can do.
+            # Owner only. Every one of these rewrites the shared board, which is
+            # the one destructive thing this view can do - a guest must not.
             if self._role() != "owner":
-                self._refuse(403, "undo is owner-only")
+                self._refuse(403, f"{route.lstrip('/')} is owner-only")
                 return
-            self._send(200, json.dumps({"result": state.undo()}), "application/json")
+            if route == "/undo":
+                self._send(200, json.dumps({"result": state.undo()}), "application/json")
+                return
+
+            seat, err = self._drafting_seat()
+            if err:
+                self._refuse(400, err)
+                return
+            player = self._param("player")
+            if route == "/taken":
+                ok, msg = state.taken(player, seat)
+            elif route == "/unknown":
+                ok, msg = state.unknown(seat)
+            elif route == "/kept":
+                if seat is None:
+                    self._refuse(400, "kept needs by=<seat>: a keeper belongs to a team")
+                    return
+                ok, msg = state.kept(player, seat)
+            else:  # /unkept
+                ok, msg = state.unkept(player)
+            # 200 either way: a refusal here is an answer for the drafter to
+            # read ("already off the board"), not a transport failure.
+            self._send(200, json.dumps({"ok": ok, "result": msg}), "application/json")
 
     return Handler
+
+
+# Every route that changes the board. One set, so the GET refusal, the POST
+# dispatch and the owner check cannot disagree about what counts as mutating.
+MUTATING_ROUTES = frozenset({"/undo", "/taken", "/unknown", "/kept", "/unkept"})
 
 
 def serve(
