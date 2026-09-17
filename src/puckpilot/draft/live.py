@@ -40,6 +40,18 @@ Commands (type and press enter):
   ?             this help
   q             quit
 Picks arrive on their own from the websocket feed; there is nothing to type in.
+
+What the columns mean, first time here:
+  VORP     value over the last startable player at that position - the one
+           number safe to compare ACROSS positions (a C and a D at the same
+           VORP are equally valuable picks). Higher is always better.
+  ADP      average draft position: where the room actually takes him.
+  Lasts?   odds he is still there at your next turn. High = safe to wait on
+           him; low = take him now or lose him.
+  *        marks a player who fills a starting slot right now, not the bench.
+"Likely still there next turn" names the room is expected to leave for you.
+"Market only, no projection" is real draft buzz (usually a rookie) priced from
+the room, not from us - a pick of one is recorded, but never recommended.
 """
 
 

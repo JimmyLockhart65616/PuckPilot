@@ -78,7 +78,7 @@ def recommend(
     # The displayed probability is fitted to real rooms, not to the scoring
     # knob - see RosterValuePolicy.display_spread. Everything downstream of
     # here is human-facing, so it gets the honest number.
-    p_survive = policy.survival(u, ctx, spread=policy.display_spread)
+    p_survive = policy.survival(u, ctx, spread=policy.display_spread, position_bias=True)
 
     mask = board.avail.copy()
     # Market-implied rows exist so the board can RECORD a pick of a player we
@@ -150,7 +150,7 @@ def market_watchlist(board: DraftBoard, seat: int | None = None, n: int = 10) ->
 
     ctx = board.pick_context(seat)
     policy = RosterValuePolicy()
-    p_survive = policy.survival(u, ctx, spread=policy.display_spread)
+    p_survive = policy.survival(u, ctx, spread=policy.display_spread, position_bias=True)
 
     rows = np.flatnonzero(mask)
     top = rows[np.argsort(u.adp_rank[rows], kind="stable")[:n]]

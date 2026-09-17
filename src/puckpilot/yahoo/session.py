@@ -233,6 +233,26 @@ class YahooSession:
                 out.append(flatten(entry))
         return out
 
+    def roster(self, team_key: str) -> list[dict]:
+        """A team's current roster - pre-draft, exactly its kept/protected players.
+
+        Yahoo nests the player list one level deeper here than `players()` or
+        `draft_results()` do: roster -> "0" -> players -> count + indexed entries.
+        """
+        tm = self.get(f"team/{team_key}/roster")["fantasy_content"]["team"]
+        roster_node = next((x["roster"] for x in tm if isinstance(x, dict) and "roster" in x), None)
+        if not roster_node:
+            return []
+        node = roster_node.get("0", {}).get("players", {})
+        if not isinstance(node, dict):  # Yahoo sends [] rather than {"count": 0} when empty
+            return []
+        out = []
+        for i in range(int(node.get("count", 0))):
+            entry = node.get(str(i), {}).get("player")
+            if entry:
+                out.append(flatten(entry))
+        return out
+
     def players(
         self, league_key: str, start: int = 0, count: int = 25, extra: str = ""
     ) -> list[dict]:

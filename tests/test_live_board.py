@@ -338,7 +338,7 @@ def test_the_shown_probability_uses_the_calibrated_spread():
     ctx = b.pick_context(0)
 
     shown = {c.row: c.p_survive for c in cands}
-    by_display = policy.survival(b.u, ctx, spread=16.0)
+    by_display = policy.survival(b.u, ctx, spread=16.0, position_bias=True)
     by_scoring = policy.survival(b.u, ctx, spread=6.0)
 
     for row, value in shown.items():

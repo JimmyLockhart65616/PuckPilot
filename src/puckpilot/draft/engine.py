@@ -8,6 +8,33 @@ import pandas as pd
 
 from puckpilot.engine.valuation import DEFAULT_SHAPE, LeagueShape, replacement_level
 
+# Display-only correction to the ADP survival curve: how many picks earlier or
+# later than a flat ADP model each position actually goes, in real rooms.
+# Fitted on 12 harvested mock drafts (80,786 in-doubt observations, within 30
+# picks of a player's own ADP - the same "in doubt" band `draft/calibrate.py`
+# implicitly assumes): a per-position intercept on top of the display_spread
+# curve, coordinate descent on a 0.25 grid. Positive = lasts longer than raw
+# ADP says; negative = goes sooner.
+#
+# Confirmed by split-half replication, not just an in-sample fit: fit on 6
+# mocks / scored on the other 6, and reversed, gave -0.1456 and -0.1508
+# log-loss respectively against the position-blind curve - same sign, same
+# rough magnitude both ways. D and G going sooner than ADP implies (draft-room
+# runs on scarce positions) is the largest single piece of it.
+#
+# Deliberately NOT folded into `survival_spread` / `score()`: that knob is
+# gated on the draft sim, which only replays real players against bot
+# opponents and cannot currently attribute a position-specific market bias to
+# anything except noise. This corrects what the drafter is SHOWN; it does not
+# change what the engine picks.
+DEFAULT_DISPLAY_POSITION_BIAS: dict[str, float] = {
+    "C": 1.75,
+    "L": 1.25,
+    "R": 1.5,
+    "D": -0.75,
+    "G": -0.5,
+}
+
 
 @dataclass(frozen=True)
 class DraftRules:
@@ -210,6 +237,14 @@ class RosterValuePolicy:
       no longer a usable out-of-sample control for anything goalie-shaped, and
       this re-tune was confirmed on 2025-26 only. Per-season team history would
       fix it and does not exist.
+
+    `display_position_bias` sits on top of `display_spread` for the same
+    reason: real rooms do not draft every position on the same curve. D and G
+    go sooner than a flat ADP model expects and forwards last longer - see
+    `DEFAULT_DISPLAY_POSITION_BIAS` for the fit and its split-half validation.
+    Also display-only: the draft sim cannot currently arbitrate a
+    position-specific market bias against bot opponents, so this does not
+    touch `score()`.
     """
 
     name = "engine"
@@ -222,6 +257,7 @@ class RosterValuePolicy:
         survival_discount: float = 0.30,
         survival_spread: float = 6.0,
         display_spread: float = 16.0,
+        display_position_bias: dict[str, float] | None = None,
         basis: str = "vorp",
         replacement_depth: float = 0.0,
     ):
@@ -235,6 +271,11 @@ class RosterValuePolicy:
         self.survival_discount = survival_discount
         self.survival_spread = survival_spread
         self.display_spread = display_spread
+        self.display_position_bias = (
+            dict(DEFAULT_DISPLAY_POSITION_BIAS)
+            if display_position_bias is None
+            else display_position_bias
+        )
         self.basis = basis
         self.replacement_depth = replacement_depth
 
@@ -273,7 +314,9 @@ class RosterValuePolicy:
             score += self.cat_weights.get(cat, 1.0) * z
         return score
 
-    def survival(self, u: Universe, ctx=None, spread: float | None = None) -> np.ndarray:
+    def survival(
+        self, u: Universe, ctx=None, spread: float | None = None, position_bias: bool = False
+    ) -> np.ndarray:
         """P(each player is still there at our next turn), per the ADP model.
 
         Exposed because the live console shows it: "he'll last, take the other
@@ -284,12 +327,24 @@ class RosterValuePolicy:
         `spread` defaults to `survival_spread`, the knob the scoring uses. Human
         facing callers pass `display_spread` instead - see that parameter for
         why the two differ and why showing the scoring value would be a lie.
+
+        `position_bias` is a separate opt-in, not inferred from `spread`, so a
+        caller that passes an explicit spread for some other reason (as the
+        regression test below does) does not silently pick up a correction it
+        never asked for. Human-facing callers pass `position_bias=True`
+        alongside `display_spread` - see `display_position_bias`. `score()`
+        never sets it.
         """
         if not (ctx and ctx.get("next_pick_no") is not None):
             return np.zeros(len(u))
         taken_by_next = ctx["next_pick_no"]
         s = self.survival_spread if spread is None else spread
-        return 1.0 / (1.0 + np.exp(-(u.adp_rank - taken_by_next) / s))
+        bias = (
+            np.array([self.display_position_bias.get(p, 0.0) for p in u.pos])
+            if position_bias
+            else 0.0
+        )
+        return 1.0 / (1.0 + np.exp(-((u.adp_rank - taken_by_next) / s + bias)))
 
     def score(self, u: Universe, counts, rules, ctx=None) -> np.ndarray:
         """Per-player score before availability and position eligibility.

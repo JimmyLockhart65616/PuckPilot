@@ -69,8 +69,41 @@ PAGE = """<!doctype html>
   <div id="gaps"></div>
   <div><span class="k">left</span> <span id="supply"></span></div>
   <div style="margin-left:auto">
+    <button id="legend-btn" title="What do these numbers mean?">? legend</button>
     <button id="undo" title="Take back the last pick the feed recorded">undo last pick</button>
     <span id="undone" class="k"></span></div>
+</div>
+<div id="legend" class="card" hidden>
+  <div class="k" style="margin-bottom:6px">WHAT THE NUMBERS MEAN &mdash; first time here?</div>
+  <ul class="r" style="columns:2 280px;column-gap:24px">
+    <li><b>VORP</b> &mdash; value over the last startable player at that position.
+      Already accounts for scarcity, so it is the one number safe to compare
+      ACROSS positions (a center and a defenseman at the same VORP are equally
+      valuable picks). Higher is always better.</li>
+    <li><b>ADP</b> &mdash; average draft position: where the room actually
+      takes him, not our opinion of him.</li>
+    <li><b>lasts %</b> &mdash; odds he is still on the board when it is your
+      next turn. High = safe to wait on him; low = take him now or lose him.</li>
+    <li><b>TAKE ONE OF THESE</b> &mdash; the engine's top picks right now.
+      Each reason is tagged <span class="pro">for taking him</span> or
+      <span class="con">against</span>.</li>
+    <li><b>THE ROOM IS SLEEPING ON</b> &mdash; startable players we rate well
+      above the room's own ADP &mdash; possible value if you wait a beat.</li>
+    <li><b>THE ROOM RATES THESE ABOVE US</b> &mdash; players the room takes
+      earlier than we would &mdash; a check on our own blind spots, worth a
+      second look before you pass.</li>
+    <li><b>MARKET ONLY &mdash; NO PROJECTION</b> &mdash; real draft buzz
+      (usually a rookie) with no season projection of ours. Priced from the
+      room, never from us &mdash; the <span class="mkt">MKT</span> tag marks
+      that it is their opinion, not ours.</li>
+    <li><b>needs</b> &mdash; starting roster slots you still have to fill.</li>
+    <li><b>left / supply</b> &mdash; players remaining, overall and by
+      position &mdash; a position marked orange is running thin.</li>
+    <li><b>blocked <span class="blk">cap</span>/<span class="blk">min</span></b>
+      &mdash; your roster rules won't let you draft that position right now
+      (already capped, or a minimum elsewhere takes priority). Still shown, not
+      hidden &mdash; it's a fact about your roster, not the player.</li>
+  </ul>
 </div>
 <div class="cols">
   <div class="col" style="flex:1.15">
@@ -202,6 +235,9 @@ function render(s){
 
   document.getElementById('diag').textContent = s.diagnostics;
 }
+document.getElementById('legend-btn').addEventListener('click', () => {
+  document.getElementById('legend').hidden = !document.getElementById('legend').hidden;
+});
 document.getElementById('undo').addEventListener('click', async () => {
   const note = document.getElementById('undone');
   try {
