@@ -365,13 +365,15 @@ def _push_snapshots(url: str, key: str, state, seats: list[int]) -> str:
         body = wire.dumps({"seats": {str(s): state.snapshot(s) for s in seats}}).encode("utf-8")
     except Exception as e:
         return f"snapshot for push failed: {e.__class__.__name__}: {e}"
-    req = urllib.request.Request(
-        url.rstrip("/") + "/push",
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/json", "X-PuckPilot-Key": key},
-    )
     try:
+        # Constructing the request parses the URL, so a mistyped --publish
+        # ("puckpilot-draft.azurecontainerapps.io", no scheme) raises here.
+        req = urllib.request.Request(
+            url.rstrip("/") + "/push",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json", "X-PuckPilot-Key": key},
+        )
         with urllib.request.urlopen(req, timeout=5) as r:
             r.read()
         return ""
@@ -719,6 +721,128 @@ def _cmd_draft_mock(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_draft_e2e(args: argparse.Namespace) -> int:
+    """Whole drafts through board -> snapshot -> local page -> push -> relay -> guest."""
+    import os
+    from pathlib import Path
+
+    import numpy as np
+
+    from puckpilot.data import store
+    from puckpilot.draft import e2e
+    from puckpilot.draft.farm import load_all
+    from puckpilot.draft.feed import ReplayFeed
+    from puckpilot.draft.live import build_live_board
+    from puckpilot.draft.wsfeed import WebsocketFeed, load_yahoo_id_map
+    from puckpilot.web.relay import build_id
+    from puckpilot.yahoo.playermap import load_adp
+
+    def say(msg: str) -> None:
+        print(msg, flush=True)
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    league = _league(args)
+    quiet = (lambda _m: None) if not args.verbose else say
+
+    if args.relay:
+        owner = args.owner_key or os.environ.get("PUCKPILOT_E2E_OWNER_KEY", "")
+        guest = args.guest_key or os.environ.get("PUCKPILOT_E2E_GUEST_KEY", "")
+        if not owner or not guest:
+            say("--relay needs both keys: --owner-key/--guest-key or PUCKPILOT_E2E_*_KEY")
+            return 2
+        relay = e2e.Relay(args.relay.rstrip("/"), owner, guest)
+        say(f"relay: {relay.url}")
+    else:
+        relay = e2e.start_local_relay()
+        say(f"relay: in-process at {relay.url}")
+
+    keys = [r[0] for r in conn.execute("SELECT DISTINCT league_key FROM yahoo_player_map")]
+    league_key = args.adp_league_key or (keys[0] if len(keys) == 1 else None)
+    adp = load_adp(conn, league_key) if league_key else None
+    say(f"ADP: {league_key or 'none'} ({len(adp or {})} players)")
+    names = e2e.yahoo_rows(conn)
+    idmap = load_yahoo_id_map(conn)
+    seats = _parse_seats(args.seats, 0)
+    expect = build_id() if args.expect_build else None
+    sources = {"sim", "harvest", "capture"} if args.source == "all" else {args.source}
+    results = []
+
+    def run(board, polls, name, source, **kw):
+        harness = e2e.Harness(
+            board,
+            relay,
+            cats=kw.pop("cats"),
+            seats=tuple(s for s in seats if s < board.n_teams),
+            every=args.every,
+            names=names,
+            expect_build=expect,
+        )
+        res = harness.run(polls, name, source, **kw)
+        results.append(res)
+        say(res.summary())
+
+    try:
+        if "sim" in sources:
+            for i in range(args.drafts):
+                seed = args.seed + i
+                board = build_live_board(
+                    conn, league, seat=seats[0], season=args.season, adp=adp,
+                    league_key=league_key, progress=quiet,
+                )  # fmt: skip
+                rng = np.random.default_rng(seed)
+                run(board, e2e.sim_polls(board, league, rng), f"sim seed {seed}", "sim",
+                    cats=league.all_cats)  # fmt: skip
+
+        if "harvest" in sources:
+            rooms = load_all(Path(args.mocks))[: args.limit or None]
+            for h in rooms:
+                room = e2e.room_league(league, h.n_teams)
+                board = build_live_board(
+                    conn, room, seat=seats[0], season=args.season, adp=adp,
+                    league_key=league_key, progress=quiet,
+                )  # fmt: skip
+                feed = ReplayFeed(h.picks, idmap, interval=0, n_teams=h.n_teams)
+                polls = e2e.replay_polls(feed, len(h.picks) + 5)
+                run(board, polls, f"room {h.started[:16]}", "harvest", cats=league.all_cats,
+                    room_picks=len(h.picks), unmapped=lambda f=feed: f.unmapped)  # fmt: skip
+
+        if "capture" in sources:
+            dirs = sorted(p.parent for p in Path(args.captures).glob("*/websocket.jsonl"))
+            for d in dirs[: args.limit or None]:
+                frames = e2e.capture_frames(d)
+                feed = WebsocketFeed(e2e._NoContext(), idmap)
+                for f in frames:  # size the room from the frames themselves
+                    feed.ingest(f)
+                n_teams = max((fr.seat for fr in feed.state.picks.values()), default=0)
+                room_picks = len(feed.state.picks)
+                if not n_teams:
+                    say(f"SKIP  {d.name}: no pick frames")
+                    continue
+                feed = WebsocketFeed(e2e._NoContext(), idmap)
+                room = e2e.room_league(league, n_teams)
+                board = build_live_board(
+                    conn, room, seat=seats[0], season=args.season, adp=adp,
+                    league_key=league_key, progress=quiet,
+                )  # fmt: skip
+                run(board, e2e.frame_polls(frames, feed), f"capture {d.name}", "capture",
+                    cats=league.all_cats, room_picks=room_picks,
+                    unmapped=lambda f=feed: f.state.unmapped)  # fmt: skip
+    finally:
+        relay.close()
+
+    failed = [r for r in results if not r.passed]
+    picks = sum(r.picks for r in results)
+    checks = sum(r.checks for r in results)
+    say("")
+    say(
+        f"{len(results)} draft(s), {picks} picks, {checks} verified states, "
+        f"{sum(r.pushes for r in results)} pushes: "
+        + ("ALL PASS" if not failed else f"{len(failed)} FAILED")
+    )
+    return 1 if failed or not results else 0
+
+
 def _cmd_lineup_replay(args: argparse.Namespace) -> int:
     from puckpilot.data import store
     from puckpilot.engine.lineup_replay import bench_regret_report
@@ -981,6 +1105,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Season to draft for and replay; must be complete to be graded",
     )
     mock.set_defaults(func=_cmd_draft_mock)
+
+    e2e = draft_sub.add_parser(
+        "e2e",
+        help="Whole drafts through board, page, push and relay, verified at every pick "
+        "(bots, harvested rooms, recorded websocket frames - never a live room)",
+    )
+    e2e.add_argument("--source", choices=("all", "sim", "harvest", "capture"), default="all")
+    e2e.add_argument("--drafts", type=int, default=3, help="Bot drafts on the real league")
+    e2e.add_argument("--seed", type=int, default=20260918)
+    e2e.add_argument("--seats", default="0,5", metavar="N,N", help="Seats to verify and push")
+    e2e.add_argument("--every", type=int, default=1, help="Verify every N picks")
+    e2e.add_argument("--season", default="20262027")
+    e2e.add_argument("--limit", type=int, default=0, help="Max rooms per replay source")
+    e2e.add_argument("--mocks", default="data/mocks")
+    e2e.add_argument("--captures", default="data/captures")
+    e2e.add_argument("--adp-league-key", default=None, help="Default: the only key in the map")
+    e2e.add_argument(
+        "--relay", default=None, metavar="URL", help="Remote relay (default: in-process)"
+    )
+    e2e.add_argument("--owner-key", default=None, help="Default: PUCKPILOT_E2E_OWNER_KEY")
+    e2e.add_argument("--guest-key", default=None, help="Default: PUCKPILOT_E2E_GUEST_KEY")
+    e2e.add_argument(
+        "--expect-build",
+        action="store_true",
+        help="Fail unless the relay's /healthz build matches this checkout",
+    )
+    e2e.add_argument("--verbose", action="store_true", help="Show board-building output")
+    e2e.set_defaults(func=_cmd_draft_e2e)
 
     farm = draft_sub.add_parser(
         "farm",

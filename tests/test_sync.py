@@ -324,3 +324,82 @@ def test_a_club_with_no_roster_for_that_season_is_skipped(db):
     # above - both count as "changed" now that a rookie is inserted rather
     # than silently dropped by a pure UPDATE matching no row.
     assert result["teams"] == 2 and result["changed"] == 2 and result["new"] == 1
+
+
+# ---- names MoneyPuck mangled ------------------------------------------------------
+#
+# MoneyPuck's CSVs delete accented letters rather than folding them: Tim Stützle
+# is "Tim Sttzle", Alexis Lafrenière "Alexis Lafrenire". The draft board showed
+# those spellings and `DraftBoard.find("stutzle")` matched nobody, which is the
+# path manual pick entry depends on.
+
+
+class NamedRoster(RosterNhl):
+    def roster(self, team_abbrev, season):
+        if team_abbrev == "DAL":
+            return {
+                "forwards": [
+                    {"id": 1, "firstName": {"default": "Tim"}, "lastName": {"default": "Stützle"}},
+                    {
+                        "id": 2,
+                        "firstName": {"default": "Mitchell"},
+                        "lastName": {"default": "Marner"},
+                    },
+                ],
+                "defensemen": [],
+                "goalies": [],
+            }
+        return {"forwards": [], "defensemen": [], "goalies": []}
+
+
+def test_a_name_moneypuck_mangled_is_repaired_from_the_roster(db):
+    store.upsert_player(db, 1, "Tim Sttzle", "L", "DAL")
+    result = sync.sync_current_rosters(db, NamedRoster(), "20262027", delay=0)
+    name = db.execute("SELECT full_name FROM nhl_players WHERE player_id = 1").fetchone()[0]
+    assert name == "Tim Stützle"
+    assert result["renamed"] == 1
+
+
+def test_a_spelling_choice_is_not_damage_and_is_left_alone(db):
+    """Only a deleted-letter copy is repaired. "Mitch" vs "Mitchell" is a
+    preference, and churning it would break every match made on the old one."""
+    store.upsert_player(db, 2, "Mitch Marner", "R", "DAL")
+    result = sync.sync_current_rosters(db, NamedRoster(), "20262027", delay=0)
+    name = db.execute("SELECT full_name FROM nhl_players WHERE player_id = 2").fetchone()[0]
+    assert name == "Mitch Marner"
+    assert result["renamed"] == 0
+
+
+def test_the_next_moneypuck_sync_does_not_undo_a_repair(db):
+    store.upsert_player(db, 1, "Tim Sttzle", "L", "OTT")
+    sync.sync_current_rosters(db, NamedRoster(), "20262027", delay=0)
+    store.upsert_player(db, 1, "Tim Sttzle", "C", "OTT")  # MoneyPuck again, next season
+    row = db.execute("SELECT full_name, position FROM nhl_players WHERE player_id = 1").fetchone()
+    assert tuple(row) == ("Tim Stützle", "C"), "name kept, everything else still updates"
+
+
+def test_a_genuinely_new_name_from_moneypuck_still_replaces_the_old_one(db):
+    store.upsert_player(db, 1, "Old Name", "L", "OTT")
+    store.upsert_player(db, 1, "New Name", "L", "OTT")
+    assert db.execute("SELECT full_name FROM nhl_players").fetchone()[0] == "New Name"
+
+
+def test_a_repaired_name_is_findable_the_way_a_drafter_types_it():
+    import pandas as pd
+
+    from puckpilot.draft.board import DraftBoard
+    from puckpilot.draft.engine import DraftRules, Universe
+    from puckpilot.engine.valuation import LeagueShape
+
+    def board_named(name):
+        df = pd.DataFrame(
+            {"name": [name, "Brady Tkachuk"], "position": ["C", "L"], "team": ["OTT", "OTT"],
+             "vorp": [9.0, 8.0], "z_total": [9.0, 8.0], "adp_rank": [1.0, 2.0]},
+            index=pd.Index([8482116, 8480801], name="player_id"),
+        )  # fmt: skip
+        shape = LeagueShape(n_teams=2, slots=(("C", 1), ("L", 1)), util_slots=0, bench_slots=0)
+        return DraftBoard(Universe(df), DraftRules(shape, 2), my_seat=0)
+
+    assert board_named("Tim Sttzle").find("stutzle") == []  # the bug, as it was
+    for typed in ("stutzle", "Stützle", "tim stutzle"):
+        assert board_named("Tim Stützle").find(typed) == [0], typed

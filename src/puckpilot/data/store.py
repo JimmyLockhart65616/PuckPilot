@@ -141,6 +141,22 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def _ascii_only(name: str) -> str:
+    return "".join(ch for ch in name if ord(ch) < 128)
+
+
+def is_lossy_copy(lossy: str, proper: str) -> bool:
+    """`lossy` is `proper` with its non-ASCII letters deleted - not folded.
+
+    MoneyPuck's CSVs spell Tim Stützle "Tim Sttzle" and Alexis Lafrenière
+    "Alexis Lafrenire". A folded "Stutzle" still matches what a drafter types;
+    a deleted letter does not, so `DraftBoard.find("stutzle")` found nobody.
+    The test is deliberately that narrow: a name that differs any other way
+    ("Mitch" vs "Mitchell") is a spelling choice, not damage, and is left alone.
+    """
+    return lossy != proper and _ascii_only(proper) == lossy
+
+
 def upsert_player(
     conn: sqlite3.Connection,
     player_id: int,
@@ -148,11 +164,30 @@ def upsert_player(
     position: str | None,
     team_abbrev: str | None,
 ) -> None:
+    # Never overwrite a repaired name with MoneyPuck's lossy copy of it, or every
+    # `data sync` would undo `repair_player_name`.
+    row = conn.execute(
+        "SELECT full_name FROM nhl_players WHERE player_id = ?", (player_id,)
+    ).fetchone()
+    if row and is_lossy_copy(full_name, row[0]):
+        full_name = row[0]
     conn.execute(
         "INSERT OR REPLACE INTO nhl_players (player_id, full_name, position, team_abbrev)"
         " VALUES (?, ?, ?, ?)",
         (player_id, full_name, position, team_abbrev),
     )
+
+
+def repair_player_name(conn: sqlite3.Connection, player_id: int, proper: str) -> int:
+    """Replace a stored name only when it is a lossy copy of `proper`."""
+    row = conn.execute(
+        "SELECT full_name FROM nhl_players WHERE player_id = ?", (player_id,)
+    ).fetchone()
+    if not row or not is_lossy_copy(row[0], proper):
+        return 0
+    return conn.execute(
+        "UPDATE nhl_players SET full_name = ? WHERE player_id = ?", (proper, player_id)
+    ).rowcount
 
 
 def update_player_team(conn: sqlite3.Connection, player_id: int, team_abbrev: str) -> int:

@@ -237,7 +237,7 @@ def sync_current_rosters(
     32 requests, one per club, same shape as `sync_player_bios`.
     """
     teams = current_team_abbrevs(nhl)
-    seen = changed = new = 0
+    seen = changed = new = renamed = 0
     for team in teams:
         try:
             data = nhl.roster(team, season)
@@ -269,12 +269,16 @@ def sync_current_rosters(
                         )
                 else:
                     changed += store.update_player_team(conn, int(pid), team)
+                    # The roster spells names properly; MoneyPuck deletes
+                    # accented letters. See store.is_lossy_copy.
+                    renamed += store.repair_player_name(conn, int(pid), _roster_name(p))
         time.sleep(delay)
     conn.commit()
     progress(
-        f"  {len(teams)} rosters, {seen} players, {changed} corrected ({new} newly seen)"
+        f"  {len(teams)} rosters, {seen} players, {changed} corrected ({new} newly seen), "
+        f"{renamed} names repaired"
     )
-    return {"teams": len(teams), "players": seen, "changed": changed, "new": new}
+    return {"teams": len(teams), "players": seen, "changed": changed, "new": new, "renamed": renamed}
 
 
 def _roster_name(p: dict) -> str:
