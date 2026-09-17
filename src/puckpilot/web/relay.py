@@ -19,18 +19,42 @@ board is silently gone.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from puckpilot.web import wire
 from puckpilot.web.access import Access
 from puckpilot.web.page import PAGE
 
 MAX_PUSH_BYTES = 8 * 1024 * 1024
+# The console pushes on every pick and on a 10-second heartbeat. Three missed
+# heartbeats means the console is gone - asleep, crashed, off the network - and
+# the guest must be told, because a frozen board looks exactly like a slow room.
+STALE_AFTER_S = 30.0
+# Every file the image copies. The build id hashes these, so a deployed relay
+# can be compared with a checkout without a key: `/healthz` answers anyone.
+BUILD_FILES = ("page.py", "relay.py", "access.py", "wire.py")
+
+
+def build_id(here: Path | None = None) -> str:
+    """Short content hash of what this relay serves.
+
+    Line endings are normalised first: a Windows checkout and the Linux image
+    hold the same code with different bytes, and that is not drift.
+    """
+    h = hashlib.sha256()
+    here = here or Path(__file__).resolve().parent
+    for name in BUILD_FILES:
+        h.update(name.encode())
+        h.update((here / name).read_bytes().replace(b"\r\n", b"\n"))
+    return h.hexdigest()[:12]
 
 
 class RelayState:
@@ -53,19 +77,31 @@ class RelayState:
     def get(self, seat: str | None) -> dict:
         with self._lock:
             if not self.seats:
+                # Every key the page reads, so a cold URL renders as "waiting"
+                # rather than "seat undefined, you are up in undefined".
                 return {
                     "waiting": True,
                     "note": "Waiting for the draft console to connect.",
+                    "seat": None if seat is None else seat,
+                    "round": None,
+                    "on_clock": None,
+                    "my_turn": False,
+                    "picks_away": None,
                     "shortlist": [],
                     "board": [],
                     "roster": [],
                     "needs": [],
+                    "supply": [],
+                    "market_gaps": {"sleeping": [], "rated": []},
+                    "market_watchlist": [],
                     "made": 0,
                     "total": 0,
                     "detected": 0,
                     "n_left": 0,
                     "gaps": [],
                     "seconds_since_pick": None,
+                    "relay_age": None,
+                    "stale": False,
                     "diagnostics": "no snapshot pushed yet",
                 }
             if seat is None or seat not in self.seats:
@@ -78,7 +114,25 @@ class RelayState:
             out = dict(snap)
             age = None if self.pushed_at is None else time.time() - self.pushed_at
             out["relay_age"] = age
+            out["stale"] = age is not None and age > STALE_AFTER_S
+            # Frozen at push time otherwise: between pushes, and forever once the
+            # console dies, the guest's "last pick" clock would stand still.
+            since = out.get("seconds_since_pick")
+            if isinstance(since, (int, float)) and age is not None:
+                out["seconds_since_pick"] = since + age
             return out
+
+    def health(self) -> dict:
+        with self._lock:
+            age = None if self.pushed_at is None else time.time() - self.pushed_at
+            return {
+                "ok": True,
+                "seats": sorted(self.seats),
+                "pushes": self.pushes,
+                "last_push_age": age,
+                "build": build_id(),
+                "git": os.environ.get("PUCKPILOT_GIT_SHA", ""),
+            }
 
 
 def make_handler(state: RelayState, access: Access):
@@ -95,7 +149,7 @@ def make_handler(state: RelayState, access: Access):
             self.wfile.write(payload)
 
         def _refuse(self, code, msg):
-            self._send(code, json.dumps({"error": msg}), "application/json")
+            self._send(code, wire.dumps({"error": msg}), "application/json")
 
         def _route(self) -> str:
             return self.path.split("?", 1)[0].rstrip("/") or "/"
@@ -124,11 +178,7 @@ def make_handler(state: RelayState, access: Access):
             # Unauthenticated on purpose: the platform's health probe has no key,
             # and it reveals only that the process is up.
             if route == "/healthz":
-                self._send(
-                    200,
-                    json.dumps({"ok": True, "seats": sorted(state.seats), "pushes": state.pushes}),
-                    "application/json",
-                )
+                self._send(200, wire.dumps(state.health()), "application/json")
                 return
             role = self._role()
             if role is None:
@@ -139,7 +189,7 @@ def make_handler(state: RelayState, access: Access):
                 seat = (query.get("seat") or [None])[0]
                 payload = state.get(seat)
                 payload["can_undo"] = False  # the board lives on the console, not here
-                self._send(200, json.dumps(payload), "application/json")
+                self._send(200, wire.dumps(payload), "application/json")
             elif route == "/undo":
                 self._refuse(405, "undo runs on the draft console, not the relay")
             else:
@@ -168,8 +218,10 @@ def make_handler(state: RelayState, access: Access):
             except (ValueError, KeyError, TypeError) as e:
                 self._refuse(400, f"bad push: {e}")
                 return
-            n = state.push(seats)
-            self._send(200, json.dumps({"ok": True, "seats": n}), "application/json")
+            # Cleaned on the way IN as well as out: a console older than the
+            # strict wire can still push a NaN, and the relay must not keep it.
+            n = state.push(wire.clean(seats))
+            self._send(200, wire.dumps({"ok": True, "seats": n}), "application/json")
 
     return Handler
 

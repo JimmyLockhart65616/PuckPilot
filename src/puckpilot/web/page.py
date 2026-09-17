@@ -60,12 +60,14 @@ PAGE = """<!doctype html>
  button:hover{border-color:var(--warn);color:var(--warn)}
 </style>
 <h1>PuckPilot <span id="seatno" class="k"></span></h1>
+<div id="banner" class="card" hidden></div>
 <div class="bar">
   <div><span class="k">round</span> <span id="round" class="big">-</span></div>
   <div><span class="k">pick</span> <span id="pick" class="big">-</span></div>
   <div><span id="turn"></span></div>
   <div><span class="k">feed</span> <span id="detected" class="big">0</span></div>
   <div><span class="k">last</span> <span id="age">never</span></div>
+  <div id="relay" class="k"></div>
   <div id="gaps"></div>
   <div><span class="k">left</span> <span id="supply"></span></div>
   <div style="margin-left:auto">
@@ -148,16 +150,40 @@ let filter = "";
 document.getElementById('filter').addEventListener('input', e => {
   filter = e.target.value.toLowerCase(); render(window.__s);
 });
+function esc(t){
+  return String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+function banner(lines){
+  const b = document.getElementById('banner');
+  b.innerHTML = lines.join('<br>'); b.hidden = !lines.length;
+}
 function render(s){
   if(!s) return;
+  // Said at the top of the page, not in the diagnostics line: each of these
+  // means the board below is not the draft as it stands.
+  const notes = [];
+  if(s.error) notes.push('<span class="bad">'+esc(s.error)+
+    (s.seats ? ' &mdash; seats with a view: '+esc(s.seats.join(', ')) : '')+'</span>');
+  if(s.waiting) notes.push('<span class="stale">'+
+    esc(s.note || 'waiting for the draft console')+'</span>');
+  if(s.stale) notes.push('<span class="bad">NOT LIVE &mdash; the draft console last '+
+    'updated this view '+Math.round(s.relay_age)+'s ago. The board below is frozen.</span>');
+  banner(notes);
+  if(s.error) return;
+  document.getElementById('relay').innerHTML = (s.relay_age == null) ? ''
+    : 'relay <span class="'+(s.stale?'bad':'live')+'">'+Math.round(s.relay_age)+'s</span>';
   document.getElementById('undo').hidden = !s.can_undo;
-  document.getElementById('seatno').textContent = (s.seat === undefined ? '' : 'seat ' + s.seat);
+  document.getElementById('seatno').textContent = (s.seat == null ? '' : 'seat ' + s.seat);
   document.getElementById('round').textContent = s.round ?? '-';
-  document.getElementById('pick').textContent = (s.made+1)+'/'+s.total;
-  document.getElementById('detected').textContent = s.detected;
+  const done = s.total > 0 && s.made >= s.total;
+  document.getElementById('pick').textContent = done ? s.made+'/'+s.total : (s.made+1)+'/'+s.total;
+  document.getElementById('detected').textContent = s.detected ?? 0;
   document.getElementById('turn').innerHTML = s.my_turn
     ? '<span class="mine">&#9654; YOUR PICK</span>'
-    : '<span class="k">seat '+s.on_clock+' &middot; you are up in '+s.picks_away+'</span>';
+    : (s.on_clock == null
+      ? '<span class="k">'+(s.waiting ? 'waiting' : 'draft complete')+'</span>'
+      : '<span class="k">seat '+s.on_clock+' &middot; '+
+        (s.picks_away == null ? 'no picks left' : 'you are up in '+s.picks_away)+'</span>');
   const age = s.seconds_since_pick, a = document.getElementById('age');
   a.textContent = age===null ? 'never' : age.toFixed(0)+'s';
   a.className = (age!==null && age < 90) ? 'live' : 'stale';
@@ -186,7 +212,7 @@ function render(s){
   document.getElementById('roster').innerHTML = s.roster.length
     ? s.roster.map(p=>'<b>'+p.position+'</b> '+p.name).join(' &middot; ') : '(empty)';
   document.getElementById('needs').textContent = s.needs.length
-    ? 'still need: '+s.needs.join(', ') : 'roster minimums met';
+    ? 'still need: '+s.needs.join(', ') : (s.waiting ? '' : 'roster minimums met');
 
   const rows = s.board.filter(p => !filter ||
       p.name.toLowerCase().includes(filter) || p.position.toLowerCase()===filter);
@@ -246,10 +272,21 @@ document.getElementById('undo').addEventListener('click', async () => {
   } catch(e) { note.textContent = 'undo failed'; }
   tick();
 });
+// Three different failures, said three different ways: the network, a reply
+// that is not JSON, and a board this page cannot draw. All three used to read
+// "server unreachable", which points the drafter at the wrong problem.
 async function tick(){
-  try { window.__s = await (await fetch(q('/state'))).json(); render(window.__s); }
+  let r, s;
+  try { r = await fetch(q('/state')); }
   catch(e){ document.getElementById('gaps').innerHTML =
-      '<span class="bad">server unreachable</span>'; }
+      '<span class="bad">server unreachable</span>'; return; }
+  try { s = await r.json(); }
+  catch(e){ banner(['<span class="bad">unreadable reply from the server (HTTP '+
+                    r.status+')</span>']); return; }
+  window.__s = s;
+  try { render(s); }
+  catch(e){ banner(['<span class="bad">this page could not draw the board: '+
+                    esc(e.message)+'</span>']); }
 }
 tick(); setInterval(tick, 1000);
 </script>

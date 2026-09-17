@@ -121,6 +121,130 @@ def test_a_malformed_push_is_refused(relay):
     assert relay.state.seats == {}
 
 
+# ---- freshness and drift -------------------------------------------------------
+
+
+def test_health_names_the_build_so_drift_is_visible_without_a_key(relay):
+    """The deployed relay ran a page two revisions behind the checkout and nothing
+    could tell. A keyless health check that names the build closes that."""
+    from puckpilot.web.relay import build_id
+
+    before = json.loads(_req(relay, "/healthz")[1])
+    assert before["build"] == build_id()
+    assert len(before["build"]) == 12
+    assert before["last_push_age"] is None
+
+    _push(relay, {"0": {"made": 1}})
+    after = json.loads(_req(relay, "/healthz")[1])
+    assert 0 <= after["last_push_age"] < 5
+    assert "shortlist" not in after and "made" not in after
+
+
+def test_the_build_id_ignores_line_endings_but_not_content(tmp_path):
+    from pathlib import Path
+
+    from puckpilot.web import relay as relay_mod
+
+    src = Path(relay_mod.__file__).resolve().parent
+    lf, crlf, edited = tmp_path / "lf", tmp_path / "crlf", tmp_path / "edited"
+    for d in (lf, crlf, edited):
+        d.mkdir()
+        for name in relay_mod.BUILD_FILES:
+            text = (src / name).read_bytes().replace(b"\r\n", b"\n")
+            (d / name).write_bytes(text.replace(b"\n", b"\r\n") if d is crlf else text)
+    (edited / "page.py").write_bytes((edited / "page.py").read_bytes() + b"\n# changed\n")
+
+    assert relay_mod.build_id(lf) == relay_mod.build_id(crlf)
+    assert relay_mod.build_id(lf) != relay_mod.build_id(edited)
+
+
+def test_a_relay_that_stops_hearing_from_the_console_says_so(relay):
+    """A frozen board looks exactly like a slow room. After three missed
+    heartbeats the guest's view must say it is not live."""
+    import time
+
+    from puckpilot.web.relay import STALE_AFTER_S
+
+    _push(relay, {"0": {"made": 5, "seconds_since_pick": 4.0}})
+    fresh = json.loads(_req(relay, f"/state?k={GUEST}")[1])
+    assert fresh["stale"] is False
+
+    relay.state.pushed_at = time.time() - (STALE_AFTER_S + 10)
+    old = json.loads(_req(relay, f"/state?k={GUEST}")[1])
+    assert old["stale"] is True
+    assert old["relay_age"] > STALE_AFTER_S
+
+
+def test_the_pick_clock_keeps_running_between_pushes(relay):
+    import time
+
+    _push(relay, {"0": {"made": 5, "seconds_since_pick": 4.0}})
+    relay.state.pushed_at = time.time() - 20
+    payload = json.loads(_req(relay, f"/state?k={GUEST}")[1])
+    assert 23.5 < payload["seconds_since_pick"] < 30
+
+
+def test_a_nan_pushed_by_an_older_console_is_served_as_null(relay):
+    """Python's json reads NaN; the guest's browser does not. The relay must not
+    store it and hand it on."""
+    from puckpilot.web import wire
+
+    url = f"http://127.0.0.1:{relay.server_address[1]}/push"
+    body = b'{"seats": {"0": {"made": 2, "board": [{"vorp": NaN}]}}}'
+    req = urllib.request.Request(url, data=body, method="POST", headers={"X-PuckPilot-Key": OWNER})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        assert r.status == 200
+    text = _req(relay, f"/state?k={GUEST}")[1]
+    assert "NaN" not in text
+    assert wire.loads(text)["board"] == [{"vorp": None}]
+
+
+def test_the_waiting_view_carries_every_key_a_real_snapshot_has(relay):
+    """Otherwise the page renders a cold URL as "seat undefined"."""
+    from puckpilot.web.server import LiveState
+    from tests.test_board import _board
+
+    real = LiveState(board=_board(), feed=None, top=3).snapshot(0)
+    waiting = json.loads(_req(relay, f"/state?k={GUEST}")[1])
+    assert set(real) - set(waiting) == set()
+
+
+IMPORTS_PROBE = """
+import sys
+import puckpilot.web.relay  # noqa: F401
+for name, mod in sorted(sys.modules.items()):
+    f = getattr(mod, '__file__', None)
+    if name.startswith('puckpilot') and f:
+        print(f)
+"""
+
+
+def test_the_image_copies_every_module_the_relay_imports():
+    """The Dockerfile copies files one by one. A new import the COPY list misses
+    builds fine and then dies on start, which on draft night is a blank page."""
+    import re
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    r = subprocess.run(
+        [sys.executable, "-c", IMPORTS_PROBE], capture_output=True, text=True, cwd=root
+    )
+    assert r.returncode == 0, r.stderr
+    imported = {
+        Path(line.strip()).resolve().relative_to(root / "src").as_posix()
+        for line in r.stdout.splitlines()
+        if line.strip()
+    }
+    dockerfile = (root / "deploy/relay/Dockerfile").read_text(encoding="utf-8")
+    copied = {
+        m.group(1).removeprefix("src/") for m in re.finditer(r"^COPY\s+(\S+)", dockerfile, re.M)
+    }
+    assert imported, "the probe found no puckpilot modules"
+    assert imported <= copied, f"imported but not copied: {sorted(imported - copied)}"
+
+
 PROBE = """
 import sys
 BANNED = {'numpy', 'pandas', 'scipy'}

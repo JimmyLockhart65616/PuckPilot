@@ -16,7 +16,6 @@ so a stalled feed is visible rather than silently frozen.
 
 from __future__ import annotations
 
-import json
 import secrets
 import threading
 import time
@@ -28,6 +27,7 @@ from puckpilot.draft.advice import market_disagreement, market_watchlist, recomm
 from puckpilot.draft.board import DraftBoard
 from puckpilot.draft.engine import RosterValuePolicy
 from puckpilot.draft.explain import summarize
+from puckpilot.web import wire
 from puckpilot.web.access import Access
 from puckpilot.web.page import PAGE
 
@@ -102,7 +102,15 @@ class LiveState:
             # left", and must not: masking it hid every capped and every
             # non-needed position regardless of value, which is the one panel
             # whose whole job is to show the room's remaining supply.
-            cands = recommend(self.board, self.policy, n=max(self.top * 8, 40), seat=seat)
+            # A seat with no picks left has nothing to take. Without this the
+            # cards kept saying "take one of these" after our last pick - and a
+            # seat whose keepers fill the final rounds runs out while the room
+            # is still drafting.
+            cands = (
+                recommend(self.board, self.policy, n=max(self.top * 8, 40), seat=seat)
+                if self.board.picks_left(seat) > 0
+                else []
+            )
             full = recommend(
                 self.board,
                 self.policy,
@@ -279,7 +287,7 @@ def make_handler(state: LiveState, access: Access | None = None):
             return seat, None
 
         def _refuse(self, code: int, msg: str) -> None:
-            self._send(code, json.dumps({"error": msg}), "application/json")
+            self._send(code, wire.dumps({"error": msg}), "application/json")
 
         def _is_same_origin(self) -> bool:
             """Reject cross-site requests to the mutating route.
@@ -335,11 +343,18 @@ def make_handler(state: LiveState, access: Access | None = None):
                 if err:
                     self._refuse(400, err)
                     return
-                payload = state.snapshot(seat)
+                try:
+                    payload = state.snapshot(seat)
+                except Exception as e:
+                    # Answered, not dropped: a handler that dies closes the socket
+                    # and the page can only say "server unreachable", which sends
+                    # the drafter looking at the network instead of the board.
+                    self._refuse(500, f"snapshot failed: {e.__class__.__name__}: {e}")
+                    return
                 # The page hides its undo button on this; the POST is gated
                 # independently, so a forged value buys nothing.
                 payload["can_undo"] = role == "owner"
-                self._send(200, json.dumps(payload), "application/json")
+                self._send(200, wire.dumps(payload), "application/json")
             elif route == "/undo":
                 # Mutating routes are POST-only, so a bare navigation or an
                 # <img> src cannot rewind the board mid-draft.
@@ -362,7 +377,7 @@ def make_handler(state: LiveState, access: Access | None = None):
             if self._role() != "owner":
                 self._refuse(403, "undo is owner-only")
                 return
-            self._send(200, json.dumps({"result": state.undo()}), "application/json")
+            self._send(200, wire.dumps({"result": state.undo()}), "application/json")
 
     return Handler
 

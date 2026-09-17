@@ -353,11 +353,18 @@ def _push_snapshots(url: str, key: str, state, seats: list[int]) -> str:
     take the local console with it. The drafter on this machine keeps working
     off the loopback view either way.
     """
-    import json
     import urllib.error
     import urllib.request
 
-    body = json.dumps({"seats": {str(s): state.snapshot(s) for s in seats}}).encode("utf-8")
+    from puckpilot.web import wire
+
+    try:
+        # Inside the guard too. Building the snapshot or serializing it can fail
+        # as well as the network can, and this runs in the console's main loop:
+        # an exception here used to end the draft console, not just the push.
+        body = wire.dumps({"seats": {str(s): state.snapshot(s) for s in seats}}).encode("utf-8")
+    except Exception as e:
+        return f"snapshot for push failed: {e.__class__.__name__}: {e}"
     req = urllib.request.Request(
         url.rstrip("/") + "/push",
         data=body,
@@ -368,7 +375,7 @@ def _push_snapshots(url: str, key: str, state, seats: list[int]) -> str:
         with urllib.request.urlopen(req, timeout=5) as r:
             r.read()
         return ""
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as e:
         return f"{e.__class__.__name__}: {e}"
 
 
