@@ -78,6 +78,11 @@ def resolve_keepers(conn: sqlite3.Connection, names: tuple[str, ...]) -> KeeperR
                 for c in cands
                 if (q.isdigit() and c[0] == int(q)) or q in (c[3].upper(), c[2].upper())
             ]
+        if not cands and qualifier.isdigit():
+            # An explicit id is the league file saying exactly who it means -
+            # the escape hatch for a name the upstream data spelled wrong
+            # (MoneyPuck stores Stützle as "Tim Sttzle", which folds to nothing).
+            cands = [c for group in by_norm.values() for c in group if c[0] == int(qualifier)]
         if not cands:
             out.unmatched.append(entry)
         elif len(cands) > 1:

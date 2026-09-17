@@ -253,6 +253,32 @@ class YahooSession:
                 out.append(flatten(entry))
         return out
 
+    def keepers(self, league_key: str) -> list[dict]:
+        """Players the league has declared as keepers, with who keeps them.
+
+        Yahoo's `status=K` filter plus the ownership subresource: each entry
+        carries `player_key`, `full` and `owner_team_key`. Empty until the
+        commissioner (or the managers) have set keepers for the season.
+        """
+        out: list[dict] = []
+        start = 0
+        while True:
+            lg = self.get(f"league/{league_key}/players;status=K;start={start};count=25/ownership")[
+                "fantasy_content"
+            ]["league"]
+            node = next((x["players"] for x in lg if isinstance(x, dict) and "players" in x), None)
+            if not isinstance(node, dict):
+                break
+            count = int(node.get("count", 0))
+            for i in range(count):
+                entry = node.get(str(i), {}).get("player")
+                if entry:
+                    out.append(flatten(entry))
+            if count < 25:
+                break
+            start += 25
+        return out
+
     def players(
         self, league_key: str, start: int = 0, count: int = 25, extra: str = ""
     ) -> list[dict]:

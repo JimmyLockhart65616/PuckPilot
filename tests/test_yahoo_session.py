@@ -136,6 +136,7 @@ def test_the_session_client_exposes_no_way_to_write():
         "draft_results",
         "players",
         "roster",
+        "keepers",
         "user_data_dir",
         "headless",
         "check_oauth",
@@ -147,3 +148,30 @@ def test_requests_are_throttled():
     from puckpilot.yahoo.session import MIN_INTERVAL_S
 
     assert MIN_INTERVAL_S >= 0.5
+
+
+def test_declared_keepers_page_through_status_k_with_ownership(monkeypatch):
+    from puckpilot.yahoo.session import YahooSession
+
+    def page(n, start):
+        players = {"count": n}
+        for i in range(n):
+            players[str(i)] = {
+                "player": [
+                    [{"player_key": f"477.p.{start + i}"}, {"name": {"full": f"P{start + i}"}}],
+                    {"ownership": {"ownership_type": "team", "owner_team_key": "477.l.1.t.5"}},
+                ]
+            }
+        return {"fantasy_content": {"league": [{"league_key": "477.l.1"}, {"players": players}]}}
+
+    calls = []
+
+    def fake_get(self, path):
+        calls.append(path)
+        return page(25, 0) if "start=0" in path else page(11, 25)
+
+    monkeypatch.setattr(YahooSession, "get", fake_get)
+    keepers = YahooSession("unused").keepers("477.l.1")
+    assert len(keepers) == 36 and len(calls) == 2
+    assert all("status=K" in c and c.endswith("/ownership") for c in calls)
+    assert keepers[0]["owner_team_key"] == "477.l.1.t.5" and keepers[0]["full"] == "P0"

@@ -23,7 +23,7 @@ def test_configured_keeper_names_all_resolve(db):
     """
     from puckpilot.config import Settings
     from puckpilot.data import store
-    from puckpilot.keepers import keeper_seats, resolve_keeper_ids
+    from puckpilot.keepers import keeper_seats, resolve_keeper_ids, split_qualifier
     from puckpilot.league import load_league
 
     league_file = Settings().resolved_league_path
@@ -34,11 +34,14 @@ def test_configured_keeper_names_all_resolve(db):
     names = league.keepers_for_season("20262027")
     assert len(names) > 0
     for i, n in enumerate(names):
-        store.upsert_player(db, 9000 + i, n, "C", "AAA")
+        # A "(12345)" qualifier names the player by id, so seed him under it.
+        name, qualifier = split_qualifier(n)
+        pid = int(qualifier) if qualifier.isdigit() else 9000 + i
+        store.upsert_player(db, pid, name, "C", "AAA")
     # accents and spelling variants must fold to the same key
-    store.upsert_player(db, 8000, "Tim Stützle", "C", "AAA")
+    store.upsert_player(db, 8000, "Alexis Lafrenière", "C", "AAA")
 
-    resolved, unmatched = resolve_keeper_ids(db, (*names, "Tim Stutzle"))
+    resolved, unmatched = resolve_keeper_ids(db, (*names, "Alexis Lafreniere"))
     assert unmatched == []
     assert len(resolved) == len(names) + 1
 

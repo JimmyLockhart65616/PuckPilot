@@ -130,6 +130,7 @@ class DraftBoard:
         keeper_rounds: dict[int, list[int]] | None = None,
         roster_rounds: int | None = None,
         keeper_placement: str = "last",
+        pick_owners: dict[tuple[int, int], int] | None = None,
     ):
         self.u = universe
         self.rules = rules
@@ -184,6 +185,9 @@ class DraftBoard:
             roster_rounds if roster_rounds is not None else rules.shape.roster_size
         )
         self._keeper_rounds = keeper_rounds
+        # (round, pick within round), both 0-based -> the seat that now makes
+        # that pick. Traded picks: the snake says one seat, the room another.
+        self._pick_owners = dict(pick_owners or {})
         # Counted from the declaration, not from what placed: an unplaceable
         # keeper still occupies his owner's draft slot in the real room.
         self._keeper_counts = {s: len(p) for s, p in keepers.items()}
@@ -215,26 +219,35 @@ class DraftBoard:
 
         The room numbers keeper slots as picks, so `slot_numbers` is what
         reconciles a feed's pick number with a count of live picks.
+
+        Traded picks (`pick_owners`) are applied to the snake first, and keepers
+        then take a seat's first or last k PICKS rather than rounds - a seat
+        that traded for a second pick in round 7 still keeps in its final
+        picks. With no trades the two readings are the same thing.
         """
         n_rounds = self._roster_rounds
-        consumed: dict[int, set[int]] = {}
+        order = snake_order(self.n_teams, n_rounds)
+        full: list[tuple[int, int]] = []
+        for i, seat in enumerate(order):
+            rnd, k = divmod(i, self.n_teams)
+            full.append((rnd, int(self._pick_owners.get((rnd, k), seat))))
+
+        dropped: set[int] = set()
         for seat in range(self.n_teams):
             k = self._keeper_counts.get(seat, 0)
+            mine = [j for j, (_r, s) in enumerate(full) if s == seat]
             if self._keeper_rounds and seat in self._keeper_rounds:
-                consumed[seat] = set(self._keeper_rounds[seat])
+                rounds = set(self._keeper_rounds[seat])
+                dropped |= {j for j in mine if full[j][0] in rounds}
+            elif not k:
+                continue
             elif self.keeper_placement == "last":
-                consumed[seat] = set(range(max(0, n_rounds - k), n_rounds))
+                dropped |= set(mine[max(0, len(mine) - k) :])
             else:
-                consumed[seat] = set(range(k))
+                dropped |= set(mine[:k])
 
-        order = snake_order(self.n_teams, n_rounds)
-        slots: list[tuple[int, int]] = []
-        numbers: list[int] = []
-        for i, seat in enumerate(order):
-            rnd = i // self.n_teams
-            if rnd not in consumed[seat]:
-                slots.append((rnd, seat))
-                numbers.append(i + 1)
+        slots = [slot for j, slot in enumerate(full) if j not in dropped]
+        numbers = [j + 1 for j in range(len(full)) if j not in dropped]
         return slots, numbers
 
     def _bump(self, seat: int, row: int) -> None:
@@ -444,6 +457,25 @@ class DraftBoard:
         if i < len(self.slot_numbers) and self.slot_numbers[i] == int(room_pick_no):
             return i
         return None
+
+    def clock_disagreement(self, room_pick_no: int, room_seat: int) -> str | None:
+        """What is wrong, if the room's clock names a different seat for a pick.
+
+        `room_seat` is 0-based. The one check that catches a pick order the
+        board was never told about - a trade, a commissioner edit - before the
+        board spends a draft attributing picks and "your turn" to the wrong
+        seat. None when they agree, or when the pick is a keeper slot here.
+        """
+        slot = self.slot_for_room_pick(room_pick_no)
+        if slot is None:
+            return None
+        expected = self.slots[slot][1]
+        if int(room_seat) == expected:
+            return None
+        return (
+            f"room has seat {room_seat} on the clock at pick {room_pick_no}; this board expects "
+            f"seat {expected} - the draft order differs (a traded pick?)"
+        )
 
     def drift(self, room_picks_made: int) -> int:
         """Live picks the room has made that this board has not recorded.

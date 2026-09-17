@@ -302,3 +302,40 @@ def test_a_player_valued_at_a_position_yahoo_forbids_is_named():
     assert check.status == pf.WARN and "Golf C (valued C, Yahoo R" in check.lines[0]
     board.u = board.u.with_eligibility({7: frozenset({"C", "R"})})
     assert pf.check_position_agreement(board, depth=50).status == pf.PASS
+
+
+# ---- declared keepers are the truth once they exist ------------------------------
+
+
+def test_declared_keepers_that_match_the_file_pass():
+    saved = {
+        "season": SEASON,
+        "derived_at": "now",
+        "declared": [
+            {"name": n, "seat": s}
+            for s, n in ((0, "Alpha C"), (1, "Delta C"), (2, "Beta D"), (3, "Gamma G"))
+        ],
+        "managers": [],
+    }
+    league = _league(keeper_owners_by_season={SEASON: {2: ("Beta D",)}})
+    check = pf.check_keeper_history(league, SEASON, saved)
+    # seats 0, 1, 3 declared in Yahoo but not in the file -> owners differ
+    assert check.status == pf.FAIL and all("owners" in line for line in check.lines)
+    full = _league(
+        keeper_owners_by_season={
+            SEASON: {0: ("Alpha C",), 1: ("Delta C",), 2: ("Beta D",), 3: ("Gamma G",)}
+        }
+    )
+    assert pf.check_keeper_history(full, SEASON, saved).status == pf.PASS
+
+
+def test_a_declared_keeper_missing_from_the_file_fails():
+    saved = {
+        "season": SEASON,
+        "declared": [{"name": "Echo D", "seat": None}, {"name": "Alpha C", "seat": None}],
+        "managers": [],
+    }
+    check = pf.check_keeper_history(_league(), SEASON, saved)
+    assert check.status == pf.FAIL
+    assert any("Echo D" in line for line in check.lines)
+    assert any("not declared in Yahoo" in line and "Beta D" in line for line in check.lines)
