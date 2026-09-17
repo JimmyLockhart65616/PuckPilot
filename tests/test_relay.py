@@ -306,3 +306,7 @@ def test_the_build_context_denies_by_default():
 
     allowed = {line[1:].rstrip("/") for line in lines if line.startswith("!")}
     assert allowed == {"src"}, f"only src/ may be re-included, got {sorted(allowed)}"
+    # Re-including src/ must not re-include the untracked, machine-only helpers
+    # that live under it.
+    excluded = {line.rstrip("/") for line in lines if not line.startswith("!")}
+    assert "src/puckpilot/local" in excluded
