@@ -210,3 +210,26 @@ def test_several_leagues_and_no_key_is_a_warning_not_a_guess(db):
     _adp_row(db, "477.p.2", "477.l.2", 2, 1)
     key, notes = resolve_adp_key(db, None, "auto")
     assert key is None and notes[0].startswith("WARNING")
+
+
+def test_position_corrections_only_touch_skaters_yahoo_will_not_play_there(db):
+    from puckpilot.yahoo.playermap import load_eligibility, position_corrections
+
+    for pid, name, pos in [(1, "Martin Necas", "C"), (2, "Leon Draisaitl", "C"), (3, "G One", "G")]:
+        store.upsert_player(db, pid, name, pos, "AAA")
+    for key, pid, raw in [
+        ("477.p.1", 1, "RW,Util"),
+        ("477.p.2", 2, "C,LW,Util"),
+        ("477.p.3", 3, "G"),
+    ]:
+        db.execute(
+            "INSERT INTO yahoo_player_map (player_key, league_key, full_name, positions,"
+            " nhl_player_id, adp_rank) VALUES (?, '477.l.1', 'x', ?, ?, 1)",
+            (key, raw, pid),
+        )
+    assert position_corrections(db) == {1: "R"}
+    assert load_eligibility(db) == {
+        1: frozenset({"R"}),
+        2: frozenset({"C", "L"}),
+        3: frozenset({"G"}),
+    }

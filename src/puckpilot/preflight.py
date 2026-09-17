@@ -430,6 +430,42 @@ def check_projection_coverage(conn: sqlite3.Connection, league_key: str | None, 
     )
 
 
+def check_position_agreement(board, depth: int | None = None) -> Check:
+    """Players valued at a position the league does not let them play.
+
+    VORP subtracts a per-position replacement level, and a centre's is far
+    higher than a winger's, so a player the NHL lists at C but Yahoo allows
+    only at RW is under-valued by roughly two VORP - and roster accounting puts
+    him in a slot he cannot fill. Needs eligibility attached to the universe.
+    """
+    u = board.u
+    if u.elig_sets is None:
+        return Check("position agreement", INFO, "no Yahoo eligibility on the board - skipped")
+    depth = depth or len(board.slots) + 30
+    rows = [
+        r
+        for r in range(len(u))
+        if board.avail[r]
+        and u.adp_rank[r] <= depth
+        and str(u.source[r]) != "market"
+        and str(u.pos[r]) not in u.elig_sets[r]
+    ]
+    rows.sort(key=lambda r: u.adp_rank[r])
+    if not rows:
+        return Check("position agreement", PASS, f"every priced player in the top {depth} agrees")
+    listed = ", ".join(
+        f"{u.names[r]} (valued {u.pos[r]}, Yahoo {'/'.join(sorted(u.elig_sets[r]))},"
+        f" ADP {u.adp_rank[r]:.0f})"
+        for r in rows
+    )
+    return Check(
+        "position agreement",
+        WARN,
+        f"{len(rows)} player(s) valued at a position Yahoo does not allow them",
+        [listed, "their VORP is computed against the wrong replacement level - judge by eye"],
+    )
+
+
 # ---- local data ---------------------------------------------------------------
 
 
@@ -527,6 +563,7 @@ def run_preflight(
     report.checks.append(adp_check)
     report.checks.append(check_playermap(conn, key, now))
     report.checks.append(check_projection_coverage(conn, key, board))
+    report.checks.append(check_position_agreement(board))
     report.checks.append(check_data_freshness(conn, season, now))
     report.checks.append(check_yahoo_probe(prober))
     return report, board

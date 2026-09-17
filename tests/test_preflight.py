@@ -292,3 +292,13 @@ def test_projection_coverage_names_priced_players_we_cannot_see(db):
     _map(db, "477.p.2", "477.l.1", None, 2)  # nowhere
     check = pf.check_projection_coverage(db, "477.l.1", board)
     assert check.status == pf.WARN and "NOT ON THE BOARD" in check.lines[0]
+
+
+def test_a_player_valued_at_a_position_yahoo_forbids_is_named():
+    board = _board()
+    assert pf.check_position_agreement(board).status == pf.INFO  # no eligibility yet
+    board.u = board.u.with_eligibility({7: frozenset({"R"})})  # Golf C: Yahoo RW only
+    check = pf.check_position_agreement(board, depth=50)
+    assert check.status == pf.WARN and "Golf C (valued C, Yahoo R" in check.lines[0]
+    board.u = board.u.with_eligibility({7: frozenset({"C", "R"})})
+    assert pf.check_position_agreement(board, depth=50).status == pf.PASS

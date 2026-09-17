@@ -109,6 +109,9 @@ class Candidate:
     # look like an opinion we hold; every consumer of `Candidate` checks this
     # before treating `vorp`/`score` as ours.
     source: str = "projected"
+    # Every position Yahoo lets him fill, primary first ("C/L"). Display, and
+    # roster accounting when the policy runs multi-position.
+    eligible: str = ""
 
 
 class DraftBoard:
@@ -403,6 +406,9 @@ class DraftBoard:
             "pick_no": self.made,
             "next_pick_no": self.next_pick_no(s),
             "avail": self.avail,
+            # Who is already on the roster, as universe rows: what
+            # multi-position accounting matches slots against.
+            "roster_rows": [p.row for p in self.roster(s)],
         }
 
     def next_pick_no(self, seat: int | None = None, after: int | None = None) -> int | None:

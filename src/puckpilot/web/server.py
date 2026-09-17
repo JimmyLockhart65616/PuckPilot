@@ -80,10 +80,18 @@ class LiveState:
         from puckpilot.draft.feed import apply
 
         with self.lock:
-            accepted, _rejected = apply(self.board, events)
-        if accepted:
+            accepted, rejected = apply(self.board, events)
+        # An unidentified pick is reported as a rejection but DID consume a
+        # slot - it moved the clock, so it counts as landed: callers push to
+        # the relay on landed picks, and "last pick" must reset for it.
+        landed = len(accepted) + sum("slot consumed" in r for r in rejected)
+        if landed:
             self.last_pick_at = time.time()
-        return len(accepted)
+        if rejected:
+            # A refused pick ("X is already off the board") is worth seeing in
+            # the diagnostics line, not only in the terminal that built it.
+            self.note = f"feed: {rejected[-1]}"
+        return landed
 
     def undo(self) -> str:
         """Recovery hatch for a bad frame or a mis-entered pick, without
@@ -173,6 +181,7 @@ class LiveState:
                 {
                     "name": c.name,
                     "position": c.position,
+                    "eligible": c.eligible,
                     "team": c.team,
                     "vorp": c.vorp,
                     "adp_rank": c.adp_rank,
@@ -200,6 +209,7 @@ class LiveState:
                     "id": c.player_id,
                     "name": c.name,
                     "position": c.position,
+                    "eligible": c.eligible,
                     "team": c.team,
                     "vorp": c.vorp,
                     "adp_rank": c.adp_rank,
@@ -247,6 +257,7 @@ class LiveState:
                     "id": c.player_id,
                     "name": c.name,
                     "position": c.position,
+                    "eligible": c.eligible,
                     "team": c.team,
                     "adp_rank": c.adp_rank,
                     "age": c.age,

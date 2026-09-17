@@ -204,7 +204,12 @@ def run_draft(
         next_pick[picks[-1]] = None
 
     for i, seat in enumerate(order):
-        ctx = {"pick_no": i, "next_pick_no": next_pick[i], "avail": avail}
+        ctx = {
+            "pick_no": i,
+            "next_pick_no": next_pick[i],
+            "avail": avail,
+            "roster_rows": rosters[seat],
+        }
         idx = bots[seat].pick(u, avail, counts[seat], rules, remaining[seat], rng, ctx)
         avail[idx] = False
         rosters[seat].append(idx)
@@ -220,11 +225,16 @@ def build_universe(
     train_seasons: tuple[str, ...],
     league: LeagueConfig = DEFAULT_LEAGUE,
     market_ids: set[int] | None = None,
+    position_overrides: dict[int, str] | None = None,
 ) -> Universe:
     """Projection-ranked pool with pseudo-ADP.
 
     Pseudo-ADP = prior-season ACTUAL value order (what casual drafters chase);
     swaps for real Yahoo ADP when API access lands.
+
+    `position_overrides` (player id -> position) re-labels skaters before
+    ranking, so their VORP is taken against the league's position rather than
+    the NHL's - see `playermap.position_corrections`.
     """
     kw = {
         "shape": league.shape,
@@ -232,8 +242,13 @@ def build_universe(
         "goalie_cats": league.goalie_cats,
     }
     proj_sk, proj_g = projections.project(conn, target_season, list(train_seasons))
-    ranked = rank_players(proj_sk, proj_g, **kw)
     act_sk, act_g = season_aggregates(conn, train_seasons[0])
+    if position_overrides:
+        for frame in (proj_sk, act_sk):
+            hit = [pid for pid in frame.index if int(pid) in position_overrides]
+            if hit:
+                frame.loc[hit, "position"] = [position_overrides[int(p)] for p in hit]
+    ranked = rank_players(proj_sk, proj_g, **kw)
     adp_ranked = rank_players(act_sk, act_g, **kw)
     adp = pd.Series(
         np.arange(1, len(adp_ranked) + 1, dtype=float), index=adp_ranked.index, name="adp_rank"
@@ -321,6 +336,8 @@ def run_sims(
     league: LeagueConfig = DEFAULT_LEAGUE,
     scoring: str = "h2h",
     progress: Callable[[str], None] | None = None,
+    eligibility: dict[int, frozenset[str]] | None = None,
+    position_overrides: dict[int, str] | None = None,
 ) -> SimReport:
     """Monte Carlo snake drafts vs bot field, each roster replayed over the
     REAL target season (walk-forward: projections never see target data).
@@ -336,7 +353,14 @@ def run_sims(
     rng = np.random.default_rng(seed)
 
     skater_keys = [c.key for c in league.skater_cats]
-    u = build_universe(conn, target_season, train_seasons, league)
+    u = build_universe(
+        conn, target_season, train_seasons, league, position_overrides=position_overrides
+    )
+    if eligibility is not None:
+        # Every team's lineups are then filled over eligibility, not only the
+        # engine's - an engine aware of it must not be scored as if it were not.
+        u = u.with_eligibility(eligibility)
+        eligibility = {int(pid): s for pid, s in zip(u.ids, u.elig_sets, strict=True)}
     data = build_replay_data(conn, target_season, skater_keys)
     positions = dict(zip(u.ids.tolist(), u.pos.tolist(), strict=True))
     scalar = dict(zip(u.ids.tolist(), u.z_total.tolist(), strict=True))
@@ -365,7 +389,7 @@ def run_sims(
         g = np.zeros((shape.n_teams, n_weeks, G_WIDTH))
         for t, ridx in enumerate(rosters):
             ids = [int(u.ids[i]) for i in ridx]
-            sk[t], g[t] = replay_roster(ids, positions, scalar, data, shape)
+            sk[t], g[t] = replay_roster(ids, positions, scalar, data, shape, eligibility)
 
         if scoring == "h2h":
             finish = run_h2h_season(

@@ -275,7 +275,8 @@ function render(s){
   s.shortlist.forEach((c,i)=>{
     const d = document.createElement('div'); d.className='card';
     d.innerHTML = '<div class="nm">'+(i+1)+'. '+c.name+'</div>'+
-      '<div class="meta">'+c.position+' &middot; '+c.team+' &middot; VORP '+c.vorp.toFixed(2)+
+      '<div class="meta">'+(c.eligible||c.position)+' &middot; '+c.team+
+      ' &middot; VORP '+c.vorp.toFixed(2)+
       ' &middot; ADP '+Math.round(c.adp_rank)+
       ' &middot; lasts '+Math.round(c.p_survive*100)+'%</div>'+
       (c.projected && c.projected.length
@@ -302,7 +303,7 @@ function render(s){
     // cannot be mistaken for a pick we can make this turn.
     const tag = p.blocked ? ' <span class="blk">'+p.blocked+'</span>' : '';
     if (p.blocked) tr.className = 'blocked';
-    tr.innerHTML='<td>'+(i+1)+'</td><td>'+p.name+tag+'</td><td>'+p.position+'</td><td>'+p.team+
+    tr.innerHTML='<td>'+(i+1)+'</td><td>'+p.name+tag+'</td><td>'+(p.eligible||p.position)+'</td><td>'+p.team+
       '</td><td class="num">'+p.vorp.toFixed(2)+'</td><td class="num">'+Math.round(p.adp_rank)+
       '</td><td class="num">'+Math.round(p.p_survive*100)+'%</td>'+
       '<td class="act">' + (s.can_undo && p.id != null

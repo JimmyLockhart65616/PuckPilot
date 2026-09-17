@@ -330,6 +330,68 @@ def load_adp(conn: sqlite3.Connection, league_key: str) -> dict[int, int]:
     }
 
 
+def load_eligibility(
+    conn: sqlite3.Connection, league_key: str | None = None
+) -> dict[int, frozenset[str]]:
+    """nhl_player_id -> the positions Yahoo lets him fill ("C,LW,Util" -> {C, L}).
+
+    Stored by `build_map` since the map was first built and never read until
+    now. Newest row wins when several leagues map the same player.
+    """
+    from puckpilot.draft.eligibility import parse_yahoo_positions
+
+    sql = (
+        "SELECT nhl_player_id, positions FROM yahoo_player_map"
+        " WHERE nhl_player_id IS NOT NULL AND positions IS NOT NULL"
+    )
+    params: tuple = ()
+    if league_key:
+        sql += " AND league_key = ?"
+        params = (league_key,)
+    out: dict[int, frozenset[str]] = {}
+    for pid, raw in conn.execute(sql + " ORDER BY updated_at", params):
+        got = parse_yahoo_positions(raw)
+        if got:
+            out[int(pid)] = got
+    return out
+
+
+def position_corrections(conn: sqlite3.Connection, league_key: str | None = None) -> dict[int, str]:
+    """nhl_player_id -> the position to VALUE him at, for skaters whose NHL
+    position is one Yahoo does not let him play at all.
+
+    Martin Necas is a C in the NHL's data and RW-only on Yahoo. VORP subtracts
+    a per-position replacement level, and a centre's sits about two VORP above
+    a winger's, so he is valued against the wrong pool - and can never fill the
+    C slot the roster accounting gives him. The correction is Yahoo's first
+    listed position. Anyone Yahoo allows at his NHL position is left alone.
+    """
+    from puckpilot.draft.eligibility import YAHOO_TO_POS
+
+    nhl = {
+        int(r[0]): str(r[1]) for r in conn.execute("SELECT player_id, position FROM nhl_players")
+    }
+    sql = (
+        "SELECT nhl_player_id, positions FROM yahoo_player_map"
+        " WHERE nhl_player_id IS NOT NULL AND positions IS NOT NULL"
+    )
+    params: tuple = ()
+    if league_key:
+        sql += " AND league_key = ?"
+        params = (league_key,)
+    out: dict[int, str] = {}
+    for pid, raw in conn.execute(sql + " ORDER BY updated_at", params):
+        listed = [YAHOO_TO_POS[p] for p in str(raw).split(",") if p in YAHOO_TO_POS]
+        current = nhl.get(int(pid))
+        if not listed or current in (None, "G") or "G" in listed:
+            continue
+        if current not in listed:
+            out[int(pid)] = listed[0]
+        else:
+            out.pop(int(pid), None)
+    return out
+
+
 def mapped_league_keys(conn: sqlite3.Connection) -> list[tuple[str, int, str]]:
     """(league_key, rows with an ADP, last updated) for every league in the map."""
     return [
