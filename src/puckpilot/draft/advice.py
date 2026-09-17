@@ -41,11 +41,18 @@ def _opt(v) -> float | None:
 
 
 def eligible_label(u, row: int) -> str:
-    """Primary position first, then any others Yahoo allows: "C/L"."""
+    """Primary position first, then any others Yahoo allows: "C/L".
+
+    When Yahoo does not allow the primary at all - Necas is a C in the NHL's
+    data and RW-only on Yahoo - the label says so ("R, valued C") rather than
+    showing a C eligibility the drafter cannot use.
+    """
     sets, _ = u.eligibility()
     primary = str(u.pos[row])
-    rest = [p for p in "CLRDG" if p in sets[row] and p != primary]
-    return "/".join([primary, *rest])
+    allowed = [p for p in "CLRDG" if p in sets[row]]
+    if primary not in allowed:
+        return f"{'/'.join(allowed)}, valued {primary}"
+    return "/".join([primary, *(p for p in allowed if p != primary)])
 
 
 def _fills_starter(board: DraftBoard, seat: int, position: str) -> bool:
