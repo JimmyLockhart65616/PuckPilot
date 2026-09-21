@@ -1359,6 +1359,39 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_proposals(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support, proposals
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    try:
+        for pid in args.approve or []:
+            print(proposals.decide(conn, pid, True).describe())
+        for pid in args.reject or []:
+            print(proposals.decide(conn, pid, False).describe())
+    except proposals.ProposalError as e:
+        print(f"puckpilot: {e}")
+        return 2
+    if args.approve or args.reject:
+        return 0
+
+    rows = proposals.listing(conn, manager.name, league_key, status=args.status)
+    if not rows:
+        print("No proposals.")
+        return 0
+    for p in rows:
+        print(p.describe())
+        if p.reason.get("timing"):
+            print(f"      {p.reason['timing']}")
+    print()
+    print("  Approve with: ppilot season proposals --approve <id>")
+    return 0
+
+
 def _cmd_season_week(args: argparse.Namespace) -> int:
     from puckpilot.draft.sim import build_universe
     from puckpilot.season import cli_support, pool
@@ -1427,7 +1460,27 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
     print()
     print(plan.text())
     print()
-    print("  Nothing here is executed. Approve a move to act on it.")
+    if args.propose and plan.targets:
+        from puckpilot.season import proposals
+
+        made = proposals.propose(
+            conn,
+            manager.name,
+            league_key,
+            ours.team_key,
+            plan.targets,
+            plan.week,
+            max_pending=manager.authority.transactions.max_pending,
+        )
+        if made:
+            print(f"  Queued {len(made)} proposal(s) for your decision:")
+            for pr in made:
+                print(f"    {pr.describe()}")
+            print("  Decide with: ppilot season proposals --approve N  (or --reject N)")
+        else:
+            print("  Nothing new to queue - these are already awaiting your decision.")
+    else:
+        print("  Nothing here is executed. Approve a move to act on it.")
 
     if args.trending:
         hot = pool.rising(available, limit=10)
@@ -1982,7 +2035,18 @@ def build_parser() -> argparse.ArgumentParser:
     s_week.add_argument("--pool", type=int, default=150, help="Free agents to consider")
     s_week.add_argument("--top", type=int, default=5, help="Targets to propose")
     s_week.add_argument("--trending", action="store_true", help="Also show rising ownership")
+    s_week.add_argument(
+        "--propose", action="store_true", help="Queue the targets for your approval"
+    )
     s_week.set_defaults(func=_cmd_season_week)
+
+    s_prop = season_sub.add_parser(
+        "proposals", parents=[seasonal], help="Review, approve or reject queued transactions"
+    )
+    s_prop.add_argument("--status", default=None, help="pending / approved / rejected / executed")
+    s_prop.add_argument("--approve", type=int, nargs="*", metavar="ID")
+    s_prop.add_argument("--reject", type=int, nargs="*", metavar="ID")
+    s_prop.set_defaults(func=_cmd_season_proposals)
 
     lineup = sub.add_parser("lineup", help="Daily lineup tools")
     lineup_sub = lineup.add_subparsers(dest="subcommand", required=True)
