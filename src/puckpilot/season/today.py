@@ -128,10 +128,7 @@ class LineupPlan:
             f"  {len(self.playing)} of {len(self.playing) + len(self.idle) + len(self.out)} "
             f"rostered players have a game."
         )
-        lines.append(
-            "  Authority: "
-            + ("will act automatically." if self.within_authority else self.authority_reason)
-        )
+        lines.append(f"  Authority: {self.authority_reason}")
         return "\n".join(lines)
 
 
@@ -420,8 +417,15 @@ def _empty_slots(shape, assignment) -> list[str]:
 
 
 def _check_authority(auth: LineupAuthority, moves, notes) -> tuple[bool, str]:
+    """Whether to act, and always a reason - the reason is what gets printed.
+
+    "Nothing to do" is trivially within authority, but saying "will act
+    automatically" to someone who has not granted any is a lie about what the
+    tool is about to do the night it does have something to do.
+    """
+    granted = "standing authority granted" if auth.enabled else "recommend only"
     if not moves:
-        return True, "nothing to do."
+        return auth.enabled, f"nothing to do ({granted})."
     if not auth.enabled:
         return False, "recommend only - no standing authority granted."
     if len(moves) > auth.max_swaps_per_day:

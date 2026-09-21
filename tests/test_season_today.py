@@ -399,3 +399,17 @@ def test_an_idle_starter_is_only_displaced_when_his_slot_is_needed(db_with_games
     assert "START Plays RW in RW" in described
     assert "BENCH Idle RW  (was RW)" in described
     assert not any("Idle D" in d for d in described)  # his slot was not wanted
+
+
+def test_nothing_to_do_does_not_claim_an_authority_that_was_never_granted(db_with_games):
+    """ "Nothing to do" is trivially within authority, but telling someone who
+    granted none that the tool "will act automatically" misdescribes what
+    happens on the night there IS something to do."""
+    r = roster(player("p.1", "Idle", 1, "VAN", "C", "C"))
+    off = plan(db_with_games, r, {1: 5.0}, auth=LineupAuthority(enabled=False))
+    assert off.is_noop
+    assert "recommend only" in off.text()
+    assert "will act automatically" not in off.text()
+
+    on = plan(db_with_games, r, {1: 5.0}, auth=LineupAuthority(enabled=True, min_gain=0.0))
+    assert "standing authority granted" in on.text()

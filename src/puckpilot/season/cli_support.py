@@ -65,9 +65,19 @@ def resolve_league_key(conn: sqlite3.Connection, manager: Manager) -> str:
 
 
 def open_db(manager: Manager) -> sqlite3.Connection:
+    """Connect, and make sure the schema is current.
+
+    `init_db` is idempotent `CREATE TABLE IF NOT EXISTS` plus an additive
+    column migration, so this is cheap and self-healing. Without it an existing
+    database - which is every database, since the in-season tables are new -
+    fails on the first write with "no such table", after the Yahoo read has
+    already happened.
+    """
     from puckpilot.data import store
 
-    return store.connect(manager.resolved_db())
+    conn = store.connect(manager.resolved_db())
+    store.init_db(conn)
+    return conn
 
 
 def open_session(manager: Manager, settings: Settings | None = None):
