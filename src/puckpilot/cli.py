@@ -1214,6 +1214,145 @@ def _cmd_draft_e2e(args: argparse.Namespace) -> int:
     return 1 if failed or not results else 0
 
 
+def _season_setup(args, *, need_session: bool = False):
+    """Manager, database, league key and (optionally) a Yahoo read session."""
+    from puckpilot.season import cli_support
+
+    manager = cli_support.resolve_manager(getattr(args, "manager", None))
+    conn = cli_support.open_db(manager)
+    league_key = cli_support.resolve_league_key(conn, manager)
+    session = cli_support.open_session(manager) if need_session else None
+    return manager, conn, league_key, session
+
+
+def _cmd_season_settings(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support
+    from puckpilot.season.fetch import fetch_runtime, load_runtime, save_runtime
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    runtime = None if args.refresh else load_runtime(conn, league_key)
+    if runtime is None:
+        try:
+            with cli_support.open_session(manager) as session:
+                runtime = fetch_runtime(session, league_key, manager.team_key, progress=print)
+        except (ManagerError, cli_support.SeasonCliError) as e:
+            return cli_support.report(e)
+        save_runtime(conn, runtime)
+        print(f"saved settings for {league_key}")
+
+    print()
+    print(
+        f"{runtime.name}  ({runtime.league_key})  {runtime.num_teams} teams, {runtime.scoring_type}"
+    )
+    print(f"  season      {runtime.start_date} -> {runtime.end_date}  ({runtime.nhl_season})")
+    print(
+        f"  weeks       {runtime.start_week}-{runtime.end_week}, "
+        f"{runtime.regular_weeks} regular, playoffs from {runtime.playoff_start_week} "
+        f"({runtime.num_playoff_teams} teams)"
+    )
+    print(
+        f"  calendar    {len(runtime.weeks)} week(s) fetched; current week {runtime.current_week}"
+    )
+    mode = "daily" if runtime.is_daily_lineup else "weekly"
+    print(f"  lineups     {mode} ({runtime.weekly_deadline})")
+    print(
+        f"  waivers     type {runtime.waiver_type}, {runtime.waiver_days}-day, "
+        f"FAAB {'yes' if runtime.uses_faab else 'no'}"
+    )
+    print(
+        f"  adds        {runtime.max_weekly_adds} per week, {runtime.max_adds} per season; "
+        f"min games {runtime.min_games_played}"
+    )
+    print(f"  slots       {', '.join(f'{s.position}x{s.count}' for s in runtime.slots)}")
+    print(f"  fetched     {runtime.fetched_at}")
+    return 0
+
+
+def _cmd_season_roster(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support
+    from puckpilot.season.fetch import discover_team_key, fetch_roster, save_roster
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.yahoo import playermap
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        with cli_support.open_session(manager) as session:
+            team_key = manager.team_key or discover_team_key(session, league_key)
+            roster = fetch_roster(
+                session, team_key, args.date, player_map=playermap.load_map(conn, league_key)
+            )
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    save_roster(conn, manager.name, roster)
+    print(f"{roster.team_key}  {roster.date}  {len(roster)} players")
+    print()
+    for p in roster.players:
+        flag = f"  [{p.status_full or p.status}{' - ' + p.injury_note if p.injury_note else ''}]"
+        print(
+            f"  {p.selected_slot:5} {p.name:24} {p.team:4} "
+            f"{'/'.join(sorted(p.eligible)):8}{flag if p.status else ''}"
+        )
+    if roster.unmapped:
+        print()
+        print(f"  not in the player map: {', '.join(roster.unmapped)}")
+        print("  run `ppilot yahoo playermap --reresolve-only` after a data sync")
+    return 0
+
+
+def _cmd_lineup_today(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support
+    from puckpilot.season.fetch import discover_team_key, fetch_roster, save_roster
+    from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.today import build_plan
+    from puckpilot.season.values import build_value_model
+    from puckpilot.yahoo import playermap
+
+    date = args.date or cli_support.today_str()
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+        with cli_support.open_session(manager) as session:
+            team_key = manager.team_key or discover_team_key(session, league_key)
+            roster = fetch_roster(
+                session, team_key, date, player_map=playermap.load_map(conn, league_key)
+            )
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    save_roster(conn, manager.name, roster)
+    season = runtime.nhl_season
+    train = [s for s in DEFAULT_SEASONS if s < season][-3:][::-1]
+    values = build_value_model(conn, season, tuple(train), manager.league)
+    goalies = ChainedGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0]))
+
+    plan = build_plan(
+        conn,
+        runtime,
+        roster,
+        values,
+        goalies,
+        date,
+        manager=manager.name,
+        authority=manager.authority.lineup,
+    )
+    print(plan.text())
+    if args.explain:
+        print()
+        print("  value tonight:")
+        for c in sorted(plan.playing, key=lambda c: -c.value):
+            extra = f"  {c.note}" if c.note else ""
+            p = f"  P(start) {c.p_start:.0%}" if c.p_start is not None else ""
+            print(f"    {c.value:+7.2f}  {c.player.name:24}{p}{extra}")
+    return 0
+
+
 def _cmd_lineup_replay(args: argparse.Namespace) -> int:
     from puckpilot.data import store
     from puckpilot.engine.lineup_replay import bench_regret_report
@@ -1691,8 +1830,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     live.set_defaults(func=_cmd_draft_live)
 
+    # In-season commands all answer "for whom, and on what day", so they share
+    # a parent parser rather than redeclaring the flags five times.
+    seasonal = argparse.ArgumentParser(add_help=False)
+    seasonal.add_argument(
+        "--manager",
+        default=None,
+        metavar="NAME",
+        help="Manager config in managers/ (optional when only one exists)",
+    )
+    seasonal.add_argument(
+        "--date", default=None, metavar="YYYY-MM-DD", help="Day to act on (default: today)"
+    )
+
+    season = sub.add_parser("season", help="In-season league state")
+    season_sub = season.add_subparsers(dest="subcommand", required=True)
+    s_settings = season_sub.add_parser(
+        "settings", parents=[seasonal], help="The league's own rules, read from Yahoo"
+    )
+    s_settings.add_argument(
+        "--refresh", action="store_true", help="Re-read from Yahoo instead of the cache"
+    )
+    s_settings.set_defaults(func=_cmd_season_settings)
+    s_roster = season_sub.add_parser(
+        "roster", parents=[seasonal], help="Your current roster, with slots and injuries"
+    )
+    s_roster.set_defaults(func=_cmd_season_roster)
+
     lineup = sub.add_parser("lineup", help="Daily lineup tools")
     lineup_sub = lineup.add_subparsers(dest="subcommand", required=True)
+    today = lineup_sub.add_parser(
+        "today", parents=[seasonal], help="Tonight's lineup changes, as a diff"
+    )
+    today.add_argument(
+        "--explain", action="store_true", help="Show each playing player's value tonight"
+    )
+    today.set_defaults(func=_cmd_lineup_today)
     replay = lineup_sub.add_parser(
         "replay", help="Bench-regret replay: optimizer vs hindsight vs set-and-forget"
     )

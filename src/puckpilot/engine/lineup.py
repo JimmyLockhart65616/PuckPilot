@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Hashable
+
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -44,9 +46,11 @@ def slot_instances(shape: LeagueShape) -> list[str]:
 
 
 def optimize_lineup(
-    players: list[tuple[int, str | frozenset[str], float]],
+    players: list[tuple[Hashable, str | frozenset[str], float]],
     shape: LeagueShape,
-) -> dict[int, str]:
+    incumbent: dict[Hashable, str] | None = None,
+    inertia: float = 1e-6,
+) -> dict[Hashable, str]:
     """Assign players to starting slots maximizing total expected value.
 
     players: (player_id, position, expected value tonight), where position is
@@ -55,18 +59,28 @@ def optimize_lineup(
     no longer optimal: a C/RW taking the last C slot can strand a C-only
     player the RW slot cannot hold. The LP cost is negligible (~18x14).
 
-    Returns {player_id: slot_name} for assigned starters; everyone else sits.
+    The id is any hashable: NHL player ids in the sims, Yahoo player keys
+    live. Returns {id: slot_name} for assigned starters; everyone else sits.
     Zero/negative-value players may occupy otherwise-empty slots harmlessly.
+
+    `incumbent` maps a player to the slot he is already in, and `inertia` is a
+    tie-break bonus for leaving him there. A multi-position player is worth the
+    same in either of his slots, so without this the assignment picks between
+    them arbitrarily - and an arbitrary choice displaces whoever holds the
+    other slot, producing changes that gain nothing. The bonus is far smaller
+    than any real difference in value, so it only ever settles a tie.
     """
     if not players:
         return {}
     slots = slot_instances(shape)
+    held = incumbent or {}
     value = np.full((len(players), len(slots)), _INELIGIBLE)
-    for i, (_pid, pos, v) in enumerate(players):
+    for i, (pid, pos, v) in enumerate(players):
         allowed = _slots_for(pos)
+        mine = held.get(pid)
         for j, slot in enumerate(slots):
             if slot in allowed:
-                value[i, j] = v
+                value[i, j] = v + (inertia if slot == mine else 0.0)
 
     # pad with one dummy player per slot so any slot can stay empty instead of
     # force-taking an ineligible (or negative-value) player
