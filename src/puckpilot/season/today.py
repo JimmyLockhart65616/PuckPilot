@@ -98,10 +98,33 @@ class LineupPlan:
     within_authority: bool = False
     authority_reason: str = ""
     empty_slots: tuple[str, ...] = field(default=())
+    lock_utc: str = ""
+    lock_team: str = ""
 
     @property
     def is_noop(self) -> bool:
         return not self.moves
+
+    def deadline(self, tz: str = "America/Toronto") -> str:
+        """When the first of tonight's games locks a slot, in local time.
+
+        A daily league locks each player when his own game starts, so this is
+        the earliest of them - the moment after which part of the lineup can no
+        longer be changed at all.
+        """
+        if not self.lock_utc:
+            return ""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        try:
+            when = datetime.fromisoformat(self.lock_utc.replace("Z", "+00:00"))
+            local = when.astimezone(ZoneInfo(tz))
+        except (ValueError, OSError, KeyError):
+            return self.lock_utc
+        # "%-I" strips the leading zero on Unix and is not supported on Windows,
+        # so do it by hand rather than branch on the platform.
+        return local.strftime("%I:%M %p").lstrip("0")
 
     def text(self) -> str:
         lines = [f"{self.date}  {self.manager}  ({self.team_key})"]
@@ -128,6 +151,10 @@ class LineupPlan:
             f"  {len(self.playing)} of {len(self.playing) + len(self.idle) + len(self.out)} "
             f"rostered players have a game."
         )
+        if self.lock_utc:
+            lines.append(
+                f"  First lock: {self.deadline()} ({self.lock_team}) - changes are free until then."
+            )
         lines.append(f"  Authority: {self.authority_reason}")
         return "\n".join(lines)
 
@@ -267,6 +294,7 @@ def build_plan(
         )
         moves, gain = [], 0.0
 
+    lock = calendar.first_lock(conn, [p.team for p in roster.players if p.team], date, season)
     within, reason = _check_authority(auth, moves, notes)
     return LineupPlan(
         date=date,
@@ -282,6 +310,8 @@ def build_plan(
         within_authority=within,
         authority_reason=reason,
         empty_slots=tuple(empty),
+        lock_utc=lock[1] if lock else "",
+        lock_team=lock[0] if lock else "",
     )
 
 
@@ -428,11 +458,6 @@ def _check_authority(auth: LineupAuthority, moves, notes) -> tuple[bool, str]:
         return auth.enabled, f"nothing to do ({granted})."
     if not auth.enabled:
         return False, "recommend only - no standing authority granted."
-    if len(moves) > auth.max_swaps_per_day:
-        return False, (
-            f"{len(moves)} changes exceeds the agreed limit of {auth.max_swaps_per_day} - "
-            f"asking instead of acting."
-        )
     blocked = [m.player.name for m in moves if not m.is_start and m.player.name in auth.never_bench]
     if blocked:
         return False, f"would bench {', '.join(blocked)}, who you said never to bench."

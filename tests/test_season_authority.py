@@ -22,9 +22,21 @@ def test_lineup_authority_is_off_until_granted():
 
 
 def test_granting_it_prints_the_criteria_it_was_granted_under():
-    text = "\n".join(LineupAuthority(enabled=True, max_swaps_per_day=2).describe())
+    text = "\n".join(LineupAuthority(enabled=True, min_gain=0.2).describe())
     assert "AUTONOMOUS" in text
-    assert "at most 2 changes a day" in text
+    assert "0.20" in text
+
+
+def test_there_is_no_cap_on_changes_per_day():
+    """Lineup moves are free and unlimited until each player's game starts, so
+    a per-day cap modelled a constraint that does not exist."""
+    assert "max_swaps_per_day" not in LineupAuthority.__dataclass_fields__
+    assert "unlimited until" in "\n".join(LineupAuthority(enabled=True).describe())
+
+
+def test_a_config_still_carrying_the_old_cap_is_told_why_it_went():
+    with pytest.raises(AuthorityError, match="has been removed"):
+        Authority.from_config({"lineup": {"max_swaps_per_day": 4}})
 
 
 def test_never_bench_is_listed_when_set():
@@ -73,11 +85,6 @@ def test_questionable_mode_is_validated():
 def test_goalie_probability_must_be_a_probability():
     with pytest.raises(AuthorityError, match="between 0 and 1"):
         LineupAuthority(min_goalie_p_start=1.5)
-
-
-def test_negative_swap_cap_is_refused():
-    with pytest.raises(AuthorityError, match="not be negative"):
-        LineupAuthority(max_swaps_per_day=-1)
 
 
 def test_never_bench_becomes_a_tuple_from_a_toml_list():

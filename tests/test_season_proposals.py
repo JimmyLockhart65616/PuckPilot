@@ -223,7 +223,5 @@ def test_a_refusal_is_not_raised_again_the_same_week(db):
 def test_a_new_week_reconsiders_a_refusal(db):
     [p] = make(db, target())
     proposals.decide(db, p.id, False)
-    again = proposals.propose(
-        db, "jimmy", "999.l.1", "999.l.1.t.5", [target()], week=3
-    )
+    again = proposals.propose(db, "jimmy", "999.l.1", "999.l.1.t.5", [target()], week=3)
     assert len(again) == 1

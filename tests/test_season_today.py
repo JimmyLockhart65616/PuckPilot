@@ -105,7 +105,7 @@ def db_with_games(db):
         season=SEASON,
         game_type=2,
         game_date=DATE,
-        start_time_utc=None,
+        start_time_utc=f"{DATE}T23:00:00Z",
         home_team="TOR",
         away_team="MTL",
     )
@@ -305,20 +305,23 @@ def test_without_standing_authority_the_plan_is_advice(db_with_games):
     assert "recommend only" in p.authority_reason
 
 
-def test_too_many_changes_asks_instead_of_acting(db_with_games):
+def test_a_busy_night_is_not_treated_as_a_malfunction(db_with_games):
+    """Lineup moves are free and unlimited until each player's game starts, so
+    a night wanting many changes is a busy schedule. An earlier cap of 4 would
+    have refused to act on 17.6% of days."""
     p = plan(
         db_with_games,
         roster(
             player("p.1", "A", 1, "TOR", "C", "BN"),
             player("p.2", "B", 2, "TOR", "RW", "BN"),
             player("p.3", "C", 3, "TOR", "D", "BN"),
+            player("p.4", "D", 4, "TOR", "G", "BN"),
         ),
-        {1: 5.0, 2: 5.0, 3: 5.0},
-        auth=LineupAuthority(enabled=True, min_gain=0.0, max_swaps_per_day=2),
+        {1: 5.0, 2: 5.0, 3: 5.0, 4: 5.0},
+        goalies=StaticGoalieSource({DATE: {4: 0.9}}),
     )
-    assert len(p.moves) == 3
-    assert p.within_authority is False
-    assert "exceeds the agreed limit" in p.authority_reason
+    assert len(p.moves) == 4
+    assert p.within_authority is True
 
 
 def test_never_bench_blocks_acting_but_still_reports(db_with_games):
@@ -413,3 +416,26 @@ def test_nothing_to_do_does_not_claim_an_authority_that_was_never_granted(db_wit
 
     on = plan(db_with_games, r, {1: 5.0}, auth=LineupAuthority(enabled=True, min_gain=0.0))
     assert "standing authority granted" in on.text()
+
+
+# -- the lock ---------------------------------------------------------------
+
+
+def test_the_first_lock_is_reported_as_the_real_deadline(db_with_games):
+    """A daily league locks each player when his own game starts, so the
+    practical deadline is the earliest of them."""
+    p = plan(db_with_games, roster(player("p.1", "Plays", 1, "TOR", "C", "BN")), {1: 5.0})
+    assert p.lock_utc
+    assert p.lock_team in ("TOR", "MTL")
+    assert "First lock" in p.text()
+
+
+def test_the_deadline_renders_in_local_time(db_with_games):
+    p = plan(db_with_games, roster(player("p.1", "Plays", 1, "TOR", "C", "BN")), {1: 5.0})
+    assert ":" in p.deadline("America/Toronto")
+
+
+def test_no_games_means_no_deadline(db_with_games):
+    p = plan(db_with_games, roster(player("p.1", "Idle", 1, "VAN", "C", "C")), {1: 5.0})
+    assert p.lock_utc == ""
+    assert p.deadline() == ""

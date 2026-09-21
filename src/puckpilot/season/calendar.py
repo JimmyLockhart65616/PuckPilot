@@ -18,6 +18,7 @@ a different calendar needs no code change.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
 from datetime import date, timedelta
 
 REGULAR_SEASON = 2
@@ -97,6 +98,37 @@ def back_to_back(
     prev, nxt = d - timedelta(days=1), d + timedelta(days=1)
     near = set(team_game_dates(conn, team, prev, nxt, season))
     return (prev.isoformat() in near, nxt.isoformat() in near)
+
+
+def lock_times(conn: sqlite3.Connection, day: str | date, season: str) -> dict[str, str]:
+    """team -> the UTC start of its first game on `day`.
+
+    In a daily league a player's slot locks when his own game starts, not at a
+    single roster deadline, so this is per club. The practical deadline for
+    setting a lineup is the earliest of them.
+    """
+    rows = conn.execute(
+        "SELECT home_team, away_team, start_time_utc FROM nhl_schedule "
+        "WHERE season = ? AND game_type = ? AND game_date = ? AND start_time_utc IS NOT NULL "
+        "ORDER BY start_time_utc",
+        (season, REGULAR_SEASON, _d(day).isoformat()),
+    ).fetchall()
+    out: dict[str, str] = {}
+    for r in rows:
+        for team in (r["home_team"], r["away_team"]):
+            out.setdefault(team, r["start_time_utc"])
+    return out
+
+
+def first_lock(
+    conn: sqlite3.Connection, teams: Iterable[str], day: str | date, season: str
+) -> tuple[str, str] | None:
+    """(team, UTC start) of the earliest game among `teams`, or None."""
+    times = lock_times(conn, day, season)
+    among = [(t, times[t]) for t in set(teams) if t in times]
+    if not among:
+        return None
+    return min(among, key=lambda kv: kv[1])
 
 
 def season_dates(conn: sqlite3.Connection, season: str) -> tuple[str, str]:

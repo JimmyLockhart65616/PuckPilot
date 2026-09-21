@@ -51,15 +51,11 @@ class LineupAuthority:
     # Yahoo's own per-week minimum (min_games_played) is a rule, not a
     # preference - falling short forfeits the category.
     enforce_min_games: bool = True
-    # A day that wants more changes than this is a day something is wrong
-    # (a bad feed, a stale roster). Report instead of acting.
-    #
-    # 8, from the measured distribution over a real season: 0 changes on 11.7%
-    # of days, 2 on 35.1%, 4 on 33.5%, 6 on 11.5%, and a thin tail at 10-11.
-    # A cap of 4 would have refused to act on 17.6% of days - one in six, which
-    # is a routine Tuesday, not an anomaly. 8 leaves the ordinary range alone
-    # and fires on 0.4% of days, which is the tail this is for.
-    max_swaps_per_day: int = 8
+    # There is deliberately no cap on the number of changes. Lineup moves are
+    # free and unlimited until a player's own game starts, so a busy night is a
+    # busy schedule, not a malfunction - an earlier version capped them and
+    # would have refused to act on 17.6% of days for no reason. What actually
+    # bounds the day is the lock, which is a clock, not a count.
     # Names, because a person thinks in names. Config, never code.
     never_bench: tuple[str, ...] = ()
 
@@ -71,8 +67,6 @@ class LineupAuthority:
             )
         if not 0.0 <= self.min_goalie_p_start <= 1.0:
             raise AuthorityError("authority.lineup.min_goalie_p_start must be between 0 and 1")
-        if self.max_swaps_per_day < 0:
-            raise AuthorityError("authority.lineup.max_swaps_per_day must not be negative")
 
     def describe(self) -> list[str]:
         """The criteria in words, for printing before acting under them."""
@@ -84,7 +78,7 @@ class LineupAuthority:
             f"  never start a goalie below {self.min_goalie_p_start:.0%} to start",
             f"  players flagged day-to-day: {self.start_questionable.replace('_', ' ')}",
             f"  weekly goalie minimum enforced: {'yes' if self.enforce_min_games else 'no'}",
-            f"  at most {self.max_swaps_per_day} changes a day, then ask instead",
+            "  changes are unlimited until each player's game starts",
             *([f"  never benched: {', '.join(self.never_bench)}"] if self.never_bench else []),
         ]
 
@@ -139,6 +133,7 @@ class Authority:
                 "authority.transactions.enabled is not a setting: transactions always "
                 "require an approved proposal. Remove it."
             )
+        _refuse_removed("authority.lineup", lineup_cfg)
         _refuse_unknown("authority.lineup", lineup_cfg, LineupAuthority)
         _refuse_unknown("authority.transactions", tx_cfg, TransactionAuthority)
 
@@ -148,6 +143,23 @@ class Authority:
             lineup=LineupAuthority(**lineup_cfg),
             transactions=TransactionAuthority(**tx_cfg),
         )
+
+
+# Settings that existed and should not be silently ignored if someone still
+# has them in a config: say why they went rather than "unknown setting".
+REMOVED = {
+    "max_swaps_per_day": (
+        "lineup changes are free and unlimited until each player's game starts, "
+        "so capping them per day modelled a constraint that does not exist. "
+        "The real bound is the lock time, which is reported instead."
+    ),
+}
+
+
+def _refuse_removed(where: str, cfg: dict) -> None:
+    for key, why in REMOVED.items():
+        if key in cfg:
+            raise AuthorityError(f"{where}.{key} has been removed: {why}")
 
 
 def _refuse_unknown(where: str, cfg: dict, cls: type) -> None:

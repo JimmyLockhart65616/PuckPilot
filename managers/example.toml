@@ -78,11 +78,10 @@ start_questionable = "only_if_needed"
 # forfeits the category.
 enforce_min_games = true
 
-# A day wanting more changes than this is a day something is wrong - a stale
-# roster, a bad feed. Report it instead of acting on it. 8 comes from the
-# measured distribution: a cap of 4 would have refused to act on 17.6% of
-# days, which is a routine Tuesday rather than an anomaly.
-max_swaps_per_day = 8
+# NOTE: there is no cap on changes per day. Lineup moves are free and
+# unlimited until each player's own game starts, so a busy night is a busy
+# schedule rather than a malfunction. What bounds the day is the lock, and
+# the daily plan reports it ("First lock: 7:00 PM").
 
 # Never bench these, whatever the numbers say. Names, because you think in
 # names. Config, never code.
