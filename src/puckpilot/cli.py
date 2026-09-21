@@ -1238,8 +1238,10 @@ def _cmd_season_settings(args: argparse.Namespace) -> int:
     runtime = None if args.refresh else load_runtime(conn, league_key)
     if runtime is None:
         try:
-            with cli_support.open_session(manager) as session:
-                runtime = fetch_runtime(session, league_key, manager.team_key, progress=print)
+            runtime = cli_support.run_session(
+                manager,
+                lambda s: fetch_runtime(s, league_key, manager.team_key, progress=print),
+            )
         except (ManagerError, cli_support.SeasonCliError) as e:
             return cli_support.report(e)
         save_runtime(conn, runtime)
@@ -1281,11 +1283,13 @@ def _cmd_season_roster(args: argparse.Namespace) -> int:
 
     try:
         manager, conn, league_key, _ = _season_setup(args)
-        with cli_support.open_session(manager) as session:
-            team_key = manager.team_key or discover_team_key(session, league_key)
-            roster = fetch_roster(
-                session, team_key, args.date, player_map=playermap.load_map(conn, league_key)
-            )
+        pmap = playermap.load_map(conn, league_key)
+
+        def _read(session):
+            key = manager.team_key or discover_team_key(session, league_key)
+            return fetch_roster(session, key, args.date, player_map=pmap)
+
+        roster = cli_support.run_session(manager, _read)
     except (ManagerError, cli_support.SeasonCliError) as e:
         return cli_support.report(e)
 
@@ -1318,11 +1322,13 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
     try:
         manager, conn, league_key, _ = _season_setup(args)
         runtime = cli_support.load_rules(conn, league_key)
-        with cli_support.open_session(manager) as session:
-            team_key = manager.team_key or discover_team_key(session, league_key)
-            roster = fetch_roster(
-                session, team_key, date, player_map=playermap.load_map(conn, league_key)
-            )
+        pmap = playermap.load_map(conn, league_key)
+
+        def _read(session):
+            key = manager.team_key or discover_team_key(session, league_key)
+            return fetch_roster(session, key, date, player_map=pmap)
+
+        roster = cli_support.run_session(manager, _read)
     except (ManagerError, cli_support.SeasonCliError) as e:
         return cli_support.report(e)
 

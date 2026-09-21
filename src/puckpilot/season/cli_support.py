@@ -71,7 +71,14 @@ def open_db(manager: Manager) -> sqlite3.Connection:
 
 
 def open_session(manager: Manager, settings: Settings | None = None):
-    """A read-only Yahoo session on this manager's browser profile."""
+    """A read-only Yahoo session on this manager's browser profile.
+
+    `check_oauth` stays on. That guard is the thing that retires the browser
+    fallback the day the official API is approved, and disabling it here would
+    quietly keep a scheduled job on the fallback forever. The cost is that such
+    a job stops on that day, so `run_session` turns it into an instruction
+    rather than a traceback.
+    """
     from puckpilot.yahoo.session import YahooSession
 
     s = settings or Settings()
@@ -82,7 +89,7 @@ def open_session(manager: Manager, settings: Settings | None = None):
             f"manager config and sign in to Yahoo there once."
         )
     _refuse_if_busy(profile)
-    return YahooSession(user_data_dir=profile, headless=True, check_oauth=False)
+    return YahooSession(user_data_dir=profile, headless=True)
 
 
 def _refuse_if_busy(profile: Path) -> None:
@@ -98,6 +105,27 @@ def _refuse_if_busy(profile: Path) -> None:
             f"{profile} is already open in another Chrome. Close it (or the "
             f"other PuckPilot command using it) and run again."
         )
+
+
+def run_session(manager: Manager, work, settings: Settings | None = None):
+    """Run `work(session)`, turning the fallback's retirement into an instruction.
+
+    `YahooSession` refuses to start once OAuth answers 200, which is correct -
+    the documented API should win the moment it is available - but to a
+    scheduled job it looks like an unexplained failure on an ordinary morning.
+    """
+    from puckpilot.yahoo.session import FallbackNoLongerNeeded
+
+    try:
+        with open_session(manager, settings) as session:
+            return work(session)
+    except FallbackNoLongerNeeded as e:
+        raise SeasonCliError(
+            f"{e}\n"
+            f"  Yahoo's official API now answers, so the browser fallback has "
+            f"retired itself. Re-consent with `ppilot yahoo probe` and move these "
+            f"commands onto the OAuth client."
+        ) from e
 
 
 def load_rules(conn: sqlite3.Connection, league_key: str) -> LeagueRuntime:
