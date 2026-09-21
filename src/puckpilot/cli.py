@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import sys
 import time
 from functools import partial
@@ -1359,6 +1360,7 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
         weights=weights,
     )
     print(plan.text())
+    _season_publish(manager, conn, league_key, plan=plan, roster=roster)
     if args.explain:
         print()
         print("  value tonight:")
@@ -1367,6 +1369,37 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
             p = f"  P(start) {c.p_start:.0%}" if c.p_start is not None else ""
             print(f"    {c.value:+7.2f}  {c.player.name:24}{p}{extra}")
     return 0
+
+
+def _season_publish(manager, conn, league_key, plan=None, week_plan=None, roster=None, quiet=False):
+    """Collect decisions, then push the view. Never fatal."""
+    from puckpilot.season import publish, snapshot
+
+    if not manager.page.publishes:
+        return
+    key = manager.page.owner_key or os.environ.get("PUCKPILOT_MANAGER_KEY", "")
+    if not key:
+        if not quiet:
+            print("  (page configured but no key - set PUCKPILOT_MANAGER_KEY)")
+        return
+    try:
+        decisions = publish.collect(manager.page.url, key)
+        for line in snapshot.apply_decisions(conn, decisions):
+            print(f"  from your phone: {line}")
+        snap = snapshot.build(
+            conn,
+            manager.name,
+            league_key,
+            team_name=manager.name,
+            plan=plan,
+            week_plan=week_plan,
+            roster=roster,
+        )
+        publish.push(manager.page.url, key, snap)
+        if not quiet:
+            print(f"  published to {manager.page.url}")
+    except publish.PublishError as e:
+        print(f"  page not updated: {e}")
 
 
 def _cmd_season_protocol(args: argparse.Namespace) -> int:
@@ -1537,6 +1570,8 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         print()
         print(stance.describe())
         print(f"  Approve with: ppilot season protocol --approve {stance.id}")
+
+    _season_publish(manager, conn, league_key, week_plan=plan, roster=ours)
 
     if args.trending:
         hot = pool.rising(available, limit=10)
