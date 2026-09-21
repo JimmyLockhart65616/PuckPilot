@@ -31,6 +31,12 @@ data/
 leagues/*
 !leagues/example.toml
 
+# Same rule as leagues/: a manager config names a real team, a real league and
+# the path to a logged-in browser profile. Private by default; only the
+# documented template is tracked.
+managers/*
+!managers/example.toml
+
 # Local, unpublished helpers - research tools, not part of the product.
 # Directory-wide for the same reason as data/ and leagues/: private by default,
 # not by someone remembering to add a rule for each new file.

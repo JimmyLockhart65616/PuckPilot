@@ -1,0 +1,101 @@
+# Who PuckPilot is acting for. Copy to managers/<name>.toml and edit; the rest
+# of managers/ is git-ignored because this file names a real team and the path
+# to a logged-in browser profile.
+#
+# Everything here is about one person's chair in one league. The league's own
+# rules - categories, roster slots, the week calendar, waiver rules,
+# acquisition caps - are NOT here: they are read from Yahoo at run time, so
+# they cannot go stale and a different league needs no edits.
+#
+# Two managers in the same league each get their own file. They are rivals, so
+# nothing is shared between them: separate rows, separate browser profiles,
+# separate page keys.
+
+name = "example"
+
+# The league file (categories, keepers, roster shape). Relative to the repo
+# root. Omit to use LEAGUE_FILE from .env.
+league_file = "leagues/example.toml"
+
+# Yahoo keys. Both are optional: the league key is taken from the player map
+# when there is only one, and the team key is discovered from Yahoo by asking
+# which team the logged-in user owns. Set them to be explicit, and set them if
+# you own teams in more than one league.
+# league_key = "465.l.12345"
+# team_key   = "465.l.12345.t.5"
+
+# A logged-in Chrome profile, only needed to ACT. Leave it out to decide and
+# view without a write path - which is the whole setup for someone on a machine
+# they cannot install a browser driver on.
+# profile_dir = "secrets/chrome-profile-example"
+
+# Defaults to DB_PATH from .env. Set it when two managers share a machine but
+# should not share rows.
+# db_path = "data/puckpilot-example.db"
+
+
+# Where this manager's view is published. Keys are per-manager: a guest key
+# shows one chair, and one manager must never be handed another's.
+[page]
+# url       = "https://<your-relay-host>"
+# owner_key = ""   # prefer the environment over a file on disk
+# guest_key = ""
+
+
+# ---------------------------------------------------------------------------
+# STANDING AUTHORITY
+#
+# The asymmetry here is the point, and it is enforced in code, not by these
+# values. A lineup change is reversible, expires in a day, and has to happen
+# ~185 times a season at an hour when you are usually busy - so you can grant
+# it in advance, bounded by criteria you wrote down. A transaction spends one
+# of a fixed number of weekly acquisitions and drops a player who may not come
+# back - so it is always proposed and never executed until you approve it.
+# ---------------------------------------------------------------------------
+
+[authority.lineup]
+# false = recommend only. Set true to grant standing authority to make these
+# changes for you, within every bound below.
+enabled = false
+
+# Leave the lineup alone unless the swap is worth this much for the day, in the
+# same units the value model uses. Churning for 0.01 makes the audit log
+# unreadable and the tool untrustworthy.
+min_gain = 0.15
+
+# Never start a goalie less likely than this to actually start. A goalie who
+# does not play scores zero in every goalie category that night.
+min_goalie_p_start = 0.5
+
+# Players Yahoo flags but does not rule out (day-to-day and similar):
+#   "never"          - bench them
+#   "only_if_needed" - start them when the alternative is an empty slot
+#   "always"         - ignore the flag
+start_questionable = "only_if_needed"
+
+# Yahoo's per-week minimum games is a rule, not a preference: falling short
+# forfeits the category.
+enforce_min_games = true
+
+# A day wanting more changes than this is a day something is wrong - a stale
+# roster, a bad feed. Report it instead of acting on it.
+max_swaps_per_day = 4
+
+# Never bench these, whatever the numbers say. Names, because you think in
+# names. Config, never code.
+never_bench = []
+
+
+[authority.transactions]
+# NOTE: there is no `enabled` here, and adding one is an error rather than a
+# setting. Adds, drops and claims are only ever executed from a proposal you
+# approved; the executor takes an approved proposal id and has no way to create
+# one itself. Making transactions autonomous is not a config change - it would
+# mean deleting that mechanism.
+
+# Do not propose a move worth less than this for the week. A proposal you will
+# reject is a notification that teaches you to ignore the next one.
+min_weekly_gain = 0.5
+
+# More than this awaiting your decision means the tool is guessing, not advising.
+max_pending = 5
