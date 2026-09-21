@@ -90,6 +90,7 @@ class TeamRoster:
     team_key: str
     date: str
     players: tuple[RosterPlayer, ...]
+    team_name: str = ""
     is_editable: bool = True
     unmapped: tuple[str, ...] = field(default=())
 
@@ -203,6 +204,10 @@ def parse_roster(
     if not isinstance(node, dict):
         raise RosterError(f"no roster node for {team_key}")
 
+    # The team's own name sits in the header section, beside its key.
+    head = next((x for x in team if isinstance(x, list)), [])
+    team_name = str(_fields(head).get("name", "")) if head else ""
+
     players_node = node.get("0", {}).get("players")
     players: list[RosterPlayer] = []
     unmapped: list[str] = []
@@ -221,6 +226,7 @@ def parse_roster(
         team_key=team_key,
         date=str(node.get("date", "")),
         players=tuple(players),
+        team_name=team_name,
         is_editable=bool(int(node.get("is_editable", 1) or 0)),
         unmapped=tuple(unmapped),
     )

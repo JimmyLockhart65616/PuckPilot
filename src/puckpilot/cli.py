@@ -1386,11 +1386,12 @@ def _season_publish(manager, conn, league_key, plan=None, week_plan=None, roster
         decisions = publish.collect(manager.page.url, key)
         for line in snapshot.apply_decisions(conn, decisions):
             print(f"  from your phone: {line}")
+        named = roster or week_plan
         snap = snapshot.build(
             conn,
             manager.name,
             league_key,
-            team_name=manager.name,
+            team_name=getattr(named, "team_name", "") or manager.name,
             plan=plan,
             week_plan=week_plan,
             roster=roster,
