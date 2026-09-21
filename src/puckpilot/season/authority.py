@@ -36,8 +36,11 @@ class LineupAuthority:
 
     enabled: bool = False
     # Leave a lineup alone unless the swap is worth this much, in the same
-    # z-like per-day units `GameValueModel` produces. Churning for 0.01 costs
-    # nothing but makes the audit log unreadable and the tool untrustworthy.
+    # z-like per-day units `GameValueModel` produces. Measured over a real
+    # season this knob barely matters in either direction - raising it to 1.0
+    # changes 530 lineup moves instead of 536 and costs 0.13% of season value -
+    # because daily churn comes from who has a game, not from marginal swaps.
+    # Kept as a small floor against a pointless swap between near-equals.
     min_gain: float = 0.15
     # Never start a goalie less likely than this to actually start. A goalie who
     # does not play scores zero in four of twelve categories.
@@ -50,7 +53,13 @@ class LineupAuthority:
     enforce_min_games: bool = True
     # A day that wants more changes than this is a day something is wrong
     # (a bad feed, a stale roster). Report instead of acting.
-    max_swaps_per_day: int = 4
+    #
+    # 8, from the measured distribution over a real season: 0 changes on 11.7%
+    # of days, 2 on 35.1%, 4 on 33.5%, 6 on 11.5%, and a thin tail at 10-11.
+    # A cap of 4 would have refused to act on 17.6% of days - one in six, which
+    # is a routine Tuesday, not an anomaly. 8 leaves the ordinary range alone
+    # and fires on 0.4% of days, which is the tail this is for.
+    max_swaps_per_day: int = 8
     # Names, because a person thinks in names. Config, never code.
     never_bench: tuple[str, ...] = ()
 

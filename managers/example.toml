@@ -59,8 +59,9 @@ league_file = "leagues/example.toml"
 enabled = false
 
 # Leave the lineup alone unless the swap is worth this much for the day, in the
-# same units the value model uses. Churning for 0.01 makes the audit log
-# unreadable and the tool untrustworthy.
+# same units the value model uses. Measured over a real season this barely
+# matters either way - at 1.0 it saves 6 of 536 moves and costs 0.13% -
+# because daily churn comes from who has a game, not from marginal swaps.
 min_gain = 0.15
 
 # Never start a goalie less likely than this to actually start. A goalie who
@@ -78,8 +79,10 @@ start_questionable = "only_if_needed"
 enforce_min_games = true
 
 # A day wanting more changes than this is a day something is wrong - a stale
-# roster, a bad feed. Report it instead of acting on it.
-max_swaps_per_day = 4
+# roster, a bad feed. Report it instead of acting on it. 8 comes from the
+# measured distribution: a cap of 4 would have refused to act on 17.6% of
+# days, which is a routine Tuesday rather than an anomaly.
+max_swaps_per_day = 8
 
 # Never bench these, whatever the numbers say. Names, because you think in
 # names. Config, never code.

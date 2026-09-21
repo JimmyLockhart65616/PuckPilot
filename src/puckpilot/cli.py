@@ -1359,6 +1359,33 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_lineup_verify(args: argparse.Namespace) -> int:
+    from puckpilot.data import store
+    from puckpilot.season.replay import live_policy_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = live_policy_report(
+        conn,
+        season=args.season,
+        n_drafts=args.drafts,
+        seed=args.seed,
+        league=_league(args),
+        min_gain=args.min_gain,
+        progress=print,
+    )
+    print()
+    print(report.text)
+    # The live path exists to run the validated policy, not a different one.
+    live = report.totals["live_perfect"]
+    validated = report.totals["validated_perfect"]
+    if validated and (live - validated) / validated < -0.02:
+        print()
+        print("FAIL: the live path is more than 2% behind the policy it replaces.")
+        return 1
+    return 0
+
+
 def _cmd_lineup_replay(args: argparse.Namespace) -> int:
     from puckpilot.data import store
     from puckpilot.engine.lineup_replay import bench_regret_report
@@ -1872,6 +1899,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--explain", action="store_true", help="Show each playing player's value tonight"
     )
     today.set_defaults(func=_cmd_lineup_today)
+    verify = lineup_sub.add_parser(
+        "verify", help="Score the live daily path against the validated optimizer"
+    )
+    verify.add_argument("--season", default="20252026", help="Season to replay")
+    verify.add_argument("--drafts", type=int, default=1, help="Drafts to source rosters from")
+    verify.add_argument("--seed", type=int, default=123)
+    verify.add_argument("--min-gain", type=float, default=0.0)
+    verify.set_defaults(func=_cmd_lineup_verify)
     replay = lineup_sub.add_parser(
         "replay", help="Bench-regret replay: optimizer vs hindsight vs set-and-forget"
     )
