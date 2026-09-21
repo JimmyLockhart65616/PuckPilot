@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS mp_season_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_mp_season_stats_season ON mp_season_stats (season, kind);
 
+-- A transaction can only be executed from an approved row here. That is the
+-- whole mechanism behind "lineups are pre-authorised, transactions are not":
+-- the executor takes a proposal id and has no path that creates one itself.
 CREATE TABLE IF NOT EXISTS waiver_proposals (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -51,7 +54,15 @@ CREATE TABLE IF NOT EXISTS waiver_proposals (
     drop_pid    INTEGER,
     reason_json TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'approved', 'rejected', 'executed'))
+        CHECK (status IN ('pending', 'approved', 'rejected', 'executed')),
+    manager         TEXT NOT NULL DEFAULT '',
+    league_key      TEXT NOT NULL DEFAULT '',
+    team_key        TEXT NOT NULL DEFAULT '',
+    kind            TEXT NOT NULL DEFAULT 'add_drop',
+    add_player_key  TEXT,
+    drop_player_key TEXT,
+    decided_at      TEXT,
+    executed_at     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS nhl_game_logs (
@@ -106,7 +117,97 @@ CREATE TABLE IF NOT EXISTS yahoo_player_map (
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS ix_yahoo_map_nhl ON yahoo_player_map(nhl_player_id);
+
+-- In-season. Everything below is keyed by `manager` as well as league, because
+-- two people in the same league may run this against the same database and the
+-- draft board already taught us what happens when "my team" is implicit.
+
+-- Yahoo's own description of the league: the week calendar, lock mode, waiver
+-- rules and caps. Cached whole rather than shredded into columns so a setting
+-- we have not thought about yet is still there when we want it.
+CREATE TABLE IF NOT EXISTS yahoo_league_runtime (
+    league_key   TEXT PRIMARY KEY,
+    settings_json TEXT NOT NULL,
+    weeks_json   TEXT NOT NULL DEFAULT '[]',
+    fetched_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- One row per player per day: what Yahoo had slotted, and what it knew about
+-- his health. Kept as history so "what did we actually start" is answerable
+-- after the fact, which is the only way an autonomous lineup change can be
+-- audited.
+CREATE TABLE IF NOT EXISTS yahoo_roster_snapshots (
+    manager       TEXT NOT NULL,
+    league_key    TEXT NOT NULL,
+    team_key      TEXT NOT NULL,
+    date          TEXT NOT NULL,
+    player_key    TEXT NOT NULL,
+    nhl_player_id INTEGER,
+    name          TEXT NOT NULL,
+    team_abbrev   TEXT,
+    selected_slot TEXT,
+    eligible      TEXT,
+    status        TEXT,
+    injury_note   TEXT,
+    is_editable   INTEGER NOT NULL DEFAULT 1,
+    fetched_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (manager, team_key, date, player_key)
+);
+CREATE INDEX IF NOT EXISTS ix_roster_snap_date ON yahoo_roster_snapshots (date);
+
+-- The free-agent and waiver pool, sampled daily. Differencing percent_owned
+-- between two days is the trending-adds signal, and it is this league's own
+-- ownership rather than a site-wide average.
+CREATE TABLE IF NOT EXISTS yahoo_fa_snapshots (
+    league_key     TEXT NOT NULL,
+    date           TEXT NOT NULL,
+    player_key     TEXT NOT NULL,
+    nhl_player_id  INTEGER,
+    name           TEXT NOT NULL,
+    team_abbrev    TEXT,
+    positions      TEXT,
+    ownership      TEXT,
+    percent_owned  REAL,
+    status         TEXT,
+    PRIMARY KEY (league_key, date, player_key)
+);
+CREATE INDEX IF NOT EXISTS ix_fa_snap_date ON yahoo_fa_snapshots (league_key, date);
+
+-- The audit log. Every lineup change made under standing authority and every
+-- transaction executed after approval lands here, with the reasoning that
+-- produced it, so the criteria can be argued with from evidence.
+CREATE TABLE IF NOT EXISTS season_actions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    manager      TEXT NOT NULL,
+    league_key   TEXT NOT NULL,
+    team_key     TEXT NOT NULL,
+    date         TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    detail_json  TEXT NOT NULL,
+    outcome      TEXT NOT NULL DEFAULT 'planned'
+        CHECK (outcome IN ('planned', 'dry-run', 'executed', 'failed', 'skipped')),
+    message      TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_season_actions_date ON season_actions (manager, date);
 """
+
+# `waiver_proposals` predates the in-season work and shipped without a manager,
+# a league or Yahoo's own player keys. There is no migration framework here and
+# `CREATE TABLE IF NOT EXISTS` will not alter an existing table, so this is the
+# narrow version of one: additive columns only, idempotent, no rewrites.
+ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "waiver_proposals": {
+        "manager": "TEXT NOT NULL DEFAULT ''",
+        "league_key": "TEXT NOT NULL DEFAULT ''",
+        "team_key": "TEXT NOT NULL DEFAULT ''",
+        "kind": "TEXT NOT NULL DEFAULT 'add_drop'",
+        "add_player_key": "TEXT",
+        "drop_player_key": "TEXT",
+        "decided_at": "TEXT",
+        "executed_at": "TEXT",
+    },
+}
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -120,7 +221,27 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _add_missing_columns(conn)
     conn.commit()
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> list[str]:
+    """Bring pre-existing tables up to the current column set.
+
+    Only ever adds, and only columns with a default, so it cannot lose data and
+    cannot fail halfway into an inconsistent shape. Returns what it added, so a
+    caller can say so rather than changing a database silently.
+    """
+    added = []
+    for table, columns in ADDED_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not have:  # table does not exist yet; the schema above just made it
+            continue
+        for name, decl in columns.items():
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                added.append(f"{table}.{name}")
+    return added
 
 
 def table_names(conn: sqlite3.Connection) -> set[str]:

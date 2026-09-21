@@ -233,13 +233,25 @@ class YahooSession:
                 out.append(flatten(entry))
         return out
 
-    def roster(self, team_key: str) -> list[dict]:
-        """A team's current roster - pre-draft, exactly its kept/protected players.
+    def roster(self, team_key: str, date: str | None = None) -> list[dict]:
+        """A team's roster - pre-draft, exactly its kept/protected players.
 
         Yahoo nests the player list one level deeper here than `players()` or
         `draft_results()` do: roster -> "0" -> players -> count + indexed entries.
+
+        `date` (YYYY-MM-DD) asks for a specific day's lineup rather than today's.
+        The resource is date-scoped in a daily-lineup league, so the slot a
+        player sits in is a fact about a day, not about the roster.
+
+        Returns flattened entries, which is lossy for roster payloads - a
+        player's own `status` collides with `is_keeper.status`. Callers that
+        need the slot, the injury or the eligibility want
+        `season.roster.parse_roster` on the raw response instead.
         """
-        tm = self.get(f"team/{team_key}/roster")["fantasy_content"]["team"]
+        path = f"team/{team_key}/roster"
+        if date:
+            path += f";date={date}"
+        tm = self.get(path)["fantasy_content"]["team"]
         roster_node = next((x["roster"] for x in tm if isinstance(x, dict) and "roster" in x), None)
         if not roster_node:
             return []
@@ -249,6 +261,29 @@ class YahooSession:
         out = []
         for i in range(int(node.get("count", 0))):
             entry = node.get(str(i), {}).get("player")
+            if entry:
+                out.append(flatten(entry))
+        return out
+
+    def matchups(self, team_key: str) -> list[dict]:
+        """Every scheduled matchup for a team, each carrying its week's dates.
+
+        This is how the week calendar is learned rather than computed. Yahoo
+        says the 2026-27 season runs 2026-09-29 to 2027-03-28 over 25 weeks;
+        Monday-Sunday arithmetic from the start date finishes a week early, so
+        at least one week is longer than seven days and every derived week
+        boundary after it would be wrong.
+
+        One request covers the whole season, and it also answers "who am I
+        playing this week", which is the other thing a weekly plan needs.
+        """
+        tm = self.get(f"team/{team_key}/matchups")["fantasy_content"]["team"]
+        node = next((x["matchups"] for x in tm if isinstance(x, dict) and "matchups" in x), None)
+        if not isinstance(node, dict):
+            return []
+        out = []
+        for i in range(int(node.get("count", 0))):
+            entry = node.get(str(i), {}).get("matchup")
             if entry:
                 out.append(flatten(entry))
         return out

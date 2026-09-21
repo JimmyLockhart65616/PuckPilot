@@ -136,6 +136,7 @@ def test_the_session_client_exposes_no_way_to_write():
         "draft_results",
         "players",
         "roster",
+        "matchups",
         "keepers",
         "user_data_dir",
         "headless",
