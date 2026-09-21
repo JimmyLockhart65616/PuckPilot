@@ -59,28 +59,15 @@ def discover_team_key(session, league_key: str) -> str:
 # -- the week calendar ------------------------------------------------------
 
 
-def weeks_from_matchups(matchups: list[dict]) -> tuple[Week, ...]:
-    """Week boundaries out of a team's matchup schedule.
+def fetch_matchups(session, team_key: str) -> list:
+    """Every scheduled matchup, parsed structurally.
 
-    Yahoo reports each matchup's own `week_start` and `week_end`, which is the
-    only trustworthy source for them: the season's weeks are not uniformly
-    seven days, so arithmetic from the start date drifts.
-
-    Tolerant by design - a matchup missing its dates is skipped rather than
-    fatal, because a partial calendar still beats a computed one, and
-    `LeagueRuntime.week_of` will say plainly when a date is not covered.
+    `session.matchups` flattens, which merges both teams of a matchup into one
+    dict and so loses the opponent - the thing a weekly plan is about.
     """
-    weeks: dict[int, Week] = {}
-    for m in matchups:
-        try:
-            n = int(m.get("week"))
-            start, end = str(m.get("week_start", "")), str(m.get("week_end", ""))
-        except (TypeError, ValueError):
-            continue
-        if not start or not end or n in weeks:
-            continue
-        weeks[n] = Week(number=n, start=start, end=end)
-    return tuple(weeks[n] for n in sorted(weeks))
+    from puckpilot.season.matchups import parse_matchups
+
+    return parse_matchups(session.get(f"team/{team_key}/matchups"), our_team_key=team_key)
 
 
 def fetch_runtime(
@@ -101,7 +88,9 @@ def fetch_runtime(
     if key:
         progress(f"week calendar from {key} ...")
         try:
-            weeks = weeks_from_matchups(session.matchups(key))
+            from puckpilot.season.matchups import weeks_of
+
+            weeks = weeks_of(fetch_matchups(session, key))
         except Exception as e:  # noqa: BLE001 - a missing calendar must not be fatal
             progress(f"  could not read the week calendar: {e}")
 
@@ -248,3 +237,17 @@ def require_runtime(conn: sqlite3.Connection, league_key: str) -> LeagueRuntime:
             f"no cached league settings for {league_key}; run `ppilot season settings --refresh`"
         )
     return rt
+
+
+def save_pool_if_any(conn: sqlite3.Connection, league_key: str, date: str, players) -> int:
+    """Snapshot the pool, tolerating an empty one.
+
+    Yahoo's own `percent_owned.delta` is a week-over-week figure, so it cannot
+    see a Tuesday and resets when the week rolls. Our own daily rows can do
+    both, and they are the only record that survives that reset.
+    """
+    if not players:
+        return 0
+    from puckpilot.season.pool import save_pool
+
+    return save_pool(conn, league_key, date, players)

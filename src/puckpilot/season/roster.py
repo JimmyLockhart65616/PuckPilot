@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from puckpilot.season.settings import BENCH_SLOTS, IR_SLOTS, OUT_STATUSES, YAHOO_TO_POS
+from puckpilot.yahoo.playermap import _team
 
 
 class RosterError(RuntimeError):
@@ -169,7 +170,10 @@ def parse_player(entry: list[Any], player_map: Mapping[str, int] | None = None) 
         player_key=key,
         yahoo_id=str(core.get("player_id", "")),
         name=str(name.get("full", "")) if isinstance(name, dict) else str(name),
-        team=str(core.get("editorial_team_abbr", "")),
+        # Yahoo spells some clubs differently from the NHL ("LA" vs "LAK"),
+        # and this field is compared against the NHL schedule - so an
+        # unnormalised abbreviation silently reads as "has no game today".
+        team=_team(core.get("editorial_team_abbr")),
         primary_position=str(core.get("primary_position", "")),
         yahoo_eligible=_positions(core.get("eligible_positions")),
         selected_slot=selected,

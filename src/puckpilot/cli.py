@@ -1359,6 +1359,91 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_week(args: argparse.Namespace) -> int:
+    from puckpilot.draft.sim import build_universe
+    from puckpilot.season import cli_support, pool
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.fetch import fetch_matchups, fetch_roster, save_pool_if_any
+    from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.matchups import for_date, for_week
+    from puckpilot.season.values import build_value_model
+    from puckpilot.yahoo import playermap
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+        pmap = playermap.load_map(conn, league_key)
+        today = args.date or runtime.current_date or cli_support.today_str()
+
+        def _read(session):
+            team_key = manager.team_key or runtime.league_key
+            matchups = fetch_matchups(session, team_key)
+            m = for_week(matchups, args.week) if args.week else for_date(matchups, today)
+            if m is None:
+                m = for_week(matchups, runtime.current_week)
+            if m is None:
+                raise cli_support.SeasonCliError(
+                    f"no matchup covering {today}; the season may be over."
+                )
+            ours = fetch_roster(session, team_key, m.start, player_map=pmap)
+            theirs = (
+                fetch_roster(session, m.opponent_key, m.start, player_map=pmap)
+                if m.opponent_key
+                else ours
+            )
+            fa = pool.fetch_pool(
+                session, league_key, "FA", limit=args.pool, player_map=pmap, progress=print
+            )
+            wv = pool.fetch_pool(session, league_key, "W", limit=50, player_map=pmap)
+            return m, ours, theirs, fa + wv
+
+        m, ours, theirs, available = cli_support.run_session(manager, _read)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    save_pool_if_any(conn, league_key, m.start, available)
+    season = runtime.nhl_season
+    train = [s for s in DEFAULT_SEASONS if s < season][-3:][::-1]
+    universe = build_universe(conn, season, tuple(train), manager.league)
+    values = build_value_model(conn, season, tuple(train), manager.league)
+    goalies = ChainedGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0]))
+
+    plan = weekmod.build_week_plan(
+        conn,
+        runtime,
+        manager.league,
+        m.as_week(),
+        m.opponent_name,
+        ours,
+        theirs,
+        available,
+        universe.frame,
+        goalies,
+        values,
+        min_gain=manager.authority.transactions.min_weekly_gain,
+        max_targets=args.top,
+    )
+    print()
+    print(plan.text())
+    print()
+    print("  Nothing here is executed. Approve a move to act on it.")
+
+    if args.trending:
+        hot = pool.rising(available, limit=10)
+        print()
+        if not hot:
+            print("  Nobody is being picked up yet - Yahoo's delta is week over week.")
+        else:
+            print("  The league is picking these up:")
+        for x in hot:
+            print(
+                f"    +{x.percent_owned_delta:>4.0f}%  {x.name:22} "
+                f"{x.team:4} ({x.percent_owned:.0f}% owned)"
+            )
+    return 0
+
+
 def _cmd_lineup_verify(args: argparse.Namespace) -> int:
     from puckpilot.data import store
     from puckpilot.season.replay import live_policy_report
@@ -1889,6 +1974,15 @@ def build_parser() -> argparse.ArgumentParser:
         "roster", parents=[seasonal], help="Your current roster, with slots and injuries"
     )
     s_roster.set_defaults(func=_cmd_season_roster)
+
+    s_week = season_sub.add_parser(
+        "week", parents=[seasonal], help="This week's category plan and add targets"
+    )
+    s_week.add_argument("--week", type=int, default=None, help="Fantasy week (default: today's)")
+    s_week.add_argument("--pool", type=int, default=150, help="Free agents to consider")
+    s_week.add_argument("--top", type=int, default=5, help="Targets to propose")
+    s_week.add_argument("--trending", action="store_true", help="Also show rising ownership")
+    s_week.set_defaults(func=_cmd_season_week)
 
     lineup = sub.add_parser("lineup", help="Daily lineup tools")
     lineup_sub = lineup.add_subparsers(dest="subcommand", required=True)
