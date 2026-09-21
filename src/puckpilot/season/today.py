@@ -209,8 +209,14 @@ def build_plan(
     manager: str = "",
     authority: LineupAuthority | None = None,
     goalie_starts_so_far: int | None = None,
+    weights: dict[str, float] | None = None,
 ) -> LineupPlan:
-    """Decide tonight's lineup and diff it against what Yahoo currently has."""
+    """Decide tonight's lineup and diff it against what Yahoo currently has.
+
+    `weights` is an approved week protocol's category stance. Absent - which is
+    the default, and the case whenever nobody has agreed one - every category
+    counts the same and this is the plain value decision.
+    """
     auth = authority or LineupAuthority()
     shape = runtime.shape()
     season = runtime.nhl_season
@@ -218,6 +224,11 @@ def build_plan(
     p_starts = goalie_source.starts(date) if goalie_source else {}
 
     notes: list[str] = []
+    if weights:
+        notes.append(
+            "Acting on this week's approved protocol: "
+            + ", ".join(f"{k} x{v:g}" for k, v in sorted(weights.items()))
+        )
     candidates: list[Candidate] = []
     idle: list[RosterPlayer] = []
     out: list[RosterPlayer] = []
@@ -239,6 +250,8 @@ def build_plan(
             continue
 
         value = values.per_game(p.nhl_player_id, date)
+        if weights:
+            value *= values.tilt(p.nhl_player_id, weights)
         p_start: float | None = None
         note = ""
 

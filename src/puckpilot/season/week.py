@@ -28,6 +28,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from puckpilot.engine.categories import Category
+from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.league import LeagueConfig
 from puckpilot.season import calendar
 from puckpilot.season.pool import PoolPlayer
@@ -48,6 +49,32 @@ class CategoryOutlook:
     category: Category
     ours: float
     theirs: float
+    # How much the lineup and the best available add could each still move this
+    # category. None means it was never measured, which is different from zero -
+    # zero is the common and informative answer.
+    lineup_room: float | None = None
+    add_room: float | None = None
+
+    @property
+    def room(self) -> float:
+        return (self.lineup_room or 0.0) + (self.add_room or 0.0)
+
+    @property
+    def measured(self) -> bool:
+        return self.lineup_room is not None
+
+    @property
+    def reachable(self) -> bool:
+        """Whether any lever left could still close this gap.
+
+        A category we lead is trivially reachable. One we trail is reachable
+        only if re-slotting plus the best add available covers the gap.
+        """
+        if self.margin >= 0:
+            return True
+        if not self.measured:
+            return True
+        return abs(self.margin) <= self.room
 
     @property
     def margin(self) -> float:
@@ -120,6 +147,18 @@ class WeekPlan:
         lines.append(
             "  In play: " + (", ".join(o.category.label for o in close) if close else "none")
         )
+        counted = [o for o in self.outlook if o.measured]
+        if counted and all(o.lineup_room == 0.0 for o in counted):
+            lines.append(
+                "  The lineup has no discretion this week - on every day, everyone "
+                "with a game fits in a slot. Only an add moves anything."
+            )
+        gone = tuple(o for o in self.outlook if not o.reachable)
+        if gone:
+            lines.append(
+                "  Out of reach even with an add: "
+                + ", ".join(f"{o.category.label} ({o.margin:+.1f})" for o in gone)
+            )
         if self.targets:
             lines.append("")
             budget = (
@@ -201,40 +240,147 @@ def project_totals(
     return out
 
 
-def expected_games(
+def expected_starts(
     conn: sqlite3.Connection,
     runtime: LeagueRuntime,
     week: Week,
     players,
     goalie_source,
+    values,
+    weights: dict[str, float] | None = None,
 ) -> dict[int, float]:
-    """Expected games for each player over the week.
+    """Expected *starts* for each player over the week, not team games.
 
-    Skaters get their team's game count. Goalies get the sum of their start
-    probabilities, which is the honest version of the same thing - a backup on
-    a four-game week is not playing four times.
+    The distinction matters. A roster carries more players than it can start -
+    thirteen slots against sixteen or seventeen bodies - so counting every
+    rostered player's team games inflates both sides of the comparison, and
+    inflates them unevenly: the team with the deeper bench gains the most from
+    a number it can never actually collect.
+
+    So the week is walked a day at a time and the same assignment the daily
+    plan uses decides who would actually be in a slot. Goalies are counted by
+    probability rather than by whether they were slotted, because a start is
+    not ours to choose.
     """
     season = runtime.nhl_season
-    dates = week.dates()
-    by_team: dict[str, int] = {}
-    starts: dict[int, float] = {}
-    for d in dates:
-        playing = calendar.teams_playing(conn, d, season)
-        for t in playing:
-            by_team[t] = by_team.get(t, 0) + 1
-        if goalie_source:
-            for pid, p in goalie_source.starts(d).items():
-                starts[pid] = starts.get(pid, 0.0) + p
-
+    shape = runtime.shape()
     out: dict[int, float] = {}
-    for p in players:
-        pid = p.nhl_player_id
-        if pid is None or getattr(p, "is_out", False):
+
+    for day in week.dates():
+        playing = calendar.teams_playing(conn, day, season)
+        p_starts = goalie_source.starts(day) if goalie_source else {}
+        cands = []
+        for p in players:
+            pid = p.nhl_player_id
+            if pid is None or getattr(p, "is_out", False) or p.team not in playing:
+                continue
+            if p.position == "G":
+                # Counted straight from the probability: the slot is not the
+                # constraint, the coach is.
+                out[pid] = out.get(pid, 0.0) + float(p_starts.get(pid, 0.0))
+                continue
+            v = values.per_game_tilted(pid, day, weights) if weights else values.per_game(pid, day)
+            cands.append((pid, p.eligible, v))
+        for pid in optimize_lineup(cands, shape):
+            out[pid] = out.get(pid, 0.0) + 1.0
+    return {k: round(v, 2) for k, v in out.items()}
+
+
+def team_games_in(conn: sqlite3.Connection, runtime: LeagueRuntime, week: Week) -> dict[str, int]:
+    """team -> games in the week. The streaming lever, on its own."""
+    by_team: dict[str, int] = {}
+    for day in week.dates():
+        for t in calendar.teams_playing(conn, day, runtime.nhl_season):
+            by_team[t] = by_team.get(t, 0) + 1
+    return by_team
+
+
+def headroom(
+    conn: sqlite3.Connection,
+    runtime: LeagueRuntime,
+    week: Week,
+    players,
+    goalie_source,
+    values,
+    rates: dict[int, dict[str, float]],
+    cats: tuple[Category, ...],
+    neutral: dict[str, float],
+    favour: float = 6.0,
+) -> dict[str, float]:
+    """How far each category could move if the lineup chased only that one.
+
+    This is what makes "out of reach" a fact rather than a threshold someone
+    picked. A gap is only unreachable if it survives the most one-eyed lineup
+    available - so each category is priced again with itself weighted heavily,
+    the week re-slotted under that, and the difference against the neutral
+    projection is the most a lineup decision could add.
+
+    It deliberately measures the *lineup* lever alone. Adds can move a category
+    much further, which is why a category out of reach here can still be worth
+    proposing a transaction for.
+    """
+    out: dict[str, float | None] = {}
+    for c in cats:
+        if c.key in DERIVED:
+            # A rate is not a total, so "how much could this move" has no
+            # answer in these units. Unmeasured, which reads as "do not claim
+            # it is out of reach" - the alternative concedes every rate
+            # category we trail by a hair.
+            out[c.key] = None
             continue
-        if p.position == "G":
-            out[pid] = round(starts.get(pid, 0.0), 2)
-        else:
-            out[pid] = float(by_team.get(p.team, 0))
+        starts = expected_starts(
+            conn, runtime, week, players, goalie_source, values, weights={c.key: favour}
+        )
+        best = project_totals(starts, rates, cats)
+        out[c.key] = max(best.get(c.key, 0.0) - neutral.get(c.key, 0.0), 0.0)
+    return out
+
+
+def add_headroom(
+    conn: sqlite3.Connection,
+    runtime: LeagueRuntime,
+    week: Week,
+    ours: TeamRoster,
+    pool,
+    rates: dict[int, dict[str, float]],
+    cats: tuple[Category, ...],
+    league,
+) -> dict[str, float]:
+    """The most one acquisition could add to each category, net of the drop.
+
+    The lineup is often the smaller lever - a roster of seventeen into thirteen
+    slots has no choice to make on a night when only nine players have games -
+    so a category out of reach for the lineup can be well within range of an
+    add. Net, because the player who makes room takes his own production with
+    him.
+    """
+    games = team_games_in(conn, runtime, week)
+    droppable = [
+        p
+        for p in ours.players
+        if not p.is_undroppable and p.nhl_player_id is not None and not p.on_ir
+    ]
+    out: dict[str, float | None] = {}
+    for c in cats:
+        if c.key in DERIVED:
+            out[c.key] = None
+            continue
+        worst = min(
+            (
+                rates.get(p.nhl_player_id, {}).get(c.key, 0.0) * games.get(p.team, 0)
+                for p in droppable
+            ),
+            default=0.0,
+        )
+        best = max(
+            (
+                rates.get(p.nhl_player_id, {}).get(c.key, 0.0) * games.get(p.team, 0)
+                for p in pool
+                if p.nhl_player_id is not None and not p.is_out
+            ),
+            default=0.0,
+        )
+        out[c.key] = max(best - worst, 0.0)
     return out
 
 
@@ -261,14 +407,22 @@ def build_week_plan(
     cats = league.all_cats
     rates = per_game_rates(frame, cats)
 
-    our_games = expected_games(conn, runtime, week, ours.players, goalie_source)
-    their_games = expected_games(conn, runtime, week, theirs.players, goalie_source)
+    our_games = expected_starts(conn, runtime, week, ours.players, goalie_source, values)
+    their_games = expected_starts(conn, runtime, week, theirs.players, goalie_source, values)
     our_totals = project_totals(our_games, rates, cats)
     their_totals = project_totals(their_games, rates, cats)
 
+    reach = headroom(
+        conn, runtime, week, ours.players, goalie_source, values, rates, cats, our_totals
+    )
+    adds = add_headroom(conn, runtime, week, ours, pool, rates, cats, league)
     outlook = tuple(
         CategoryOutlook(
-            category=c, ours=our_totals.get(c.key, 0.0), theirs=their_totals.get(c.key, 0.0)
+            category=c,
+            ours=our_totals.get(c.key, 0.0),
+            theirs=their_totals.get(c.key, 0.0),
+            lineup_room=reach.get(c.key),
+            add_room=adds.get(c.key),
         )
         for c in cats
     )

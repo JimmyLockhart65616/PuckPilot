@@ -190,6 +190,24 @@ CREATE TABLE IF NOT EXISTS season_actions (
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS ix_season_actions_date ON season_actions (manager, date);
+
+-- A stance for the week, agreed before it starts: which categories are out of
+-- reach and which are live. Approving one is what licenses the daily lineup to
+-- weigh players by it, so the status here is load-bearing, not a label.
+CREATE TABLE IF NOT EXISTS week_protocols (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    manager      TEXT NOT NULL,
+    league_key   TEXT NOT NULL,
+    team_key     TEXT NOT NULL,
+    week         INTEGER NOT NULL,
+    opponent     TEXT,
+    stances_json TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'proposed'
+        CHECK (status IN ('proposed', 'approved', 'rejected')),
+    decided_at   TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_week_protocols ON week_protocols (manager, league_key, week);
 """
 
 # `waiver_proposals` predates the in-season work and shipped without a manager,

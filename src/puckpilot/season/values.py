@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import bisect
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from puckpilot.draft.replay import ReplayData, build_replay_data
 from puckpilot.engine.lineup_replay import GameValueModel, projected_pg_values
@@ -39,6 +39,8 @@ class ValueModel:
     proj_pg: dict[int, float]
     season: str
     scale_season: str
+    frame: object | None = None
+    _tilts: dict = field(default_factory=dict)
 
     def day_index(self, date: str) -> int:
         """Dates strictly before `date`. No lookahead by construction."""
@@ -59,6 +61,75 @@ class ValueModel:
 
     def knows(self, pid: int) -> bool:
         return pid in self.proj_pg
+
+    # -- category tilt -----------------------------------------------------
+
+    def tilt(self, pid: int, weights: dict[str, float]) -> float:
+        """How much a player is worth under a category stance, as a multiplier.
+
+        The blended value is one scalar, so a stance cannot be applied to it
+        directly - the categories have already been summed away. Instead the
+        player's projected per-game line is scored twice, once flat and once
+        weighted, and the ratio tilts the blended number. That keeps the recent
+        form the blend carries, which re-deriving value from projections alone
+        would throw away.
+
+        A player whose flat value is near zero has no meaningful ratio, so he
+        is left alone rather than multiplied by something enormous.
+        """
+        if not weights or self.frame is None:
+            return 1.0
+        key = (pid, tuple(sorted(weights.items())))
+        got = self._tilts.get(key)
+        if got is None:
+            got = self._tilts[key] = self._compute_tilt(pid, weights)
+        return got
+
+    def per_game_tilted(self, pid: int, date: str, weights: dict[str, float]) -> float:
+        return self.per_game(pid, date) * self.tilt(pid, weights)
+
+    def _compute_tilt(self, pid: int, weights: dict[str, float]) -> float:
+        import numpy as np
+
+        try:
+            row = self.frame.loc[pid]
+        except (KeyError, AttributeError):
+            return 1.0
+        gp = max(_num(row.get("proj_gp")), 1.0)
+
+        if str(row.get("position")) == "G":
+            sa = _num(row.get("shots_against")) / gp
+            saves = _num(row.get("saves")) / gp
+            raw = {
+                "wins": _num(row.get("wins")) / gp,
+                "saves": saves,
+                "shots_against": sa,
+                "save_pct": saves - self.vm.pool_sv * sa,
+                "shutouts": _num(row.get("shutouts")) / gp,
+            }
+            pairs = [
+                (c.key, raw.get(c.key, 0.0) / sd)
+                for c, sd in zip(self.vm.goalie_cats, self.vm.g_sd, strict=True)
+            ]
+        else:
+            keys = self.data.skater_keys
+            sd = np.asarray(self.vm.sk_sd, dtype=float)
+            pairs = [(k, _num(row.get(k)) / gp / s) for k, s in zip(keys, sd, strict=False)]
+
+        flat = sum(z for _, z in pairs)
+        if abs(flat) < 1e-9:
+            return 1.0
+        tilted = sum(z * weights.get(k, 1.0) for k, z in pairs)
+        return tilted / flat
+
+
+def _num(v) -> float:
+    """A projection cell as a number; NaN and absent both mean zero."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if f != f else f
 
 
 def build_value_model(
@@ -86,4 +157,11 @@ def build_value_model(
     live = build_replay_data(conn, season, skater_keys)
     proj_pg = projected_pg_values(universe.frame, vm, skater_keys)
 
-    return ValueModel(vm=vm, data=live, proj_pg=proj_pg, season=season, scale_season=scale)
+    return ValueModel(
+        vm=vm,
+        data=live,
+        proj_pg=proj_pg,
+        season=season,
+        scale_season=scale,
+        frame=universe.frame,
+    )

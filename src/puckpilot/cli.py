@@ -1338,6 +1338,15 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
     values = build_value_model(conn, season, tuple(train), manager.league)
     goalies = ChainedGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0]))
 
+    from puckpilot.season import protocol as protocol_mod
+
+    weights: dict[str, float] = {}
+    try:
+        live = protocol_mod.active(conn, manager.name, league_key, runtime.week_of(date))
+        weights = live.weights() if live else {}
+    except Exception:  # noqa: BLE001 - no calendar, no protocol; the plain plan stands
+        weights = {}
+
     plan = build_plan(
         conn,
         runtime,
@@ -1347,6 +1356,7 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
         date,
         manager=manager.name,
         authority=manager.authority.lineup,
+        weights=weights,
     )
     print(plan.text())
     if args.explain:
@@ -1356,6 +1366,37 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
             extra = f"  {c.note}" if c.note else ""
             p = f"  P(start) {c.p_start:.0%}" if c.p_start is not None else ""
             print(f"    {c.value:+7.2f}  {c.player.name:24}{p}{extra}")
+    return 0
+
+
+def _cmd_season_protocol(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support
+    from puckpilot.season import protocol as protocol_mod
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    try:
+        for pid in args.approve or []:
+            print(protocol_mod.decide(conn, pid, True).describe())
+        for pid in args.reject or []:
+            print(protocol_mod.decide(conn, pid, False).describe())
+    except protocol_mod.ProtocolError as e:
+        print(f"puckpilot: {e}")
+        return 2
+    if args.approve or args.reject:
+        return 0
+
+    rows = protocol_mod.listing(conn, manager.name, league_key)
+    if not rows:
+        print("No protocols yet - run `ppilot season week` to propose one.")
+        return 0
+    for p in rows:
+        print(p.describe())
+        print()
     return 0
 
 
@@ -1481,6 +1522,21 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
             print("  Nothing new to queue - these are already awaiting your decision.")
     else:
         print("  Nothing here is executed. Approve a move to act on it.")
+
+    from puckpilot.season import protocol as protocol_mod
+
+    stance = protocol_mod.derive(
+        plan.outlook, manager.name, league_key, ours.team_key, plan.week, m.opponent_name
+    )
+    existing = protocol_mod.load(conn, manager.name, league_key, plan.week)
+    if existing and existing.status == protocol_mod.APPROVED:
+        print()
+        print(existing.describe())
+    else:
+        stance = protocol_mod.save(conn, stance)
+        print()
+        print(stance.describe())
+        print(f"  Approve with: ppilot season protocol --approve {stance.id}")
 
     if args.trending:
         hot = pool.rising(available, limit=10)
@@ -2047,6 +2103,15 @@ def build_parser() -> argparse.ArgumentParser:
     s_prop.add_argument("--approve", type=int, nargs="*", metavar="ID")
     s_prop.add_argument("--reject", type=int, nargs="*", metavar="ID")
     s_prop.set_defaults(func=_cmd_season_proposals)
+
+    s_proto = season_sub.add_parser(
+        "protocol",
+        parents=[seasonal],
+        help="The week's agreed category stance: what to chase and what to give up",
+    )
+    s_proto.add_argument("--approve", type=int, nargs="*", metavar="ID")
+    s_proto.add_argument("--reject", type=int, nargs="*", metavar="ID")
+    s_proto.set_defaults(func=_cmd_season_protocol)
 
     lineup = sub.add_parser("lineup", help="Daily lineup tools")
     lineup_sub = lineup.add_subparsers(dest="subcommand", required=True)
