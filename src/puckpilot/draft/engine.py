@@ -297,7 +297,14 @@ class RosterValuePolicy:
         cat_weights: dict[str, float] | None = None,
         survival_discount: float = 0.30,
         survival_spread: float = 6.0,
-        display_spread: float = 16.0,
+        # Draft night 2026-09-18: the display now shows the scoring curve (6.0,
+        # no position bias). 16.0 + DEFAULT_DISPLAY_POSITION_BIAS put Kucherov,
+        # ADP 1, at 58% to last 20 picks. Against today's Yahoo pool ADP the
+        # 12 harvested mocks say a player at ADP 1-48 lasted 5+ picks past it
+        # 0-1% of the time; 16.0 still wins full-window log-loss only because
+        # late-ADP players get reached for 10-30 picks early. The proper fix
+        # is a spread that grows with ADP - see docs/STATUS.md.
+        display_spread: float = 6.0,
         display_position_bias: dict[str, float] | None = None,
         basis: str = "vorp",
         replacement_depth: float = 0.0,
@@ -313,11 +320,11 @@ class RosterValuePolicy:
         self.survival_discount = survival_discount
         self.survival_spread = survival_spread
         self.display_spread = display_spread
-        self.display_position_bias = (
-            dict(DEFAULT_DISPLAY_POSITION_BIAS)
-            if display_position_bias is None
-            else display_position_bias
-        )
+        # DEFAULT_DISPLAY_POSITION_BIAS is kept, and can be passed, but is no
+        # longer applied by default: its forward intercepts (+1.25..+1.75, i.e.
+        # 20-28 picks later than ADP at spread 16) are what made elite
+        # forwards look safe to wait on.
+        self.display_position_bias = {} if display_position_bias is None else display_position_bias
         self.basis = basis
         self.replacement_depth = replacement_depth
         # Roster accounting over Yahoo's multi-position eligibility instead of

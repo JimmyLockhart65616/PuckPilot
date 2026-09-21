@@ -301,8 +301,25 @@ def test_the_board_owns_the_pick_context():
     b = _board()
     ctx = b.pick_context(0)
     assert ctx["pick_no"] == b.made
-    assert ctx["next_pick_no"] == b.next_pick_no(0)
+    assert ctx["next_pick_no"] == b.survival_pick_no(0)
     assert ctx["avail"] is b.avail
+
+
+def test_survival_is_scored_against_the_following_turn_as_the_sim_does():
+    """On the clock, `sim.run_draft` gives a seat its FOLLOWING pick: will this
+    player still be there if we pass now? The board used to hand over the pick
+    being made, so every "lasts %" on the clock asked the wrong question and
+    the shortlist was ranked on a discount the sim never tuned."""
+    b = _board()
+    while b.on_the_clock() != 2:
+        b.record(int(b.u.ids[np.flatnonzero(b.avail)[0]]))
+    on_clock = b.made
+    following = b.next_pick_no(2, after=on_clock)
+    assert b.slots[following][1] == 2 and following > on_clock
+    assert b.pick_context(2)["next_pick_no"] == following
+    # off the clock it previews that same question for the upcoming turn
+    upcoming = b.next_pick_no(3)
+    assert b.pick_context(3)["next_pick_no"] == b.next_pick_no(3, after=upcoming)
 
 
 def test_recommend_never_offers_a_drafted_player():
@@ -337,7 +354,9 @@ def test_last_pick_of_the_draft_discounts_nobody():
     b = _board()
     b.slots = b.slots[:1]
     assert b.next_pick_no(0) == 0
+    assert b.pick_context(0)["next_pick_no"] is None
     cands = recommend(b, n=3)
+    assert all(c.p_survive == 0.0 for c in cands)
     b.record(cands[0].player_id)
     assert b.complete
     assert b.next_pick_no(0) is None

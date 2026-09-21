@@ -226,6 +226,7 @@ def build_universe(
     league: LeagueConfig = DEFAULT_LEAGUE,
     market_ids: set[int] | None = None,
     position_overrides: dict[int, str] | None = None,
+    eligibility: dict[int, frozenset[str]] | None = None,
 ) -> Universe:
     """Projection-ranked pool with pseudo-ADP.
 
@@ -235,11 +236,16 @@ def build_universe(
     `position_overrides` (player id -> position) re-labels skaters before
     ranking, so their VORP is taken against the league's position rather than
     the NHL's - see `playermap.position_corrections`.
+
+    `eligibility` (player id -> Yahoo positions) values multi-position skaters
+    at their best allowed position - see `valuation.replacement_adjust`. It
+    changes VORP only; attach it to the universe separately for accounting.
     """
     kw = {
         "shape": league.shape,
         "skater_cats": league.skater_cats,
         "goalie_cats": league.goalie_cats,
+        "eligibility": eligibility,
     }
     proj_sk, proj_g = projections.project(conn, target_season, list(train_seasons))
     act_sk, act_g = season_aggregates(conn, train_seasons[0])

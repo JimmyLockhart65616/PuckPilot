@@ -150,7 +150,8 @@ def test_no_gaps_reported_before_the_draft_starts():
 def test_on_the_clock_tracks_the_latest_clock_frame():
     feed = replay(["D|1|1|30", "0|1|100|1|C|0", "D|2|2|30"], {})
     assert feed.state.on_the_clock.pick == 2
-    assert feed.status()["on_the_clock"] == {"pick": 2, "seat": 2}
+    # no seat: in a real league room the frame carries the Yahoo team id
+    assert feed.status()["on_the_clock"] == {"pick": 2}
 
 
 def test_malformed_frames_never_raise():
@@ -235,3 +236,19 @@ def test_pump_falls_back_to_sleeping_when_no_page_is_usable():
         start = time.perf_counter()
         pump(ctx, 0.02)
         assert time.perf_counter() - start >= 0.015
+
+
+def test_the_reconnect_snapshot_restores_every_pick_so_far():
+    """Draft night: on (re)connect a league room sends one `P|` frame listing
+    every pick made so far, and individual pick frames only from then on.
+    Ignoring it lost every pick made while the socket was reconnecting."""
+    feed = replay(["P|1=5425,12,0|2=7905,10,0|3=6752,11,0", "0|4|33423|5|RW|0"], {})
+    assert sorted(feed.state.picks) == [1, 2, 3, 4]
+    assert feed.state.picks[2].yahoo_id == "7905" and feed.state.gaps == []
+
+
+def test_keeper_picks_in_the_snapshot_do_not_move_the_room_or_make_gaps():
+    """The real snapshot lists picks #1-30 AND the keeper picks #157-192."""
+    feed = replay(["P|1=11,1,0|2=12,2,0|157=99,3,0|192=98,4,0", "D|3|5|60"], {})
+    assert feed.status()["room_picks"] == 2
+    assert feed.status()["gaps"] == []

@@ -308,6 +308,34 @@ def test_replacement_adjust_last_starter_is_zero():
     assert out.loc[3, "vorp"] == pytest.approx(-2.0)
 
 
+def test_replacement_adjust_values_flex_player_at_best_position():
+    # C replacement z is 3.0, R replacement z is 0.0: a C/R is a right winger's price.
+    df = _frame(
+        {
+            1: {"z_total": 5.0, "position": "C"},
+            2: {"z_total": 3.0, "position": "C"},
+            3: {"z_total": 4.0, "position": "C"},
+            4: {"z_total": 2.0, "position": "R"},
+            5: {"z_total": 0.0, "position": "R"},
+            6: {"z_total": 2.0, "position": "R"},
+        }
+    )
+    starters = {"C": 3, "R": 3}
+    base = valuation.replacement_adjust(df, starters)
+    out = valuation.replacement_adjust(
+        df, starters, {3: frozenset({"C", "R"}), 4: frozenset({"C", "R"}), 6: frozenset({"C"})}
+    )
+    assert base.loc[3, "vorp"] == pytest.approx(1.0)
+    assert out.loc[3, "vorp"] == pytest.approx(4.0)  # flex C valued against R
+    # flexibility never costs: an R who is also C-eligible keeps the R price
+    assert out.loc[4, "vorp"] == pytest.approx(base.loc[4, "vorp"])
+    # not allowed at his own position -> left on the primary valuation
+    assert out.loc[6, "vorp"] == pytest.approx(base.loc[6, "vorp"])
+    # replacement levels themselves do not move, and no eligibility is the old path
+    assert out.loc[[1, 2, 5], "vorp"].tolist() == base.loc[[1, 2, 5], "vorp"].tolist()
+    assert valuation.replacement_adjust(df, starters, {}).equals(base)
+
+
 def test_rank_players_combines_and_sorts():
     skaters = _frame({1: {"goals": 30, "position": "C"}, 2: {"goals": 10, "position": "C"}})
     goalies = _frame(

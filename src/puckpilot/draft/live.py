@@ -396,11 +396,24 @@ def build_live_board(
         warnings.append(msg.strip())
         progress(msg)
 
+    # Yahoo's own position eligibility. Loaded before the ranking because it
+    # prices VORP: a C/RW is valued at whichever of the two is scarcer.
+    eligibility = None
+    if adp:
+        from puckpilot.yahoo.playermap import load_eligibility
+
+        eligibility = load_eligibility(conn, league_key)
+
     # Anyone the market prices goes on the board even if our own ranking would
     # have cut him: the room can draft him, and a pick we cannot record is a
     # pick our clock does not see.
     universe = build_universe(
-        conn, season, train_seasons, league, market_ids=set(adp) if adp else None
+        conn,
+        season,
+        train_seasons,
+        league,
+        market_ids=set(adp) if adp else None,
+        eligibility=eligibility,
     )
     if adp:
         # Real Yahoo ADP beats the prior-season-value proxy, and survival_discount
@@ -426,12 +439,10 @@ def build_live_board(
             )
             universe = attach_market_frame(universe, market_frame, adp)
 
-        # Yahoo's own position eligibility, after the market rows are in so
-        # they get it too. Shown on every row; used for roster accounting only
-        # when the policy runs multi-position.
-        from puckpilot.yahoo.playermap import load_eligibility
-
-        universe = universe.with_eligibility(load_eligibility(conn, league_key))
+        # Attached after the market rows are in so they get it too. Shown on
+        # every row; used for roster accounting only when the policy runs
+        # multi-position.
+        universe = universe.with_eligibility(eligibility)
     else:
         # This used to be silence: `--yahoo` given bare, or a key with a typo,
         # built a board on the proxy and said nothing at all.

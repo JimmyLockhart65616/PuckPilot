@@ -566,13 +566,72 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
 
         profile = settings._resolve(Path("secrets/chrome-profile"))
         pw = sync_playwright().start()
-        ctx = pw.chromium.launch_persistent_context(str(profile), headless=False, channel="chrome")
+        # This is the window the drafter drafts in: Yahoo allows one draft-room
+        # connection per account, so a second browser would log this one out
+        # and blind the feed. no_viewport lets the page follow the real window
+        # instead of Playwright's fixed 1280x720, and it opens maximized.
+        ctx = pw.chromium.launch_persistent_context(
+            str(profile),
+            headless=False,
+            channel="chrome",
+            no_viewport=True,
+            args=["--start-maximized"],
+        )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         with contextlib.suppress(Exception):
             page.goto(args.room, wait_until="domcontentloaded")
-        feed = WebsocketFeed(ctx, load_yahoo_id_map(conn), load_yahoo_names(conn))
+        import datetime
+
+        frame_log = settings._resolve(Path("data/captures")) / (
+            f"draft-frames-{datetime.datetime.now():%Y%m%d-%H%M%S}.log"
+        )
+        frame_log.parent.mkdir(parents=True, exist_ok=True)
+        ws_feed = WebsocketFeed(
+            ctx, load_yahoo_id_map(conn), load_yahoo_names(conn), frame_log=frame_log
+        )
+        feed = ws_feed
+        results_key = args.yahoo if "." in str(args.yahoo) else league_key
+        if results_key:
+            # Second source: the room's own draft results, read through this
+            # same logged-in browser from a background tab (not a draft-room
+            # connection, so it cannot log the drafter out). On draft night
+            # the websocket caught 2 of the first 6 picks; this lists them all,
+            # and a restarted console catches up on every pick made so far.
+            from puckpilot.draft.feed import CombinedFeed, YahooDraftFeed
+            from puckpilot.yahoo.playermap import load_map
+            from puckpilot.yahoo.session import YahooSession, YahooSessionError
+
+            class _OpenPageSession(YahooSession):
+                """Reads through whichever Yahoo page this browser already has
+                open - never a tab of its own, which the drafter can close and
+                which steals focus from the draft room when it opens."""
+
+                def get(self, path: str) -> dict:
+                    pages = [
+                        p for p in ctx.pages if not p.is_closed() and "yahoo.com" in (p.url or "")
+                    ]
+                    if not pages:
+                        raise YahooSessionError("no open Yahoo page to read draft results through")
+                    self._page = pages[0]
+                    return super().get(path)
+
+            api = _OpenPageSession(profile, check_oauth=False)
+            key_names = {
+                str(k): str(n)
+                for k, n in conn.execute("SELECT player_key, full_name FROM yahoo_player_map")
+            }
+            feed = CombinedFeed(
+                [
+                    ws_feed,
+                    YahooDraftFeed(
+                        api, results_key, load_map(conn, results_key), key_names, min_interval=3.0
+                    ),
+                ]
+            )
+            print(f"Draft results feed armed for {results_key} (every 3s).")
+        print(f"Raw websocket frames -> {frame_log}")
         pump_fn = partial(pump, ctx)
-        print(f"Websocket feed armed ({len(feed.yahoo_to_nhl)} ids). Join your draft room.")
+        print(f"Websocket feed armed ({len(ws_feed.yahoo_to_nhl)} ids). Join your draft room.")
 
     board = build_live_board(
         conn,

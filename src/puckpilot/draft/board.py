@@ -417,19 +417,35 @@ class DraftBoard:
         s = self.my_seat if seat is None else seat
         return {
             "pick_no": self.made,
-            "next_pick_no": self.next_pick_no(s),
+            "next_pick_no": self.survival_pick_no(s),
             "avail": self.avail,
             # Who is already on the roster, as universe rows: what
             # multi-position accounting matches slots against.
             "roster_rows": [p.row for p in self.roster(s)],
         }
 
+    def survival_pick_no(self, seat: int | None = None) -> int | None:
+        """The pick a player must survive to for `seat` to pass on him now.
+
+        That is the turn AFTER the one the seat makes next - on the clock, its
+        following pick. `sim.run_draft` hands a seat exactly that while it
+        picks, and `survival_discount` was tuned on it. This used to be the
+        upcoming pick itself, so on the clock every "lasts %" asked whether a
+        player would survive the pick being made, and the discount hit
+        everyone the room would not have taken by now rather than everyone
+        who would come back. Off the clock it previews the on-clock ranking.
+        None on the seat's last turn: nothing survives past it.
+        """
+        seat = self.my_seat if seat is None else seat
+        upcoming = self.next_pick_no(seat)
+        return None if upcoming is None else self.next_pick_no(seat, after=upcoming)
+
     def next_pick_no(self, seat: int | None = None, after: int | None = None) -> int | None:
         """0-based index of `seat`'s next pick after `after` (default: now).
 
-        This is what feeds `ctx["next_pick_no"]`, so it deliberately matches the
-        semantics `sim.run_draft` tuned against: an absolute index into the pick
-        sequence, not a round or a countdown.
+        An absolute index into the pick sequence, not a round or a countdown -
+        the same units `sim.run_draft` uses. Survival is scored against
+        `survival_pick_no`, the turn after this one.
         """
         seat = self.my_seat if seat is None else seat
         start = self.made if after is None else after + 1

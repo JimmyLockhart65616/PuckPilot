@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -120,16 +121,44 @@ def replacement_level(values: np.ndarray, depth: int) -> float:
     return float(values[min(depth, len(values)) - 1])
 
 
-def replacement_adjust(df: pd.DataFrame, starters_by_pos: dict[str, int]) -> pd.DataFrame:
-    """vorp = z_total minus the z_total of the last starter at that position."""
+def replacement_adjust(
+    df: pd.DataFrame,
+    starters_by_pos: dict[str, int],
+    eligibility: Mapping[int, frozenset[str]] | None = None,
+) -> pd.DataFrame:
+    """vorp = z_total minus the z_total of the last starter at that position.
+
+    With `eligibility` (player id -> positions the league lets him fill), a
+    multi-position player is measured against the most forgiving replacement
+    level among them: Tage Thompson is a C in the NHL's data and C/RW on Yahoo,
+    and the replacement centre sits ~2.6 z above the replacement right wing, so
+    pricing him as a centre alone made his flexibility a penalty. Filling a
+    second position can only add value, never subtract it.
+
+    Only players whose own position is among the allowed ones are re-based. One
+    Yahoo will not let play his NHL position at all ("R, valued C") keeps the
+    primary valuation, which is what his board label says.
+
+    Adopted on draft night 2026-09-18 on principle, NOT sim-gated yet - see
+    docs/STATUS.md. `eligibility=None` is exactly the single-position path.
+    """
     df = df.copy()
     df["vorp"] = df["z_total"]
+    repl: dict[str, float] = {}
     for pos, group in df.groupby("position"):
         k = starters_by_pos.get(pos, 0)
         if k <= 0:
             continue
         sorted_z = group["z_total"].sort_values(ascending=False).to_numpy()
-        df.loc[group.index, "vorp"] = group["z_total"] - replacement_level(sorted_z, k)
+        repl[str(pos)] = replacement_level(sorted_z, k)
+        df.loc[group.index, "vorp"] = group["z_total"] - repl[str(pos)]
+    if eligibility:
+        for pid, pos in df["position"].items():
+            allowed = eligibility.get(int(pid))
+            if not allowed or pos not in allowed or pos not in repl:
+                continue
+            best = min(repl[p] for p in allowed if p in repl)
+            df.at[pid, "vorp"] = df.at[pid, "z_total"] - best
     return df
 
 
@@ -139,13 +168,18 @@ def rank_players(
     shape: LeagueShape = DEFAULT_SHAPE,
     skater_cats: tuple[Category, ...] = SKATER_CATS_DEFAULT,
     goalie_cats: tuple[Category, ...] = GOALIE_CATS_DEFAULT,
+    eligibility: Mapping[int, frozenset[str]] | None = None,
 ) -> pd.DataFrame:
-    """Combined skater+goalie ranking by VORP (descending)."""
+    """Combined skater+goalie ranking by VORP (descending).
+
+    `eligibility` values multi-position skaters at their best allowed position
+    (see `replacement_adjust`); without it every player has one position.
+    """
     starters = shape.starters_by_pos()
     parts = []
     if not skaters.empty:
         sk = replacement_adjust(
-            value_players(skaters, skater_cats, shape.skater_pool_size), starters
+            value_players(skaters, skater_cats, shape.skater_pool_size), starters, eligibility
         )
         sk["kind"] = "skater"
         parts.append(sk)

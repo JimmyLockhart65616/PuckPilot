@@ -376,7 +376,8 @@ def test_an_unidentified_pick_consumes_its_slot():
     b = _board()
     accepted, rejected = apply(b, [PickEvent(None, 1, "feed", label="Prospect X", pick_no=1)])
     assert accepted == [] and b.made == 1
-    assert b.picks[0].name == "Prospect X" and b.picks[0].seat == 1
+    # pick 1 is seat 0 by the board's order, whatever seat the feed claimed
+    assert b.picks[0].name == "Prospect X" and b.picks[0].seat == 0
     assert rejected and "slot consumed" in rejected[0]
 
 
@@ -453,3 +454,102 @@ def test_a_replay_drop_goes_silent_while_the_room_keeps_drafting():
     assert board.drift(feed.status()["room_picks"]) == 0
     apply(board, feed.poll(board))  # the feed is back
     assert board.made == 6 and board.drift(feed.status()["room_picks"]) == 0
+
+
+# ---- draft night: seat by pick number, draft results, combined sources --------
+
+
+def test_a_feed_seat_is_overridden_by_the_boards_own_order():
+    """Yahoo's websocket sends the TEAM id as the seat; the board's order for
+    that pick number is what decides whose roster it lands on."""
+    b = _board()
+    pid = int(b.u.ids[0])
+    apply(b, [PickEvent(pid, 3, "websocket", pick_no=2)])  # pick 2 belongs to seat 1
+    assert b.picks[0].seat == 1
+
+
+class _Results:
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = 0
+
+    def draft_results(self, key):
+        self.calls += 1
+        return list(self.rows)
+
+
+def test_draft_results_catch_up_every_pick_in_order_and_rate_limit():
+    from puckpilot.draft.feed import YahooDraftFeed
+
+    b = _board()
+    ids = [int(x) for x in b.u.ids[:3]]
+    rows = [
+        {"pick": 2, "team_key": "t.9", "player_key": "477.p.2"},
+        {"pick": 1, "team_key": "t.7", "player_key": "477.p.1"},
+        {"pick": 3, "team_key": "t.8", "player_key": "477.p.3"},
+    ]
+    t = [100.0]
+    feed = YahooDraftFeed(
+        _Results(rows),
+        "477.l.1",
+        {f"477.p.{i + 1}": pid for i, pid in enumerate(ids)},
+        min_interval=3.0,
+        clock=lambda: t[0],
+    )
+    apply(b, feed.poll(b))
+    assert [p.player_id for p in b.picks] == ids
+    assert [p.seat for p in b.picks] == [0, 1, 2]  # the board's order, not t.N
+    assert feed.status()["room_picks"] == 3
+    t[0] += 1.0
+    assert feed.poll(b) == [] and feed.session.calls == 1  # too soon
+    t[0] += 3.0
+    assert feed.poll(b) == [] and feed.session.calls == 2  # nothing new
+
+
+def test_a_combined_feed_merges_sources_without_counting_a_pick_twice():
+    from puckpilot.draft.feed import CombinedFeed
+
+    b = _board()
+    pid = int(b.u.ids[0])
+
+    class One:
+        name = "x"
+        last_error = None
+
+        def __init__(self, room):
+            self.room = room
+
+        def poll(self, board):
+            return [PickEvent(pid, None, "x", pick_no=1)]
+
+        def status(self):
+            return {"chosen": "x", "room_picks": self.room, "unmapped_names": []}
+
+    feed = CombinedFeed([One(1), One(2)])
+    accepted, rejected = apply(b, feed.poll(b))
+    assert b.made == 1 and len(accepted) == 1 and "already off the board" in rejected[0]
+    assert feed.status()["room_picks"] == 2 and feed.status()["chosen"] == "x+x"
+
+
+def test_the_websocket_clock_reports_no_seat_and_raw_frames_are_logged(tmp_path):
+    from puckpilot.draft.wsfeed import replay
+
+    feed = replay([], {})
+    feed.frame_log = tmp_path / "frames.log"
+    feed.ingest("D|5|7|60")
+    assert feed.status()["on_the_clock"] == {"pick": 5}
+    assert "D|5|7|60" in feed.frame_log.read_text(encoding="utf-8")
+
+
+def test_keeper_picks_in_the_results_do_not_count_as_room_progress():
+    """Keepers sit at #157-192 in Yahoo's results from the first pick; the
+    room's progress is the unbroken run of filled picks from #1."""
+    from puckpilot.draft.feed import YahooDraftFeed
+
+    b = _board()
+    rows = [{"pick": 1, "team_key": "t.1", "player_key": "477.p.1"}] + [
+        {"pick": n, "team_key": "t.2", "player_key": f"477.p.{n}"} for n in (25, 26)
+    ]
+    feed = YahooDraftFeed(_Results(rows), "477.l.1", {"477.p.1": int(b.u.ids[0])})
+    feed.poll(b)
+    assert feed.status()["room_picks"] == 1
