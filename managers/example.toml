@@ -87,6 +87,14 @@ enforce_min_games = true
 # names. Config, never code.
 never_bench = []
 
+# Whether an approved week protocol also re-weights the daily lineup.
+# OFF on measurement: scored by categories won per week it was positive in
+# 3 of 6 runs across two seasons and three seeds, every effect inside 0.08
+# categories of ~5.8 - noise. The reason is the headroom finding: most weeks
+# everyone with a game fits in a slot, so there is no lineup decision for a
+# weight to change. The protocol still steers the ADDS, where the lever is.
+follow_protocol = false
+
 
 [authority.transactions]
 # NOTE: there is no `enabled` here, and adding one is an error rather than a

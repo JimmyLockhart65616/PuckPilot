@@ -96,3 +96,18 @@ def test_an_empty_config_is_the_safe_default():
     a = Authority.from_config({})
     assert a.lineup.enabled is False
     assert a.transactions.requires_approval is True
+
+
+def test_the_protocol_does_not_steer_the_lineup_unless_asked():
+    """Measured inert: scored on categories won per week it was positive in 3
+    of 6 runs across two seasons and three seeds, every effect inside 0.08 of
+    ~5.8. Most weeks everyone with a game fits in a slot, so there is no
+    lineup decision for a weight to change."""
+    assert LineupAuthority().follow_protocol is False
+    text = "\n".join(LineupAuthority(enabled=True).describe())
+    assert "measured inert" in text
+
+
+def test_opting_in_is_possible_and_says_so():
+    text = "\n".join(LineupAuthority(enabled=True, follow_protocol=True).describe())
+    assert "week protocol steers the lineup: yes" in text

@@ -46,6 +46,7 @@ from puckpilot.engine.lineup_replay import (
     _daily_optimizer_total,
     _hindsight_total,
     _set_and_forget_total,
+    iter_daily_assignments,
     projected_pg_values,
     skater_availability,
 )
@@ -336,3 +337,200 @@ def _pct(a: float, b: float) -> str:
     if not b:
         return "n/a"
     return f"{(a - b) / b * 100:+.1f}%  ({a - b:+.1f}/roster)"
+
+
+# -- does a week protocol actually win more categories? ---------------------
+#
+# The protocol exists to trade a category that is gone for one that is live,
+# and the metric for that cannot be season value - trading value for category
+# wins is the entire point, so a value comparison would score the mechanism by
+# the thing it deliberately gives up. It is scored on categories taken.
+#
+# One team is tested at a time with the other eleven frozen, the same shape as
+# `waivers.waiver_backtest`, so the opponents' lineups are identical in both
+# arms and the only difference is our own weighting. The tilt is applied to the
+# validated daily optimizer rather than the live path, because this is
+# measuring the protocol and not everything else.
+
+
+def _week_day_ranges(data) -> dict[int, range]:
+    """Week index -> the date indices in it."""
+    out: dict[int, range] = {}
+    weeks = data.weeks
+    for w in sorted(set(int(x) for x in weeks)):
+        idx = [i for i, v in enumerate(weeks) if int(v) == w]
+        if idx:
+            out[w] = range(idx[0], idx[-1] + 1)
+    return out
+
+
+def _weekly_totals(roster, positions, pg_value, data, shape, avail, goalie_src, vm, days, league):
+    """Real category production of whoever the optimizer started, for one week."""
+    import numpy as np
+
+    from puckpilot.draft.replay import G_WIDTH
+
+    sk = np.zeros(len(data.skater_keys))
+    g = np.zeros(G_WIDTH)
+    for i, assigned in iter_daily_assignments(
+        lambda _d: roster,
+        positions,
+        pg_value,
+        data,
+        shape,
+        avail,
+        goalie_src,
+        day_range=days,
+        min_goalie_appearances=league.min_goalie_appearances,
+    ):
+        for pid in assigned:
+            line = data.skater.get(pid, {}).get(i)
+            if line is not None:
+                sk += line
+                continue
+            line = data.goalie.get(pid, {}).get(i)
+            if line is not None:
+                g += line
+    return sk, g
+
+
+def _category_values(sk, g, league, vm, skater_keys):
+    """Per-category scalars in the league's own units, for one week."""
+    from puckpilot.draft.replay import goalie_values
+
+    out = [float(sk[skater_keys.index(c.key)]) for c in league.skater_cats]
+    out += list(goalie_values(g, league.goalie_cats))
+    return out
+
+
+@dataclass
+class ProtocolGateReport:
+    n_tested: int
+    season: str
+    cats_off: float
+    cats_on: float
+    weeks: int
+    text: str
+
+
+def protocol_gate_report(
+    conn: sqlite3.Connection,
+    season: str = "20252026",
+    train_seasons: tuple[str, ...] = ("20242025", "20232024", "20222023"),
+    n_teams_tested: int = 6,
+    seed: int | None = 123,
+    league: LeagueConfig = DEFAULT_LEAGUE,
+    progress: Callable[[str], None] | None = None,
+) -> ProtocolGateReport:
+    from puckpilot.draft.engine import RosterValuePolicy
+    from puckpilot.draft.h2h import round_robin_schedule, score_matchup
+    from puckpilot.season.protocol import derive
+    from puckpilot.season.week import CategoryOutlook
+
+    say = progress or (lambda _m: None)
+    rules = league.draft_rules()
+    shape = rules.shape
+    rng = np.random.default_rng(seed)
+    skater_keys = [c.key for c in league.skater_cats]
+
+    u = build_universe(conn, season, train_seasons, league)
+    data = build_replay_data(conn, season, skater_keys)
+    vm = GameValueModel(data, set(u.ids.tolist()), league.goalie_cats)
+    pg_value = projected_pg_values(u.frame, vm, skater_keys)
+    positions = dict(zip(u.ids.tolist(), u.pos.tolist(), strict=True))
+    values = ValueModel(
+        vm=vm, data=data, proj_pg=pg_value, season=season, scale_season=season, frame=u.frame
+    )
+
+    opponents = _default_opponents(rng, league)
+    order = rng.permutation(len(opponents))
+    bots, oi = [], 0
+    for seat in range(shape.n_teams):
+        bots.append(RosterValuePolicy() if seat == 0 else opponents[order[oi]])
+        oi += 0 if seat == 0 else 1
+    keepers = keepers_for(conn, u, season, league, rng)
+    rosters = [[int(u.ids[i]) for i in r] for r in run_draft(u, bots, rules, rng, keepers)]
+
+    all_pids = {p for r in rosters for p in r}
+    avail = skater_availability(conn, season, data, all_pids)
+    goalie_src = HindsightGoalieSource(conn, season)
+    ranges = _week_day_ranges(data)
+    weeks = sorted(ranges)[: league.regular_weeks]
+    schedule = round_robin_schedule(len(rosters), len(weeks))
+
+    # Neutral weekly production for every team, computed once: the opponents
+    # never change between arms, and our own neutral arm is one of these.
+    neutral: dict[tuple[int, int], list[float]] = {}
+    for t, roster in enumerate(rosters):
+        for wi, w in enumerate(weeks):
+            sk, g = _weekly_totals(
+                roster, positions, pg_value, data, shape, avail, goalie_src, vm, ranges[w], league
+            )
+            neutral[(t, wi)] = _category_values(sk, g, league, vm, skater_keys)
+        say(f"  neutral {t + 1}/{len(rosters)}")
+
+    cats_off = cats_on = 0
+    played = 0
+    for t in range(min(n_teams_tested, len(rosters))):
+        for wi, _w in enumerate(weeks):
+            opp = next((b if a == t else a for a, b in schedule[wi] if t in (a, b)), None)
+            if opp is None:
+                continue
+            played += 1
+            ours_off, theirs = neutral[(t, wi)], neutral[(opp, wi)]
+            won_off, _, _ = score_matchup(np.array(ours_off), np.array(theirs))
+            cats_off += won_off
+
+            # What the tool would have seen on Monday, and decided.
+            outlook = [
+                CategoryOutlook(
+                    category=c,
+                    ours=ours_off[k],
+                    theirs=theirs[k],
+                    lineup_room=None,
+                    add_room=None,
+                )
+                for k, c in enumerate(league.all_cats)
+            ]
+            proto = derive(outlook, "replay", "l", "t", wi + 1, "opp")
+            weights = {s.category.key: s.weight for s in proto.stances if s.stance != "hold"}
+            if not weights:
+                cats_on += won_off
+                continue
+            tilted = {pid: v * values.tilt(pid, weights) for pid, v in pg_value.items()}
+            sk, g = _weekly_totals(
+                rosters[t],
+                positions,
+                tilted,
+                data,
+                shape,
+                avail,
+                goalie_src,
+                vm,
+                ranges[weeks[wi]],
+                league,
+            )
+            ours_on = _category_values(sk, g, league, vm, skater_keys)
+            won_on, _, _ = score_matchup(np.array(ours_on), np.array(theirs))
+            cats_on += won_on
+        say(f"  tested {t + 1}/{min(n_teams_tested, len(rosters))}")
+
+    n = min(n_teams_tested, len(rosters))
+    off = cats_off / max(played, 1)
+    on = cats_on / max(played, 1)
+    lines = [
+        f"Week-protocol gate: {n} team(s) x {len(weeks)} weeks of {season}, {played} matchups",
+        "",
+        f"  categories won per week, protocol OFF   {off:.3f}",
+        f"  categories won per week, protocol ON    {on:.3f}",
+        f"  difference                              {on - off:+.3f}"
+        f"  ({(on - off) / max(off, 1e-9) * 100:+.1f}%)",
+    ]
+    return ProtocolGateReport(
+        n_tested=n,
+        season=season,
+        cats_off=off,
+        cats_on=on,
+        weeks=len(weeks),
+        text=chr(10).join(lines),
+    )

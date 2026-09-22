@@ -1342,11 +1342,12 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
     from puckpilot.season import protocol as protocol_mod
 
     weights: dict[str, float] = {}
-    try:
-        live = protocol_mod.active(conn, manager.name, league_key, runtime.week_of(date))
-        weights = live.weights() if live else {}
-    except Exception:  # noqa: BLE001 - no calendar, no protocol; the plain plan stands
-        weights = {}
+    if manager.authority.lineup.follow_protocol:
+        try:
+            live = protocol_mod.active(conn, manager.name, league_key, runtime.week_of(date))
+            weights = live.weights() if live else {}
+        except Exception:  # noqa: BLE001 - no calendar, no protocol; the plain plan stands
+            weights = {}
 
     plan = build_plan(
         conn,
@@ -1401,6 +1402,25 @@ def _season_publish(manager, conn, league_key, plan=None, week_plan=None, roster
             print(f"  published to {manager.page.url}")
     except publish.PublishError as e:
         print(f"  page not updated: {e}")
+
+
+def _cmd_season_gate(args: argparse.Namespace) -> int:
+    from puckpilot.data import store
+    from puckpilot.season.replay import protocol_gate_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = protocol_gate_report(
+        conn,
+        season=args.season,
+        n_teams_tested=args.teams,
+        seed=args.seed,
+        league=_league(args),
+        progress=print if args.verbose else None,
+    )
+    print()
+    print(report.text)
+    return 0
 
 
 def _cmd_season_preflight(args: argparse.Namespace) -> int:
@@ -2228,6 +2248,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--offline", action="store_true", help="Skip the Yahoo reads and check the rest"
     )
     s_pre.set_defaults(func=_cmd_season_preflight)
+
+    s_gate = season_sub.add_parser(
+        "gate", help="Does a week protocol win more categories? (scored on categories, not value)"
+    )
+    s_gate.add_argument("--season", default="20252026")
+    s_gate.add_argument("--teams", type=int, default=6)
+    s_gate.add_argument("--seed", type=int, default=123)
+    s_gate.add_argument("--verbose", action="store_true")
+    s_gate.set_defaults(func=_cmd_season_gate)
 
     s_week = season_sub.add_parser(
         "week", parents=[seasonal], help="This week's category plan and add targets"

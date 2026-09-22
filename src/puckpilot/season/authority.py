@@ -58,6 +58,21 @@ class LineupAuthority:
     # bounds the day is the lock, which is a clock, not a count.
     # Names, because a person thinks in names. Config, never code.
     never_bench: tuple[str, ...] = ()
+    # Whether an approved week protocol also re-weights the daily lineup.
+    #
+    # OFF, on measurement. Scored by categories won per week - the only metric
+    # that can judge a mechanism whose whole purpose is trading value for
+    # category wins - it came out positive in 3 of 6 runs across two seasons
+    # and three seeds, with every effect inside +-0.08 categories of ~5.8.
+    # That is noise, and it agrees with why: lineup headroom is zero most
+    # weeks, because a roster of seventeen into thirteen slots has no choice
+    # to make on a night when nine players have games. A weight cannot change
+    # a decision that was never open.
+    #
+    # The protocol still earns its keep as analysis - it says which categories
+    # are gone and which are live - and that steers the adds, where the lever
+    # actually is. This flag only governs the lineup.
+    follow_protocol: bool = False
 
     def __post_init__(self) -> None:
         if self.start_questionable not in QUESTIONABLE_MODES:
@@ -79,6 +94,8 @@ class LineupAuthority:
             f"  players flagged day-to-day: {self.start_questionable.replace('_', ' ')}",
             f"  weekly goalie minimum enforced: {'yes' if self.enforce_min_games else 'no'}",
             "  changes are unlimited until each player's game starts",
+            "  week protocol steers the lineup: "
+            + ("yes" if self.follow_protocol else "no (measured inert; it steers adds)"),
             *([f"  never benched: {', '.join(self.never_bench)}"] if self.never_bench else []),
         ]
 
