@@ -17,6 +17,8 @@ from puckpilot.season.week import AddTarget
 
 
 def target(name="Add Me", key="p.add", pid=9001, gain=3.0, drop=True, helps=("PPP +1.2",)):
+    """An `AddTarget` in its post-repricing shape: net starts and net category
+    change, rather than an abstract value number."""
     player = PoolPlayer(
         player_key=key,
         name=name,
@@ -42,11 +44,13 @@ def target(name="Add Me", key="p.add", pid=9001, gain=3.0, drop=True, helps=("PP
     )
     return AddTarget(
         player=player,
-        games=4,
-        value=gain + 1.0,
+        starts=4.0,
+        drop_starts=2.0,
+        deltas={"ppp": 1.2, "sog": 4.4},
         helps=helps,
         drop=dropped,
-        drop_value=1.0,
+        score=gain,
+        labels={"ppp": "PPP", "sog": "SOG"},
         timing=player.timing(),
     )
 
@@ -102,7 +106,10 @@ def test_a_proposal_records_why_it_was_made(db):
     assert p.reason["helps"] == ["PPP +1.2", "G +0.8"]
     assert p.reason["week"] == 2
     assert "race" in p.reason["timing"]
-    assert "PPP +1.2" in p.describe()
+    # The net effect in the league's own units, not an abstract score.
+    assert p.reason["extra_starts"] == 2.0
+    assert "SOG +4.4" in p.reason["moved"]
+    assert "+2 starts" in p.describe()
 
 
 def test_re_proposing_the_same_add_does_not_duplicate(db):
@@ -140,11 +147,13 @@ def test_an_unmapped_player_is_never_proposed(db):
             yahoo_eligible=frozenset({"C"}),
             nhl_player_id=None,
         ),
-        games=t.games,
-        value=t.value,
+        starts=t.starts,
+        drop_starts=t.drop_starts,
+        deltas=t.deltas,
         helps=t.helps,
         drop=t.drop,
-        drop_value=t.drop_value,
+        score=t.score,
+        labels=t.labels,
         timing=t.timing,
     )
     assert make(db, t) == []

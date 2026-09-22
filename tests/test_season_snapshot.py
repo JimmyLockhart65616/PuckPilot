@@ -69,7 +69,9 @@ def test_pending_proposals_appear_with_their_reasoning(db):
     s = snapshot.build(db, "jimmy", "999.l.1", "T")
     assert len(s["proposals"]) == 1
     assert s["proposals"][0]["add"] == "Shane Pinto"
-    assert "PPP" in s["proposals"][0]["why"]
+    # The net effect, in real units, not a score nobody can interpret.
+    assert "+2 starts this week" in s["proposals"][0]["why"]
+    assert "SOG +4.4" in s["proposals"][0]["why"]
     assert "race" in s["proposals"][0]["timing"]
 
 

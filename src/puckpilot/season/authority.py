@@ -108,9 +108,14 @@ class TransactionAuthority:
     so this class tunes what reaches a person, not what happens without one.
     """
 
-    # Do not propose a move worth less than this for the week; a proposal the
-    # person will reject is a notification that trains them to ignore the next.
-    min_weekly_gain: float = 0.5
+    # How much of a live category gap a swap must close to be worth raising.
+    # 0.25 is a quarter of it. A proposal the person will reject is a
+    # notification that trains them to ignore the next one.
+    #
+    # This is a SHARE, not a score. It used to be an abstract value number, and
+    # when adds started being priced by re-slotting the week the same 0.5 quietly
+    # became "must close half a gap" and cut five proposals to one.
+    min_weekly_gain: float = 0.25
     # More pending proposals than this means the tool is guessing, not advising.
     max_pending: int = 5
 
@@ -122,7 +127,7 @@ class TransactionAuthority:
     def describe(self) -> list[str]:
         return [
             "Transactions (add / drop / claim): APPROVAL REQUIRED, always.",
-            f"  proposed only when worth at least {self.min_weekly_gain:.2f} for the week",
+            f"  proposed only when it closes {self.min_weekly_gain:.0%} of a live gap",
             f"  at most {self.max_pending} awaiting your decision at once",
         ]
 

@@ -60,13 +60,18 @@ class Proposal:
         return str(self.reason.get("drop_name", self.drop_player_key or "-"))
 
     def describe(self) -> str:
-        gain = self.reason.get("gain")
-        helps = ", ".join(self.reason.get("helps", [])) or "general value"
         line = f"#{self.id} {self.status.upper():9} ADD {self.add_name}"
         if self.drop_player_key:
             line += f"  DROP {self.drop_name}"
-        if gain is not None:
-            line += f"  (+{float(gain):.2f}, helps {helps})"
+        moved = self.reason.get("moved")
+        extra = self.reason.get("extra_starts")
+        bits = []
+        if extra is not None:
+            bits.append(f"{float(extra):+g} starts")
+        if moved:
+            bits.append(str(moved))
+        if bits:
+            line += "  (" + ", ".join(bits) + ")"
         return line
 
 
@@ -127,15 +132,18 @@ def propose(
             continue
         reason = {
             "week": week,
-            "gain": round(t.gain, 3),
-            "week_value": round(t.value, 3),
-            "games": t.games,
+            # `gain` is a share of the live gap now, not an abstract value
+            # number - adds are priced by re-slotting the week and subtracting.
+            "gain": round(t.score, 3),
+            "starts": round(t.starts, 2),
+            "drop_starts": round(t.drop_starts, 2),
+            "extra_starts": round(t.extra_starts, 2),
+            "moved": t.moved(),
             "helps": list(t.helps),
             "timing": t.timing,
             "add_name": t.player.name,
             "add_team": t.player.team,
             "drop_name": t.drop.name if t.drop else "",
-            "drop_value": round(t.drop_value, 3),
         }
         cur = conn.execute(
             "INSERT INTO waiver_proposals "

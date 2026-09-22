@@ -43,6 +43,14 @@ CLOSE_BAND = 0.06
 # Rate categories are not summed; they are derived from their components.
 DERIVED = {"save_pct": ("saves", "shots_against"), "gaa": ("goals_against", "toi_hours")}
 
+# A contribution smaller than this share of the gap is not why you would make
+# the move, so listing it makes every candidate look identical.
+MATERIAL = 0.25
+
+# A gap smaller than this is a coin flip; treat it as this wide so a near-tie
+# does not divide by nothing.
+MIN_GAP = 0.5
+
 
 @dataclass(frozen=True)
 class CategoryOutlook:
@@ -98,17 +106,28 @@ class CategoryOutlook:
 
 @dataclass(frozen=True)
 class AddTarget:
+    """One swap, priced by what it actually changes over the week."""
+
     player: PoolPlayer
-    games: int
-    value: float
+    starts: float
+    drop_starts: float
+    deltas: dict[str, float]
     helps: tuple[str, ...]
     drop: RosterPlayer | None
-    drop_value: float
+    score: float
     timing: str
 
     @property
-    def gain(self) -> float:
-        return self.value - self.drop_value
+    def extra_starts(self) -> float:
+        """The only games number that matters: his starts minus the ones lost."""
+        return self.starts - self.drop_starts
+
+    labels: dict[str, str] = field(default_factory=dict)
+
+    def moved(self, limit: int = 4) -> str:
+        """The biggest category changes, in the league's own units and labels."""
+        best = sorted(self.deltas.items(), key=lambda kv: -abs(kv[1]))[:limit]
+        return "  ".join(f"{self.labels.get(k, k)} {v:+.1f}" for k, v in best if abs(v) >= 0.05)
 
 
 @dataclass(frozen=True)
@@ -167,15 +186,31 @@ class WeekPlan:
                 else "no cap"
             )
             lines.append(f"  Adds worth proposing ({budget}):")
+            lines.append(
+                "  Every number below is the NET change to your week - the week "
+                "re-slotted with the swap made, minus the week as it stands."
+            )
             for t in self.targets:
-                helps = ", ".join(t.helps) if t.helps else "general value"
+                lines.append("")
                 lines.append(
-                    f"    {t.player.name:22} {t.player.team:4} "
-                    f"{'/'.join(sorted(t.player.eligible)):7} "
-                    f"{t.games}g  +{t.gain:.2f}  helps {helps}"
+                    f"    {t.player.name} ({t.player.team} "
+                    f"{'/'.join(sorted(t.player.eligible))})"
+                    + (f" for {t.drop.name}" if t.drop else "")
                 )
-                if t.drop:
-                    lines.append(f"      drop {t.drop.name} ({t.drop_value:.2f})")
+                lines.append(
+                    f"      starts {t.starts:g} this week"
+                    + (
+                        f", {t.drop.name} would have started {t.drop_starts:g}"
+                        f" - net {t.extra_starts:+g}"
+                        if t.drop
+                        else ""
+                    )
+                )
+                moved = t.moved()
+                if moved:
+                    lines.append(f"      net change: {moved}")
+                if t.helps:
+                    lines.append(f"      closes: {', '.join(t.helps)}")
                 lines.append(f"      {t.timing}")
         for n in self.notes:
             lines.append(f"  ! {n}")
@@ -470,6 +505,7 @@ def build_week_plan(
         values,
         min_gain,
         max_targets,
+        base_totals=our_totals,
     )
 
     return WeekPlan(
@@ -501,72 +537,128 @@ def _targets(
     values,
     min_gain,
     max_targets,
+    base_totals=None,
+    screen: int = 20,
 ) -> tuple[AddTarget, ...]:
-    """Adds that move a category actually in play, with a legal drop."""
-    season = runtime.nhl_season
-    dates = week.dates()
-    games_by_team: dict[str, int] = {}
-    for d in dates:
-        for t in calendar.teams_playing(conn, d, season):
-            games_by_team[t] = games_by_team.get(t, 0) + 1
+    """Adds that move a category in play, priced by re-slotting the actual week.
 
-    # What the weakest droppable roster player is worth over the same week.
+    The first version of this assumed an added player starts every one of his
+    team's games and the dropped one would have too. Neither is true. On a
+    night when your lineup is already full he displaces somebody, so only the
+    difference counts; on a night with an empty slot he is worth the whole
+    thing. The only honest number is the delta, and the only way to get it is
+    to slot the week both ways and subtract.
+
+    That costs an optimizer pass per candidate, so the pool is screened
+    cheaply first and only the shortlist is priced properly.
+    """
+    cats = league.all_cats
     droppable = [
         p
         for p in ours.players
         if not p.is_undroppable and p.nhl_player_id is not None and not p.on_ir
     ]
-    drop_values = {
-        p.player_key: values.per_game(p.nhl_player_id, week.start) * games_by_team.get(p.team, 0)
-        for p in droppable
-    }
-
     counts: dict[str, int] = {}
     for p in ours.players:
         counts[p.position] = counts.get(p.position, 0) + 1
     rules = league.draft_rules()
 
+    base_starts = expected_starts(conn, runtime, week, ours.players, goalie_source, values)
+    if base_totals is None:
+        base_totals = project_totals(base_starts, rates, cats)
+    games = team_games_in(conn, runtime, week)
+
+    # Cheap screen: his team's games times his rate, which overstates everyone
+    # equally and so orders them about right.
+    screened = sorted(
+        (
+            c
+            for c in pool
+            if c.nhl_player_id is not None and not c.is_out and c.nhl_player_id in rates
+        ),
+        key=lambda c: -values.per_game(c.nhl_player_id, week.start) * games.get(c.team, 0),
+    )[: max(screen, max_targets)]
+
     out: list[AddTarget] = []
-    for cand in pool:
-        pid = cand.nhl_player_id
-        if pid is None or cand.is_out or pid not in rates:
+    for cand in screened:
+        rough = _rough(droppable, values, games, week)
+        drop = _cheapest_legal_drop(cand, droppable, rough, counts, rules)
+        if drop is None:
             continue
-        games = games_by_team.get(cand.team, 0)
-        if cand.position == "G":
-            games = round(sum(goalie_source.starts(d).get(pid, 0.0) for d in dates), 2)
-        if games <= 0:
-            continue
-        value = values.per_game(pid, week.start) * games
-        helps = _categories_helped(rates[pid], games, close_by_key)
-        drop = _cheapest_legal_drop(cand, droppable, drop_values, counts, rules)
-        dv = drop_values.get(drop.player_key, 0.0) if drop else 0.0
-        if value - dv < min_gain:
-            continue
-        # A target that moves nothing in play is season value, not a week plan.
+        after = [p for p in ours.players if p.player_key != drop.player_key] + [cand]
+        after_starts = expected_starts(conn, runtime, week, after, goalie_source, values)
+        after_totals = project_totals(after_starts, rates, cats)
+
+        deltas = {
+            c.key: after_totals.get(c.key, 0.0) - base_totals.get(c.key, 0.0)
+            for c in cats
+            if c.key not in DERIVED
+        }
+        helps = _helped_by(deltas, close_by_key)
         if close_by_key and not helps:
+            continue
+
+        starts = after_starts.get(cand.nhl_player_id, 0.0)
+        lost = base_starts.get(drop.nhl_player_id, 0.0)
+        score = _score(deltas, close_by_key)
+        if score < min_gain:
             continue
         out.append(
             AddTarget(
                 player=cand,
-                games=int(games) if cand.position != "G" else games,
-                value=value,
+                starts=starts,
+                drop_starts=lost,
+                deltas=deltas,
                 helps=helps,
                 drop=drop,
-                drop_value=dv,
+                score=score,
+                labels={c.key: c.label for c in cats},
                 timing=cand.timing(runtime.waiver_days),
             )
         )
-    out.sort(key=lambda t: -t.gain)
+    out.sort(key=lambda t: -t.score)
     return tuple(out[:max_targets])
 
 
-# A contribution smaller than this share of the gap is not why you would make
-# the move, so listing it makes every candidate look identical.
-MATERIAL = 0.25
+def _rough(droppable, values, games, week) -> dict[str, float]:
+    """A quick ordering of who is cheapest to let go, for the legality check."""
+    return {
+        p.player_key: values.per_game(p.nhl_player_id, week.start) * games.get(p.team, 0)
+        for p in droppable
+    }
 
-# A gap smaller than this is a coin flip; treat it as this wide so a near-tie
-# does not divide by nothing.
-MIN_GAP = 0.5
+
+def _helped_by(deltas: dict[str, float], close: dict[str, CategoryOutlook]) -> tuple[str, ...]:
+    """Close categories this swap actually moves, largest share of the gap first."""
+    out: list[tuple[float, str]] = []
+    for key, o in close.items():
+        if key in DERIVED:
+            continue
+        adds = deltas.get(key, 0.0)
+        if adds <= 0:
+            continue
+        share = adds / max(abs(o.margin), MIN_GAP)
+        if share >= MATERIAL:
+            pct = min(share, 1.0)
+            out.append((share, f"{o.category.label} {adds:+.1f} ({pct:.0%} of the gap)"))
+    out.sort(key=lambda x: -x[0])
+    return tuple(label for _, label in out[:3])
+
+
+def _score(deltas: dict[str, float], close: dict[str, CategoryOutlook]) -> float:
+    """Rank by how much of each live gap the swap closes, not by raw value.
+
+    A player who adds six shots into a category you trail by seven is worth
+    more this week than one who adds twelve into a category already won.
+    """
+    if not close:
+        return sum(max(v, 0.0) for v in deltas.values())
+    total = 0.0
+    for key, o in close.items():
+        if key in DERIVED:
+            continue
+        total += max(deltas.get(key, 0.0), 0.0) / max(abs(o.margin), MIN_GAP)
+    return total
 
 
 def _categories_helped(

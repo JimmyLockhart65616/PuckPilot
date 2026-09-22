@@ -129,15 +129,13 @@ def build(
 
 
 def _why(p) -> str:
-    helps = ", ".join(p.reason.get("helps", []))
-    gain = p.reason.get("gain")
+    """The net effect, in the league's own units - not an abstract score."""
     bits = []
-    if gain is not None:
-        bits.append(f"+{float(gain):.1f} this week")
-    if p.reason.get("games"):
-        bits.append(f"{p.reason['games']} games")
-    if helps:
-        bits.append(helps)
+    extra = p.reason.get("extra_starts")
+    if extra is not None:
+        bits.append(f"{float(extra):+g} starts this week")
+    if p.reason.get("moved"):
+        bits.append(str(p.reason["moved"]))
     return " · ".join(bits)
 
 

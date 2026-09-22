@@ -103,9 +103,10 @@ follow_protocol = false
 # one itself. Making transactions autonomous is not a config change - it would
 # mean deleting that mechanism.
 
-# Do not propose a move worth less than this for the week. A proposal you will
-# reject is a notification that teaches you to ignore the next one.
-min_weekly_gain = 0.5
+# How much of a live category gap a swap must close to be worth raising -
+# 0.25 is a quarter of it. A SHARE, not a score: adds are priced by
+# re-slotting the actual week and subtracting, so this is in gap units.
+min_weekly_gain = 0.25
 
 # More than this awaiting your decision means the tool is guessing, not advising.
 max_pending = 5

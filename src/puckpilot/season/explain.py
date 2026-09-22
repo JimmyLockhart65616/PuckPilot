@@ -202,6 +202,12 @@ def week_story(plan, runtime: LeagueRuntime) -> list[str]:
             + ", ".join(f"{o.category.label} ({o.margin:+.1f})" for o in close)
             + ". These are where the week is decided, and where an add should go."
         )
+        if any(o.verdict == "behind" for o in plan.outlook):
+            lines.append(
+                "Close is measured against the size of the category, not in raw "
+                "units - a week is about 70 shots and about 22 points, so trailing "
+                "by 7 shots is nearer than trailing by 5 points."
+            )
     else:
         lines.append(
             "Nothing is close enough to swing, so there is no category worth chasing this week."
@@ -210,8 +216,10 @@ def week_story(plan, runtime: LeagueRuntime) -> list[str]:
         lines.append("")
         lines.append(
             f"The {len(plan.targets)} players below are free agents who would move "
-            f"those categories. '+N' is what they add for the week, after "
-            f"subtracting what the player you drop would have given you."
+            f"those categories. Every number is the NET change to your week: the "
+            f"week re-slotted with the swap made, minus the week as it stands - so "
+            f"it already accounts for whom he displaces and what the dropped player "
+            f"would have contributed."
         )
     return lines
 
