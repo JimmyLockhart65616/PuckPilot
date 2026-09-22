@@ -44,6 +44,7 @@ def build(
     plan=None,
     week_plan=None,
     roster=None,
+    reasons: dict[str, str] | None = None,
     tz: str = DEFAULT_TZ,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
@@ -69,7 +70,13 @@ def build(
     if plan is not None:
         snap["date"] = plan.date
         snap["moves"] = [
-            {"kind": _move_kind(m), "name": m.player.name, "detail": _move_detail(m)}
+            {
+                "kind": _move_kind(m),
+                "name": m.player.name,
+                # The reason, where there is one - the slot change is the
+                # instruction, but the reason is what makes it checkable.
+                "detail": (reasons or {}).get(m.player.player_key) or _move_detail(m),
+            }
             for m in plan.moves
         ]
         snap["out"] = [p.label() for p in plan.out]

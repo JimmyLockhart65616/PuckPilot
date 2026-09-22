@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from functools import partial
+from pathlib import Path
 
 from puckpilot.config import Settings
 
@@ -1360,8 +1361,25 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
         authority=manager.authority.lineup,
         weights=weights,
     )
-    print(plan.text())
-    _season_publish(manager, conn, league_key, plan=plan, roster=roster)
+    from puckpilot.season import explain
+
+    reasons = explain.move_reasons(conn, runtime, plan)
+    print()
+    for line in explain.plan_story(conn, runtime, plan):
+        print(f"  {line}" if line else "")
+    if plan.moves:
+        print()
+        print("  What to change in Yahoo:")
+        for m in plan.moves:
+            print(f"    {m.describe()}")
+            why = reasons.get(m.player.player_key)
+            if why:
+                print(f"        {why}")
+        print()
+        print(f"  Worth {plan.gain:+.2f} for tonight, in the same units the board used.")
+    print()
+    print(f"  {plan.authority_reason}")
+    _season_publish(manager, conn, league_key, plan=plan, roster=roster, reasons=reasons)
     if args.explain:
         print()
         print("  value tonight:")
@@ -1372,7 +1390,9 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
     return 0
 
 
-def _season_publish(manager, conn, league_key, plan=None, week_plan=None, roster=None, quiet=False):
+def _season_publish(
+    manager, conn, league_key, plan=None, week_plan=None, roster=None, reasons=None, quiet=False
+):
     """Collect decisions, then push the view. Never fatal."""
     from puckpilot.season import publish, snapshot
 
@@ -1396,12 +1416,90 @@ def _season_publish(manager, conn, league_key, plan=None, week_plan=None, roster
             plan=plan,
             week_plan=week_plan,
             roster=roster,
+            reasons=reasons,
         )
         publish.push(manager.page.url, key, snap)
         if not quiet:
             print(f"  published to {manager.page.url}")
     except publish.PublishError as e:
         print(f"  page not updated: {e}")
+
+
+def _cmd_season_schedule(args: argparse.Namespace) -> int:
+    """Register (or show, or remove) the daily runs."""
+    import os
+
+    from puckpilot.config import REPO_ROOT
+    from puckpilot.season import cli_support, schedule
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager = cli_support.resolve_manager(getattr(args, "manager", None))
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    times = tuple(t.strip() for t in args.at.split(",") if t.strip())
+    items = schedule.tasks(manager.name, REPO_ROOT, times)
+
+    already = schedule.installed()
+    if already:
+        print("Already registered: " + ", ".join(already))
+        print()
+
+    if args.remove:
+        for line in schedule.remove(items):
+            print(line)
+        return 0
+
+    print(schedule.describe(items, bool(os.environ.get("PUCKPILOT_MANAGER_KEY"))))
+    if not args.install:
+        print()
+        print("Nothing registered. Add --install to set these up, --remove to take them away.")
+        return 0
+
+    print()
+    for line in schedule.install(items):
+        print(line)
+    print()
+    print("Remove them with: ppilot season schedule --remove")
+    return 0
+
+
+def _cmd_season_run(args: argparse.Namespace) -> int:
+    """Everything a day needs, in order. Built to be scheduled."""
+    from puckpilot.season import cli_support
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.run import run_day
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    day = args.date or runtime.current_date or cli_support.today_str()
+    lines: list[str] = []
+
+    def say(text):
+        lines.append(text)
+        print(text)
+
+    report = run_day(
+        conn,
+        manager,
+        league_key,
+        runtime,
+        day,
+        weekly=True if args.weekly else (False if args.no_weekly else None),
+        do_sync=not args.no_sync,
+        say=say,
+    )
+    if args.log:
+        path = Settings()._resolve(Path(args.log))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(chr(10).join(lines) + chr(10) * 2)
+    return 1 if report.failed else 0
 
 
 def _cmd_season_gate(args: argparse.Namespace) -> int:
@@ -1519,12 +1617,16 @@ def _cmd_season_protocol(args: argparse.Namespace) -> int:
     if args.approve or args.reject:
         return 0
 
+    from puckpilot.season import explain
+
     rows = protocol_mod.listing(conn, manager.name, league_key)
     if not rows:
         print("No protocols yet - run `ppilot season week` to propose one.")
         return 0
     for p in rows:
-        print(p.describe())
+        print(f"[{p.status.upper()}] #{p.id}")
+        for line in explain.protocol_story(p):
+            print(f"  {line}" if line else "")
         print()
     return 0
 
@@ -1627,6 +1729,11 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         min_gain=manager.authority.transactions.min_weekly_gain,
         max_targets=args.top,
     )
+    from puckpilot.season import explain
+
+    print()
+    for line in explain.week_story(plan, runtime):
+        print(f"  {line}" if line else "")
     print()
     print(plan.text())
     print()
@@ -1658,14 +1765,19 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         plan.outlook, manager.name, league_key, ours.team_key, plan.week, m.opponent_name
     )
     existing = protocol_mod.load(conn, manager.name, league_key, plan.week)
-    if existing and existing.status == protocol_mod.APPROVED:
-        print()
-        print(existing.describe())
-    else:
+    live = existing if existing and existing.status == protocol_mod.APPROVED else None
+    if live is None:
         stance = protocol_mod.save(conn, stance)
-        print()
-        print(stance.describe())
-        print(f"  Approve with: ppilot season protocol --approve {stance.id}")
+    shown = live or stance
+    print()
+    for line in explain.protocol_story(shown, plan.adds_left_week):
+        print(f"  {line}" if line else "")
+    print()
+    if live is not None:
+        print(f"  Already approved (protocol #{live.id}).")
+    else:
+        print(f"  Approve with: ppilot season protocol --approve {shown.id}")
+        print("  Or just ignore it - nothing happens until you decide.")
 
     _season_publish(manager, conn, league_key, week_plan=plan, roster=ours)
 
@@ -1813,6 +1925,12 @@ def _cmd_data_sync(args: argparse.Namespace) -> int:
 
     print(f"Done: {settings.resolved_db_path}")
     return 0
+
+
+def schedule_times() -> tuple[str, ...]:
+    from puckpilot.season.schedule import DEFAULT_TIMES
+
+    return DEFAULT_TIMES
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2257,6 +2375,36 @@ def build_parser() -> argparse.ArgumentParser:
     s_gate.add_argument("--seed", type=int, default=123)
     s_gate.add_argument("--verbose", action="store_true")
     s_gate.set_defaults(func=_cmd_season_gate)
+
+    s_run = season_sub.add_parser(
+        "run",
+        parents=[seasonal],
+        help="Everything for today in one go: sync, decisions, lineup, page (and Mondays)",
+    )
+    s_run.add_argument(
+        "--weekly", action="store_true", help="Also do the weekly plan, whatever day it is"
+    )
+    s_run.add_argument(
+        "--no-weekly", action="store_true", help="Skip the weekly plan even on week one's first day"
+    )
+    s_run.add_argument("--no-sync", action="store_true", help="Skip the data catch-up")
+    s_run.add_argument(
+        "--log", default="data/logs/season.log", metavar="PATH", help="Append the run to this file"
+    )
+    s_run.set_defaults(func=_cmd_season_run)
+
+    s_sched = season_sub.add_parser(
+        "schedule", parents=[seasonal], help="Run it daily without being asked (Task Scheduler)"
+    )
+    s_sched.add_argument("--install", action="store_true", help="Actually register the tasks")
+    s_sched.add_argument("--remove", action="store_true", help="Take them away again")
+    s_sched.add_argument(
+        "--at",
+        default=",".join(schedule_times()),
+        metavar="HH:MM,...",
+        help="Local times to run at",
+    )
+    s_sched.set_defaults(func=_cmd_season_schedule)
 
     s_week = season_sub.add_parser(
         "week", parents=[seasonal], help="This week's category plan and add targets"
