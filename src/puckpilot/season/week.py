@@ -345,14 +345,23 @@ def add_headroom(
     rates: dict[int, dict[str, float]],
     cats: tuple[Category, ...],
     league,
-) -> dict[str, float]:
-    """The most one acquisition could add to each category, net of the drop.
+    adds_left: int = 1,
+) -> dict[str, float | None]:
+    """The most the acquisitions left this week could add to each category.
 
     The lineup is often the smaller lever - a roster of seventeen into thirteen
-    slots has no choice to make on a night when only nine players have games -
-    so a category out of reach for the lineup can be well within range of an
-    add. Net, because the player who makes room takes his own production with
-    him.
+    slots has no choice to make on a night when nine players have games - so a
+    category out of reach for the lineup can be well within range of an add.
+
+    Every part of that sentence is load-bearing. Net of the drop, because the
+    player who makes room takes his own production with him. And over the
+    acquisitions actually remaining rather than one, because this league allows
+    three a week: costing it at one add called a 1.3-goal gap unreachable in
+    week 1, which it plainly is not.
+
+    Best-n against worst-n rather than the best add times n, since you cannot
+    sign the same player three times and each further move displaces a better
+    player than the last.
     """
     games = team_games_in(conn, runtime, week)
     droppable = [
@@ -360,27 +369,25 @@ def add_headroom(
         for p in ours.players
         if not p.is_undroppable and p.nhl_player_id is not None and not p.on_ir
     ]
+    n = max(int(adds_left), 0)
     out: dict[str, float | None] = {}
     for c in cats:
         if c.key in DERIVED:
             out[c.key] = None
             continue
-        worst = min(
-            (
-                rates.get(p.nhl_player_id, {}).get(c.key, 0.0) * games.get(p.team, 0)
-                for p in droppable
-            ),
-            default=0.0,
-        )
-        best = max(
-            (
-                rates.get(p.nhl_player_id, {}).get(c.key, 0.0) * games.get(p.team, 0)
-                for p in pool
-                if p.nhl_player_id is not None and not p.is_out
-            ),
-            default=0.0,
-        )
-        out[c.key] = max(best - worst, 0.0)
+        if n == 0:
+            out[c.key] = 0.0
+            continue
+
+        def week_total(p, key=c.key):
+            return rates.get(p.nhl_player_id, {}).get(key, 0.0) * games.get(p.team, 0)
+
+        give_up = sorted(week_total(p) for p in droppable)[:n]
+        gain = sorted(
+            (week_total(p) for p in pool if p.nhl_player_id is not None and not p.is_out),
+            reverse=True,
+        )[:n]
+        out[c.key] = max(sum(gain) - sum(give_up), 0.0)
     return out
 
 
@@ -412,10 +419,25 @@ def build_week_plan(
     our_totals = project_totals(our_games, rates, cats)
     their_totals = project_totals(their_games, rates, cats)
 
+    adds_left_week = (
+        None
+        if runtime.max_weekly_adds is None
+        else max(runtime.max_weekly_adds - adds_used_week, 0)
+    )
     reach = headroom(
         conn, runtime, week, ours.players, goalie_source, values, rates, cats, our_totals
     )
-    adds = add_headroom(conn, runtime, week, ours, pool, rates, cats, league)
+    adds = add_headroom(
+        conn,
+        runtime,
+        week,
+        ours,
+        pool,
+        rates,
+        cats,
+        league,
+        adds_left=adds_left_week if adds_left_week is not None else 1,
+    )
     outlook = tuple(
         CategoryOutlook(
             category=c,
@@ -429,11 +451,6 @@ def build_week_plan(
     close_by_key = {o.category.key: o for o in outlook if o.in_play}
 
     notes: list[str] = []
-    adds_left_week = (
-        None
-        if runtime.max_weekly_adds is None
-        else max(runtime.max_weekly_adds - adds_used_week, 0)
-    )
     adds_left_season = (
         None if runtime.max_adds is None else max(runtime.max_adds - adds_used_season, 0)
     )

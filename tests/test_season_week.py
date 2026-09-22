@@ -151,3 +151,94 @@ def test_at_most_three_categories_are_named():
     }
     rate = dict.fromkeys(["goals", "pim", "ppp", "sog"], 1.0)
     assert len(_categories_helped(rate, games=4, close=close)) == 3
+
+
+# -- how far an add can reach --------------------------------------------------
+
+
+class _Roster:
+    def __init__(self, players):
+        self.players = players
+
+
+class _P:
+    def __init__(self, pid, team="TOR", undroppable=False, out=False, slot="BN"):
+        self.nhl_player_id = pid
+        self.team = team
+        self.is_undroppable = undroppable
+        self.is_out = out
+        self.on_ir = False
+        self.selected_slot = slot
+
+
+def _headroom(db, adds_left, pool_rate, drop_rate):
+    from puckpilot.data import store
+    from puckpilot.season.week import add_headroom
+
+    for gid, d in enumerate(["2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08"], start=1):
+        store.upsert_schedule_game(
+            db,
+            game_id=gid,
+            season="20262027",
+            game_type=2,
+            game_date=d,
+            start_time_utc=None,
+            home_team="TOR",
+            away_team="MTL",
+        )
+    db.commit()
+    rt = _runtime_for_week()
+    rates = {
+        1: {"goals": drop_rate},
+        2: {"goals": drop_rate},
+        9: {"goals": pool_rate},
+        10: {"goals": pool_rate},
+    }
+    return add_headroom(
+        db,
+        rt,
+        rt.week(1),
+        _Roster([_P(1), _P(2)]),
+        [_P(9), _P(10)],
+        rates,
+        (resolve("G"),),
+        None,
+        adds_left=adds_left,
+    )
+
+
+def _runtime_for_week():
+    from puckpilot.season.settings import LeagueRuntime, Week
+    from tests.test_season_settings import payload
+
+    return LeagueRuntime.from_payload(
+        payload(), weeks=(Week(1, "2026-10-05", "2026-10-08"),), fetched_at="now"
+    )
+
+
+def test_headroom_counts_every_acquisition_still_available(db):
+    """Costing it at one add called a 1.3-goal gap unreachable in week 1,
+    which it plainly is not - the league allows three a week."""
+    one = _headroom(db, 1, pool_rate=0.5, drop_rate=0.1)["goals"]
+    three = _headroom(db, 3, pool_rate=0.5, drop_rate=0.1)["goals"]
+    assert three > one
+
+
+def test_headroom_is_net_of_what_the_drop_takes_with_him(db):
+    cheap = _headroom(db, 1, pool_rate=0.5, drop_rate=0.0)["goals"]
+    costly = _headroom(db, 1, pool_rate=0.5, drop_rate=0.4)["goals"]
+    assert cheap > costly
+
+
+def test_no_acquisitions_left_means_no_room(db):
+    assert _headroom(db, 0, pool_rate=0.9, drop_rate=0.0)["goals"] == 0.0
+
+
+def test_a_rate_category_stays_unmeasured_however_many_adds_are_left(db):
+    from puckpilot.season.week import add_headroom
+
+    rt = _runtime_for_week()
+    got = add_headroom(
+        db, rt, rt.week(1), _Roster([]), [], {}, (resolve("SV%"),), None, adds_left=3
+    )
+    assert got["save_pct"] is None
