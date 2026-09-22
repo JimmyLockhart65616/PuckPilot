@@ -283,7 +283,13 @@ def sync_current_rosters(
         f"  {len(teams)} rosters, {seen} players, {changed} corrected ({new} newly seen), "
         f"{renamed} names repaired"
     )
-    return {"teams": len(teams), "players": seen, "changed": changed, "new": new, "renamed": renamed}
+    return {
+        "teams": len(teams),
+        "players": seen,
+        "changed": changed,
+        "new": new,
+        "renamed": renamed,
+    }
 
 
 ROSTERS_META = "rosters:{season}"
@@ -386,3 +392,93 @@ def sync_players_and_logs(
             "logs_skipped": skipped,
         }
     return report
+
+
+def players_behind_their_boxscores(
+    conn: sqlite3.Connection, season: str, limit: int | None = None
+) -> list[int]:
+    """Players with a boxscore row for a game their game log does not have.
+
+    This is the whole incremental rule for an in-season sync, and it is a
+    question rather than a watermark on purpose: it answers itself from the
+    data, it self-heals after an interrupted run, and it cannot drift out of
+    step with what was actually stored.
+
+    The game log is still needed despite the boxscore carrying most of a stat
+    line, because it does NOT carry power-play points - one of this league's
+    twelve categories - nor short-handed points or game-winning goals.
+
+    Players who dressed without playing are excluded, and that is what makes
+    this converge rather than chase itself. A backup goalie gets a boxscore row
+    every night he is on the bench and a game-log entry only when he appears,
+    so without the ice-time filter every backup in the league reads as
+    permanently behind - 122 of them on a fully synced season, refetched every
+    run, forever.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT b.player_id FROM nhl_boxscore_stats b "
+        "LEFT JOIN nhl_game_logs l ON l.player_id = b.player_id AND l.game_id = b.game_id "
+        "WHERE b.season = ? AND l.player_id IS NULL "
+        "  AND COALESCE(json_extract(b.stats_json, '$.toi'), '00:00') "
+        "      NOT IN ('00:00', '0:00', '') "
+        "ORDER BY b.player_id" + (" LIMIT ?" if limit else ""),
+        (season, limit) if limit else (season,),
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def sync_day(
+    conn: sqlite3.Connection,
+    nhl: NhlClient,
+    season: str,
+    *,
+    delay: float = POLITE_DELAY_S,
+    today: date | None = None,
+    max_players: int | None = None,
+    progress: Progress = _noop,
+) -> dict[str, int]:
+    """Bring one season up to date: last night's boxscores, then the logs behind them.
+
+    Built for a daily job rather than a rebuild. `sync_players_and_logs` never
+    marks an incomplete season done, so running it in-season refetches every
+    player's log every time - about a thousand requests to learn what a handful
+    of games changed. This fetches one boxscore per newly played game, then a
+    log only for players those games moved.
+
+    A player's log endpoint returns his whole season, so one request catches him
+    up however many games he is behind.
+    """
+    boxes = sync_boxscores(conn, nhl, [season], delay=delay, today=today, progress=progress)
+    fetched = boxes.get(season, {}).get("fetched", 0)
+
+    behind = players_behind_their_boxscores(conn, season, limit=max_players)
+    progress(f"  {season}: {len(behind)} player(s) with logs behind their boxscores")
+    synced = 0
+    for i, pid in enumerate(behind, start=1):
+        try:
+            log = nhl.player_game_log(pid, season)
+        except NhlApiError as e:  # a single missing player must not end the run
+            progress(f"    {pid}: {e}")
+            continue
+        for entry in log.get("gameLog", []):
+            store.upsert_game_log(
+                conn,
+                player_id=pid,
+                game_id=entry["gameId"],
+                season=season,
+                game_type=REGULAR_SEASON,
+                game_date=entry["gameDate"],
+                team_abbrev=entry.get("teamAbbrev"),
+                opponent_abbrev=entry.get("opponentAbbrev"),
+                is_home=1 if entry.get("homeRoadFlag") == "H" else 0,
+                stats_json=json.dumps(entry),
+            )
+        conn.commit()
+        synced += 1
+        if i % 50 == 0:
+            progress(f"    {i}/{len(behind)} players caught up")
+        time.sleep(delay)
+
+    still = len(players_behind_their_boxscores(conn, season))
+    progress(f"  {season}: {synced} player log(s) updated, {still} still behind")
+    return {"boxscores": fetched, "players_synced": synced, "still_behind": still}

@@ -1403,6 +1403,81 @@ def _season_publish(manager, conn, league_key, plan=None, week_plan=None, roster
         print(f"  page not updated: {e}")
 
 
+def _cmd_season_preflight(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support
+    from puckpilot.season import preflight as pf
+    from puckpilot.season.fetch import discover_team_key, fetch_roster, load_runtime
+    from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.today import build_plan
+    from puckpilot.season.values import build_value_model
+    from puckpilot.yahoo import playermap
+
+    report = pf.SeasonPreflightReport()
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        print(f"puckpilot: {e}")
+        return 2
+
+    report.checks.append(pf.check_manager(manager))
+    report.checks.append(pf.check_authority(manager))
+
+    runtime = load_runtime(conn, league_key)
+    report.checks.append(pf.check_runtime(runtime))
+    day = args.date or (runtime.current_date if runtime else None) or cli_support.today_str()
+    report.checks.append(pf.check_calendar(runtime, day))
+    report.checks.append(pf.check_player_map(conn, league_key))
+
+    roster = None
+    if runtime is not None:
+        season = runtime.nhl_season
+        report.checks.append(pf.check_schedule(conn, season, day))
+        report.checks.append(pf.check_data_freshness(conn, season, day))
+        if not args.offline:
+            pmap = playermap.load_map(conn, league_key)
+
+            def _read(session):
+                key = manager.team_key or discover_team_key(session, league_key)
+                return fetch_roster(session, key, day, player_map=pmap)
+
+            try:
+                roster = cli_support.run_session(manager, _read)
+            except (ManagerError, cli_support.SeasonCliError) as e:
+                report.checks.append(pf.Check("yahoo session", pf.FAIL, str(e)))
+        report.checks.append(
+            pf.check_roster(roster)
+            if roster or not args.offline
+            else pf.Check("roster", pf.INFO, "skipped (--offline)")
+        )
+
+        train = [x for x in DEFAULT_SEASONS if x < season][-3:][::-1]
+        values = build_value_model(conn, season, tuple(train), manager.league)
+        report.checks.append(pf.check_projections(values, roster))
+        goalies = ChainedGoalieSource(
+            TrailingStartShareSource(conn, season, fallback_season=train[0])
+        )
+        report.checks.append(pf.check_goalies(goalies, roster, day))
+
+        if roster is not None:
+            plan = build_plan(
+                conn,
+                runtime,
+                roster,
+                values,
+                goalies,
+                day,
+                manager=manager.name,
+                authority=manager.authority.lineup,
+            )
+            report.checks.append(pf.check_plan(plan))
+
+    page_key = manager.page.owner_key or os.environ.get("PUCKPILOT_MANAGER_KEY", "")
+    report.checks.append(pf.check_page(manager, page_key))
+    print(report.text)
+    return 1 if report.failed else 0
+
+
 def _cmd_season_protocol(args: argparse.Namespace) -> int:
     from puckpilot.season import cli_support
     from puckpilot.season import protocol as protocol_mod
@@ -1666,6 +1741,23 @@ def _cmd_shadow_season(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_data_daily(args: argparse.Namespace) -> int:
+    from puckpilot.data import store
+    from puckpilot.data.nhl import NhlClient
+    from puckpilot.data.sync import sync_day
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    store.init_db(conn)
+    nhl = NhlClient()
+    out = sync_day(conn, nhl, args.season, max_players=args.max_players, progress=print)
+    print(
+        f"{args.season}: {out['boxscores']} boxscore(s), "
+        f"{out['players_synced']} player log(s), {out['still_behind']} still behind"
+    )
+    return 0
+
+
 def _cmd_data_sync(args: argparse.Namespace) -> int:
     from puckpilot.data import store, sync
     from puckpilot.data.moneypuck import MoneyPuckClient, season_start_year
@@ -1804,6 +1896,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sync per-game boxscores only (hits/blocks); use for the one-time backfill",
     )
     sync.set_defaults(func=_cmd_data_sync)
+
+    daily = data_sub.add_parser(
+        "daily", help="In-season catch-up: last night's boxscores and the logs behind them"
+    )
+    daily.add_argument("--season", default="20262027")
+    daily.add_argument(
+        "--max-players", type=int, default=None, help="Cap player log fetches for a quick run"
+    )
+    daily.set_defaults(func=_cmd_data_daily)
 
     rosters = data_sub.add_parser(
         "rosters",
@@ -2119,6 +2220,14 @@ def build_parser() -> argparse.ArgumentParser:
         "roster", parents=[seasonal], help="Your current roster, with slots and injuries"
     )
     s_roster.set_defaults(func=_cmd_season_roster)
+
+    s_pre = season_sub.add_parser(
+        "preflight", parents=[seasonal], help="Is everything current enough to act on?"
+    )
+    s_pre.add_argument(
+        "--offline", action="store_true", help="Skip the Yahoo reads and check the rest"
+    )
+    s_pre.set_defaults(func=_cmd_season_preflight)
 
     s_week = season_sub.add_parser(
         "week", parents=[seasonal], help="This week's category plan and add targets"
