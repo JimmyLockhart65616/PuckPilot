@@ -27,11 +27,17 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from puckpilot.season import proposals as proposals_mod
+from puckpilot.season.preflight import age_days as _age_days
 
 # The league's own settings carry the week calendar and which week it is now.
 # They change rarely, but a cache that never refreshes goes wrong silently:
 # `current_week` simply stops advancing while everything still looks healthy.
 RUNTIME_REFRESH_DAYS = 3.0
+
+# The player map is the bridge between a Yahoo free agent and a projection, and
+# the players it will be missing are exactly the ones an in-season add comes
+# from: call-ups who did not exist when it was built. Refreshed weekly.
+MAP_REFRESH_DAYS = 7.0
 
 
 @dataclass
@@ -232,6 +238,45 @@ def run_day(
     return report
 
 
+def _upkeep(conn, manager, league_key, season, report):
+    """Weekly housekeeping, in the order each step makes the next one useful.
+
+    A call-up has to cross three gaps before the tool can value him: onto an
+    NHL roster, into our player table, and into the Yahoo map. Doing them in
+    that order means one week's lag rather than three.
+    """
+    from puckpilot.data.nhl import NhlClient
+    from puckpilot.data.sync import sync_current_rosters
+    from puckpilot.season import cli_support
+    from puckpilot.yahoo import playermap
+
+    lines = []
+    rosters = sync_current_rosters(conn, NhlClient(), season, progress=lambda _m: None)
+    lines.append(
+        f"NHL rosters: {rosters.get('new', 0)} new player(s), {rosters.get('changed', 0)} re-teamed"
+    )
+
+    again = playermap.reresolve_unmatched(conn)
+    lines.append(f"re-resolved {again.matched}/{again.total} previously unmapped")
+
+    age = _map_age(conn, league_key)
+    if age is None or age >= MAP_REFRESH_DAYS:
+        built = cli_support.run_session(
+            manager, lambda s: playermap.build_map(conn, s, league_key, limit=900)
+        )
+        lines.append(f"player map rebuilt: {built.matched}/{built.total} matched")
+    else:
+        lines.append(f"player map {age:.1f} days old, still fresh")
+    report.add("upkeep", True, "player map and rosters", lines)
+
+
+def _map_age(conn, league_key: str) -> float | None:
+    row = conn.execute(
+        "SELECT MAX(updated_at) FROM yahoo_player_map WHERE league_key = ?", (league_key,)
+    ).fetchone()
+    return _age_days(row[0]) if row and row[0] else None
+
+
 def _refresh_runtime(conn, manager, league_key, runtime, report):
     """Re-read the league settings when the cache has aged."""
     from puckpilot.season import cli_support
@@ -249,17 +294,6 @@ def _refresh_runtime(conn, manager, league_key, runtime, report):
         f"refreshed - week {got.current_week}, {len(got.weeks)} week(s) known",
     )
     return got
-
-
-def _age_days(stamp: str) -> float | None:
-    from datetime import datetime
-
-    try:
-        when = datetime.fromisoformat((stamp or "").replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
-    return (now - when).total_seconds() / 86400.0
 
 
 def _weekly(conn, manager, league_key, runtime, day, propose, report):
@@ -289,6 +323,8 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report):
         )
         fa = pool.fetch_pool(session, league_key, "FA", limit=150, player_map=pmap)
         return m, ours, theirs, fa
+
+    _guard(report, "upkeep", lambda: _upkeep(conn, manager, league_key, season, report))
 
     got = cli_support.run_session(manager, _read)
     if got is None:

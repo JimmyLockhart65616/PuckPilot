@@ -449,7 +449,9 @@ def sync_day(
     up however many games he is behind.
     """
     boxes = sync_boxscores(conn, nhl, [season], delay=delay, today=today, progress=progress)
-    fetched = boxes.get(season, {}).get("fetched", 0)
+    # sync_boxscores calls it "synced"; reading a key it never sets reported 0
+    # boxscores on a run that fetched three, in the log a person is meant to trust.
+    fetched = boxes.get(season, {}).get("synced", 0)
 
     behind = players_behind_their_boxscores(conn, season, limit=max_players)
     progress(f"  {season}: {len(behind)} player(s) with logs behind their boxscores")

@@ -211,3 +211,38 @@ def test_the_report_is_ready_on_warnings_alone():
     rep = pf.SeasonPreflightReport(checks=[pf.Check("x", WARN, "meh"), pf.Check("y", PASS, "ok")])
     assert not rep.failed
     assert "READY" in rep.text
+
+
+# -- how old is that, really ------------------------------------------------
+
+
+def test_a_naive_timestamp_is_read_as_utc_not_local():
+    """The schema defaults to SQLite's `datetime('now')`, which is UTC. Reading
+    it as local time made a map written minutes ago report "-0.2 days old"."""
+    from datetime import UTC, datetime, timedelta
+
+    from puckpilot.season.preflight import age_days
+
+    just_now = datetime.now(UTC).replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
+    assert age_days(just_now) is not None
+    assert -0.01 < age_days(just_now) < 0.01
+
+    a_week = (datetime.now(UTC) - timedelta(days=7)).replace(tzinfo=None).isoformat(sep=" ")
+    assert 6.9 < age_days(a_week) < 7.1
+
+
+def test_an_offset_aware_timestamp_is_respected():
+    from datetime import UTC, datetime, timedelta
+
+    from puckpilot.season.preflight import age_days
+
+    stamp = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+    assert 1.9 < age_days(stamp) < 2.1
+
+
+def test_an_unreadable_timestamp_is_none_rather_than_a_crash():
+    from puckpilot.season.preflight import age_days
+
+    assert age_days("not a date") is None
+    assert age_days("") is None
+    assert age_days(None) is None

@@ -131,10 +131,3 @@ def test_an_aged_settings_cache_is_due_a_refresh():
 
     old = (datetime.now() - timedelta(days=9)).isoformat()
     assert _age_days(old) > RUNTIME_REFRESH_DAYS
-
-
-def test_an_unparseable_timestamp_does_not_crash_the_run():
-    from puckpilot.season.run import _age_days
-
-    assert _age_days("not a date") is None
-    assert _age_days("") is None

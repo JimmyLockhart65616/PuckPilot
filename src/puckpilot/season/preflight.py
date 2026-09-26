@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
 
@@ -58,15 +58,25 @@ class SeasonPreflightReport:
         return "\n".join(out)
 
 
-def _age_days(stamp: str) -> float | None:
-    for parse in (datetime.fromisoformat,):
-        try:
-            when = parse(stamp.replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
-            continue
-        now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
-        return (now - when).total_seconds() / 86400.0
-    return None
+def age_days(stamp: str) -> float | None:
+    """How long ago a stored timestamp was written, in days.
+
+    Naive stamps are treated as UTC, because that is what they are: the schema
+    defaults to SQLite's `datetime('now')`. Reading them as local time made a
+    map written minutes ago report as "-0.2 days old", which is the kind of
+    number that makes a person stop believing the rest of the line.
+    """
+    try:
+        when = datetime.fromisoformat((stamp or "").replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - when).total_seconds() / 86400.0
+
+
+# Kept for the checks below, which read better with the short name.
+_age_days = age_days
 
 
 # -- the checks -------------------------------------------------------------
