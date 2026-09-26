@@ -28,6 +28,11 @@ from datetime import datetime
 
 from puckpilot.season import proposals as proposals_mod
 
+# The league's own settings carry the week calendar and which week it is now.
+# They change rarely, but a cache that never refreshes goes wrong silently:
+# `current_week` simply stops advancing while everything still looks healthy.
+RUNTIME_REFRESH_DAYS = 3.0
+
 
 @dataclass
 class Step:
@@ -100,8 +105,15 @@ def run_day(
     from puckpilot.yahoo import playermap
 
     report = RunReport(date=day, manager=manager.name)
-    season = runtime.nhl_season
     page_key = manager.page.owner_key or _env_key()
+
+    # 0. Keep the league's own rules current. Cheap, and the alternative is a
+    # week calendar that quietly stops advancing.
+    refreshed = _guard(
+        report, "settings", lambda: _refresh_runtime(conn, manager, league_key, runtime, report)
+    )
+    runtime = refreshed or runtime
+    season = runtime.nhl_season
 
     # 1. Last night's games, so recent form and the goalie model are current.
     if do_sync:
@@ -220,6 +232,36 @@ def run_day(
     return report
 
 
+def _refresh_runtime(conn, manager, league_key, runtime, report):
+    """Re-read the league settings when the cache has aged."""
+    from puckpilot.season import cli_support
+    from puckpilot.season.fetch import fetch_runtime, save_runtime
+
+    age = _age_days(runtime.fetched_at)
+    if age is not None and age < RUNTIME_REFRESH_DAYS:
+        report.add("settings", True, f"cached {age:.1f} days ago, still fresh")
+        return runtime
+    got = cli_support.run_session(manager, lambda s: fetch_runtime(s, league_key, manager.team_key))
+    save_runtime(conn, got)
+    report.add(
+        "settings",
+        True,
+        f"refreshed - week {got.current_week}, {len(got.weeks)} week(s) known",
+    )
+    return got
+
+
+def _age_days(stamp: str) -> float | None:
+    from datetime import datetime
+
+    try:
+        when = datetime.fromisoformat((stamp or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    now = datetime.now(when.tzinfo) if when.tzinfo else datetime.now()
+    return (now - when).total_seconds() / 86400.0
+
+
 def _weekly(conn, manager, league_key, runtime, day, propose, report):
     from puckpilot.draft.sim import build_universe
     from puckpilot.season import cli_support, explain, pool
@@ -227,7 +269,7 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report):
     from puckpilot.season import week as weekmod
     from puckpilot.season.fetch import fetch_matchups, fetch_roster
     from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
-    from puckpilot.season.matchups import for_date
+    from puckpilot.season.matchups import current_or_next
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
 
@@ -236,7 +278,7 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report):
 
     def _read(session):
         team_key = manager.team_key
-        m = for_date(fetch_matchups(session, team_key), day)
+        m = current_or_next(fetch_matchups(session, team_key), day)
         if m is None:
             return None
         ours = fetch_roster(session, team_key, m.start, player_map=pmap)
@@ -250,7 +292,7 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report):
 
     got = cli_support.run_session(manager, _read)
     if got is None:
-        report.add("week", False, f"no matchup covering {day}")
+        report.add("week", False, f"no matchup covering {day} and none after it")
         return None
     m, ours, theirs, fa = got
     pool.save_pool(conn, league_key, m.start, fa)

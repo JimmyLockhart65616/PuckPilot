@@ -173,12 +173,24 @@ def save(conn: sqlite3.Connection, p: WeekProtocol) -> WeekProtocol:
     A week has one plan. Re-deriving it on Wednesday should refresh Monday's
     proposal rather than stack another beside it - but never overwrite one that
     has been approved, because the lineup has been acting on that.
+
+    And while the decision is unchanged the row keeps its id, margins refreshed
+    in place. A scheduled job re-derives this several times a day; replacing the
+    row each time would leave whoever is looking at the page holding an Approve
+    button for something that no longer exists.
     """
     live = load(conn, p.manager, p.league_key, p.week)
     if live and live.status == APPROVED:
         raise ProtocolError(
             f"week {p.week} already has an approved protocol; reject it first to replace it"
         )
+    if live and live.status == PROPOSED and _same_decision(live, p):
+        conn.execute(
+            "UPDATE week_protocols SET stances_json = ?, opponent = ? WHERE id = ?",
+            (_stances_json(p), p.opponent, live.id),
+        )
+        conn.commit()
+        return load_by_id(conn, live.id)
     conn.execute(
         "DELETE FROM week_protocols WHERE manager = ? AND league_key = ? AND week = ? "
         "AND status = ?",
@@ -194,12 +206,24 @@ def save(conn: sqlite3.Connection, p: WeekProtocol) -> WeekProtocol:
             p.team_key,
             p.week,
             p.opponent,
-            json.dumps([[s.category.key, s.stance, s.margin, s.relative] for s in p.stances]),
+            _stances_json(p),
             p.status,
         ),
     )
     conn.commit()
     return load_by_id(conn, int(cur.lastrowid))
+
+
+def _stances_json(p: WeekProtocol) -> str:
+    return json.dumps([[s.category.key, s.stance, s.margin, s.relative] for s in p.stances])
+
+
+def _same_decision(a: WeekProtocol, b: WeekProtocol) -> bool:
+    """Same categories chased and conceded. Margins drift every run; the
+    decision is what a person agreed to."""
+    return {(s.category.key, s.stance) for s in a.stances} == {
+        (s.category.key, s.stance) for s in b.stances
+    }
 
 
 def _row(r: sqlite3.Row) -> WeekProtocol:

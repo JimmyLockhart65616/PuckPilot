@@ -122,3 +122,16 @@ def for_week(matchups: list[Matchup], week: int) -> Matchup | None:
 
 def for_date(matchups: list[Matchup], day: str) -> Matchup | None:
     return next((m for m in matchups if m.contains(day)), None)
+
+
+def current_or_next(matchups: list[Matchup], day: str) -> Matchup | None:
+    """The week `day` falls in, or the next one to start.
+
+    Between seasons, and in the days before one opens, there is no current
+    week - and "what is the plan for the week coming" is the most reasonable
+    question anyone asks then.
+    """
+    now = for_date(matchups, day)
+    if now is not None:
+        return now
+    return next((m for m in matchups if m.start >= day), None)

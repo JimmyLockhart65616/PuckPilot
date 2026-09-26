@@ -1477,7 +1477,10 @@ def _cmd_season_run(args: argparse.Namespace) -> int:
     except (ManagerError, cli_support.SeasonCliError) as e:
         return cli_support.report(e)
 
-    day = args.date or runtime.current_date or cli_support.today_str()
+    # Today, not `runtime.current_date` - that is a cached field, so a job
+    # running on a settings snapshot from last week would quietly plan last
+    # week's day and look entirely healthy doing it.
+    day = args.date or cli_support.today_str()
     lines: list[str] = []
 
     def say(text):
@@ -1543,7 +1546,7 @@ def _cmd_season_preflight(args: argparse.Namespace) -> int:
 
     runtime = load_runtime(conn, league_key)
     report.checks.append(pf.check_runtime(runtime))
-    day = args.date or (runtime.current_date if runtime else None) or cli_support.today_str()
+    day = args.date or cli_support.today_str()
     report.checks.append(pf.check_calendar(runtime, day))
     report.checks.append(pf.check_player_map(conn, league_key))
 
@@ -1671,7 +1674,7 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
     from puckpilot.season.fetch import fetch_matchups, fetch_roster, save_pool_if_any
     from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
     from puckpilot.season.manager import ManagerError
-    from puckpilot.season.matchups import for_date, for_week
+    from puckpilot.season.matchups import current_or_next, for_week
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
 
@@ -1679,17 +1682,17 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         manager, conn, league_key, _ = _season_setup(args)
         runtime = cli_support.load_rules(conn, league_key)
         pmap = playermap.load_map(conn, league_key)
-        today = args.date or runtime.current_date or cli_support.today_str()
+        today = args.date or cli_support.today_str()
 
         def _read(session):
             team_key = manager.team_key or runtime.league_key
             matchups = fetch_matchups(session, team_key)
-            m = for_week(matchups, args.week) if args.week else for_date(matchups, today)
+            m = for_week(matchups, args.week) if args.week else current_or_next(matchups, today)
             if m is None:
                 m = for_week(matchups, runtime.current_week)
             if m is None:
                 raise cli_support.SeasonCliError(
-                    f"no matchup covering {today}; the season may be over."
+                    f"no matchup covering {today} and none after it; the season is over."
                 )
             ours = fetch_roster(session, team_key, m.start, player_map=pmap)
             theirs = (

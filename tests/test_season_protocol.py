@@ -152,3 +152,36 @@ def test_stances_survive_a_round_trip(db):
 def test_a_missing_protocol_is_an_error_not_none(db):
     with pytest.raises(ProtocolError, match="no protocol"):
         protocol.load_by_id(db, 999)
+
+
+# -- a scheduled job re-derives this several times a day --------------------
+
+
+def test_an_unchanged_decision_keeps_its_id(db):
+    """Replacing the row each run leaves whoever is looking at the page holding
+    an Approve button for something that no longer exists."""
+    # Both of these sit inside the close band, so the decision is "chase" each
+    # time even though the numbers moved.
+    first = protocol.save(db, derive(outlook("PPP", 8.5, 7.7, add_room=5.0)))
+    again = protocol.save(db, derive(outlook("PPP", 8.4, 7.8, add_room=5.0)))
+    assert first.stances[0].stance == again.stances[0].stance == CHASE
+    assert again.id == first.id
+    assert len(protocol.listing(db, "jimmy", "999.l.1")) == 1
+
+
+def test_refreshed_margins_are_kept_even_when_the_id_is(db):
+    first = protocol.save(db, derive(outlook("PPP", 8.5, 7.7, add_room=5.0)))
+    again = protocol.save(db, derive(outlook("PPP", 8.4, 7.8, add_room=5.0)))
+    assert again.id == first.id
+    assert again.stances[0].margin != first.stances[0].margin
+
+
+def test_a_changed_decision_replaces_the_proposal(db):
+    """Going from chasing a category to conceding it is a different thing to
+    agree to, so it gets a new row."""
+    first = protocol.save(db, derive(outlook("HIT", 41.0, 42.0, add_room=5.0)))
+    assert first.stances[0].stance == CHASE
+    second = protocol.save(db, derive(outlook("HIT", 41.0, 60.0, add_room=1.0)))
+    assert second.stances[0].stance == CONCEDE
+    assert second.id != first.id
+    assert len(protocol.listing(db, "jimmy", "999.l.1")) == 1

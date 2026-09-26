@@ -109,3 +109,32 @@ def test_the_preview_says_nothing_is_written_to_yahoo():
 def test_custom_times_are_honoured():
     items = schedule.tasks("jimmy", Path("."), times=("07:30",))
     assert len(items) == 1 and items[0].time == "07:30"
+
+
+# -- staleness, which is how a scheduled job goes wrong quietly -------------
+
+
+def test_a_fresh_settings_cache_is_left_alone():
+    from datetime import datetime, timedelta
+
+    from puckpilot.season.run import RUNTIME_REFRESH_DAYS, _age_days
+
+    recent = (datetime.now() - timedelta(hours=6)).isoformat()
+    assert _age_days(recent) < RUNTIME_REFRESH_DAYS
+
+
+def test_an_aged_settings_cache_is_due_a_refresh():
+    """`current_week` simply stops advancing while everything looks healthy."""
+    from datetime import datetime, timedelta
+
+    from puckpilot.season.run import RUNTIME_REFRESH_DAYS, _age_days
+
+    old = (datetime.now() - timedelta(days=9)).isoformat()
+    assert _age_days(old) > RUNTIME_REFRESH_DAYS
+
+
+def test_an_unparseable_timestamp_does_not_crash_the_run():
+    from puckpilot.season.run import _age_days
+
+    assert _age_days("not a date") is None
+    assert _age_days("") is None

@@ -174,3 +174,31 @@ def test_a_matchup_without_dates_is_skipped_not_fatal():
 
 def test_a_payload_that_is_not_a_team_gives_nothing():
     assert parse_matchups({"fantasy_content": {"league": []}}) == []
+
+
+def test_before_the_season_starts_it_looks_at_the_week_coming():
+    """There is no current week in the days before one opens, and "what is the
+    plan for the week coming" is the reasonable question then."""
+    from puckpilot.season.matchups import current_or_next
+
+    ms = parse_matchups(
+        matchup_payload(
+            (1, "2026-09-29", "2026-10-04", ("t.2", "A")),
+            (2, "2026-10-05", "2026-10-11", ("t.3", "B")),
+        ),
+        our_team_key="999.l.1.t.5",
+    )
+    assert current_or_next(ms, "2026-09-25").week == 1
+    assert current_or_next(ms, "2026-10-01").week == 1  # inside a week, that week wins
+    assert current_or_next(ms, "2026-10-04").week == 1
+    assert current_or_next(ms, "2026-10-05").week == 2
+
+
+def test_after_the_last_week_there_is_nothing_to_look_forward_to():
+    from puckpilot.season.matchups import current_or_next
+
+    ms = parse_matchups(
+        matchup_payload((1, "2026-09-29", "2026-10-04", ("t.2", "A"))),
+        our_team_key="999.l.1.t.5",
+    )
+    assert current_or_next(ms, "2027-06-01") is None
