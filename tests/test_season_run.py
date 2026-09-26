@@ -76,10 +76,27 @@ def test_every_task_runs_the_same_idempotent_command():
     assert "--manager jimmy" in items[0].command
 
 
-def test_there_is_more_than_one_run_a_day():
-    """A player locks when his own game starts, so a Saturday matinee locks at
-    one o'clock. A single evening run is too late for every afternoon game."""
-    assert len(schedule.tasks("jimmy", Path("."))) >= 3
+def test_the_fixed_schedule_is_only_an_anchor():
+    """Coverage comes from lock-timed one-shots, not from guessing times. The
+    anchor exists to start that chain: exactly one game day in 185 begins
+    before 11:00."""
+    assert schedule.DEFAULT_TIMES == ("11:00",)
+    assert len(schedule.tasks("jimmy", Path("."))) == 1
+
+
+def test_lock_runs_are_one_shot_and_separately_named():
+    """Daily tasks would fire at yesterday's game times forever."""
+    items = schedule.lock_tasks("jimmy", Path("."), ["12:40", "19:40"])
+    assert [t.time for t in items] == ["12:40", "19:40"]
+    assert all(schedule.LOCK_TAG in t.name for t in items)
+    assert "ONCE" in items[0].create_args(once=True)
+    assert "DAILY" in items[0].create_args()
+
+
+def test_a_lock_run_does_the_same_work_as_the_anchor():
+    anchor = schedule.tasks("jimmy", Path("C:/repo/puckpilot"))[0]
+    lock = schedule.lock_tasks("jimmy", Path("C:/repo/puckpilot"), ["12:40"])[0]
+    assert anchor.command == lock.command
 
 
 def test_task_names_are_recognisable_and_unique():
@@ -131,3 +148,105 @@ def test_an_aged_settings_cache_is_due_a_refresh():
 
     old = (datetime.now() - timedelta(days=9)).isoformat()
     assert _age_days(old) > RUNTIME_REFRESH_DAYS
+
+
+# -- when the slots actually close ------------------------------------------
+
+
+def _sched(db, day="2026-10-04"):
+    from puckpilot.data import store
+
+    games = [
+        (1, "2026-10-04T17:00:00Z", "DET", "TOR"),  # 1pm local
+        (2, "2026-10-04T22:00:00Z", "NYR", "MTL"),  # 6pm local
+        (3, "2026-10-05T00:00:00Z", "ANA", "CGY"),  # 8pm local
+        (4, "2026-10-04T23:00:00Z", "BOS", "BUF"),  # 7pm, nobody of ours
+    ]
+    for gid, utc, home, away in games:
+        store.upsert_schedule_game(
+            db,
+            game_id=gid,
+            season="20262027",
+            game_type=2,
+            game_date=day,
+            start_time_utc=utc,
+            home_team=home,
+            away_team=away,
+        )
+    for name, team in (("Raymond", "DET"), ("Miller", "NYR"), ("Dostal", "ANA")):
+        db.execute(
+            "INSERT INTO yahoo_roster_snapshots (manager, league_key, team_key, date, "
+            "player_key, name, team_abbrev, selected_slot) VALUES "
+            "('jimmy','l','t',?,?,?,?,'BN')",
+            (day, f"p.{name}", name, team),
+        )
+    db.commit()
+    return db
+
+
+def test_each_distinct_game_time_is_its_own_lock(db):
+    from puckpilot.season import locks
+
+    _sched(db)
+    teams = locks.roster_teams(db, "jimmy")
+    got = locks.locks_for(db, "20262027", "2026-10-04", teams)
+    assert [x.hhmm for x in got] == ["13:00", "18:00", "20:00"]
+
+
+def test_a_game_with_none_of_your_players_is_not_a_lock(db):
+    """A 7pm Boston game is irrelevant if you own nobody in it, and the
+    difference is how many times a browser launches on a Saturday."""
+    from puckpilot.season import locks
+
+    _sched(db)
+    teams = locks.roster_teams(db, "jimmy")
+    got = locks.locks_for(db, "20262027", "2026-10-04", teams)
+    assert all("BOS" not in x.teams and "BUF" not in x.teams for x in got)
+
+
+def test_a_lock_names_the_players_it_closes(db):
+    from puckpilot.season import locks
+
+    _sched(db)
+    teams = locks.roster_teams(db, "jimmy")
+    first = locks.locks_for(db, "20262027", "2026-10-04", teams)[0]
+    assert first.players == ("Raymond",)
+    assert "1:00 PM" in first.describe()
+
+
+def test_runs_are_scheduled_before_the_lock_not_on_it(db):
+    from puckpilot.season import locks
+
+    _sched(db)
+    teams = locks.roster_teams(db, "jimmy")
+    got = locks.locks_for(db, "20262027", "2026-10-04", teams)
+    assert locks.run_times(got) == ["12:40", "17:40", "19:40"]
+
+
+def test_locks_already_past_are_not_worth_running_before(db):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from puckpilot.season import locks
+
+    _sched(db)
+    teams = locks.roster_teams(db, "jimmy")
+    got = locks.locks_for(db, "20262027", "2026-10-04", teams)
+    evening = datetime(2026, 10, 4, 19, 0, tzinfo=ZoneInfo("America/Toronto"))
+    assert [x.hhmm for x in locks.upcoming(got, now=evening)] == ["20:00"]
+
+
+def test_a_day_with_none_of_your_players_playing_says_so(db):
+    from puckpilot.season import locks
+
+    _sched(db)
+    teams = locks.roster_teams(db, "jimmy")
+    got = locks.locks_for(db, "20262027", "2026-12-25", teams)
+    assert got == []
+    assert "none of your players have a game" in locks.describe("2026-12-25", got)
+
+
+def test_planning_with_no_roster_snapshot_is_empty_not_a_crash(db):
+    from puckpilot.season import locks
+
+    assert locks.roster_teams(db, "nobody") == {}

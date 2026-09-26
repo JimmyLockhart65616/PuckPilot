@@ -100,6 +100,7 @@ def run_day(
     weekly: bool | None = None,
     do_sync: bool = True,
     propose: bool = True,
+    reschedule: bool = True,
     say=print,
 ) -> RunReport:
     """Everything a day needs, in the order it needs it."""
@@ -234,8 +235,42 @@ def run_day(
 
         _guard(report, "page", _push)
 
+    # 6. Line up the rest of today against the real game times.
+    if reschedule:
+        _guard(report, "schedule", lambda: _plan_rest_of_day(conn, manager, runtime, day, report))
+
     say(report.text)
     return report
+
+
+def _plan_rest_of_day(conn, manager, runtime, day, report):
+    """Register a run shortly before each lock still to come today.
+
+    Done on every run rather than once in the morning, so a game that moves, a
+    roster that changes, or a missed run all self-correct at the next one.
+    """
+    from datetime import date as _date
+
+    from puckpilot.config import REPO_ROOT
+    from puckpilot.season import locks, schedule
+
+    if day != _date.today().isoformat():
+        report.add("schedule", True, f"not planning {day}; only today is schedulable")
+        return
+    teams = locks.roster_teams(conn, manager.name)
+    if not teams:
+        report.add("schedule", True, "no roster snapshot yet, so nothing to plan against")
+        return
+    todays = locks.locks_for(conn, runtime.nhl_season, day, teams)
+    ahead = locks.upcoming(todays)
+    times = locks.run_times(ahead)
+    lines = schedule.plan_day(manager.name, REPO_ROOT, times)
+    detail = (
+        f"{len(ahead)} lock(s) left today: " + ", ".join(x.pretty for x in ahead)
+        if ahead
+        else "no locks left today"
+    )
+    report.add("schedule", True, detail, lines)
 
 
 def _upkeep(conn, manager, league_key, season, report):

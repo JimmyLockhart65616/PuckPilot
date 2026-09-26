@@ -25,10 +25,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PREFIX = "PuckPilot"
+LOCK_TAG = "lock"
 
-# Local times. The last is the one that matters most nights; the first two are
-# for matinees and for leaving a person time to disagree.
-DEFAULT_TIMES = ("11:00", "15:30", "18:45")
+# The one fixed run. Everything else is planned from the schedule, because a
+# player locks when his own game starts and 41% of game days have a game before
+# 18:45 - so any fixed evening time is too late two days in five. This anchor
+# exists to start that chain: exactly one game day in 185 begins before 11:00.
+ANCHOR_TIMES = ("11:00",)
+DEFAULT_TIMES = ANCHOR_TIMES
 
 
 @dataclass(frozen=True)
@@ -37,7 +41,9 @@ class Task:
     time: str
     command: str
 
-    def create_args(self) -> list[str]:
+    def create_args(self, once: bool = False) -> list[str]:
+        # ONCE with no /SD means today, which is the only day a lock-timed run
+        # is ever wanted - they are re-planned every run.
         return [
             "schtasks",
             "/Create",
@@ -46,7 +52,7 @@ class Task:
             "/TR",
             self.command,
             "/SC",
-            "DAILY",
+            "ONCE" if once else "DAILY",
             "/ST",
             self.time,
             "/F",
@@ -60,11 +66,14 @@ def _python() -> str:
     return str(Path(sys.executable).resolve())
 
 
+LOG = "data/logs/season.log"
+
+
 def tasks(
     manager: str,
     repo: Path,
     times: tuple[str, ...] = DEFAULT_TIMES,
-    log: str = "data/logs/season.log",
+    log: str = LOG,
 ) -> list[Task]:
     """One task per run time, all running the same idempotent command."""
     py = _python()
@@ -76,6 +85,51 @@ def tasks(
         )
         out.append(Task(name=f"{PREFIX}-{manager}-{t.replace(':', '')}", time=t, command=cmd))
     return out
+
+
+def lock_tasks(manager: str, repo: Path, times: list[str], log: str = LOG) -> list[Task]:
+    """One-shot runs, each timed to land shortly before a lock."""
+    py = _python()
+    cmd = (
+        f'cmd /c cd /d "{repo}" && "{py}" -m puckpilot.cli season run '
+        f"--manager {manager} --log {log}"
+    )
+    return [
+        Task(name=f"{PREFIX}-{manager}-{LOCK_TAG}-{t.replace(':', '')}", time=t, command=cmd)
+        for t in times
+    ]
+
+
+def plan_day(manager: str, repo: Path, times: list[str], log: str = LOG) -> list[str]:
+    """Replace today's one-shot runs with the ones the schedule now implies.
+
+    Cleared and rebuilt rather than reconciled: a game can be rescheduled, and
+    a stale task that fires at yesterday's time is a browser launching for no
+    reason at an hour nobody is watching.
+    """
+    out = [f"cleared {n}" for n in _clear_locks(manager)]
+    for t in lock_tasks(manager, repo, times, log):
+        r = subprocess.run(t.create_args(once=True), capture_output=True, text=True)
+        ok = r.returncode == 0
+        out.append(
+            f"{'scheduled' if ok else 'FAILED'} a run at {t.time}"
+            + ("" if ok else f" - {(r.stderr or r.stdout).strip()[:100]}")
+        )
+    if not times:
+        out.append("no further locks today - nothing more to run")
+    return out
+
+
+def _clear_locks(manager: str) -> list[str]:
+    tag = f"{PREFIX}-{manager}-{LOCK_TAG}-"
+    gone = []
+    for name in installed():
+        if name.startswith(tag):
+            subprocess.run(
+                ["schtasks", "/Delete", "/TN", name, "/F"], capture_output=True, text=True
+            )
+            gone.append(name)
+    return gone
 
 
 def describe(items: list[Task], key_set: bool) -> str:
@@ -93,6 +147,10 @@ def describe(items: list[Task], key_set: bool) -> str:
         "The command syncs last night's games, collects anything you decided on the",
         "page, works out tonight's lineup, and on the first day of a fantasy week",
         "works out the week and proposes adds. Nothing is written to Yahoo.",
+        "",
+        "Each run also schedules the rest of today from the real game times - a",
+        "player locks when his own game starts, so a 1pm matinee needs a run before",
+        "lunch and a 10pm west-coast game needs one at 9:40.",
     ]
     if not key_set:
         lines += [
@@ -117,12 +175,24 @@ def install(items: list[Task]) -> list[str]:
     return out
 
 
-def remove(items: list[Task]) -> list[str]:
+def remove(manager: str) -> list[str]:
+    """Take away every task for this manager, whatever time it runs at.
+
+    Deliberately by prefix rather than by the times currently configured:
+    removing only what today's defaults happen to name is how the run times of
+    an older version get orphaned, firing on a schedule nobody remembers
+    setting. That happened once already.
+    """
+    tag = f"{PREFIX}-{manager}-"
     out = []
-    for t in items:
-        r = subprocess.run(t.delete_args(), capture_output=True, text=True)
-        out.append(f"{'removed' if r.returncode == 0 else 'not found'} {t.name}")
-    return out
+    for name in installed():
+        if not name.startswith(tag):
+            continue
+        r = subprocess.run(
+            ["schtasks", "/Delete", "/TN", name, "/F"], capture_output=True, text=True
+        )
+        out.append(f"{'removed' if r.returncode == 0 else 'could not remove'} {name}")
+    return out or ["nothing registered for " + manager]
 
 
 def installed() -> list[str]:

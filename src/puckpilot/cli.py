@@ -1425,6 +1425,35 @@ def _season_publish(
         print(f"  page not updated: {e}")
 
 
+def _cmd_season_locks(args: argparse.Namespace) -> int:
+    """When today's slots actually close, and by when a run has to happen."""
+    from puckpilot.season import cli_support, locks
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    day = args.date or cli_support.today_str()
+    teams = locks.roster_teams(conn, manager.name)
+    if not teams:
+        print("No roster snapshot yet - run `ppilot season roster` first.")
+        return 2
+    todays = locks.locks_for(conn, runtime.nhl_season, day, teams)
+    print(locks.describe(day, todays))
+    ahead = locks.upcoming(todays)
+    if day == cli_support.today_str():
+        print()
+        if ahead:
+            print("  Still to come: " + ", ".join(x.pretty for x in ahead))
+            print("  Runs would be scheduled at: " + ", ".join(locks.run_times(ahead)))
+        else:
+            print("  Everything of yours has locked for today.")
+    return 0
+
+
 def _cmd_season_schedule(args: argparse.Namespace) -> int:
     """Register (or show, or remove) the daily runs."""
     import os
@@ -1447,7 +1476,7 @@ def _cmd_season_schedule(args: argparse.Namespace) -> int:
         print()
 
     if args.remove:
-        for line in schedule.remove(items):
+        for line in schedule.remove(manager.name):
             print(line)
         return 0
 
@@ -1495,6 +1524,7 @@ def _cmd_season_run(args: argparse.Namespace) -> int:
         day,
         weekly=True if args.weekly else (False if args.no_weekly else None),
         do_sync=not args.no_sync,
+        reschedule=not args.no_reschedule,
         say=say,
     )
     if args.log:
@@ -2392,6 +2422,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s_run.add_argument("--no-sync", action="store_true", help="Skip the data catch-up")
     s_run.add_argument(
+        "--no-reschedule",
+        action="store_true",
+        help="Do not re-plan today's lock-timed runs",
+    )
+    s_run.add_argument(
         "--log", default="data/logs/season.log", metavar="PATH", help="Append the run to this file"
     )
     s_run.set_defaults(func=_cmd_season_run)
@@ -2408,6 +2443,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Local times to run at",
     )
     s_sched.set_defaults(func=_cmd_season_schedule)
+
+    s_locks = season_sub.add_parser(
+        "locks", parents=[seasonal], help="When today's slots close, player by player"
+    )
+    s_locks.set_defaults(func=_cmd_season_locks)
 
     s_week = season_sub.add_parser(
         "week", parents=[seasonal], help="This week's category plan and add targets"
