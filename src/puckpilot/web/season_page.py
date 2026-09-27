@@ -193,6 +193,9 @@ function renderWeek(root, w) {
   if (!w || !w.cats || !w.cats.length) return;
   h2(root, 'Week ' + (w.week || '') + (w.opponent ? ' vs ' + w.opponent : ''));
   var c = card(root);
+  if (w.expected !== undefined && w.expected !== null) {
+    c.appendChild(el('div', null, 'Expect ' + w.expected + ' of ' + w.of + ' categories'));
+  }
   var gl = w.games_left;
   if (gl && gl.ours !== undefined) {
     var bits = ['Starts left: you ' + gl.ours + ', them ' + gl.theirs];
@@ -201,11 +204,13 @@ function renderWeek(root, w) {
   }
   // Once the week has begun, what is banked sits beside where it should end.
   var live = w.cats.some(function (r) { return r.now_ours !== undefined && r.now_ours !== null; });
+  var odds = w.cats.some(function (r) { return r.chance !== undefined && r.chance !== null; });
   var t = el('table');
   var head = el('tr');
-  (live ? ['cat', 'now', 'final', ''] : ['cat', 'you', 'them', '']).forEach(function (x) {
-    head.appendChild(el('th', null, x));
-  });
+  var cols = live ? ['cat', 'now', 'final'] : ['cat', 'you', 'them'];
+  if (odds) cols.push('win');
+  cols.push('');
+  cols.forEach(function (x) { head.appendChild(el('th', null, x)); });
   t.appendChild(head);
   w.cats.forEach(function (row) {
     var tr = el('tr');
@@ -216,6 +221,10 @@ function renderWeek(root, w) {
     } else {
       tr.appendChild(el('td', null, row.ours));
       tr.appendChild(el('td', null, row.theirs));
+    }
+    if (odds) {
+      var ch = row.chance === undefined || row.chance === null ? '–' : row.chance + '%';
+      tr.appendChild(el('td', null, ch));
     }
     var hot = row.state === 'in play' || row.state === 'close';
     tr.appendChild(el('td', hot ? 'close' : 'muted', row.state));

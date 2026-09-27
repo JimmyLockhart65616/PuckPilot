@@ -156,3 +156,23 @@ def test_a_dead_source_degrades_to_the_floor_not_to_an_empty_lineup():
 
     chained = ChainedGoalieSource(Broken(), StaticGoalieSource({"d": {1: 0.6}}))
     assert chained.starts("d") == {1: 0.6}
+
+
+def test_a_frozen_source_does_not_see_games_after_its_cutoff(db):
+    """Replay only: asked on Wednesday about Saturday, the trailing model would
+    count Thursday's start. Frozen at Wednesday, it cannot."""
+    from puckpilot.season.goalies import AsOfGoalieSource
+
+    add_player(db, 1, "A", "G")
+    add_player(db, 2, "B", "G")
+    sched(db, 100, "2026-10-05", "TOR", "MTL")
+    started(db, 1, 100, "2026-10-05", "TOR")
+    sched(db, 101, "2026-10-08", "TOR", "OTT")
+    started(db, 2, 101, "2026-10-08", "TOR")  # Thursday: after the cutoff
+    sched(db, 102, "2026-10-10", "TOR", "BOS")
+    db.commit()
+    src = TrailingStartShareSource(db, SEASON)
+    assert src.starts("2026-10-10") != {1: 1.0}  # unfrozen: Thursday counts
+    frozen = AsOfGoalieSource(src, "2026-10-07")
+    assert frozen.starts("2026-10-10") == {1: 1.0}
+    assert frozen.starts("2026-10-09") == {}  # TOR do not play that day

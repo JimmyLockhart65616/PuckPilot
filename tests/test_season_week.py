@@ -590,3 +590,43 @@ def test_reachable_uses_the_odds_when_the_spread_is_known():
     near = _odds("SOG", 50.0, 53.0, sd=2.0, lineup_room=0.0, add_room=2.5)
     far = _odds("SOG", 40.0, 53.0, sd=2.0, lineup_room=0.0, add_room=2.5)
     assert near.reachable and not far.reachable
+
+
+def test_the_plan_carries_calibrated_odds_and_bands_by_them(db):
+    from puckpilot.season.odds import OddsModel
+
+    p = _live_week(
+        db,
+        banked_ours={"G": 6.0},
+        banked_theirs={"G": 1.0},
+        from_day="2026-10-08",
+        odds_model=OddsModel(p_play=1.0),
+    )
+    g = p.outlook[0]
+    assert g.p_win is not None and g.p_win > 0.95  # +5 with a day left
+    assert g.band == "likely"
+    assert p.expected == pytest.approx(g.expected)
+
+
+def test_without_an_odds_model_nothing_claims_a_probability(db):
+    p = _live_week(db, banked_ours={"G": 6.0}, banked_theirs={"G": 1.0}, from_day="2026-10-08")
+    assert p.odds is None and p.expected is None and p.outlook[0].p_win is None
+
+
+def test_every_run_logs_what_the_odds_said(db):
+    import json
+
+    from puckpilot.season.odds import OddsModel, log_week
+
+    p = _live_week(
+        db,
+        banked_ours={"G": 3.0},
+        banked_theirs={"G": 1.0},
+        from_day="2026-10-07",
+        odds_model=OddsModel(p_play=1.0),
+    )
+    assert log_week(db, "jimmy", "l", "t.5", p, "2026-10-07")
+    row = db.execute("SELECT * FROM week_odds_log").fetchone()
+    assert row["week"] == 1 and row["days_left"] == 2
+    assert row["expected"] == pytest.approx(p.expected, abs=1e-4)
+    assert json.loads(row["cats_json"])["goals"][0] == pytest.approx(p.outlook[0].p_win, abs=1e-4)

@@ -123,6 +123,9 @@ def build(
             "days_left": getattr(week_plan, "days_left", 0),
             # Starts, not team games: what each side can still actually collect.
             "games_left": {"ours": week_plan.our_games, "theirs": week_plan.their_games},
+            # Calibrated (gate G1) - the only reason a percentage is allowed here.
+            "expected": _one(getattr(week_plan, "expected", None)),
+            "of": len(week_plan.outlook),
             "cats": [
                 {
                     "label": o.category.label,
@@ -131,6 +134,7 @@ def build(
                     "now_ours": _maybe(getattr(o, "banked_ours", None), o.category.key, banked),
                     "now_theirs": _maybe(getattr(o, "banked_theirs", None), o.category.key, banked),
                     "state": _state(o),
+                    "chance": _pct(getattr(o, "expected", None)),
                 }
                 for o in week_plan.outlook
             ],
@@ -191,6 +195,15 @@ def _state(o) -> str:
 def _round(v: float, key: str) -> float:
     # A rate needs three places to be readable; a counting stat needs one.
     return round(v, 3) if v and abs(v) < 5 else round(v, 1)
+
+
+def _pct(p) -> int | None:
+    """A category's expected score as a whole percentage, or None."""
+    return None if p is None else int(round(100 * p))
+
+
+def _one(v) -> float | None:
+    return None if v is None else round(v, 1)
 
 
 def _maybe(v, key: str, banked: bool):

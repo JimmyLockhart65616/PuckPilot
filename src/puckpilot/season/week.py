@@ -89,6 +89,16 @@ class CategoryOutlook:
     # Yahoo's own totals so far, when the week has started.
     banked_ours: float | None = None
     banked_theirs: float | None = None
+    # Calibrated odds (season/odds.py, gate G1), when computed.
+    p_win: float | None = None
+    p_tie: float | None = None
+
+    @property
+    def expected(self) -> float | None:
+        """This category's expected score: P(win) + half P(tie)."""
+        if self.p_win is None:
+            return None
+        return self.p_win + 0.5 * (self.p_tie or 0.0)
 
     @property
     def room(self) -> float:
@@ -116,6 +126,13 @@ class CategoryOutlook:
     def band(self) -> str:
         """likely / in play / long shot, by the odds; by the relative margin
         only where no spread was modelled."""
+        e = self.expected
+        if e is not None:
+            if e >= LIKELY:
+                return "likely"
+            if e <= 1.0 - LIKELY:
+                return "long shot"
+            return "in play"
         z = self.z
         if z is None:
             if abs(self.relative) <= CLOSE_BAND:
@@ -208,6 +225,12 @@ class WeekPlan:
     status: str = ""
     days_left: int = 0
     banked: bool = False
+    odds: object | None = None  # season.odds.WeekOdds
+
+    @property
+    def expected(self) -> float | None:
+        """Expected categories won this week, when the odds were computed."""
+        return self.odds.expected if self.odds is not None else None
 
     def close(self) -> tuple[CategoryOutlook, ...]:
         return tuple(o for o in self.outlook if o.in_play)
@@ -446,6 +469,7 @@ def expected_starts(
     weights: dict[str, float] | None = None,
     days: list[str] | None = None,
     exclude: dict[str, set[str]] | None = None,
+    goalie_games: dict[int, list[float]] | None = None,
 ) -> dict[int, float]:
     """Expected *starts* for each player over the week, not team games.
 
@@ -492,6 +516,8 @@ def expected_starts(
         goalies.sort(reverse=True)
         for _, p_start, pid in goalies[:g_slots]:
             out[pid] = out.get(pid, 0.0) + p_start
+            if goalie_games is not None and p_start > 0:
+                goalie_games.setdefault(pid, []).append(p_start)
         for pid in optimize_lineup(cands, shape):
             out[pid] = out.get(pid, 0.0) + 1.0
     return {k: round(v, 2) for k, v in out.items()}
@@ -638,6 +664,7 @@ def build_week_plan(
     started: set[str] | None = None,
     status: str = "",
     find_targets: bool = True,
+    odds_model=None,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -658,11 +685,29 @@ def build_week_plan(
     base_theirs = banked_components(banked_theirs or {})
     banked = banked_ours is not None
 
+    our_goalie_games: dict[int, list[float]] = {}
+    their_goalie_games: dict[int, list[float]] = {}
     our_games = expected_starts(
-        conn, runtime, week, ours.players, goalie_source, values, days=days, exclude=exclude
+        conn,
+        runtime,
+        week,
+        ours.players,
+        goalie_source,
+        values,
+        days=days,
+        exclude=exclude,
+        goalie_games=our_goalie_games,
     )
     their_games = expected_starts(
-        conn, runtime, week, theirs.players, goalie_source, values, days=days, exclude=exclude
+        conn,
+        runtime,
+        week,
+        theirs.players,
+        goalie_source,
+        values,
+        days=days,
+        exclude=exclude,
+        goalie_games=their_goalie_games,
     )
     our_rest = project_totals(our_games, rates, cats)
     our_totals = project_totals(our_games, rates, cats, base=base_ours)
@@ -698,6 +743,28 @@ def build_week_plan(
             return None
         return math.sqrt(max(our_var.get(key, 0.0) + their_var.get(key, 0.0), 0.0))
 
+    odds = None
+    if odds_model is not None:
+        from puckpilot.season import odds as odds_mod
+
+        def skaters_only(players, games):
+            skate = {p.nhl_player_id for p in players if p.position != "G"}
+            return {pid: n for pid, n in games.items() if pid in skate}
+
+        odds = odds_model.week(
+            cats,
+            odds_mod.side(
+                base_ours, skaters_only(ours.players, our_games), our_goalie_games, rates
+            ),
+            odds_mod.side(
+                base_theirs, skaters_only(theirs.players, their_games), their_goalie_games, rates
+            ),
+        )
+
+    def chance(key: str) -> tuple[float | None, float | None]:
+        o = odds.of(key) if odds is not None else None
+        return (o.p_win, o.p_tie) if o is not None else (None, None)
+
     outlook = tuple(
         CategoryOutlook(
             category=c,
@@ -708,6 +775,8 @@ def build_week_plan(
             sd=sd(c.key),
             banked_ours=ours_now.get(c.key) if banked else None,
             banked_theirs=theirs_now.get(c.key) if banked else None,
+            p_win=chance(c.key)[0],
+            p_tie=chance(c.key)[1],
         )
         for c in cats
     )
@@ -753,6 +822,7 @@ def build_week_plan(
         status=status,
         days_left=len(days),
         banked=banked,
+        odds=odds,
         adds_used_week=adds_used_week,
         adds_left_week=adds_left_week,
         adds_left_season=adds_left_season,

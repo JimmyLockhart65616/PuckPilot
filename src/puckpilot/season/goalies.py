@@ -117,6 +117,27 @@ class TrailingStartShareSource:
         }
 
 
+class AsOfGoalieSource:
+    """P(start) for any later date, as the trailing model saw it on `cutoff`.
+
+    Live, a later date's history cannot include games not yet played, so the
+    trailing model is as-of by construction. In a replay it is not: asked about
+    Saturday on Wednesday, it would count Thursday's and Friday's starts. This
+    freezes each team's history at the cutoff - the only honest forecast a
+    Wednesday can make of a Saturday.
+    """
+
+    def __init__(self, source: TrailingStartShareSource, cutoff: str):
+        self.source = source
+        self.cutoff = cutoff
+
+    def starts(self, date: str) -> dict[int, float]:
+        out: dict[int, float] = {}
+        for team in self.source._schedule.get(date, ()):
+            out.update(self.source._team_probabilities(team, self.cutoff))
+        return out
+
+
 class ChainedGoalieSource:
     """The first source with an opinion about a goalie wins, per date.
 

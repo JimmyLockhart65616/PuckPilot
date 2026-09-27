@@ -209,3 +209,22 @@ def test_the_protocol_card_is_on_every_run_not_just_mondays(db):
     p = protocol_mod.save(db, derive(outlook("PPP", 8.5, 7.7, add_room=5.0), week=2))
     s = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_no=2)
     assert s["protocol"]["id"] == p.id and s["week"] is None
+
+
+def test_the_week_card_shows_calibrated_odds_when_there_are_some(db):
+    from puckpilot.engine.categories import resolve
+    from puckpilot.season.odds import CategoryOdds, WeekOdds
+    from puckpilot.season.week import CategoryOutlook, WeekPlan
+
+    g = resolve("G")
+    wp = WeekPlan(
+        week=1,
+        start="a",
+        end="b",
+        opponent="X",
+        outlook=(CategoryOutlook(g, 9.0, 8.0, sd=2.0, p_win=0.58, p_tie=0.08),),
+        odds=WeekOdds((CategoryOdds(g, 0.58, 0.08, 9.0, 8.0),)),
+    )
+    w = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_plan=wp)["week"]
+    assert w["expected"] == 0.6 and w["of"] == 1
+    assert w["cats"][0]["chance"] == 62

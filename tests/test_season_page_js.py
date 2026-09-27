@@ -265,3 +265,38 @@ def test_a_week_in_progress_shows_the_score_beside_the_projection():
         "no longer eligible",
     ):
         assert expected in out["app"], expected
+
+
+def test_the_odds_render_as_percentages_with_the_expected_total():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "Home Team",
+            "moves": [],
+            "week": {
+                "week": 1,
+                "opponent": "Visitors",
+                "expected": 5.4,
+                "of": 11,
+                "games_left": {"ours": 23, "theirs": 27},
+                "days_left": 3,
+                "cats": [
+                    {"label": "G", "ours": 9.2, "theirs": 10.4, "state": "in play", "chance": 38},
+                    {"label": "SV", "ours": 103, "theirs": 81, "state": "likely", "chance": 0},
+                    {
+                        "label": "SV%",
+                        "ours": 0.9,
+                        "theirs": 0.91,
+                        "state": "in play",
+                        "chance": None,
+                    },
+                ],
+                "note": "",
+            },
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    for expected in ("Expect 5.4 of 11 categories", "win", "38%", "0%", "–"):
+        assert expected in out["app"], expected

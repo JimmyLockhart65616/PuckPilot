@@ -228,6 +228,21 @@ CREATE TABLE IF NOT EXISTS matchup_snapshots (
     raw_json     TEXT,
     PRIMARY KEY (manager, team_key, week, fetched_at)
 );
+
+-- What the odds said at each run, so live weeks can be scored against how they
+-- ended (gate G3) - the same test the replay passed, on the real league.
+CREATE TABLE IF NOT EXISTS week_odds_log (
+    manager    TEXT NOT NULL,
+    league_key TEXT NOT NULL,
+    team_key   TEXT NOT NULL,
+    week       INTEGER NOT NULL,
+    logged_at  TEXT NOT NULL,
+    day        TEXT NOT NULL,
+    days_left  INTEGER,
+    expected   REAL,
+    cats_json  TEXT NOT NULL,
+    PRIMARY KEY (manager, team_key, week, logged_at)
+);
 """
 
 # `waiver_proposals` predates the in-season work and shipped without a manager,

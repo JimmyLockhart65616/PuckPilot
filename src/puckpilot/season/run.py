@@ -474,6 +474,7 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models):
     from puckpilot.draft.sim import build_universe
     from puckpilot.season import pool as pool_mod
     from puckpilot.season import week as weekmod
+    from puckpilot.season.odds import OddsModel, log_week
 
     values, goalies = models
     season = runtime.nhl_season
@@ -494,8 +495,10 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models):
         adds_used_week=used_week,
         adds_used_season=used_season,
         find_targets=False,
+        odds_model=OddsModel(),
         **live_inputs(conn, runtime, ctx.week, ctx.live, day),
     )
+    log_week(conn, manager.name, league_key, ctx.roster.team_key, plan, day)
     report.add("week", True, _week_line(plan))
     return plan
 
@@ -505,9 +508,10 @@ def _week_line(plan) -> str:
     for o in plan.outlook:
         bands.setdefault(o.band, []).append(o.category.label)
     bits = [f"{k}: {' '.join(v)}" for k, v in sorted(bands.items())]
+    exp = f" - expect {plan.expected:.1f} of {len(plan.outlook)}" if plan.expected else ""
     return (
         f"week {plan.week} vs {plan.opponent or '?'} - starts left {plan.our_games} v "
-        f"{plan.their_games} - " + "; ".join(bits)
+        f"{plan.their_games}{exp} - " + "; ".join(bits)
     )
 
 
@@ -523,6 +527,7 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, model
     from puckpilot.season import week as weekmod
     from puckpilot.season.fetch import fetch_matchups, fetch_roster
     from puckpilot.season.matchups import current_or_next
+    from puckpilot.season.odds import OddsModel, log_week
     from puckpilot.yahoo import playermap
 
     season = runtime.nhl_season
@@ -576,8 +581,10 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, model
         adds_used_week=used_week,
         adds_used_season=used_season,
         min_gain=manager.authority.transactions.min_weekly_gain,
+        odds_model=OddsModel(),
         **live_inputs(conn, runtime, week, live, day),
     )
+    log_week(conn, manager.name, league_key, ours.team_key, plan, day)
     lines = [ln for ln in explain.week_story(plan, runtime) if ln]
 
     stance = protocol_mod.derive(

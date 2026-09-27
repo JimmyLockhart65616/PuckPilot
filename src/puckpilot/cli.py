@@ -1555,6 +1555,26 @@ def _cmd_season_gate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_calibrate(args: argparse.Namespace) -> int:
+    """Gate G1: are the category odds honest? Exits non-zero on FAIL."""
+    from puckpilot.data import store
+    from puckpilot.season.calibration import calibration_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = calibration_report(
+        conn,
+        _league(args),
+        fit_season=args.fit_season,
+        test_season=args.test_season,
+        seed=args.seed,
+        progress=print if args.verbose else None,
+    )
+    print()
+    print(report.text)
+    return 0 if report.text.rstrip().endswith("PASS") else 1
+
+
 def _cmd_season_preflight(args: argparse.Namespace) -> int:
     from puckpilot.season import cli_support
     from puckpilot.season import preflight as pf
@@ -1708,6 +1728,7 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
     from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
     from puckpilot.season.manager import ManagerError
     from puckpilot.season.matchups import current_or_next, for_week
+    from puckpilot.season.odds import OddsModel, log_week
     from puckpilot.season.run import adds_used, live_inputs
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
@@ -1772,8 +1793,10 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         adds_used_season=used_season,
         min_gain=manager.authority.transactions.min_weekly_gain,
         max_targets=args.top,
+        odds_model=OddsModel(),
         **live_inputs(conn, runtime, m.as_week(), live, today),
     )
+    log_week(conn, manager.name, league_key, ours.team_key, plan, today)
     from puckpilot.season import explain
 
     print()
@@ -2426,6 +2449,16 @@ def build_parser() -> argparse.ArgumentParser:
     s_gate.add_argument("--seed", type=int, default=123)
     s_gate.add_argument("--verbose", action="store_true")
     s_gate.set_defaults(func=_cmd_season_gate)
+
+    s_cal = season_sub.add_parser(
+        "calibrate",
+        help="Gate G1: do the category odds mean what they say? (replayed seasons)",
+    )
+    s_cal.add_argument("--fit-season", default="20242025")
+    s_cal.add_argument("--test-season", default="20252026")
+    s_cal.add_argument("--seed", type=int, default=20261)
+    s_cal.add_argument("--verbose", action="store_true")
+    s_cal.set_defaults(func=_cmd_season_calibrate)
 
     s_run = season_sub.add_parser(
         "run",
