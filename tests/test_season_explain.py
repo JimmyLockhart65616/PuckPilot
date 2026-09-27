@@ -157,8 +157,10 @@ def test_the_protocol_says_what_approving_it_does_and_does_not_do():
     text = " ".join(explain.protocol_story(proto, adds_left=3))
     assert "Stop spending on: HIT" in text
     assert "Go after: PPP" in text
-    assert "steers which free agents get proposed" in text
-    assert "does NOT do: change your daily lineup" in text
+    # Approval is agreement, not a switch: the pickups already aim at what is
+    # in play, and the lineup and goalies were measured not to benefit.
+    assert "changes nothing on its own" in text
+    assert "does NOT change your daily lineup or which goalies start" in text
     assert "3 acquisition(s) left" in text
 
 

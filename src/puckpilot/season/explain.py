@@ -268,26 +268,27 @@ def protocol_story(proto, adds_left: int | None = None) -> list[str]:
         lines.append(
             "  Stop spending on: "
             + ", ".join(s.category.label for s in give)
-            + " - behind by more than a lineup change and an add together could close."
+            + " - a long shot even if every move left went its way."
         )
     if chase:
         lines.append(
             "  Go after: "
             + ", ".join(s.category.label for s in chase)
-            + " - close enough that one move could take them."
+            + " - could go either way; this is where the week is decided."
         )
     if not give and not chase:
         lines.append("  Nothing to concede and nothing close - play it straight.")
 
     lines.append("")
     lines.append(
-        "  What approving this does: it steers which free agents get proposed to "
-        "you, toward the categories still in play."
+        "  Approving records that you agree with this read of the week. It changes "
+        "nothing on its own: the pickups proposed already aim at the categories in "
+        "play, approved or not."
     )
     lines.append(
-        "  What it does NOT do: change your daily lineup. That was measured and it "
-        "made no difference - most weeks everyone with a game fits in a slot, so "
-        "there is no choice for a weighting to change."
+        "  It does NOT change your daily lineup or which goalies start - both were "
+        "measured over two replayed seasons and made no difference. Most nights "
+        "everyone with a game fits in a slot, so there is nothing for it to change."
     )
     if adds_left is not None:
         lines.append(f"  You have {adds_left} acquisition(s) left this week.")
