@@ -169,11 +169,15 @@ class _P:
         self.is_out = out
         self.on_ir = False
         self.selected_slot = slot
+        self.player_key = f"p.{pid}"
+        self.yahoo_eligible = frozenset()
+        self.is_editable = True
 
 
 def _headroom(db, adds_left, pool_rate, drop_rate):
     from puckpilot.data import store
     from puckpilot.season.week import add_headroom
+    from tests.test_season_settings import _slots
 
     for gid, d in enumerate(["2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08"], start=1):
         store.upsert_schedule_game(
@@ -187,7 +191,8 @@ def _headroom(db, adds_left, pool_rate, drop_rate):
             away_team="MTL",
         )
     db.commit()
-    rt = _runtime_for_week()
+    # Two active spots for two players: a full roster, so every add costs a drop.
+    rt = _runtime_for_week(roster_positions=_slots(("C", 1, 1), ("BN", 1, 0)))
     rates = {
         1: {"goals": drop_rate},
         2: {"goals": drop_rate},
@@ -207,12 +212,12 @@ def _headroom(db, adds_left, pool_rate, drop_rate):
     )
 
 
-def _runtime_for_week():
+def _runtime_for_week(**over):
     from puckpilot.season.settings import LeagueRuntime, Week
     from tests.test_season_settings import payload
 
     return LeagueRuntime.from_payload(
-        payload(), weeks=(Week(1, "2026-10-05", "2026-10-08"),), fetched_at="now"
+        payload(**over), weeks=(Week(1, "2026-10-05", "2026-10-08"),), fetched_at="now"
     )
 
 
@@ -242,3 +247,193 @@ def test_a_rate_category_stays_unmeasured_however_many_adds_are_left(db):
         db, rt, rt.week(1), _Roster([]), [], {}, (resolve("SV%"),), None, adds_left=3
     )
     assert got["save_pct"] is None
+
+
+# -- who an add costs -------------------------------------------------------
+
+
+def _week_games(db):
+    """TOR plays four times this week; MTL once now and ten times in November."""
+    from puckpilot.data import store
+
+    gid = 1
+    for d in ("2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08"):
+        store.upsert_schedule_game(
+            db,
+            game_id=gid,
+            season="20262027",
+            game_type=2,
+            game_date=d,
+            start_time_utc=None,
+            home_team="TOR",
+            away_team="OTT",
+        )
+        gid += 1
+    for d in ["2026-10-08"] + [f"2026-11-{n:02d}" for n in range(1, 11)]:
+        store.upsert_schedule_game(
+            db,
+            game_id=gid,
+            season="20262027",
+            game_type=2,
+            game_date=d,
+            start_time_utc=None,
+            home_team="MTL",
+            away_team="BUF",
+        )
+        gid += 1
+    db.commit()
+
+
+class _PerGame:
+    def __init__(self, pg):
+        self.pg = pg
+
+    def per_game(self, pid, day):
+        return float(self.pg.get(pid, 0.0))
+
+
+def _rp(key, name, pid, team, slot, status="", eligible=("C", "Util")):
+    from puckpilot.season.roster import RosterPlayer
+
+    return RosterPlayer(
+        player_key=key,
+        yahoo_id=key,
+        name=name,
+        team=team,
+        primary_position="C",
+        yahoo_eligible=frozenset(eligible),
+        selected_slot=slot,
+        nhl_player_id=pid,
+        status=status,
+    )
+
+
+def _targets_for(db, players, slots):
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season.pool import PoolPlayer
+    from puckpilot.season.roster import TeamRoster
+    from puckpilot.season.week import _targets
+    from tests.test_season_settings import _slots
+
+    _week_games(db)
+    rt = _runtime_for_week(roster_positions=_slots(*slots))
+    ours = TeamRoster(league_key="999.l.1", team_key="t", date="2026-10-05", players=players)
+    streamer = PoolPlayer(
+        player_key="fa.1",
+        name="Streamer",
+        team="TOR",
+        primary_position="C",
+        yahoo_eligible=frozenset({"C", "Util"}),
+        nhl_player_id=9,
+    )
+    goals = resolve("G")
+    return _targets(
+        db,
+        rt,
+        LeagueConfig(skater_cats=(goals,), goalie_cats=()),
+        rt.week(1),
+        ours,
+        [streamer],
+        {1: {"goals": 0.5}, 2: {"goals": 0.2}, 9: {"goals": 0.3}},
+        {},
+        None,
+        _PerGame({1: 1.5, 2: 0.5, 9: 1.0}),
+        0.0,
+        5,
+    )
+
+
+def test_a_regular_with_a_light_week_is_never_the_cheapest_drop(db):
+    """Star plays once this week and eleven more times; Depth plays four times
+    and that is his season. Ranked by this week's games, Star was the drop."""
+    got = _targets_for(
+        db,
+        (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+        (("C", 2, 1),),
+    )
+    assert got and got[0].drop.name == "Depth"
+
+
+def test_an_open_roster_spot_means_an_add_with_no_drop(db):
+    got = _targets_for(
+        db,
+        (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+        (("C", 2, 1), ("BN", 1, 0)),
+    )
+    assert got and got[0].drop is None
+    assert got[0].extra_starts == got[0].starts
+
+
+def test_the_spot_an_injured_player_frees_for_ir_is_filled_without_a_drop(db):
+    """Sanderson's case end to end: out, IR+-eligible, holding a spot. He is
+    not cut for a streamer - he goes to IR and the streamer takes his spot."""
+    got = _targets_for(
+        db,
+        (
+            _rp("p.1", "Star", 1, "MTL", "C"),
+            _rp("p.2", "Hurt", 2, "TOR", "C", status="O", eligible=("C", "IR+", "Util")),
+        ),
+        (("C", 2, 1), ("IR+", 1, 0)),
+    )
+    assert got and got[0].drop is None
+
+
+def test_a_like_for_like_swap_is_legal_at_the_position_minimum(db):
+    """Two centres against a minimum of two: dropping one for another centre
+    leaves two. The check used to refuse it for leaving one."""
+    from puckpilot.draft.engine import DraftRules
+    from puckpilot.season.week import _cheapest_legal_drop
+
+    class Cand:
+        position = "C"
+
+    ours = [_rp("p.1", "A", 1, "TOR", "C"), _rp("p.2", "B", 2, "TOR", "C")]
+    got = _cheapest_legal_drop(Cand(), ours, {"p.1": 5.0, "p.2": 1.0}, {"C": 2}, DraftRules())
+    assert got is not None and got.name == "B"
+
+
+def test_only_as_many_goalies_count_as_there_are_g_slots(db):
+    """Three goalies playing the same night fill two slots; the third's start
+    cannot count. Summing every P(start) credited it anyway."""
+    from puckpilot.data import store
+    from puckpilot.season.goalies import StaticGoalieSource
+    from puckpilot.season.roster import RosterPlayer
+    from puckpilot.season.week import expected_starts
+    from tests.test_season_settings import _slots
+
+    for gid, (home, away) in enumerate((("TOR", "OTT"), ("MTL", "BUF")), start=1):
+        store.upsert_schedule_game(
+            db,
+            game_id=gid,
+            season="20262027",
+            game_type=2,
+            game_date="2026-10-05",
+            start_time_utc=None,
+            home_team=home,
+            away_team=away,
+        )
+    db.commit()
+    rt = _runtime_for_week(roster_positions=_slots(("G", 2, 1), ("BN", 1, 0)))
+    goalies = [
+        RosterPlayer(
+            player_key=f"g.{i}",
+            yahoo_id=str(i),
+            name=f"G{i}",
+            team=team,
+            primary_position="G",
+            yahoo_eligible=frozenset({"G"}),
+            selected_slot="G",
+            nhl_player_id=i,
+        )
+        for i, team in ((1, "TOR"), (2, "MTL"), (3, "OTT"))
+    ]
+    got = expected_starts(
+        db,
+        rt,
+        rt.week(1),
+        goalies,
+        StaticGoalieSource({"2026-10-05": {1: 0.8, 2: 0.7, 3: 0.6}}),
+        _PerGame({1: 1.0, 2: 1.0, 3: 1.0}),
+        days=["2026-10-05"],
+    )
+    assert got == {1: 0.8, 2: 0.7}

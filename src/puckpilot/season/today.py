@@ -455,6 +455,19 @@ def ir_changes(runtime: LeagueRuntime, roster: TeamRoster) -> tuple[list[Move], 
     return moves, alerts
 
 
+def open_roster_spots(runtime: LeagueRuntime, roster: TeamRoster) -> int:
+    """Active roster spots free once today's IR moves are made.
+
+    Each one is an add that needs no drop - the spot an injured player was
+    holding, once he is on IR.
+    """
+    moves, _ = ir_changes(runtime, roster)
+    cap = sum(s.count for s in runtime.slots if s.position not in IR_SLOTS)
+    active = sum(1 for p in roster.players if not p.on_ir)
+    active += sum(1 for m in moves if m.is_activation) - sum(1 for m in moves if m.is_ir)
+    return max(cap - active, 0)
+
+
 def _demote_questionable(candidates: list[Candidate]) -> None:
     """Rank day-to-day players below every healthy one, without going negative.
 

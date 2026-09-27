@@ -283,8 +283,12 @@ def expected_starts(
     goalie_source,
     values,
     weights: dict[str, float] | None = None,
+    days: list[str] | None = None,
 ) -> dict[int, float]:
     """Expected *starts* for each player over the week, not team games.
+
+    `days` narrows it to part of the week - the days still to play, once some
+    have been banked. Default: all of it.
 
     The distinction matters. A roster carries more players than it can start -
     thirteen slots against sixteen or seventeen bodies - so counting every
@@ -295,36 +299,46 @@ def expected_starts(
     So the week is walked a day at a time and the same assignment the daily
     plan uses decides who would actually be in a slot. Goalies are counted by
     probability rather than by whether they were slotted, because a start is
-    not ours to choose.
+    not ours to choose - but only as many as there are G slots, taken in the
+    order the lineup would start them. Summing every goalie's P(start) counted a
+    third goalie's start on nights when he could only have sat.
     """
     season = runtime.nhl_season
     shape = runtime.shape()
+    g_slots = sum(n for pos, n in shape.slots if pos == "G")
     out: dict[int, float] = {}
 
-    for day in week.dates():
+    for day in week.dates() if days is None else days:
         playing = calendar.teams_playing(conn, day, season)
         p_starts = goalie_source.starts(day) if goalie_source else {}
         cands = []
+        goalies = []
         for p in players:
             pid = p.nhl_player_id
             if pid is None or getattr(p, "is_out", False) or p.team not in playing:
                 continue
-            if p.position == "G":
-                # Counted straight from the probability: the slot is not the
-                # constraint, the coach is.
-                out[pid] = out.get(pid, 0.0) + float(p_starts.get(pid, 0.0))
+            if getattr(p, "on_ir", False):
                 continue
             v = values.per_game_tilted(pid, day, weights) if weights else values.per_game(pid, day)
+            if p.position == "G":
+                p_start = float(p_starts.get(pid, 0.0))
+                goalies.append((p_start * v, p_start, pid))
+                continue
             cands.append((pid, p.eligible, v))
+        goalies.sort(reverse=True)
+        for _, p_start, pid in goalies[:g_slots]:
+            out[pid] = out.get(pid, 0.0) + p_start
         for pid in optimize_lineup(cands, shape):
             out[pid] = out.get(pid, 0.0) + 1.0
     return {k: round(v, 2) for k, v in out.items()}
 
 
-def team_games_in(conn: sqlite3.Connection, runtime: LeagueRuntime, week: Week) -> dict[str, int]:
-    """team -> games in the week. The streaming lever, on its own."""
+def team_games_in(
+    conn: sqlite3.Connection, runtime: LeagueRuntime, week: Week, days: list[str] | None = None
+) -> dict[str, int]:
+    """team -> games in the week (or in `days` of it). The streaming lever, on its own."""
     by_team: dict[str, int] = {}
-    for day in week.dates():
+    for day in week.dates() if days is None else days:
         for t in calendar.teams_playing(conn, day, runtime.nhl_season):
             by_team[t] = by_team.get(t, 0) + 1
     return by_team
@@ -381,6 +395,7 @@ def add_headroom(
     cats: tuple[Category, ...],
     league,
     adds_left: int = 1,
+    days: list[str] | None = None,
 ) -> dict[str, float | None]:
     """The most the acquisitions left this week could add to each category.
 
@@ -396,14 +411,21 @@ def add_headroom(
 
     Best-n against worst-n rather than the best add times n, since you cannot
     sign the same player three times and each further move displaces a better
-    player than the last.
+    player than the last. An open roster spot is an add with nothing given up.
     """
-    games = team_games_in(conn, runtime, week)
+    from puckpilot.season.today import ir_changes, open_roster_spots
+
+    games = team_games_in(conn, runtime, week, days)
+    to_ir = {m.player.player_key for m in ir_changes(runtime, ours)[0] if m.is_ir}
     droppable = [
         p
         for p in ours.players
-        if not p.is_undroppable and p.nhl_player_id is not None and not p.on_ir
+        if not p.is_undroppable
+        and p.nhl_player_id is not None
+        and not p.on_ir
+        and p.player_key not in to_ir
     ]
+    free = open_roster_spots(runtime, ours)
     n = max(int(adds_left), 0)
     out: dict[str, float | None] = {}
     for c in cats:
@@ -417,7 +439,7 @@ def add_headroom(
         def week_total(p, key=c.key):
             return rates.get(p.nhl_player_id, {}).get(key, 0.0) * games.get(p.team, 0)
 
-        give_up = sorted(week_total(p) for p in droppable)[:n]
+        give_up = sorted(week_total(p) for p in droppable)[: max(n - free, 0)]
         gain = sorted(
             (week_total(p) for p in pool if p.nhl_player_id is not None and not p.is_out),
             reverse=True,
@@ -539,6 +561,7 @@ def _targets(
     max_targets,
     base_totals=None,
     screen: int = 20,
+    days: list[str] | None = None,
 ) -> tuple[AddTarget, ...]:
     """Adds that move a category in play, priced by re-slotting the actual week.
 
@@ -552,41 +575,64 @@ def _targets(
     That costs an optimizer pass per candidate, so the pool is screened
     cheaply first and only the shortlist is priced properly.
     """
+    from puckpilot.season.today import ir_changes, open_roster_spots
+
     cats = league.all_cats
+    days = days if days is not None else week.dates()
+    # Going to IR is not the same as being worth dropping: an injured regular
+    # is put on IR, which frees his spot, rather than cut for a streamer.
+    to_ir = {m.player.player_key for m in ir_changes(runtime, ours)[0] if m.is_ir}
     droppable = [
         p
         for p in ours.players
-        if not p.is_undroppable and p.nhl_player_id is not None and not p.on_ir
+        if not p.is_undroppable
+        and p.nhl_player_id is not None
+        and not p.on_ir
+        and p.player_key not in to_ir
     ]
     counts: dict[str, int] = {}
     for p in ours.players:
-        counts[p.position] = counts.get(p.position, 0) + 1
+        if not p.on_ir and p.player_key not in to_ir:
+            counts[p.position] = counts.get(p.position, 0) + 1
     rules = league.draft_rules()
+    open_spots = open_roster_spots(runtime, ours)
 
-    base_starts = expected_starts(conn, runtime, week, ours.players, goalie_source, values)
+    base_starts = expected_starts(
+        conn, runtime, week, ours.players, goalie_source, values, days=days
+    )
     if base_totals is None:
         base_totals = project_totals(base_starts, rates, cats)
-    games = team_games_in(conn, runtime, week)
+    holes = open_slot_days(conn, runtime, ours.players, goalie_source, values, days)
+    playing = {d: calendar.teams_playing(conn, d, runtime.nhl_season) for d in days}
+    # What each player is worth to the rest of the season, not to this week: a
+    # regular with one game this week is still a regular.
+    season_left = calendar.games_by_team(conn, days[0], runtime.end_date, runtime.nhl_season)
+    keep = _season_value(droppable, values, season_left, days[0])
 
-    # Cheap screen: his team's games times his rate, which overstates everyone
-    # equally and so orders them about right.
+    # Cheap screen: his rate times the games he would actually fill - days his
+    # team plays AND a slot he can take is empty. Ranking by team games alone
+    # favoured a four-game week that lands on nights the lineup is already full.
     screened = sorted(
         (
             c
             for c in pool
             if c.nhl_player_id is not None and not c.is_out and c.nhl_player_id in rates
         ),
-        key=lambda c: -values.per_game(c.nhl_player_id, week.start) * games.get(c.team, 0),
+        key=lambda c: -values.per_game(c.nhl_player_id, days[0]) * _screen_games(c, holes, playing),
     )[: max(screen, max_targets)]
 
     out: list[AddTarget] = []
     for cand in screened:
-        rough = _rough(droppable, values, games, week)
-        drop = _cheapest_legal_drop(cand, droppable, rough, counts, rules)
-        if drop is None:
-            continue
-        after = [p for p in ours.players if p.player_key != drop.player_key] + [cand]
-        after_starts = expected_starts(conn, runtime, week, after, goalie_source, values)
+        over_cap = counts.get(cand.position, 0) + 1 > rules.caps.get(cand.position, 99)
+        if open_spots > 0 and not over_cap:
+            drop = None
+        else:
+            drop = _cheapest_legal_drop(cand, droppable, keep, counts, rules)
+            if drop is None:
+                continue
+        after = [p for p in ours.players if drop is None or p.player_key != drop.player_key]
+        after.append(cand)
+        after_starts = expected_starts(conn, runtime, week, after, goalie_source, values, days=days)
         after_totals = project_totals(after_starts, rates, cats)
 
         deltas = {
@@ -599,7 +645,7 @@ def _targets(
             continue
 
         starts = after_starts.get(cand.nhl_player_id, 0.0)
-        lost = base_starts.get(drop.nhl_player_id, 0.0)
+        lost = base_starts.get(drop.nhl_player_id, 0.0) if drop is not None else 0.0
         score = _score(deltas, close_by_key)
         if score < min_gain:
             continue
@@ -620,12 +666,70 @@ def _targets(
     return tuple(out[:max_targets])
 
 
-def _rough(droppable, values, games, week) -> dict[str, float]:
-    """A quick ordering of who is cheapest to let go, for the legality check."""
+def _season_value(droppable, values, games_left, day) -> dict[str, float]:
+    """What letting each player go costs: his value over the rest of the season.
+
+    This used to be his value over *this week* - rate times this week's games -
+    so a regular whose club happened to play once was the cheapest player on
+    the roster, and the add engine could propose cutting him for a four-game
+    streamer.
+    """
     return {
-        p.player_key: values.per_game(p.nhl_player_id, week.start) * games.get(p.team, 0)
+        p.player_key: values.per_game(p.nhl_player_id, day) * games_left.get(p.team, 0)
         for p in droppable
     }
+
+
+def open_slot_days(conn, runtime, players, goalie_source, values, days) -> dict[str, set[str]]:
+    """day -> the engine slots nobody on this roster fills that day."""
+    from puckpilot.engine.lineup import slot_instances
+
+    shape = runtime.shape()
+    out: dict[str, set[str]] = {}
+    for day in days:
+        playing = calendar.teams_playing(conn, day, runtime.nhl_season)
+        p_starts = goalie_source.starts(day) if goalie_source else {}
+        cands = []
+        for p in players:
+            pid = p.nhl_player_id
+            if pid is None or getattr(p, "is_out", False) or getattr(p, "on_ir", False):
+                continue
+            if p.team not in playing:
+                continue
+            v = values.per_game(pid, day)
+            if p.position == "G":
+                v *= float(p_starts.get(pid, 0.0))
+            cands.append((pid, p.eligible, v))
+        filled: dict[str, int] = {}
+        for slot in optimize_lineup(cands, shape).values():
+            filled[slot] = filled.get(slot, 0) + 1
+        empty: set[str] = set()
+        for slot in slot_instances(shape):
+            if filled.get(slot, 0) > 0:
+                filled[slot] -= 1
+            else:
+                empty.add(slot)
+        out[day] = empty
+    return out
+
+
+def _screen_games(cand, holes: dict[str, set[str]], playing: dict[str, set[str]]) -> float:
+    """Games a candidate would play straight into an empty slot, for the screen.
+
+    Plus a quarter of his other games, so a week with no holes at all still
+    ranks by schedule rather than arbitrarily - on a full night he can still
+    displace somebody worse, which the full re-slot then prices.
+    """
+    from puckpilot.engine.lineup import _slots_for
+
+    his = _slots_for(cand.eligible)
+    fills = games = 0
+    for day, empty in holes.items():
+        if cand.team in playing.get(day, ()):
+            games += 1
+            if empty & his:
+                fills += 1
+    return fills + 0.25 * (games - fills)
 
 
 def _helped_by(deltas: dict[str, float], close: dict[str, CategoryOutlook]) -> tuple[str, ...]:
@@ -698,7 +802,8 @@ def _cheapest_legal_drop(cand, droppable, drop_values, counts, rules):
 
     Position arithmetic only, the same check `waivers.best_move` makes: over a
     positional cap the drop must come from that position, and no drop may take
-    a position below its minimum.
+    a position below its minimum - counting the player coming in, so a centre
+    for a centre is never refused for leaving the roster a centre short.
     """
     pos_add = cand.position
     over_cap = counts.get(pos_add, 0) + 1 > rules.caps.get(pos_add, 99)
@@ -707,7 +812,8 @@ def _cheapest_legal_drop(cand, droppable, drop_values, counts, rules):
         pos_drop = p.position
         if over_cap and pos_drop != pos_add:
             continue
-        if counts.get(pos_drop, 0) - 1 < rules.mins.get(pos_drop, 0):
+        after = counts.get(pos_drop, 0) - 1 + (1 if pos_drop == pos_add else 0)
+        if after < rules.mins.get(pos_drop, 0):
             continue
         best = p
         break
