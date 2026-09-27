@@ -183,19 +183,30 @@ def week_story(plan, runtime: LeagueRuntime) -> list[str]:
     gone = tuple(o for o in plan.outlook if not o.reachable)
     ahead = tuple(o for o in plan.outlook if o.verdict == "ahead")
 
+    n = len(plan.outlook)
+    if getattr(plan, "banked", False):
+        games = (
+            f"With {plan.days_left} day(s) to play, your players have {plan.our_games} "
+            f"starts still to come; theirs have {plan.their_games}. What is already "
+            f"banked is Yahoo's own count, so only those starts can still move anything."
+        )
+    else:
+        games = (
+            f"Your players have {plan.our_games} starts this week; theirs have "
+            f"{plan.their_games}. More games is more of everything that gets counted, "
+            f"so that gap matters on its own."
+        )
     lines = [
         f"Week {plan.week} against {plan.opponent or 'your opponent'}, {plan.start} to {plan.end}.",
-        f"Your players have {plan.our_games} games this week; theirs have "
-        f"{plan.their_games}. More games is more of everything that gets counted, "
-        f"so that gap matters on its own.",
+        games,
         "",
-        "A head-to-head week is won by taking more of the twelve categories, not "
-        "by scoring most overall. So the question is not who is better - it is "
-        "which categories are still undecided.",
+        f"A head-to-head week is won by taking more of the {n} categories, not by "
+        "scoring most overall. So the question is not who is better - it is which "
+        "categories are still undecided.",
     ]
     if ahead:
         lines.append(
-            f"Comfortably ahead in {len(ahead)}: "
+            f"Likely in {len(ahead)}: "
             + ", ".join(o.category.label for o in ahead)
             + ". Nothing to do there; they are already yours on these projections."
         )
@@ -223,9 +234,9 @@ def week_story(plan, runtime: LeagueRuntime) -> list[str]:
         )
         if any(o.verdict == "behind" for o in plan.outlook):
             lines.append(
-                "Close is measured against the size of the category, not in raw "
-                "units - a week is about 70 shots and about 22 points, so trailing "
-                "by 7 shots is nearer than trailing by 5 points."
+                "In play means it could go either way given what is left to play - "
+                "roughly between 15% and 85%. Shots swing far more in a week than "
+                "points do, so trailing by 7 shots is nearer than trailing by 5 points."
             )
     else:
         lines.append(

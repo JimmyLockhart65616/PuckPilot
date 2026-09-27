@@ -54,6 +54,7 @@ def build(
     roster=None,
     reasons: dict[str, str] | None = None,
     tz: str = DEFAULT_TZ,
+    week_no: int | None = None,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -107,17 +108,28 @@ def build(
         for p in pending
     ]
 
+    # The protocol card shows on every run, not only the one that derived it -
+    # a push replaces the whole page, and an Approve button that vanishes on
+    # the next run is one that cannot be pressed.
+    week_no = week_plan.week if week_plan is not None else week_no
+    if week_no is not None:
+        snap["protocol"] = _protocol(protocol_mod.load(conn, manager, league_key, week_no))
     if week_plan is not None:
-        live = protocol_mod.load(conn, manager, league_key, week_plan.week)
-        snap["protocol"] = _protocol(live)
+        banked = getattr(week_plan, "banked", False)
         snap["week"] = {
             "week": week_plan.week,
             "opponent": week_plan.opponent,
+            "status": getattr(week_plan, "status", ""),
+            "days_left": getattr(week_plan, "days_left", 0),
+            # Starts, not team games: what each side can still actually collect.
+            "games_left": {"ours": week_plan.our_games, "theirs": week_plan.their_games},
             "cats": [
                 {
                     "label": o.category.label,
                     "ours": _round(o.ours, o.category.key),
                     "theirs": _round(o.theirs, o.category.key),
+                    "now_ours": _maybe(getattr(o, "banked_ours", None), o.category.key, banked),
+                    "now_theirs": _maybe(getattr(o, "banked_theirs", None), o.category.key, banked),
                     "state": _state(o),
                 }
                 for o in week_plan.outlook
@@ -164,16 +176,26 @@ def _protocol(live) -> dict | None:
 
 
 def _state(o) -> str:
+    """likely / in play / long shot by the odds bands; gone when even every
+    lever left could not make it more than a long shot."""
     if not o.reachable:
         return "gone"
+    band = getattr(o, "band", None)
+    if band:
+        return band
     if o.in_play:
-        return "close"
-    return "ahead" if o.margin > 0 else "behind"
+        return "in play"
+    return "likely" if o.margin > 0 else "long shot"
 
 
 def _round(v: float, key: str) -> float:
     # A rate needs three places to be readable; a counting stat needs one.
     return round(v, 3) if v and abs(v) < 5 else round(v, 1)
+
+
+def _maybe(v, key: str, banked: bool):
+    """A banked total, or None before the week has anything in it."""
+    return _round(v, key) if banked and v is not None else None
 
 
 def _week_note(wp) -> str:

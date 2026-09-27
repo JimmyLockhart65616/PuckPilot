@@ -70,6 +70,56 @@ def fetch_matchups(session, team_key: str) -> list:
     return parse_matchups(session.get(f"team/{team_key}/matchups"), our_team_key=team_key)
 
 
+def fetch_live(session, team_key: str, week: int):
+    """This week's score, both sides, plus the raw payload it was read from.
+
+    The same request as the calendar, narrowed to one week. Returns
+    (LiveMatchup | None, raw payload).
+    """
+    from puckpilot.season.matchups import parse_live
+
+    raw = session.get(f"team/{team_key}/matchups;weeks={week}")
+    return parse_live(raw, our_team_key=team_key, week=week), raw
+
+
+def save_live(
+    conn: sqlite3.Connection, manager: str, league_key: str, live, raw: dict | None = None
+) -> None:
+    """Log one reading of the live score. Every run adds a row."""
+
+    def side(t) -> str:
+        return json.dumps(
+            {
+                "team_key": t.team_key,
+                "name": t.name,
+                "stats": {str(k): v for k, v in t.stats.items()},
+                "remaining_games": t.remaining_games,
+                "live_games": t.live_games,
+                "completed_games": t.completed_games,
+            }
+        )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO matchup_snapshots (manager, league_key, team_key, week, "
+        "fetched_at, status, opponent_key, ours_json, theirs_json, winners_json, raw_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            manager,
+            league_key,
+            live.ours.team_key,
+            live.week,
+            _now(),
+            live.status,
+            live.theirs.team_key,
+            side(live.ours),
+            side(live.theirs),
+            json.dumps({str(k): v for k, v in live.winners.items()}),
+            json.dumps(raw) if raw is not None else None,
+        ),
+    )
+    conn.commit()
+
+
 def fetch_runtime(
     session, league_key: str, team_key: str = "", progress: Progress = _noop
 ) -> LeagueRuntime:

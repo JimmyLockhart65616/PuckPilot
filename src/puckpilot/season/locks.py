@@ -57,25 +57,41 @@ class Lock:
 
 
 def roster_teams(
-    conn: sqlite3.Connection, manager: str, team_key: str = ""
+    conn: sqlite3.Connection, manager: str, team_key: str = "", day: str = ""
 ) -> dict[str, list[str]]:
-    """team -> player names, from the most recent roster snapshot.
+    """team -> player names, from the latest roster snapshot on or before `day`.
 
     Read from what was last stored rather than from Yahoo: planning the day's
     runs must not itself need a browser, or the thing that schedules the work
     becomes the thing most likely to fail.
+
+    Two traps. A roster read *for* a future date is still a snapshot, so the
+    newest date is not the newest read - a 10-07 read taken on 09-21 planned
+    every lock for days - hence `day`. And each run now also saves the
+    opponent's roster under the same manager, so the manager's own team has to
+    be named: without `team_key` it is taken to be the team with the most
+    snapshots, which the opponents of single weeks never are.
     """
+    if not team_key:
+        top = conn.execute(
+            "SELECT team_key FROM yahoo_roster_snapshots WHERE manager = ? "
+            "GROUP BY team_key ORDER BY COUNT(*) DESC LIMIT 1",
+            (manager,),
+        ).fetchone()
+        if not top:
+            return {}
+        team_key = top[0]
     row = conn.execute(
-        "SELECT MAX(date) FROM yahoo_roster_snapshots WHERE manager = ?"
-        + (" AND team_key = ?" if team_key else ""),
-        (manager, team_key) if team_key else (manager,),
+        "SELECT MAX(date) FROM yahoo_roster_snapshots WHERE manager = ? AND team_key = ?"
+        + (" AND date <= ?" if day else ""),
+        (manager, team_key, day) if day else (manager, team_key),
     ).fetchone()
     if not row or not row[0]:
         return {}
     rows = conn.execute(
         "SELECT name, team_abbrev, status FROM yahoo_roster_snapshots "
-        "WHERE manager = ? AND date = ?",
-        (manager, row[0]),
+        "WHERE manager = ? AND team_key = ? AND date = ?",
+        (manager, team_key, row[0]),
     ).fetchall()
     out: dict[str, list[str]] = {}
     for r in rows:

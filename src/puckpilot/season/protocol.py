@@ -140,12 +140,27 @@ class WeekProtocol:
 
 
 def derive(outlook, manager: str, league_key: str, team_key: str, week: int, opponent: str):
-    """Read a stance off the week's projected category margins."""
+    """Read a stance off the week's projected categories.
+
+    By odds where the outlook models the spread - a long shot even with every
+    lever pulled is conceded, a coin flip is chased - and by the relative
+    margin only where it does not. The margin is taken in our favour (`edge`),
+    so a category scored lower-is-better is not read backwards.
+    """
+    from puckpilot.season.week import Z_BAND
+
     stances = []
     for o in outlook:
         measured = getattr(o, "measured", False)
-        unreachable = not o.reachable if measured else o.relative <= -OUT_OF_REACH
-        if o.margin < 0 and unreachable:
+        edge = getattr(o, "edge", o.margin)
+        z = getattr(o, "z", None)
+        if measured:
+            unreachable = not o.reachable
+        elif z is not None:
+            unreachable = z <= -Z_BAND
+        else:
+            unreachable = o.relative <= -OUT_OF_REACH
+        if edge < 0 and unreachable:
             stance = CONCEDE
         elif o.in_play:
             stance = CHASE

@@ -250,3 +250,100 @@ def test_planning_with_no_roster_snapshot_is_empty_not_a_crash(db):
     from puckpilot.season import locks
 
     assert locks.roster_teams(db, "nobody") == {}
+
+
+def _snap(db, team_key, date, *names):
+    for name, club in names:
+        db.execute(
+            "INSERT INTO yahoo_roster_snapshots (manager, league_key, team_key, date, "
+            "player_key, name, team_abbrev, selected_slot) VALUES "
+            "('jimmy','l',?,?,?,?,?,'BN')",
+            (team_key, date, f"p.{team_key}.{name}", name, club),
+        )
+    db.commit()
+
+
+def test_a_roster_read_for_a_future_date_does_not_plan_today(db):
+    """The real case: a 10-07 read taken on 09-21 was MAX(date) for days, so
+    every lock was planned from a stale roster."""
+    from puckpilot.season import locks
+
+    _snap(db, "t", "2026-09-26", ("Current", "DET"))
+    _snap(db, "t", "2026-10-07", ("Stale", "NYR"))
+    assert locks.roster_teams(db, "jimmy", "t", "2026-09-26") == {"DET": ["Current"]}
+
+
+def test_the_opponents_roster_never_leaks_into_our_locks(db):
+    """Every run now saves the opponent's roster under the same manager."""
+    from puckpilot.season import locks
+
+    _snap(db, "t.5", "2026-09-29", ("Ours", "DET"))
+    _snap(db, "t.5", "2026-09-30", ("Ours", "DET"))
+    _snap(db, "t.11", "2026-09-30", ("Theirs", "BOS"))
+    assert locks.roster_teams(db, "jimmy", "t.5", "2026-09-30") == {"DET": ["Ours"]}
+    # Unnamed, our team is the one with the most snapshots.
+    assert locks.roster_teams(db, "jimmy", day="2026-09-30") == {"DET": ["Ours"]}
+
+
+# -- the week, on every run -------------------------------------------------
+
+
+def _rt(weeks):
+    from puckpilot.season.settings import LeagueRuntime, Week
+    from tests.test_season_settings import payload
+
+    return LeagueRuntime.from_payload(
+        payload(), weeks=tuple(Week(*w) for w in weeks), fetched_at="now"
+    )
+
+
+def test_before_the_season_this_week_is_the_first_one():
+    from puckpilot.season.run import week_for
+
+    rt = _rt([(1, "2026-09-29", "2026-10-04"), (2, "2026-10-05", "2026-10-11")])
+    assert week_for(rt, "2026-09-26").number == 1
+    assert week_for(rt, "2026-10-06").number == 2
+    assert week_for(rt, "2027-06-01") is None
+
+
+def test_adds_used_come_from_yahoo_and_only_for_this_week():
+    from puckpilot.season.roster import TeamRoster
+    from puckpilot.season.run import adds_used
+    from puckpilot.season.settings import Week
+
+    r = TeamRoster(
+        league_key="l",
+        team_key="t",
+        date="d",
+        players=(),
+        adds_this_week=2,
+        adds_week=3,
+        moves_season=11,
+    )
+    assert adds_used(r, Week(3, "a", "b")) == (2, 11)
+    assert adds_used(r, Week(4, "a", "b")) == (0, 11)
+    assert adds_used(None, Week(3, "a", "b")) == (0, 0)
+
+
+def test_a_game_already_under_way_is_banked_not_projected(db):
+    from datetime import UTC, datetime
+
+    from puckpilot.data import store
+    from puckpilot.season.run import started_clubs
+
+    for gid, (utc, home, away) in enumerate(
+        (("2026-10-04T17:00:00Z", "DET", "NYR"), ("2026-10-04T23:00:00Z", "ANA", "BOS")), 1
+    ):
+        store.upsert_schedule_game(
+            db,
+            game_id=gid,
+            season="20262027",
+            game_type=2,
+            game_date="2026-10-04",
+            start_time_utc=utc,
+            home_team=home,
+            away_team=away,
+        )
+    db.commit()
+    at_six = datetime(2026, 10, 4, 22, 0, tzinfo=UTC)
+    assert started_clubs(db, "20262027", "2026-10-04", now=at_six) == {"DET", "NYR"}

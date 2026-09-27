@@ -11,7 +11,7 @@ whole point - is exactly what it loses.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from puckpilot.season.roster import _fields
@@ -107,6 +107,149 @@ def parse_matchups(payload: dict, our_team_key: str = "") -> list[Matchup]:
         )
     out.sort(key=lambda m: m.week)
     return out
+
+
+# -- the live score ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TeamScore:
+    """One side's week so far, as Yahoo reports it."""
+
+    team_key: str
+    name: str
+    # stat_id -> value; None where Yahoo shows "-" (a save percentage with no
+    # shots faced is undefined, not zero).
+    stats: dict[int, float | None]
+    remaining_games: int | None = None
+    live_games: int | None = None
+    completed_games: int | None = None
+
+
+@dataclass(frozen=True)
+class LiveMatchup:
+    """The score of a week in progress: both sides' totals and who leads what.
+
+    Yahoo sends this inside the same `team/{key}/matchups` response the week
+    calendar is read from; for a season it was simply thrown away.
+    """
+
+    week: int
+    status: str  # preevent / midevent / postevent
+    ours: TeamScore
+    theirs: TeamScore
+    # stat_id -> "ours" / "theirs" / "tie", for the categories Yahoo adjudicates.
+    winners: dict[int, str] = field(default_factory=dict)
+
+    @property
+    def started(self) -> bool:
+        return self.status in ("midevent", "postevent")
+
+    def banked(self, labels: dict[int, str], side: str = "ours") -> dict[str, float]:
+        """label -> value for one side, using Yahoo's stat_id -> label map."""
+        team = self.ours if side == "ours" else self.theirs
+        return {labels[sid]: v for sid, v in team.stats.items() if sid in labels and v is not None}
+
+
+def _value(v: Any) -> float | None:
+    """Yahoo's stat strings: "14", ".915", "-" or "" when undefined."""
+    if v in (None, "", "-"):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _score(entry: list) -> TeamScore:
+    """One team entry of a matchup: metadata first, then stats blocks."""
+    core = _fields(entry[0]) if isinstance(entry[0], list) else _fields([entry[0]])
+    tail = _fields(entry[1:])
+    stats: dict[int, float | None] = {}
+    block = tail.get("team_stats")
+    for item in (block or {}).get("stats", []) if isinstance(block, dict) else []:
+        st = item.get("stat") if isinstance(item, dict) else None
+        if isinstance(st, dict) and "stat_id" in st:
+            try:
+                stats[int(st["stat_id"])] = _value(st.get("value"))
+            except (TypeError, ValueError):
+                continue
+    games = tail.get("team_remaining_games")
+    total = games.get("total") if isinstance(games, dict) else None
+    total = total if isinstance(total, dict) else {}
+
+    def count(k: str) -> int | None:
+        try:
+            return int(total[k])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    return TeamScore(
+        team_key=str(core.get("team_key", "")),
+        name=str(core.get("name", "")),
+        stats=stats,
+        remaining_games=count("remaining_games"),
+        live_games=count("live_games"),
+        completed_games=count("completed_games"),
+    )
+
+
+def parse_live(payload: dict, our_team_key: str, week: int | None = None) -> LiveMatchup | None:
+    """The live score of one week (default: the first matchup in the response).
+
+    Fields verified against Yahoo's documented matchup shape, not yet against a
+    live week of this league - the first in-season fetch is kept raw in
+    `matchup_snapshots` so this can be checked and re-parsed.
+    """
+    try:
+        team = payload["fantasy_content"]["team"]
+    except (KeyError, TypeError):
+        return None
+    node = next((x["matchups"] for x in team if isinstance(x, dict) and "matchups" in x), None)
+    if not isinstance(node, dict):
+        return None
+    for i in range(int(node.get("count", 0))):
+        m = node.get(str(i), {}).get("matchup")
+        if not isinstance(m, dict):
+            continue
+        try:
+            wk = int(m.get("week"))
+        except (TypeError, ValueError):
+            continue
+        if week is not None and wk != week:
+            continue
+        teams = (m.get("0") or {}).get("teams")
+        if not isinstance(teams, dict):
+            return None
+        sides = []
+        for j in range(int(teams.get("count", 0))):
+            entry = teams.get(str(j), {}).get("team")
+            if isinstance(entry, list) and entry:
+                sides.append(_score(entry))
+        ours = next((s for s in sides if s.team_key == our_team_key), None)
+        theirs = next((s for s in sides if s.team_key != our_team_key), None)
+        if ours is None or theirs is None:
+            return None
+        winners: dict[int, str] = {}
+        for w in m.get("stat_winners") or []:
+            sw = w.get("stat_winner") if isinstance(w, dict) else None
+            if not isinstance(sw, dict) or "stat_id" not in sw:
+                continue
+            sid = int(sw["stat_id"])
+            if str(sw.get("is_tied", "0")) == "1":
+                winners[sid] = "tie"
+            elif sw.get("winner_team_key") == our_team_key:
+                winners[sid] = "ours"
+            elif sw.get("winner_team_key"):
+                winners[sid] = "theirs"
+        return LiveMatchup(
+            week=wk,
+            status=str(m.get("status", "")),
+            ours=ours,
+            theirs=theirs,
+            winners=winners,
+        )
+    return None
 
 
 def weeks_of(matchups: list[Matchup]) -> tuple[Week, ...]:

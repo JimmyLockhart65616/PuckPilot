@@ -184,20 +184,41 @@ function renderProposals(root, list) {
   });
 }
 
+function pair(a, b) {
+  if (a === undefined || a === null || b === undefined || b === null) return '–';
+  return a + '–' + b;
+}
+
 function renderWeek(root, w) {
   if (!w || !w.cats || !w.cats.length) return;
   h2(root, 'Week ' + (w.week || '') + (w.opponent ? ' vs ' + w.opponent : ''));
   var c = card(root);
+  var gl = w.games_left;
+  if (gl && gl.ours !== undefined) {
+    var bits = ['Starts left: you ' + gl.ours + ', them ' + gl.theirs];
+    if (w.days_left) bits.push(w.days_left + ' day' + (w.days_left === 1 ? '' : 's') + ' to play');
+    c.appendChild(el('div', 'sub', bits.join(' · ')));
+  }
+  // Once the week has begun, what is banked sits beside where it should end.
+  var live = w.cats.some(function (r) { return r.now_ours !== undefined && r.now_ours !== null; });
   var t = el('table');
   var head = el('tr');
-  ['cat', 'you', 'them', ''].forEach(function (x) { head.appendChild(el('th', null, x)); });
+  (live ? ['cat', 'now', 'final', ''] : ['cat', 'you', 'them', '']).forEach(function (x) {
+    head.appendChild(el('th', null, x));
+  });
   t.appendChild(head);
   w.cats.forEach(function (row) {
     var tr = el('tr');
     tr.appendChild(el('td', row.state === 'gone' ? 'gone' : null, row.label));
-    tr.appendChild(el('td', null, row.ours));
-    tr.appendChild(el('td', null, row.theirs));
-    tr.appendChild(el('td', row.state === 'close' ? 'close' : 'muted', row.state));
+    if (live) {
+      tr.appendChild(el('td', null, pair(row.now_ours, row.now_theirs)));
+      tr.appendChild(el('td', null, pair(row.ours, row.theirs)));
+    } else {
+      tr.appendChild(el('td', null, row.ours));
+      tr.appendChild(el('td', null, row.theirs));
+    }
+    var hot = row.state === 'in play' || row.state === 'close';
+    tr.appendChild(el('td', hot ? 'close' : 'muted', row.state));
     t.appendChild(tr);
   });
   c.appendChild(t);

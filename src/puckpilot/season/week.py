@@ -1,9 +1,9 @@
 """The week ahead: which categories are in play, and what to do about it.
 
 `engine/waivers.py` ranks an add by how much season value it adds. That is the
-right question in a roto league and the wrong one here. This league is head to
-head over twelve categories: a week is won by taking seven of them, and value
-banked in a category you were going to win by miles is value wasted.
+right question in a roto league and the wrong one here. Head to head, a week
+is won category by category, and value banked in a category you were going to
+win by miles is value wasted.
 
 So the order of business is the opposite way round. First work out where this
 week is actually decided - project both rosters over the week's real games and
@@ -24,10 +24,12 @@ A transaction is never executed from here. This produces proposals, and
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from dataclasses import dataclass, field
+from statistics import NormalDist
 
-from puckpilot.engine.categories import Category
+from puckpilot.engine.categories import CATALOG, Category
 from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.league import LeagueConfig
 from puckpilot.season import calendar
@@ -51,6 +53,25 @@ MATERIAL = 0.25
 # does not divide by nothing.
 MIN_GAP = 0.5
 
+# Stances by odds rather than by share of the total: "likely" from 85%, "long
+# shot" below 15%. The relative band compared margins across categories whose
+# weekly noise differs tenfold - it called a +12% lead in wins "safe" when two
+# goalie starts either way make it a coin flip. These are labels, not claims:
+# no percentage is shown until the odds are calibrated against real weeks.
+LIKELY = 0.85
+Z_BAND = NormalDist().inv_cdf(LIKELY)
+
+# Per-game variance as a multiple of the per-game mean, measured within player
+# on 2025-26 game lines: 0.96-1.11 for goals, assists, points, PPP, shots, hits
+# and blocks (Poisson), 3.84 for penalty minutes (majors and misconducts come
+# in lumps). Saves and shots against run about 2. Wins and shutouts are
+# yes/no per start and handled as such.
+DISPERSION = {"pim": 3.84, "saves": 2.0, "shots_against": 2.0, "goals_against": 1.5}
+BERNOULLI = {"wins", "shutouts"}
+# Save percentage varies more than shots alone explain - shot quality, and who
+# is in net - so its binomial spread is widened by this much.
+SV_PCT_INFLATION = 1.3
+
 
 @dataclass(frozen=True)
 class CategoryOutlook:
@@ -62,6 +83,12 @@ class CategoryOutlook:
     # zero is the common and informative answer.
     lineup_room: float | None = None
     add_room: float | None = None
+    # Spread of the final margin from what is still to play; None when not
+    # modelled. It shrinks to nothing as the week is banked.
+    sd: float | None = None
+    # Yahoo's own totals so far, when the week has started.
+    banked_ours: float | None = None
+    banked_theirs: float | None = None
 
     @property
     def room(self) -> float:
@@ -72,16 +99,48 @@ class CategoryOutlook:
         return self.lineup_room is not None
 
     @property
+    def edge(self) -> float:
+        """The margin in our favour: positive is winning, whichever way the
+        category is scored. `margin` alone reads a GAA lead backwards."""
+        return self.margin if self.category.higher_is_better else -self.margin
+
+    @property
+    def z(self) -> float | None:
+        if self.sd is None:
+            return None
+        if self.sd <= 1e-9:
+            return float("inf") if self.edge > 0 else float("-inf") if self.edge < 0 else 0.0
+        return self.edge / self.sd
+
+    @property
+    def band(self) -> str:
+        """likely / in play / long shot, by the odds; by the relative margin
+        only where no spread was modelled."""
+        z = self.z
+        if z is None:
+            if abs(self.relative) <= CLOSE_BAND:
+                return "in play"
+            return "likely" if self.edge > 0 else "long shot"
+        if z >= Z_BAND:
+            return "likely"
+        if z <= -Z_BAND:
+            return "long shot"
+        return "in play"
+
+    @property
     def reachable(self) -> bool:
         """Whether any lever left could still close this gap.
 
         A category we lead is trivially reachable. One we trail is reachable
-        only if re-slotting plus the best add available covers the gap.
+        only if re-slotting plus the best add available could make it more
+        than a long shot - with no spread modelled, only if they cover the gap.
         """
-        if self.margin >= 0:
+        if self.edge >= 0:
             return True
         if not self.measured:
             return True
+        if self.sd is not None and self.sd > 1e-9:
+            return (self.edge + self.room) / self.sd > -Z_BAND
         return abs(self.margin) <= self.room
 
     @property
@@ -91,17 +150,17 @@ class CategoryOutlook:
     @property
     def relative(self) -> float:
         total = abs(self.ours) + abs(self.theirs)
-        return self.margin / total if total else 0.0
+        return self.edge / total if total else 0.0
 
     @property
     def verdict(self) -> str:
-        if abs(self.relative) <= CLOSE_BAND:
+        if self.band == "in play":
             return "close"
-        return "ahead" if self.margin > 0 else "behind"
+        return "ahead" if self.edge > 0 else "behind"
 
     @property
     def in_play(self) -> bool:
-        return self.verdict == "close"
+        return self.band == "in play"
 
 
 @dataclass(frozen=True)
@@ -144,23 +203,43 @@ class WeekPlan:
     adds_left_week: int | None = None
     adds_left_season: int | None = None
     notes: tuple[str, ...] = field(default=())
+    # Where the week stands: Yahoo's status, the days still to play, and
+    # whether the totals include Yahoo's banked results.
+    status: str = ""
+    days_left: int = 0
+    banked: bool = False
 
     def close(self) -> tuple[CategoryOutlook, ...]:
         return tuple(o for o in self.outlook if o.in_play)
 
     def text(self) -> str:
+        left = f" over {self.days_left} day(s)" if self.banked else ""
         lines = [
             f"Week {self.week}  {self.start} -> {self.end}   vs {self.opponent or '?'}",
-            f"  games this week: you {self.our_games}, them {self.their_games}",
+            f"  starts left{left}: you {self.our_games}, them {self.their_games}",
             "",
-            f"  {'cat':5}{'you':>10}{'them':>10}{'margin':>10}   where it stands",
         ]
+        if self.banked:
+            lines.append(f"  {'cat':5}{'now':>14}{'projected':>18}{'margin':>10}   where it stands")
+        else:
+            lines.append(f"  {'cat':5}{'you':>10}{'them':>10}{'margin':>10}   where it stands")
         for o in self.outlook:
             fmt = ".3f" if o.category.key in DERIVED else ".1f"
-            lines.append(
-                f"  {o.category.label:5}{o.ours:>10{fmt}}{o.theirs:>10{fmt}}"
-                f"{o.margin:>+10{fmt}}   {o.verdict}"
-            )
+            if self.banked:
+                now = (
+                    f"{o.banked_ours:{fmt}}-{o.banked_theirs:{fmt}}"
+                    if o.banked_ours is not None and o.banked_theirs is not None
+                    else "-"
+                )
+                final = f"{o.ours:{fmt}}-{o.theirs:{fmt}}"
+                lines.append(
+                    f"  {o.category.label:5}{now:>14}{final:>18}{o.margin:>+10{fmt}}   {o.band}"
+                )
+            else:
+                lines.append(
+                    f"  {o.category.label:5}{o.ours:>10{fmt}}{o.theirs:>10{fmt}}"
+                    f"{o.margin:>+10{fmt}}   {o.band}"
+                )
         close = self.close()
         lines.append("")
         lines.append(
@@ -254,10 +333,18 @@ def _f(v) -> float:
 
 
 def project_totals(
-    games: dict[int, float], rates: dict[int, dict[str, float]], cats: tuple[Category, ...]
+    games: dict[int, float],
+    rates: dict[int, dict[str, float]],
+    cats: tuple[Category, ...],
+    base: dict[str, float] | None = None,
 ) -> dict[str, float]:
-    """Category totals for a week, from per-player expected games."""
-    acc: dict[str, float] = {}
+    """Category totals for a week, from per-player expected games.
+
+    `base` is what is already banked, as components - saves and shots against
+    rather than save percentage - so a rate comes out as the ratio of the whole
+    week's totals, banked and projected together.
+    """
+    acc: dict[str, float] = dict(base or {})
     for pid, n in games.items():
         r = rates.get(pid)
         if not r or n <= 0:
@@ -275,6 +362,80 @@ def project_totals(
     return out
 
 
+def remaining_variance(
+    games: dict[int, float],
+    rates: dict[int, dict[str, float]],
+    cats: tuple[Category, ...],
+    totals: dict[str, float],
+    base: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Variance of each category's total from the games still to play.
+
+    Banked results are fixed, so only the remainder is uncertain - which is why
+    the spread, and with it every "in play" call, narrows as the week goes on.
+    Rates use the delta method on the final ratio: the binomial spread of the
+    remaining saves, over the week's shots squared.
+    """
+    var: dict[str, float] = {}
+    for pid, n in games.items():
+        r = rates.get(pid)
+        if not r or n <= 0:
+            continue
+        for k, rate in r.items():
+            if rate <= 0:
+                continue
+            if k in BERNOULLI:
+                per = min(rate, 1.0) * (1.0 - min(rate, 1.0))
+            else:
+                per = DISPERSION.get(k, 1.0) * rate
+            var[k] = var.get(k, 0.0) + per * n
+    out: dict[str, float] = {}
+    acc_rem: dict[str, float] = {}
+    for pid, n in games.items():
+        for k, rate in (rates.get(pid) or {}).items():
+            acc_rem[k] = acc_rem.get(k, 0.0) + rate * max(n, 0.0)
+    for c in cats:
+        if c.key == "save_pct":
+            shots = (base or {}).get("shots_against", 0.0) + acc_rem.get("shots_against", 0.0)
+            p = totals.get("save_pct", 0.0)
+            rem = acc_rem.get("shots_against", 0.0)
+            out[c.key] = (
+                (SV_PCT_INFLATION**2) * p * (1.0 - p) * rem / shots**2 if shots > 0 else 0.0
+            )
+        elif c.key in DERIVED:
+            out[c.key] = 0.0  # unmodelled; its stance falls back to the relative band
+        else:
+            out[c.key] = var.get(c.key, 0.0)
+    return out
+
+
+# Yahoo labels that are not categories here but are components of one.
+_COMPONENT_LABELS = {"GA": "goals_against"}
+
+
+def banked_components(by_label: dict[str, float]) -> dict[str, float]:
+    """Yahoo's week-so-far totals, as the component keys projections use.
+
+    Rates themselves are dropped - a banked save percentage is recomputed from
+    banked saves and shots against - and GAA's hours are backed out of GA and
+    GAA, since Yahoo reports no time on ice.
+    """
+    by_key = {c.label.casefold(): c for c in CATALOG.values()}
+    out: dict[str, float] = {}
+    for label, v in by_label.items():
+        if label in _COMPONENT_LABELS:
+            out[_COMPONENT_LABELS[label]] = v
+            continue
+        c = by_key.get(label.casefold())
+        if c is None or c.key in DERIVED:
+            continue
+        out[c.key] = v
+    gaa = next((v for k, v in by_label.items() if k.casefold() == "gaa"), None)
+    if gaa and "goals_against" in out and gaa > 0:
+        out["toi_hours"] = out["goals_against"] / gaa
+    return out
+
+
 def expected_starts(
     conn: sqlite3.Connection,
     runtime: LeagueRuntime,
@@ -284,11 +445,14 @@ def expected_starts(
     values,
     weights: dict[str, float] | None = None,
     days: list[str] | None = None,
+    exclude: dict[str, set[str]] | None = None,
 ) -> dict[int, float]:
     """Expected *starts* for each player over the week, not team games.
 
     `days` narrows it to part of the week - the days still to play, once some
-    have been banked. Default: all of it.
+    have been banked. Default: all of it. `exclude` removes clubs from a day:
+    games already under way, whose stats are in Yahoo's banked totals and
+    must not be projected a second time.
 
     The distinction matters. A roster carries more players than it can start -
     thirteen slots against sixteen or seventeen bodies - so counting every
@@ -309,7 +473,7 @@ def expected_starts(
     out: dict[int, float] = {}
 
     for day in week.dates() if days is None else days:
-        playing = calendar.teams_playing(conn, day, season)
+        playing = calendar.teams_playing(conn, day, season) - (exclude or {}).get(day, set())
         p_starts = goalie_source.starts(day) if goalie_source else {}
         cands = []
         goalies = []
@@ -355,6 +519,7 @@ def headroom(
     cats: tuple[Category, ...],
     neutral: dict[str, float],
     favour: float = 6.0,
+    days: list[str] | None = None,
 ) -> dict[str, float]:
     """How far each category could move if the lineup chased only that one.
 
@@ -378,7 +543,7 @@ def headroom(
             out[c.key] = None
             continue
         starts = expected_starts(
-            conn, runtime, week, players, goalie_source, values, weights={c.key: favour}
+            conn, runtime, week, players, goalie_source, values, weights={c.key: favour}, days=days
         )
         best = project_totals(starts, rates, cats)
         out[c.key] = max(best.get(c.key, 0.0) - neutral.get(c.key, 0.0), 0.0)
@@ -467,14 +632,45 @@ def build_week_plan(
     adds_used_season: int = 0,
     min_gain: float = 0.5,
     max_targets: int = 5,
+    banked_ours: dict[str, float] | None = None,
+    banked_theirs: dict[str, float] | None = None,
+    from_day: str | None = None,
+    started: set[str] | None = None,
+    status: str = "",
+    find_targets: bool = True,
 ) -> WeekPlan:
+    """Both sides' week: what is banked, plus what the days left should add.
+
+    `banked_*` is Yahoo's week-so-far, by Yahoo label (`LiveMatchup.banked`);
+    `from_day` is the first day not yet played, and `started` the clubs whose
+    game that day is already under way - banked, so not projected again. With
+    neither, this is the whole week from its first day, as before.
+
+    Everything that compares two projections - the lineup headroom, the add
+    deltas - works on the remainder alone: a banked total on one side of a
+    difference would be counted as something an add could change.
+    """
     cats = league.all_cats
     rates = per_game_rates(frame, cats)
+    days = [d for d in week.dates() if from_day is None or d >= from_day]
+    exclude = {days[0]: set(started)} if days and started else None
+    base_ours = banked_components(banked_ours or {})
+    base_theirs = banked_components(banked_theirs or {})
+    banked = banked_ours is not None
 
-    our_games = expected_starts(conn, runtime, week, ours.players, goalie_source, values)
-    their_games = expected_starts(conn, runtime, week, theirs.players, goalie_source, values)
-    our_totals = project_totals(our_games, rates, cats)
-    their_totals = project_totals(their_games, rates, cats)
+    our_games = expected_starts(
+        conn, runtime, week, ours.players, goalie_source, values, days=days, exclude=exclude
+    )
+    their_games = expected_starts(
+        conn, runtime, week, theirs.players, goalie_source, values, days=days, exclude=exclude
+    )
+    our_rest = project_totals(our_games, rates, cats)
+    our_totals = project_totals(our_games, rates, cats, base=base_ours)
+    their_totals = project_totals(their_games, rates, cats, base=base_theirs)
+    our_var = remaining_variance(our_games, rates, cats, our_totals, base_ours)
+    their_var = remaining_variance(their_games, rates, cats, their_totals, base_theirs)
+    ours_now = project_totals({}, {}, cats, base=base_ours) if banked else {}
+    theirs_now = project_totals({}, {}, cats, base=base_theirs) if banked else {}
 
     adds_left_week = (
         None
@@ -482,7 +678,7 @@ def build_week_plan(
         else max(runtime.max_weekly_adds - adds_used_week, 0)
     )
     reach = headroom(
-        conn, runtime, week, ours.players, goalie_source, values, rates, cats, our_totals
+        conn, runtime, week, ours.players, goalie_source, values, rates, cats, our_rest, days=days
     )
     adds = add_headroom(
         conn,
@@ -494,7 +690,14 @@ def build_week_plan(
         cats,
         league,
         adds_left=adds_left_week if adds_left_week is not None else 1,
+        days=days,
     )
+
+    def sd(key: str) -> float | None:
+        if key in DERIVED and key != "save_pct":
+            return None
+        return math.sqrt(max(our_var.get(key, 0.0) + their_var.get(key, 0.0), 0.0))
+
     outlook = tuple(
         CategoryOutlook(
             category=c,
@@ -502,6 +705,9 @@ def build_week_plan(
             theirs=their_totals.get(c.key, 0.0),
             lineup_room=reach.get(c.key),
             add_room=adds.get(c.key),
+            sd=sd(c.key),
+            banked_ours=ours_now.get(c.key) if banked else None,
+            banked_theirs=theirs_now.get(c.key) if banked else None,
         )
         for c in cats
     )
@@ -513,22 +719,27 @@ def build_week_plan(
     )
     if adds_left_week == 0:
         notes.append("No acquisitions left this week - these are for next week.")
+    if not days:
+        notes.append("The week is over - nothing left to play.")
 
-    targets = _targets(
-        conn,
-        runtime,
-        league,
-        week,
-        ours,
-        pool,
-        rates,
-        close_by_key,
-        goalie_source,
-        values,
-        min_gain,
-        max_targets,
-        base_totals=our_totals,
-    )
+    targets: tuple[AddTarget, ...] = ()
+    if find_targets and days:
+        targets = _targets(
+            conn,
+            runtime,
+            league,
+            week,
+            ours,
+            pool,
+            rates,
+            close_by_key,
+            goalie_source,
+            values,
+            min_gain,
+            max_targets,
+            base_totals=our_rest,
+            days=days,
+        )
 
     return WeekPlan(
         week=week.number,
@@ -539,6 +750,9 @@ def build_week_plan(
         targets=targets,
         our_games=int(sum(our_games.values())),
         their_games=int(sum(their_games.values())),
+        status=status,
+        days_left=len(days),
+        banked=banked,
         adds_used_week=adds_used_week,
         adds_left_week=adds_left_week,
         adds_left_season=adds_left_season,

@@ -172,3 +172,40 @@ def test_the_cold_payload_carries_every_key_a_snapshot_does(db):
         if key in ("team", "date", "out", "lock_local", "playing", "rostered"):
             continue  # optional on the page by design
         assert key in cold, key
+
+
+def test_the_week_card_carries_the_score_so_far_and_games_left(db):
+    from puckpilot.engine.categories import resolve
+    from puckpilot.season.week import CategoryOutlook, WeekPlan
+
+    wp = WeekPlan(
+        week=1,
+        start="2026-09-29",
+        end="2026-10-04",
+        opponent="Visitors",
+        outlook=(
+            CategoryOutlook(resolve("G"), 9.2, 10.4, sd=3.0, banked_ours=4.0, banked_theirs=6.0),
+            CategoryOutlook(
+                resolve("SV%"), 0.912, 0.905, sd=0.02, banked_ours=0.915, banked_theirs=0.901
+            ),
+        ),
+        our_games=23,
+        their_games=27,
+        status="midevent",
+        days_left=3,
+        banked=True,
+    )
+    s = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_plan=wp)
+    w = s["week"]
+    assert w["games_left"] == {"ours": 23, "theirs": 27} and w["days_left"] == 3
+    g, sv = w["cats"]
+    assert (g["now_ours"], g["now_theirs"], g["state"]) == (4.0, 6.0, "in play")
+    assert sv["now_ours"] == 0.915
+
+
+def test_the_protocol_card_is_on_every_run_not_just_mondays(db):
+    """A push replaces the whole page; an Approve button that vanished on the
+    next run could not be pressed."""
+    p = protocol_mod.save(db, derive(outlook("PPP", 8.5, 7.7, add_room=5.0), week=2))
+    s = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_no=2)
+    assert s["protocol"]["id"] == p.id and s["week"] is None

@@ -90,6 +90,82 @@ def starts_a_week(runtime, day: str) -> bool:
         return False
 
 
+def week_for(runtime, day: str):
+    """The week `day` falls in, or the next one to start.
+
+    Before the season - and between a week's end and the next's start, should
+    the calendar ever have such a gap - "this week" means the one coming.
+    """
+    try:
+        return runtime.week(runtime.week_of(day))
+    except Exception:  # noqa: BLE001 - outside every known week
+        later = [w for w in runtime.weeks if w.start > day]
+        return min(later, key=lambda w: w.start) if later else None
+
+
+@dataclass
+class WeekContext:
+    """What one run learned about the week, shared by every step after the read."""
+
+    week: object | None = None
+    roster: object | None = None
+    theirs: object | None = None
+    live: object | None = None
+    raw: dict | None = None
+    error: str = ""
+
+
+def started_clubs(conn, season: str, day: str, now=None) -> set[str]:
+    """Clubs whose game on `day` has already begun.
+
+    Their stats are already in Yahoo's banked totals, so projecting the game
+    as well would count it twice.
+    """
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    now = now or _dt.now(UTC)
+    out: set[str] = set()
+    for r in conn.execute(
+        "SELECT start_time_utc, home_team, away_team FROM nhl_schedule "
+        "WHERE season = ? AND game_type = 2 AND game_date = ? AND start_time_utc IS NOT NULL",
+        (season, day),
+    ):
+        try:
+            begins = _dt.fromisoformat(r["start_time_utc"].replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if begins <= now:
+            out.update((r["home_team"], r["away_team"]))
+    return out
+
+
+def live_inputs(conn, runtime, week, live, day: str, now=None) -> dict:
+    """The banked-plus-remaining arguments for `build_week_plan`.
+
+    Before the week starts (or with no labels to read Yahoo's stats by) nothing
+    is banked and the whole week, or what is left of it, is projected.
+    """
+    from_day = max(day, week.start)
+    started = started_clubs(conn, runtime.nhl_season, day, now) if from_day == day else set()
+    out: dict = {"from_day": from_day, "started": started or None}
+    out["status"] = live.status if live is not None else ""
+    labels = runtime.stat_labels()
+    if live is not None and live.started and labels:
+        out["banked_ours"] = live.banked(labels, "ours")
+        out["banked_theirs"] = live.banked(labels, "theirs")
+    return out
+
+
+def adds_used(roster, week) -> tuple[int, int]:
+    """(this week, this season) - Yahoo's own counters, zero only when unknown."""
+    wk = roster.adds_this_week if roster is not None else None
+    if wk is not None and roster.adds_week not in (None, getattr(week, "number", None)):
+        wk = 0  # a count for another week
+    season = roster.moves_season if roster is not None else None
+    return wk or 0, season or 0
+
+
 def run_day(
     conn: sqlite3.Connection,
     manager,
@@ -105,7 +181,7 @@ def run_day(
 ) -> RunReport:
     """Everything a day needs, in the order it needs it."""
     from puckpilot.season import cli_support, explain, publish, snapshot
-    from puckpilot.season.fetch import discover_team_key, fetch_roster, save_roster
+    from puckpilot.season.fetch import discover_team_key, fetch_live, fetch_roster, save_roster
     from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
     from puckpilot.season.today import build_plan, yahoo_goalie_games
     from puckpilot.season.values import build_value_model
@@ -149,25 +225,46 @@ def run_day(
 
         _guard(report, "decisions", _collect)
 
-    # 3. Tonight.
+    # 3. Tonight - and the week's live score and the opponent's roster, read in
+    # the same browser session. Intra-week state cannot be fetched afterwards,
+    # so every run logs it.
     pmap = playermap.load_map(conn, league_key)
+    week = week_for(runtime, day)
+    ctx = WeekContext(week=week)
 
     def _read(session):
         key = manager.team_key or discover_team_key(session, league_key)
-        return fetch_roster(session, key, day, player_map=pmap)
+        roster = fetch_roster(session, key, day, player_map=pmap)
+        if week is not None:
+            try:
+                ctx.live, ctx.raw = fetch_live(session, key, week.number)
+                opp = ctx.live.theirs.team_key if ctx.live is not None else ""
+                if opp:
+                    when = day if week.contains(day) else week.start
+                    ctx.theirs = fetch_roster(session, opp, when, player_map=pmap)
+            except Exception as e:  # noqa: BLE001 - the lineup must not die with the score
+                ctx.error = f"{type(e).__name__}: {e}"
+        return roster
 
     roster = _guard(report, "roster", lambda: cli_support.run_session(manager, _read))
+    ctx.roster = roster
+    _guard(report, "score", lambda: _log_week(conn, manager, league_key, ctx, report))
+    train = _train_seasons(season)
+    models = _guard(
+        report,
+        "model",
+        lambda: (
+            build_value_model(conn, season, train, manager.league),
+            ChainedGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0])),
+        ),
+    )
     plan = None
     if roster is not None:
         save_roster(conn, manager.name, roster)
         report.add("roster", True, f"{len(roster)} players", list(roster.unmapped))
 
         def _plan():
-            train = _train_seasons(season)
-            values = build_value_model(conn, season, train, manager.league)
-            goalies = ChainedGoalieSource(
-                TrailingStartShareSource(conn, season, fallback_season=train[0])
-            )
+            values, goalies = models
             got = build_plan(
                 conn,
                 runtime,
@@ -203,18 +300,25 @@ def run_day(
             )
             return got, reasons
 
-        got = _guard(report, "lineup", _plan)
+        got = _guard(report, "lineup", _plan) if models else None
         plan, reasons = got if got else (None, {})
 
-    # 4. The week, on the day it turns over.
+    # 4. The week: the full plan, with adds, on the day it turns over; where it
+    # stands - banked plus what is left - on every other run.
     week_plan = None
     if weekly is None:
         weekly = starts_a_week(runtime, day)
-    if weekly:
+    if weekly and models:
         week_plan = _guard(
             report,
             "week",
-            lambda: _weekly(conn, manager, league_key, runtime, day, propose, report),
+            lambda: _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, models),
+        )
+    elif models and ctx.roster is not None and ctx.theirs is not None and week is not None:
+        week_plan = _guard(
+            report,
+            "week",
+            lambda: _outlook(conn, manager, league_key, runtime, day, report, ctx, models),
         )
 
     # 5. Publish whatever we managed to work out.
@@ -230,6 +334,7 @@ def run_day(
                 week_plan=week_plan,
                 roster=roster,
                 reasons=reasons if plan else None,
+                week_no=week.number if week is not None else None,
             )
             publish.push(manager.page.url, page_key, snap)
             report.add("page", True, manager.page.url)
@@ -238,13 +343,18 @@ def run_day(
 
     # 6. Line up the rest of today against the real game times.
     if reschedule:
-        _guard(report, "schedule", lambda: _plan_rest_of_day(conn, manager, runtime, day, report))
+        own = manager.team_key or getattr(roster, "team_key", "")
+        _guard(
+            report,
+            "schedule",
+            lambda: _plan_rest_of_day(conn, manager, runtime, day, report, own),
+        )
 
     say(report.text)
     return report
 
 
-def _plan_rest_of_day(conn, manager, runtime, day, report):
+def _plan_rest_of_day(conn, manager, runtime, day, report, team_key: str = ""):
     """Register a run shortly before each lock still to come today.
 
     Done on every run rather than once in the morning, so a game that moves, a
@@ -258,7 +368,7 @@ def _plan_rest_of_day(conn, manager, runtime, day, report):
     if day != _date.today().isoformat():
         report.add("schedule", True, f"not planning {day}; only today is schedulable")
         return
-    teams = locks.roster_teams(conn, manager.name)
+    teams = locks.roster_teams(conn, manager.name, team_key, day)
     if not teams:
         report.add("schedule", True, "no roster snapshot yet, so nothing to plan against")
         return
@@ -334,33 +444,109 @@ def _refresh_runtime(conn, manager, league_key, runtime, report):
     return got
 
 
-def _weekly(conn, manager, league_key, runtime, day, propose, report):
+def _log_week(conn, manager, league_key, ctx, report):
+    """Record this run's reading of the live score, and the opponent's roster."""
+    from puckpilot.season.fetch import save_live, save_roster
+
+    if ctx.error:
+        report.add("score", False, f"live score not read: {ctx.error}")
+        return
+    if ctx.live is None:
+        if ctx.week is not None:
+            report.add("score", True, f"week {ctx.week.number}: no live score in the response")
+        return
+    save_live(conn, manager.name, league_key, ctx.live, ctx.raw)
+    if ctx.theirs is not None:
+        save_roster(conn, manager.name, ctx.theirs)
+    t = ctx.live
+    left = ""
+    if t.ours.remaining_games is not None:
+        left = f", Yahoo counts {t.ours.remaining_games} games left vs {t.theirs.remaining_games}"
+    report.add("score", True, f"week {t.week} vs {t.theirs.name} ({t.status}){left}")
+
+
+def _outlook(conn, manager, league_key, runtime, day, report, ctx, models):
+    """Where the week stands on a run that is not the week's first.
+
+    Banked plus what is left, both sides, from the rosters just read - no add
+    search, which is the weekly job's, and no new protocol, which Monday's.
+    """
+    from puckpilot.draft.sim import build_universe
+    from puckpilot.season import pool as pool_mod
+    from puckpilot.season import week as weekmod
+
+    values, goalies = models
+    season = runtime.nhl_season
+    universe = build_universe(conn, season, _train_seasons(season), manager.league)
+    used_week, used_season = adds_used(ctx.roster, ctx.week)
+    plan = weekmod.build_week_plan(
+        conn,
+        runtime,
+        manager.league,
+        ctx.week,
+        ctx.live.theirs.name if ctx.live is not None else "",
+        ctx.roster,
+        ctx.theirs,
+        pool_mod.load_pool(conn, league_key, day),
+        universe.frame,
+        goalies,
+        values,
+        adds_used_week=used_week,
+        adds_used_season=used_season,
+        find_targets=False,
+        **live_inputs(conn, runtime, ctx.week, ctx.live, day),
+    )
+    report.add("week", True, _week_line(plan))
+    return plan
+
+
+def _week_line(plan) -> str:
+    bands: dict[str, list[str]] = {}
+    for o in plan.outlook:
+        bands.setdefault(o.band, []).append(o.category.label)
+    bits = [f"{k}: {' '.join(v)}" for k, v in sorted(bands.items())]
+    return (
+        f"week {plan.week} vs {plan.opponent or '?'} - starts left {plan.our_games} v "
+        f"{plan.their_games} - " + "; ".join(bits)
+    )
+
+
+def _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, models):
+    """The week's first run: the full plan, the add search, and the protocol.
+
+    Reuses what this run already read - our roster, theirs, the live score -
+    and falls back to reading the matchups itself when the score read failed.
+    """
     from puckpilot.draft.sim import build_universe
     from puckpilot.season import cli_support, explain, pool
     from puckpilot.season import protocol as protocol_mod
     from puckpilot.season import week as weekmod
     from puckpilot.season.fetch import fetch_matchups, fetch_roster
-    from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
     from puckpilot.season.matchups import current_or_next
-    from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
 
     season = runtime.nhl_season
     pmap = playermap.load_map(conn, league_key)
 
     def _read(session):
-        team_key = manager.team_key
-        m = current_or_next(fetch_matchups(session, team_key), day)
-        if m is None:
-            return None
-        ours = fetch_roster(session, team_key, m.start, player_map=pmap)
-        theirs = (
-            fetch_roster(session, m.opponent_key, m.start, player_map=pmap)
-            if m.opponent_key
-            else ours
-        )
+        team_key = manager.team_key or (ctx.roster.team_key if ctx.roster else "")
+        week = ctx.week
+        opp_key = ctx.live.theirs.team_key if ctx.live is not None else ""
+        opp_name = ctx.live.theirs.name if ctx.live is not None else ""
+        if week is None or not opp_key:
+            m = current_or_next(fetch_matchups(session, team_key), day)
+            if m is None:
+                return None
+            week, opp_key, opp_name = m.as_week(), m.opponent_key, m.opponent_name
+        when = day if week.contains(day) else week.start
+        ours = ctx.roster
+        if ours is None or ours.date != when:
+            ours = fetch_roster(session, team_key, when, player_map=pmap)
+        theirs = ctx.theirs
+        if theirs is None:
+            theirs = fetch_roster(session, opp_key, when, player_map=pmap) if opp_key else ours
         fa = pool.fetch_pool(session, league_key, "FA", limit=150, player_map=pmap)
-        return m, ours, theirs, fa
+        return week, opp_name, ours, theirs, fa
 
     _guard(report, "upkeep", lambda: _upkeep(conn, manager, league_key, season, report))
 
@@ -368,31 +554,34 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report):
     if got is None:
         report.add("week", False, f"no matchup covering {day} and none after it")
         return None
-    m, ours, theirs, fa = got
-    pool.save_pool(conn, league_key, m.start, fa)
+    week, opp_name, ours, theirs, fa = got
+    pool.save_pool(conn, league_key, day, fa)
 
-    train = _train_seasons(season)
-    universe = build_universe(conn, season, train, manager.league)
-    values = build_value_model(conn, season, train, manager.league)
-    goalies = ChainedGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0]))
+    values, goalies = models
+    universe = build_universe(conn, season, _train_seasons(season), manager.league)
+    used_week, used_season = adds_used(ours, week)
+    live = ctx.live if ctx.week is not None and ctx.week.number == week.number else None
     plan = weekmod.build_week_plan(
         conn,
         runtime,
         manager.league,
-        m.as_week(),
-        m.opponent_name,
+        week,
+        opp_name,
         ours,
         theirs,
         fa,
         universe.frame,
         goalies,
         values,
+        adds_used_week=used_week,
+        adds_used_season=used_season,
         min_gain=manager.authority.transactions.min_weekly_gain,
+        **live_inputs(conn, runtime, week, live, day),
     )
     lines = [ln for ln in explain.week_story(plan, runtime) if ln]
 
     stance = protocol_mod.derive(
-        plan.outlook, manager.name, league_key, ours.team_key, plan.week, m.opponent_name
+        plan.outlook, manager.name, league_key, ours.team_key, plan.week, opp_name
     )
     existing = protocol_mod.load(conn, manager.name, league_key, plan.week)
     if not (existing and existing.status == protocol_mod.APPROVED):
@@ -416,7 +605,7 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report):
             max_pending=manager.authority.transactions.max_pending,
         )
         lines += [p.describe() for p in made] or ["nothing new to propose"]
-    report.add("week", True, f"week {plan.week} vs {m.opponent_name}", lines)
+    report.add("week", True, f"week {plan.week} vs {opp_name}", lines)
     return plan
 
 

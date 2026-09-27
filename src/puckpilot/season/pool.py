@@ -209,6 +209,42 @@ def save_pool(
     return len(players)
 
 
+def load_pool(conn: sqlite3.Connection, league_key: str, on_or_before: str) -> list[PoolPlayer]:
+    """The most recent saved pool, as of a day - for the runs that do not fetch one.
+
+    Stored eligibility has no primary position, so the first startable one
+    stands in: good enough for what a saved pool is used for (how far an add
+    could move a category), never used to propose one.
+    """
+    row = conn.execute(
+        "SELECT MAX(date) FROM yahoo_fa_snapshots WHERE league_key = ? AND date <= ?",
+        (league_key, on_or_before),
+    ).fetchone()
+    if not row or not row[0]:
+        return []
+    out: list[PoolPlayer] = []
+    for r in conn.execute(
+        "SELECT * FROM yahoo_fa_snapshots WHERE league_key = ? AND date = ?",
+        (league_key, row[0]),
+    ):
+        elig = frozenset(x for x in (r["positions"] or "").split(",") if x)
+        primary = next((p for p in ("C", "LW", "RW", "D", "G") if p in elig), "")
+        out.append(
+            PoolPlayer(
+                player_key=r["player_key"],
+                name=r["name"],
+                team=r["team_abbrev"] or "",
+                primary_position=primary,
+                yahoo_eligible=elig,
+                nhl_player_id=r["nhl_player_id"],
+                status=r["status"] or "",
+                ownership_type=r["ownership"] or "",
+                percent_owned=r["percent_owned"] or 0.0,
+            )
+        )
+    return out
+
+
 def rising(players: list[PoolPlayer], limit: int = 15) -> list[PoolPlayer]:
     """The league is picking these up. Yahoo's own weekly delta, biggest first."""
     moving = [p for p in players if p.percent_owned_delta > 0 and not p.is_out]

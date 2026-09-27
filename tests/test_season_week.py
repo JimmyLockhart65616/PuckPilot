@@ -291,6 +291,9 @@ class _PerGame:
     def per_game(self, pid, day):
         return float(self.pg.get(pid, 0.0))
 
+    def per_game_tilted(self, pid, day, weights):
+        return self.per_game(pid, day)
+
 
 def _rp(key, name, pid, team, slot, status="", eligible=("C", "Util")):
     from puckpilot.season.roster import RosterPlayer
@@ -437,3 +440,153 @@ def test_only_as_many_goalies_count_as_there_are_g_slots(db):
         days=["2026-10-05"],
     )
     assert got == {1: 0.8, 2: 0.7}
+
+
+# -- banked plus what is left ------------------------------------------------
+
+
+def _live_week(db, **kw):
+    import pandas as pd
+
+    from puckpilot.data import store
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season.roster import TeamRoster
+    from puckpilot.season.week import build_week_plan
+    from tests.test_season_settings import _slots
+
+    for gid, d in enumerate(("2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08"), 1):
+        store.upsert_schedule_game(
+            db,
+            game_id=gid,
+            season="20262027",
+            game_type=2,
+            game_date=d,
+            start_time_utc=None,
+            home_team="TOR",
+            away_team="OTT",
+        )
+    db.commit()
+    rt = _runtime_for_week(roster_positions=_slots(("C", 1, 1), ("BN", 1, 0)))
+    ours = TeamRoster(
+        league_key="l", team_key="t.5", date="d", players=(_rp("p.1", "Ours", 1, "TOR", "C"),)
+    )
+    theirs = TeamRoster(
+        league_key="l", team_key="t.11", date="d", players=(_rp("p.2", "Theirs", 2, "OTT", "C"),)
+    )
+    frame = pd.DataFrame({"goals": [41.0, 20.5], "proj_gp": [82.0, 82.0]}, index=[1, 2])
+    return build_week_plan(
+        db,
+        rt,
+        LeagueConfig(skater_cats=(resolve("G"),), goalie_cats=()),
+        rt.week(1),
+        "Them",
+        ours,
+        theirs,
+        [],
+        frame,
+        None,
+        _PerGame({1: 1.0, 2: 1.0}),
+        find_targets=False,
+        **kw,
+    )
+
+
+def test_the_week_is_what_is_banked_plus_what_is_left(db):
+    """On Wednesday, Monday and Tuesday are Yahoo's numbers, not projections."""
+    p = _live_week(db, banked_ours={"G": 3.0}, banked_theirs={"G": 1.0}, from_day="2026-10-07")
+    g = p.outlook[0]
+    assert g.banked_ours == 3.0 and g.banked_theirs == 1.0
+    assert g.ours == pytest.approx(3.0 + 0.5 * 2)
+    assert g.theirs == pytest.approx(1.0 + 0.25 * 2)
+    assert (p.our_games, p.their_games, p.days_left) == (2, 2, 2)
+    assert p.banked is True
+
+
+def test_a_game_already_under_way_is_not_counted_twice(db):
+    p = _live_week(
+        db,
+        banked_ours={"G": 3.0},
+        banked_theirs={"G": 1.0},
+        from_day="2026-10-07",
+        started={"TOR", "OTT"},
+    )
+    assert p.outlook[0].ours == pytest.approx(3.0 + 0.5 * 1)
+
+
+def test_the_spread_narrows_as_the_week_runs_out(db):
+    early = _live_week(db, banked_ours={"G": 0.0}, banked_theirs={"G": 0.0}, from_day="2026-10-05")
+    late = _live_week(db, banked_ours={"G": 0.0}, banked_theirs={"G": 0.0}, from_day="2026-10-08")
+    assert early.outlook[0].sd > late.outlook[0].sd > 0
+    assert late.outlook[0].sd == pytest.approx((0.5 + 0.25) ** 0.5)  # Poisson: var = mean
+
+
+def test_with_nothing_banked_it_is_the_whole_week_as_before(db):
+    p = _live_week(db)
+    assert p.banked is False and p.days_left == 4
+    assert p.outlook[0].ours == pytest.approx(2.0) and p.outlook[0].banked_ours is None
+
+
+def test_a_banked_rate_is_rebuilt_from_its_components():
+    """A week's SV% is the ratio of the week's totals, so it is carried as
+    saves and shots against - SA is display-only but is the denominator."""
+    from puckpilot.season.week import banked_components, project_totals
+
+    base = banked_components({"SV": 90.0, "SA": 100.0, "SV%": 0.9, "W": 2.0})
+    assert base == {"saves": 90.0, "shots_against": 100.0, "wins": 2.0}
+    got = project_totals({}, {}, (resolve("SV%"), resolve("W")), base=base)
+    assert got == {"save_pct": pytest.approx(0.9), "wins": 2.0}
+
+
+def test_gaa_hours_are_backed_out_of_ga_and_gaa():
+    from puckpilot.season.week import banked_components
+
+    assert banked_components({"GA": 10.0, "GAA": 2.5}) == {
+        "goals_against": 10.0,
+        "toi_hours": 4.0,
+    }
+
+
+def test_penalty_minutes_are_lumpier_than_goals_and_wins_are_yes_or_no():
+    from puckpilot.season.week import remaining_variance
+
+    cats = (resolve("G"), resolve("PIM"), resolve("W"))
+    var = remaining_variance(
+        {1: 2.0}, {1: {"goals": 0.5, "pim": 0.5, "wins": 0.5}}, cats, totals={}
+    )
+    assert var["goals"] == pytest.approx(1.0)
+    assert var["pim"] == pytest.approx(3.84)
+    assert var["wins"] == pytest.approx(0.5)  # 2 starts x 0.5 x 0.5
+
+
+def _odds(label, ours, theirs, sd, **kw):
+    from puckpilot.season.week import CategoryOutlook
+
+    return CategoryOutlook(category=resolve(label), ours=ours, theirs=theirs, sd=sd, **kw)
+
+
+def test_the_bands_are_odds_not_shares_of_the_total():
+    """Week 1's real case: +0.44 wins on 3.6 is +12% of the total - "safe" under
+    the old band - and with two goalie starts either way it is a coin flip."""
+    assert _odds("W", 4.0, 3.56, sd=1.5).band == "in play"
+    assert _odds("SV", 135.0, 99.3, sd=21.3).band == "likely"
+    assert _odds("PPP", 5.0, 8.0, sd=2.6).band == "long shot"
+
+
+def test_a_lower_is_better_lead_reads_as_a_lead():
+    o = _odds("GAA", 2.0, 3.0, sd=0.3)
+    assert o.edge == pytest.approx(1.0)
+    assert o.band == "likely" and o.verdict == "ahead"
+
+
+def test_a_banked_certainty_has_no_spread_left():
+    assert _odds("G", 9.0, 5.0, sd=0.0).band == "likely"
+    assert _odds("G", 5.0, 9.0, sd=0.0).band == "long shot"
+    assert _odds("G", 5.0, 5.0, sd=0.0).band == "in play"
+
+
+def test_reachable_uses_the_odds_when_the_spread_is_known():
+    """Behind by 3 with room to move 2.5: not covered outright, but no longer
+    a long shot once the levers are pulled, so it is still reachable."""
+    near = _odds("SOG", 50.0, 53.0, sd=2.0, lineup_room=0.0, add_room=2.5)
+    far = _odds("SOG", 40.0, 53.0, sd=2.0, lineup_room=0.0, add_room=2.5)
+    assert near.reachable and not far.reachable

@@ -1438,7 +1438,7 @@ def _cmd_season_locks(args: argparse.Namespace) -> int:
         return cli_support.report(e)
 
     day = args.date or cli_support.today_str()
-    teams = locks.roster_teams(conn, manager.name)
+    teams = locks.roster_teams(conn, manager.name, manager.team_key, day)
     if not teams:
         print("No roster snapshot yet - run `ppilot season roster` first.")
         return 2
@@ -1704,10 +1704,11 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
     from puckpilot.draft.sim import build_universe
     from puckpilot.season import cli_support, pool
     from puckpilot.season import week as weekmod
-    from puckpilot.season.fetch import fetch_matchups, fetch_roster, save_pool_if_any
+    from puckpilot.season.fetch import fetch_live, fetch_matchups, fetch_roster, save_pool_if_any
     from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
     from puckpilot.season.manager import ManagerError
     from puckpilot.season.matchups import current_or_next, for_week
+    from puckpilot.season.run import adds_used, live_inputs
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
 
@@ -1727,28 +1728,33 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
                 raise cli_support.SeasonCliError(
                     f"no matchup covering {today} and none after it; the season is over."
                 )
-            ours = fetch_roster(session, team_key, m.start, player_map=pmap)
+            # Once the week has begun, today's rosters and Yahoo's score so far;
+            # before it, the rosters as they will start it.
+            when = today if m.contains(today) else m.start
+            ours = fetch_roster(session, team_key, when, player_map=pmap)
             theirs = (
-                fetch_roster(session, m.opponent_key, m.start, player_map=pmap)
+                fetch_roster(session, m.opponent_key, when, player_map=pmap)
                 if m.opponent_key
                 else ours
             )
+            live = fetch_live(session, team_key, m.week)[0] if m.contains(today) else None
             fa = pool.fetch_pool(
                 session, league_key, "FA", limit=args.pool, player_map=pmap, progress=print
             )
             wv = pool.fetch_pool(session, league_key, "W", limit=50, player_map=pmap)
-            return m, ours, theirs, fa + wv
+            return m, ours, theirs, fa + wv, live
 
-        m, ours, theirs, available = cli_support.run_session(manager, _read)
+        m, ours, theirs, available, live = cli_support.run_session(manager, _read)
     except (ManagerError, cli_support.SeasonCliError) as e:
         return cli_support.report(e)
 
-    save_pool_if_any(conn, league_key, m.start, available)
+    save_pool_if_any(conn, league_key, today, available)
     season = runtime.nhl_season
     train = [s for s in DEFAULT_SEASONS if s < season][-3:][::-1]
     universe = build_universe(conn, season, tuple(train), manager.league)
     values = build_value_model(conn, season, tuple(train), manager.league)
     goalies = ChainedGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0]))
+    used_week, used_season = adds_used(ours, m.as_week())
 
     plan = weekmod.build_week_plan(
         conn,
@@ -1762,8 +1768,11 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         universe.frame,
         goalies,
         values,
+        adds_used_week=used_week,
+        adds_used_season=used_season,
         min_gain=manager.authority.transactions.min_weekly_gain,
         max_targets=args.top,
+        **live_inputs(conn, runtime, m.as_week(), live, today),
     )
     from puckpilot.season import explain
 

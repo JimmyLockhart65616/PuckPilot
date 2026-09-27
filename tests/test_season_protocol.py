@@ -185,3 +185,34 @@ def test_a_changed_decision_replaces_the_proposal(db):
     assert second.stances[0].stance == CONCEDE
     assert second.id != first.id
     assert len(protocol.listing(db, "jimmy", "999.l.1")) == 1
+
+
+# -- stances by odds --------------------------------------------------------
+
+
+def _live(label, ours, theirs, sd, **kw):
+    from puckpilot.engine.categories import resolve
+    from puckpilot.season.week import CategoryOutlook
+
+    return CategoryOutlook(category=resolve(label), ours=ours, theirs=theirs, sd=sd, **kw)
+
+
+def test_a_coin_flip_is_chased_whatever_its_share_of_the_total():
+    """W at +12% of the total was "hold" under the old band; it is 62%."""
+    p = derive(_live("W", 4.0, 3.56, sd=1.5))
+    assert p.stances[0].stance == CHASE
+
+
+def test_a_long_shot_nothing_can_rescue_is_conceded():
+    p = derive(_live("PPP", 5.0, 9.0, sd=1.5, lineup_room=0.0, add_room=0.5))
+    assert p.stances[0].stance == CONCEDE
+
+
+def test_a_long_shot_an_add_could_rescue_is_not_conceded():
+    p = derive(_live("PPP", 5.0, 9.0, sd=1.5, lineup_room=0.0, add_room=3.5))
+    assert p.stances[0].stance != CONCEDE
+
+
+def test_a_lower_is_better_lead_is_never_conceded():
+    p = derive(_live("GAA", 2.0, 3.0, sd=0.3, lineup_room=0.0, add_room=0.0))
+    assert p.stances[0].stance == HOLD

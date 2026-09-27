@@ -86,6 +86,8 @@ def run_page(payload: dict) -> dict:
         input=wire.dumps(payload),
         capture_output=True,
         text=True,
+        # The page is UTF-8; the platform default is not, on Windows.
+        encoding="utf-8",
         timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
@@ -210,3 +212,56 @@ def test_a_zero_value_category_does_not_render_as_undefined():
     out = run_page(state.get("jimmy"))
     assert_clean(out)
     assert "PPP" in out["app"]
+
+
+def test_a_week_in_progress_shows_the_score_beside_the_projection():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "Home Team",
+            "moves": [{"kind": "ir", "name": "Jake Sanderson", "detail": "D to IR+"}],
+            "alerts": ["Barzal is no longer eligible for IR+"],
+            "week": {
+                "week": 1,
+                "opponent": "Visitors",
+                "status": "midevent",
+                "days_left": 3,
+                "games_left": {"ours": 23, "theirs": 27},
+                "cats": [
+                    {
+                        "label": "G",
+                        "ours": 9.2,
+                        "theirs": 10.4,
+                        "now_ours": 4.0,
+                        "now_theirs": 6.0,
+                        "state": "in play",
+                    },
+                    {
+                        "label": "SV%",
+                        "ours": 0.912,
+                        "theirs": 0.905,
+                        "now_ours": 0,
+                        "now_theirs": None,
+                        "state": "likely",
+                    },
+                ],
+                "note": "",
+            },
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    for expected in (
+        "Starts left: you 23, them 27",
+        "3 days to play",
+        "now",
+        "final",
+        "4–6",
+        "9.2–10.4",
+        "in play",
+        "IR",
+        "Jake Sanderson",
+        "no longer eligible",
+    ):
+        assert expected in out["app"], expected

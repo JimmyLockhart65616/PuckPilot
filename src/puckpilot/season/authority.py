@@ -43,7 +43,7 @@ class LineupAuthority:
     # Kept as a small floor against a pointless swap between near-equals.
     min_gain: float = 0.15
     # Never start a goalie less likely than this to actually start. A goalie who
-    # does not play scores zero in four of twelve categories.
+    # does not play scores zero in every goalie category.
     min_goalie_p_start: float = 0.5
     # "never" benches anyone carrying a status; "always" ignores the flag;
     # "only_if_needed" starts him when the alternative is an empty slot.

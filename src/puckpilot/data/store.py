@@ -208,6 +208,26 @@ CREATE TABLE IF NOT EXISTS week_protocols (
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS ix_week_protocols ON week_protocols (manager, league_key, week);
+
+-- The live score of a week, as Yahoo reported it at each run. Intra-week state
+-- cannot be fetched after the fact - Yahoo only ever says "now" - so this log is
+-- the only record of how a week unfolded, and the only live data the win
+-- probabilities can ever be checked against. The raw payload is kept because
+-- the parser was written before a live week existed to test it on.
+CREATE TABLE IF NOT EXISTS matchup_snapshots (
+    manager      TEXT NOT NULL,
+    league_key   TEXT NOT NULL,
+    team_key     TEXT NOT NULL,
+    week         INTEGER NOT NULL,
+    fetched_at   TEXT NOT NULL,
+    status       TEXT,
+    opponent_key TEXT,
+    ours_json    TEXT NOT NULL,
+    theirs_json  TEXT NOT NULL,
+    winners_json TEXT,
+    raw_json     TEXT,
+    PRIMARY KEY (manager, team_key, week, fetched_at)
+);
 """
 
 # `waiver_proposals` predates the in-season work and shipped without a manager,
