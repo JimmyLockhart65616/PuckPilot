@@ -318,7 +318,9 @@ def _refresh_runtime(conn, manager, league_key, runtime, report):
     from puckpilot.season.fetch import fetch_runtime, save_runtime
 
     age = _age_days(runtime.fetched_at)
-    if age is not None and age < RUNTIME_REFRESH_DAYS:
+    # A cache written before the scored categories were read has none, and
+    # without them Yahoo's live category totals cannot be labelled.
+    if age is not None and age < RUNTIME_REFRESH_DAYS and runtime.stat_categories:
         report.add("settings", True, f"cached {age:.1f} days ago, still fresh")
         return runtime
     got = cli_support.run_session(manager, lambda s: fetch_runtime(s, league_key, manager.team_key))

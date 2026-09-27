@@ -46,7 +46,13 @@ MIN_INTERVAL_S = 0.75
 ORIGIN = "https://hockey.fantasysports.yahoo.com/hockey/mock_lobby"
 
 # Structured fields worth keeping whole rather than flattening away.
-KEEP_WHOLE = ("roster_positions", "stat_categories", "bye_weeks")
+KEEP_WHOLE = (
+    "roster_positions",
+    "stat_categories",
+    "bye_weeks",
+    # {"1": 1, ..., "13": 0}: flattened, it scatters into bare week numbers.
+    "week_has_enough_qualifying_days",
+)
 
 FETCH_JS = """async (u) => {
     const r = await fetch(u, {credentials: 'include'});

@@ -246,3 +246,55 @@ def test_an_unreadable_timestamp_is_none_rather_than_a_crash():
     assert age_days("not a date") is None
     assert age_days("") is None
     assert age_days(None) is None
+
+
+# -- the categories valued against the ones scored --------------------------
+
+
+def _league(*labels):
+    from puckpilot.engine.categories import resolve
+    from puckpilot.league import LeagueConfig
+
+    cats = tuple(resolve(x) for x in labels)
+    return LeagueConfig(
+        name="test",
+        skater_cats=tuple(c for c in cats if c.kind == "skater"),
+        goalie_cats=tuple(c for c in cats if c.kind == "goalie"),
+    )
+
+
+def _scoring(**over):
+    from tests.test_season_settings import _cats, _stat
+
+    return runtime(
+        stat_categories=_cats(
+            _stat(1, "G"), _stat(19, "W"), _stat(25, "SV"),
+            _stat(24, "SA", display_only="1"), _stat(26, "SV%"),
+        ),
+        **over,
+    )
+
+
+def test_valuing_a_display_only_stat_fails():
+    """The real bug: SA was in the league file and Yahoo does not score it."""
+    c = pf.check_categories(_scoring(), _league("G", "W", "SV", "SA", "SV%"))
+    assert c.status == FAIL
+    assert any("valued here but not scored: SA" in ln for ln in c.lines)
+
+
+def test_missing_a_scored_category_fails():
+    c = pf.check_categories(_scoring(), _league("G", "W", "SV%"))
+    assert c.status == FAIL
+    assert any("scored but not valued here: SV" in ln for ln in c.lines)
+
+
+def test_matching_categories_pass_and_name_the_display_only_ones():
+    c = pf.check_categories(_scoring(), _league("G", "W", "SV", "SV%"))
+    assert c.status == PASS
+    assert any("display only (not categories): SA" in ln for ln in c.lines)
+
+
+def test_an_old_cache_without_categories_warns_with_the_fix():
+    c = pf.check_categories(runtime(), _league("G"))
+    assert c.status == WARN
+    assert "season settings --refresh" in c.detail

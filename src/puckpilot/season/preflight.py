@@ -123,6 +123,43 @@ def check_runtime(runtime) -> Check:
     return Check("league settings", PASS, runtime.name, lines)
 
 
+def check_categories(runtime, league) -> Check:
+    """The categories valued here against the ones Yahoo actually scores.
+
+    `leagues/*.toml` is a transcription, and a transcription can be wrong in a
+    way nothing downstream notices: this league's file listed SA, which Yahoo
+    shows beside save percentage but marks display-only. Every engine then
+    valued goalies for a twelfth category that never decides a week. Silently
+    mis-valuing players for the wrong league is this tool's worst failure, so a
+    mismatch fails rather than warns.
+    """
+    ours = [c.label for c in league.all_cats]
+    if runtime is None or not runtime.stat_categories:
+        return Check(
+            "categories",
+            WARN,
+            "Yahoo's scored categories not cached - run `ppilot season settings --refresh`",
+            ["valuing: " + " ".join(ours)],
+        )
+    scored = list(runtime.scored_labels)
+    have, want = {x.casefold() for x in ours}, {x.casefold() for x in scored}
+    lines = [f"Yahoo scores {len(scored)}: " + " ".join(scored)]
+    display = [s.label for s in runtime.stat_categories if not s.scored]
+    if display:
+        lines.append("display only (not categories): " + " ".join(display))
+    if have != want:
+        extra = [x for x in ours if x.casefold() not in want]
+        missing = [x for x in scored if x.casefold() not in have]
+        detail = "the league file disagrees with Yahoo"
+        if extra:
+            lines.append("valued here but not scored: " + " ".join(extra))
+        if missing:
+            lines.append("scored but not valued here: " + " ".join(missing))
+        lines.append(f"fix the categories in {league.name}'s league file")
+        return Check("categories", FAIL, detail, lines)
+    return Check("categories", PASS, f"{len(scored)} match Yahoo", lines)
+
+
 def check_calendar(runtime, day: str) -> Check:
     if runtime is None:
         return Check("week calendar", FAIL, "no settings, so no calendar")

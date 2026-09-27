@@ -1576,6 +1576,7 @@ def _cmd_season_preflight(args: argparse.Namespace) -> int:
 
     runtime = load_runtime(conn, league_key)
     report.checks.append(pf.check_runtime(runtime))
+    report.checks.append(pf.check_categories(runtime, manager.league))
     day = args.date or cli_support.today_str()
     report.checks.append(pf.check_calendar(runtime, day))
     report.checks.append(pf.check_player_map(conn, league_key))

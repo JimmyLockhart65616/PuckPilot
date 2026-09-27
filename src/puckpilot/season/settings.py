@@ -51,6 +51,22 @@ class RosterSlot:
 
 
 @dataclass(frozen=True)
+class StatCategory:
+    """One stat in the league's stat list, and whether it actually scores.
+
+    Yahoo lists display-only stats beside the scored ones - this league shows
+    shots against next to save percentage without scoring it - and only the
+    `is_only_display_stat` flag tells them apart. Counting one as a category
+    values players for a contest that is not being played.
+    """
+
+    stat_id: int
+    label: str
+    scored: bool
+    higher_is_better: bool = True
+
+
+@dataclass(frozen=True)
 class Week:
     number: int
     start: str
@@ -94,6 +110,10 @@ class LeagueRuntime:
     slots: tuple[RosterSlot, ...]
     weeks: tuple[Week, ...] = ()
     fetched_at: str = ""
+    # Empty on a cache written before these were read; `season run` refreshes it.
+    stat_categories: tuple[StatCategory, ...] = ()
+    # Weeks Yahoo says have too few days to hold anyone to the goalie minimum.
+    min_games_waived: tuple[int, ...] = ()
 
     # -- calendar ----------------------------------------------------------
 
@@ -128,6 +148,25 @@ class LeagueRuntime:
             if w.number == number:
                 return w
         raise SettingsError(f"week {number} not in the loaded calendar")
+
+    def min_goalie_games(self, week: int) -> int:
+        """The goalie minimum Yahoo will actually enforce in `week`."""
+        return 0 if week in self.min_games_waived else self.min_games_played
+
+    # -- scoring -----------------------------------------------------------
+
+    @property
+    def scored_labels(self) -> tuple[str, ...]:
+        """The categories the league scores, as Yahoo labels them."""
+        return tuple(s.label for s in self.stat_categories if s.scored)
+
+    def stat_labels(self) -> dict[int, str]:
+        """stat_id -> label for every stat Yahoo reports, scored or not.
+
+        Display-only stats are kept: a team's shots against is not a category
+        here, but it is the denominator of one.
+        """
+        return {s.stat_id: s.label for s in self.stat_categories}
 
     # -- roster ------------------------------------------------------------
 
@@ -198,6 +237,9 @@ class LeagueRuntime:
         if not slots:
             raise SettingsError("Yahoo settings carried no roster_positions")
 
+        stats = _stat_categories(flat.get("stat_categories"))
+        waived = _waived_weeks(flat.get("week_has_enough_qualifying_days"))
+
         # max_adds is absent in leagues that do not cap acquisitions; that is a
         # real setting ("unlimited"), not a missing field, so it stays None and
         # waivers.budget_threshold already treats None that way.
@@ -228,4 +270,47 @@ class LeagueRuntime:
             slots=slots,
             weeks=weeks,
             fetched_at=fetched_at,
+            stat_categories=stats,
+            min_games_waived=waived,
         )
+
+
+def _stat_categories(node) -> tuple[StatCategory, ...]:
+    """Yahoo's `stat_categories` block, kept whole by `flatten`.
+
+    `sort_order` "1" means a higher value wins the category; "0" means lower
+    does (goals against average).
+    """
+    if not isinstance(node, dict):
+        return ()
+    out: list[StatCategory] = []
+    for entry in node.get("stats", []) or []:
+        st = entry.get("stat") if isinstance(entry, dict) else None
+        if not isinstance(st, dict) or "stat_id" not in st:
+            continue
+        label = str(st.get("display_name") or st.get("abbr") or st.get("name") or "")
+        enabled = str(st.get("enabled", "1")) == "1"
+        display_only = str(st.get("is_only_display_stat", "0")) == "1"
+        out.append(
+            StatCategory(
+                stat_id=int(st["stat_id"]),
+                label=label,
+                scored=enabled and not display_only,
+                higher_is_better=str(st.get("sort_order", "1")) == "1",
+            )
+        )
+    return tuple(out)
+
+
+def _waived_weeks(node) -> tuple[int, ...]:
+    """Weeks flagged as not having enough qualifying days for the minimum."""
+    if not isinstance(node, dict):
+        return ()
+    out = []
+    for week, ok in node.items():
+        try:
+            if int(ok) == 0:
+                out.append(int(week))
+        except (TypeError, ValueError):
+            continue
+    return tuple(sorted(out))

@@ -145,3 +145,106 @@ def test_a_date_outside_the_season_is_an_error_not_a_clamp():
     r = LeagueRuntime.from_payload(payload(), weeks=(Week(1, "2026-09-29", "2026-10-04"),))
     with pytest.raises(SettingsError, match="outside weeks"):
         r.week_of("2027-06-01")
+
+
+# -- which stats actually score ---------------------------------------------
+
+
+def _stat(sid, label, display_only="0", sort="1", enabled="1"):
+    return {
+        "stat": {
+            "stat_id": sid,
+            "enabled": enabled,
+            "display_name": label,
+            "sort_order": sort,
+            "is_only_display_stat": display_only,
+        }
+    }
+
+
+def _cats(*stats):
+    return {"stats": list(stats)}
+
+
+def test_a_display_only_stat_is_listed_but_not_scored():
+    """This league shows SA beside SV% and scores eleven categories, not twelve.
+    Counting it valued goalies for a contest that is not being played."""
+    rt = LeagueRuntime.from_payload(
+        payload(
+            stat_categories=_cats(
+                _stat(19, "W"), _stat(25, "SV"), _stat(24, "SA", display_only="1"), _stat(26, "SV%")
+            )
+        )
+    )
+    assert rt.scored_labels == ("W", "SV", "SV%")
+    assert rt.stat_labels()[24] == "SA"
+
+
+def test_sort_order_zero_means_lower_wins():
+    rt = LeagueRuntime.from_payload(payload(stat_categories=_cats(_stat(23, "GAA", sort="0"))))
+    assert rt.stat_categories[0].higher_is_better is False
+
+
+def test_a_disabled_stat_is_not_scored():
+    rt = LeagueRuntime.from_payload(payload(stat_categories=_cats(_stat(4, "+/-", enabled="0"))))
+    assert rt.scored_labels == ()
+
+
+def test_a_payload_without_stat_categories_still_builds():
+    """Old caches and thin fixtures carry none; `season run` refreshes them."""
+    assert LeagueRuntime.from_payload(payload()).stat_categories == ()
+
+
+def test_the_goalie_minimum_is_waived_in_weeks_yahoo_flags():
+    rt = LeagueRuntime.from_payload(
+        payload(week_has_enough_qualifying_days={"12": 1, "13": 0, "14": 1})
+    )
+    assert rt.min_games_waived == (13,)
+    assert rt.min_goalie_games(13) == 0
+    assert rt.min_goalie_games(12) == 3
+
+
+def test_flatten_keeps_the_qualifying_days_whole():
+    """Flattened, {"13": 0} scatters into a bare key "13" that nothing can find."""
+    from puckpilot.yahoo.session import flatten
+
+    flat = flatten(
+        {"league": [{"week_has_enough_qualifying_days": {"12": 1, "13": 0}}, {"x": "y"}]}
+    )
+    assert flat["week_has_enough_qualifying_days"] == {"12": 1, "13": 0}
+    assert "13" not in flat
+
+
+def test_the_scored_categories_survive_the_cache(db):
+    from puckpilot.season.fetch import load_runtime, save_runtime
+
+    rt = LeagueRuntime.from_payload(
+        payload(
+            stat_categories=_cats(_stat(25, "SV"), _stat(24, "SA", display_only="1")),
+            week_has_enough_qualifying_days={"13": 0},
+        ),
+        weeks=(Week(1, "2026-09-29", "2026-10-04"),),
+        fetched_at="2026-09-26T00:00:00+00:00",
+    )
+    save_runtime(db, rt)
+    back = load_runtime(db, "999.l.1")
+    assert back.stat_categories == rt.stat_categories
+    assert back.min_games_waived == (13,)
+
+
+def test_a_cache_written_before_categories_were_read_still_loads(db):
+    import json
+
+    from puckpilot.season.fetch import _runtime_row, load_runtime
+
+    rt = LeagueRuntime.from_payload(payload())
+    row = _runtime_row(rt)
+    del row["stat_categories"], row["min_games_waived"]
+    db.execute(
+        "INSERT INTO yahoo_league_runtime (league_key, settings_json, weeks_json, fetched_at) "
+        "VALUES (?, ?, '[]', '2026-09-20')",
+        ("999.l.1", json.dumps(row)),
+    )
+    db.commit()
+    back = load_runtime(db, "999.l.1")
+    assert back.stat_categories == () and back.min_games_waived == ()

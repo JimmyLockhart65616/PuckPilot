@@ -183,9 +183,16 @@ def load_runtime(conn: sqlite3.Connection, league_key: str) -> LeagueRuntime | N
     data["weeks"] = weeks
     data["fetched_at"] = row["fetched_at"]
     slots = data.pop("slots")
-    from puckpilot.season.settings import RosterSlot
+    from puckpilot.season.settings import RosterSlot, StatCategory
 
     data["slots"] = tuple(RosterSlot(p, int(c), bool(s)) for p, c, s in slots)
+    # Absent from a cache written before they were read; the defaults stand and
+    # `season run` refreshes.
+    data["stat_categories"] = tuple(
+        StatCategory(int(i), str(label), bool(scored), bool(hib))
+        for i, label, scored, hib in data.pop("stat_categories", [])
+    )
+    data["min_games_waived"] = tuple(int(w) for w in data.pop("min_games_waived", []))
     return LeagueRuntime(**data)
 
 
@@ -196,6 +203,10 @@ def _runtime_row(runtime: LeagueRuntime) -> dict:
         if f not in ("weeks", "fetched_at")
     }
     d["slots"] = [[s.position, s.count, s.starting] for s in runtime.slots]
+    d["stat_categories"] = [
+        [s.stat_id, s.label, s.scored, s.higher_is_better] for s in runtime.stat_categories
+    ]
+    d["min_games_waived"] = list(runtime.min_games_waived)
     return d
 
 
