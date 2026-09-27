@@ -660,3 +660,47 @@ def test_ir_moves_are_recommendations_until_agreed(db_with_games):
         manage=False,
     )
     assert p.ir_moves and p.ir_within_authority is False
+
+
+# -- a goalie below the floor, into a slot that would otherwise be empty ------
+
+
+def _floor_plan(db, goalies, values, fill=True):
+    """One G slot; goalies as (key, name, pid, p_start)."""
+    return build_plan(
+        db,
+        runtime(),
+        roster(*(player(k, n, pid, "TOR", "G", "BN") for k, n, pid, _ in goalies)),
+        Values(values),
+        StaticGoalieSource({DATE: {pid: p for _, _, pid, p in goalies}}),
+        DATE,
+        manager="test",
+        authority=LineupAuthority(
+            enabled=True, min_gain=0.0, min_goalie_p_start=0.5, fill_empty_goalie_slot=fill
+        ),
+    )
+
+
+def test_a_goalie_below_the_floor_fills_a_slot_that_would_otherwise_be_empty(db_with_games):
+    """Not starting scores nothing - the same as the empty slot - so the floor
+    costs a chance and protects nothing."""
+    p = _floor_plan(db_with_games, [("g.1", "Backup", 1, 0.3)], {1: 5.0})
+    assert [m.describe() for m in p.moves] == ["START Backup in G"]
+    assert "would otherwise be empty" in p.playing[0].note
+
+
+def test_without_the_agreement_the_floor_still_holds(db_with_games):
+    p = _floor_plan(db_with_games, [("g.1", "Backup", 1, 0.3)], {1: 5.0}, fill=False)
+    assert p.is_noop
+
+
+def test_the_floor_still_decides_between_goalies_for_one_slot(db_with_games):
+    """A 45% goalie with the bigger projection does not take the slot from a
+    60% one - that would be removing the floor, which is not what was agreed."""
+    p = _floor_plan(
+        db_with_games,
+        [("g.1", "Likely", 1, 0.6), ("g.2", "Long Shot Star", 2, 0.45)],
+        {1: 2.0, 2: 9.0},
+    )
+    assert [m.describe() for m in p.moves] == ["START Likely in G"]
+    assert [x.name for x in p.idle] == ["Long Shot Star"]

@@ -280,6 +280,7 @@ def build_plan(
             + ", ".join(f"{k} x{v:g}" for k, v in sorted(weights.items()))
         )
     candidates: list[Candidate] = []
+    spare: list[tuple[float, float, RosterPlayer]] = []
     idle: list[RosterPlayer] = []
     out: list[RosterPlayer] = []
     locked: list[RosterPlayer] = []
@@ -315,6 +316,10 @@ def build_plan(
             # The minimum is a rule and the floor a preference, so on a night
             # the rule needs a start, any goalie who might play is a candidate.
             if below and not (forced and p_start > 0.0):
+                if auth.fill_empty_goalie_slot and p_start > 0.0:
+                    # Held back: he starts only if a G slot is left empty.
+                    spare.append((value * p_start, p_start, p))
+                    continue
                 note = f"{p_start:.0%} to start"
                 idle.append(p)
                 continue
@@ -336,6 +341,23 @@ def build_plan(
         )
 
     _demote_questionable(candidates)
+
+    # A goalie below the floor fills a G slot only if nobody above it will:
+    # one who does not start then scores what the empty slot would have.
+    g_slots = sum(n for pos, n in shape.slots if pos == "G")
+    room = g_slots - sum(1 for c in candidates if c.is_goalie)
+    for i, (v, p_start, g) in enumerate(sorted(spare, key=lambda x: -x[0])):
+        if i < room:
+            candidates.append(
+                Candidate(
+                    player=g,
+                    value=v,
+                    p_start=p_start,
+                    note=f"{p_start:.0%} to start - in because the slot would otherwise be empty",
+                )
+            )
+        else:
+            idle.append(g)
 
     # The weekly goalie minimum is a rule, not a preference.
     if forced:

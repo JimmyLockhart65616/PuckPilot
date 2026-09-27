@@ -47,6 +47,11 @@ class LineupAuthority:
     # Never start a goalie less likely than this to actually start. A goalie who
     # does not play scores zero in every goalie category.
     min_goalie_p_start: float = 0.5
+    # ...except when a G slot would otherwise sit empty: a goalie who does not
+    # start then scores nothing, the same as the empty slot, so the floor costs
+    # something and protects nothing. The floor still decides between goalies
+    # competing for a slot - a 45% goalie never takes one from a 60% one here.
+    fill_empty_goalie_slot: bool = False
     # "never" benches anyone carrying a status; "always" ignores the flag;
     # "only_if_needed" starts him when the alternative is an empty slot.
     start_questionable: str = "only_if_needed"
@@ -76,9 +81,10 @@ class LineupAuthority:
     # to make on a night when nine players have games. A weight cannot change
     # a decision that was never open.
     #
-    # The protocol still earns its keep as analysis - it says which categories
-    # are gone and which are live - and that steers the adds, where the lever
-    # actually is. This flag only governs the lineup.
+    # The protocol is analysis, not a switch: it says which categories are gone
+    # and which are live, from the same odds the add search prices by. Gate G2
+    # also found no gain in choosing goalies by those odds, so nothing in the
+    # daily lineup acts on it. This flag only governs the lineup.
     follow_protocol: bool = False
 
     def __post_init__(self) -> None:
@@ -97,14 +103,17 @@ class LineupAuthority:
         return [
             "Lineup changes: AUTONOMOUS within these criteria -",
             f"  swap only when it gains at least {self.min_gain:.2f} for the day",
-            f"  never start a goalie below {self.min_goalie_p_start:.0%} to start",
+            f"  never start a goalie below {self.min_goalie_p_start:.0%} to start"
+            + (
+                " - unless a G slot would otherwise be empty" if self.fill_empty_goalie_slot else ""
+            ),
             f"  players flagged day-to-day: {self.start_questionable.replace('_', ' ')}",
             f"  weekly goalie minimum enforced: {'yes' if self.enforce_min_games else 'no'}",
             "  out players moved to a free IR slot: "
             + ("yes" if self.manage_ir else "no (recommended, not made)"),
             "  changes are unlimited until each player's game starts",
             "  week protocol steers the lineup: "
-            + ("yes" if self.follow_protocol else "no (measured inert; it steers adds)"),
+            + ("yes" if self.follow_protocol else "no (measured inert)"),
             *([f"  never benched: {', '.join(self.never_bench)}"] if self.never_bench else []),
         ]
 
