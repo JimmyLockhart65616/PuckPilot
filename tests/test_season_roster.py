@@ -180,3 +180,41 @@ def test_a_non_team_payload_is_refused():
 def test_league_key_is_derived_from_the_team_key():
     r = parse_roster(roster_payload([]), team_key="999.l.1.t.5")
     assert r.league_key == "999.l.1"
+
+
+# -- Yahoo's own counters ---------------------------------------------------
+
+
+def _with_counters(payload, minimum=None, adds=None, moves=None):
+    team = payload["fantasy_content"]["team"]
+    if adds is not None:
+        team[0].append({"roster_adds": {"coverage_type": "week", "coverage_value": 2, "value": adds}})
+    if moves is not None:
+        team[0].append({"number_of_moves": moves})
+    if minimum is not None:
+        team[1]["roster"]["minimum_games"] = {
+            "coverage_type": "week",
+            "coverage_value": "2",
+            "value": minimum,
+        }
+    return payload
+
+
+def test_the_goalie_count_and_adds_are_read_off_the_payload():
+    """Yahoo's numbers are the authority: our snapshots record slots, not who
+    played, and counting slots read the goalie minimum as met by Tuesday."""
+    r = parse_roster(
+        _with_counters(roster_payload([]), minimum="2", adds="1", moves=7),
+        team_key="999.l.1.t.5",
+    )
+    assert (r.goalie_games, r.goalie_games_week) == (2, 2)
+    assert (r.adds_this_week, r.adds_week) == (1, 2)
+    assert r.moves_season == 7
+
+
+def test_absent_counters_are_unknown_not_zero():
+    """Zero is a claim - "no adds used" - and an absent field makes none."""
+    r = parse_roster(roster_payload([]), team_key="999.l.1.t.5")
+    assert r.goalie_games is None
+    assert r.adds_this_week is None
+    assert r.moves_season is None

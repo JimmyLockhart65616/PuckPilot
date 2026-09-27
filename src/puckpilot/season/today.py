@@ -17,8 +17,10 @@ comes from the engines:
     a goalie is starting    P(start), which the optimizer weights value by
 
 The weekly goalie minimum is the one hard rule here. Yahoo enforces it and
-falling short forfeits the categories, so when the days left in the week can no
-longer satisfy it, starting a goalie stops being a preference.
+falling short forfeits the categories, so when the goalie games left in the
+week can no longer be relied on to satisfy it, starting a goalie stops being a
+preference - including one below the agreed P(start) floor. The count comes
+from Yahoo's own roster payload, never from our snapshots.
 """
 
 from __future__ import annotations
@@ -38,6 +40,14 @@ BENCH = "BN"
 UTIL = "UTIL"
 YAHOO_UTIL = "Util"
 
+# Force tonight's goalie start unless the rest of the week reaches the minimum
+# with at least this probability. Starting a goalie who has a game costs almost
+# nothing; missing the minimum forfeits the category.
+GOALIE_CONFIDENCE = 0.9
+
+# Large enough to beat any real value, small enough to stay finite.
+_FORCED_START = 1e6
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -46,6 +56,9 @@ class Candidate:
     p_start: float | None = None
     note: str = ""
     questionable: bool = False
+    # Added for the optimizer only - a forced start - and never counted as value
+    # gained, or one mandatory goalie reports a million-point night.
+    bump: float = 0.0
 
     @property
     def is_goalie(self) -> bool:
@@ -174,29 +187,23 @@ def _engine_slot(yahoo_slot: str) -> str | None:
     return YAHOO_TO_POS.get(yahoo_slot)
 
 
-def goalie_starts_this_week(
-    conn: sqlite3.Connection,
-    runtime: LeagueRuntime,
-    manager: str,
-    team_key: str,
-    date: str,
-) -> int:
-    """Goalie starts already recorded this week, from our own snapshots.
+def yahoo_goalie_games(roster: TeamRoster, runtime: LeagueRuntime, date: str) -> int | None:
+    """Goalie games already counted toward this week's minimum, per Yahoo.
 
-    Yahoo reports the same number in the roster payload's `minimum_games`, and
-    that is the authority; this is the fallback when the payload is not to hand.
+    Only Yahoo's number is used. The fallback this replaced counted goalie
+    *slot*-days in our own snapshots - two a day whether anyone played - so the
+    minimum read as met by the second day and the forced start never fired.
+    A count for another week (a roster read for a different date) is refused.
     """
-    try:
-        week = runtime.week(runtime.week_of(date))
-    except Exception:  # noqa: BLE001 - no calendar means no weekly claim
-        return 0
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM yahoo_roster_snapshots "
-        "WHERE manager = ? AND team_key = ? AND date >= ? AND date < ? "
-        "  AND selected_slot = 'G'",
-        (manager, team_key, week.start, date),
-    ).fetchone()
-    return int(row["n"]) if row else 0
+    if roster.goalie_games is None:
+        return None
+    if roster.goalie_games_week is not None:
+        try:
+            if runtime.week_of(date) != roster.goalie_games_week:
+                return None
+        except Exception:  # noqa: BLE001 - no calendar: trust the payload
+            pass
+    return roster.goalie_games
 
 
 def build_plan(
@@ -210,12 +217,17 @@ def build_plan(
     authority: LineupAuthority | None = None,
     goalie_starts_so_far: int | None = None,
     weights: dict[str, float] | None = None,
+    goalie_confidence: float = GOALIE_CONFIDENCE,
 ) -> LineupPlan:
     """Decide tonight's lineup and diff it against what Yahoo currently has.
 
     `weights` is an approved week protocol's category stance. Absent - which is
     the default, and the case whenever nobody has agreed one - every category
     counts the same and this is the plain value decision.
+
+    `goalie_starts_so_far` is Yahoo's count toward the weekly goalie minimum
+    (`yahoo_goalie_games`). Without it the minimum is reported as unchecked
+    rather than guessed at.
     """
     auth = authority or LineupAuthority()
     shape = runtime.shape()
@@ -224,6 +236,13 @@ def build_plan(
     p_starts = goalie_source.starts(date) if goalie_source else {}
 
     notes: list[str] = []
+    forced = False
+    if auth.enforce_min_games and runtime.min_games_played:
+        forced, why = _minimum_forces_a_start(
+            conn, runtime, roster, goalie_source, date, goalie_starts_so_far, goalie_confidence
+        )
+        if why:
+            notes.append(why)
     if weights:
         notes.append(
             "Acting on this week's approved protocol: "
@@ -257,10 +276,15 @@ def build_plan(
 
         if p.position == "G":
             p_start = float(p_starts.get(p.nhl_player_id, 0.0))
-            if p_start < auth.min_goalie_p_start:
+            below = p_start < auth.min_goalie_p_start
+            # The minimum is a rule and the floor a preference, so on a night
+            # the rule needs a start, any goalie who might play is a candidate.
+            if below and not (forced and p_start > 0.0):
                 note = f"{p_start:.0%} to start"
                 idle.append(p)
                 continue
+            if below:
+                note = f"{p_start:.0%} to start - in for the weekly minimum"
             value *= p_start
 
         questionable = False
@@ -279,10 +303,20 @@ def build_plan(
     _demote_questionable(candidates)
 
     # The weekly goalie minimum is a rule, not a preference.
-    if auth.enforce_min_games and runtime.min_games_played:
-        _force_goalie_if_required(
-            conn, runtime, roster, candidates, date, manager, goalie_starts_so_far, notes
-        )
+    if forced:
+        goalies = [i for i, c in enumerate(candidates) if c.is_goalie]
+        for i in goalies:
+            c = candidates[i]
+            candidates[i] = Candidate(
+                player=c.player,
+                value=c.value,
+                p_start=c.p_start,
+                note=c.note or "forced: the week's goalie minimum needs a start tonight",
+                questionable=c.questionable,
+                bump=_FORCED_START,
+            )
+        if not goalies:
+            notes.append("None of your goalies plays tonight, so the minimum is at risk.")
 
     incumbent = {
         c.player.player_key: slot
@@ -290,7 +324,7 @@ def build_plan(
         if (slot := _engine_slot(c.player.selected_slot)) is not None
     }
     assignment = optimize_lineup(
-        [(c.player.player_key, c.player.eligible, c.value) for c in candidates],
+        [(c.player.player_key, c.player.eligible, c.value + c.bump) for c in candidates],
         shape,
         incumbent=incumbent,
     )
@@ -351,40 +385,80 @@ def _demote_questionable(candidates: list[Candidate]) -> None:
             p_start=c.p_start,
             note=c.note,
             questionable=True,
+            bump=c.bump,
         )
 
 
-def _force_goalie_if_required(
-    conn, runtime, roster, candidates, date, manager, so_far, notes
-) -> None:
-    """Make starting a goalie non-negotiable when the week is running out."""
+def _minimum_forces_a_start(
+    conn, runtime, roster, goalie_source, date, so_far, confidence
+) -> tuple[bool, str]:
+    """Whether tonight's goalie start is mandatory, and the sentence saying so.
+
+    Asks how likely the rest of the week is to supply what is still needed:
+    each later day's goalies with a game, the likeliest first, only as many as
+    there are G slots, each an independent chance at P(start). The rule this
+    replaced counted calendar days, so a Saturday with one goalie game left
+    looked as safe as one with six. (Two goalies of the same club are not
+    independent - one starts - but a roster rarely carries both.)
+    """
     try:
         week = runtime.week(runtime.week_of(date))
-    except Exception:  # noqa: BLE001
-        return
-    started = (
-        so_far
-        if so_far is not None
-        else goalie_starts_this_week(conn, runtime, manager, roster.team_key, date)
-    )
-    needed = runtime.min_games_played - started
+    except Exception:  # noqa: BLE001 - no calendar, no weekly rule to apply
+        return False, ""
+    required = runtime.min_goalie_games(week.number)
+    if not required:
+        return False, ""
+    if so_far is None:
+        return False, (
+            f"Yahoo's goalie count for the week was not in the roster read, so the "
+            f"{required}-game minimum is not being checked tonight."
+        )
+    needed = required - so_far
     if needed <= 0:
-        return
-    days_left = sum(1 for d in week.dates() if d >= date)
-    if needed < days_left:
-        return
-    for i, c in enumerate(candidates):
-        if c.is_goalie:
-            candidates[i] = Candidate(
-                player=c.player,
-                value=c.value + 1e6,
-                p_start=c.p_start,
-                note="forced: the week's goalie minimum can no longer be met otherwise",
-            )
-    notes.append(
-        f"Weekly goalie minimum: {needed} start(s) needed with {days_left} day(s) left - "
-        f"starting a goalie tonight is mandatory."
+        return False, ""
+    chances = _goalie_chances_after(conn, runtime, roster, goalie_source, week, date)
+    p_reach = _p_at_least(chances, needed)
+    if p_reach >= confidence:
+        return False, ""
+    return True, (
+        f"Weekly goalie minimum: {so_far} of {required} played, and only a "
+        f"{p_reach:.0%} chance the rest of the week covers it - a goalie start "
+        f"tonight is mandatory."
     )
+
+
+def _goalie_chances_after(conn, runtime, roster, goalie_source, week, date) -> list[float]:
+    """P(start) of every goalie game this roster could still count after `date`."""
+    slots = sum(n for pos, n in runtime.shape().slots if pos == "G")
+    ours = [
+        p
+        for p in roster.players
+        if p.position == "G" and not p.is_out and p.nhl_player_id is not None
+    ]
+    out: list[float] = []
+    for day in week.dates():
+        if day <= date:
+            continue
+        playing = calendar.teams_playing(conn, day, runtime.nhl_season)
+        starts = goalie_source.starts(day) if goalie_source else {}
+        ps = sorted(
+            (float(starts.get(p.nhl_player_id, 0.0)) for p in ours if p.team in playing),
+            reverse=True,
+        )
+        out.extend(ps[:slots])
+    return out
+
+
+def _p_at_least(chances: list[float], k: int) -> float:
+    """P(at least k successes) over independent chances - exact, by counting."""
+    dist = [1.0]
+    for p in chances:
+        nxt = [0.0] * (len(dist) + 1)
+        for n, q in enumerate(dist):
+            nxt[n] += q * (1.0 - p)
+            nxt[n + 1] += q * p
+        dist = nxt
+    return sum(dist[k:])
 
 
 def _diff(roster, candidates, assignment, shape) -> tuple[list[Move], float]:

@@ -1316,7 +1316,7 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
     from puckpilot.season.fetch import discover_team_key, fetch_roster, save_roster
     from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
     from puckpilot.season.manager import ManagerError
-    from puckpilot.season.today import build_plan
+    from puckpilot.season.today import build_plan, yahoo_goalie_games
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
 
@@ -1359,6 +1359,7 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
         date,
         manager=manager.name,
         authority=manager.authority.lineup,
+        goalie_starts_so_far=yahoo_goalie_games(roster, runtime, date),
         weights=weights,
     )
     from puckpilot.season import explain
@@ -1560,7 +1561,7 @@ def _cmd_season_preflight(args: argparse.Namespace) -> int:
     from puckpilot.season.fetch import discover_team_key, fetch_roster, load_runtime
     from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
     from puckpilot.season.manager import ManagerError
-    from puckpilot.season.today import build_plan
+    from puckpilot.season.today import build_plan, yahoo_goalie_games
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
 
@@ -1621,6 +1622,7 @@ def _cmd_season_preflight(args: argparse.Namespace) -> int:
                 day,
                 manager=manager.name,
                 authority=manager.authority.lineup,
+                goalie_starts_so_far=yahoo_goalie_games(roster, runtime, day),
             )
             report.checks.append(pf.check_plan(plan))
 

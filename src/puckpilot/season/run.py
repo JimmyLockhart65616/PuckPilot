@@ -107,7 +107,7 @@ def run_day(
     from puckpilot.season import cli_support, explain, publish, snapshot
     from puckpilot.season.fetch import discover_team_key, fetch_roster, save_roster
     from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
-    from puckpilot.season.today import build_plan
+    from puckpilot.season.today import build_plan, yahoo_goalie_games
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
 
@@ -177,6 +177,7 @@ def run_day(
                 day,
                 manager=manager.name,
                 authority=manager.authority.lineup,
+                goalie_starts_so_far=yahoo_goalie_games(roster, runtime, day),
             )
             reasons = explain.move_reasons(conn, runtime, got)
             report.add(

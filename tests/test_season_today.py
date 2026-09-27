@@ -211,22 +211,97 @@ def test_a_likely_starter_is_started_and_his_value_is_weighted(db_with_games):
     assert p.gain == pytest.approx(8.0)  # 10.0 x 0.8
 
 
-def test_the_weekly_goalie_minimum_overrides_the_probability_floor(db_with_games):
-    """Yahoo enforces it; falling short forfeits the categories."""
-    rt = runtime(min_games_played="1")
-    r = roster(player("p.1", "Any Goalie", 1, "TOR", "G", "BN"))
-    p = build_plan(
-        db_with_games,
-        rt,
-        r,
-        Values({1: 1.0}),
-        StaticGoalieSource({DATE: {1: 0.9}}),
-        "2026-10-11",  # last day of the week
+def _minimum_plan(db, p_start, so_far, *, later=None, value=1.0, waived=None, date=DATE):
+    """A one-goalie roster against a weekly minimum of one game."""
+    over = {"min_games_played": "1"}
+    if waived:
+        over["week_has_enough_qualifying_days"] = {str(waived): 0}
+    starts = {DATE: {1: p_start}}
+    if later:
+        for day in later:
+            store.upsert_schedule_game(
+                db,
+                game_id=100 + int(day[-2:]),
+                season=SEASON,
+                game_type=2,
+                game_date=day,
+                start_time_utc=f"{day}T23:00:00Z",
+                home_team="TOR",
+                away_team="OTT",
+            )
+            starts[day] = {1: 0.9}
+        db.commit()
+    return build_plan(
+        db,
+        runtime(**over),
+        roster(player("p.1", "Backup", 1, "TOR", "G", "BN")),
+        Values({1: value}),
+        StaticGoalieSource(starts),
+        date,
         manager="test",
-        authority=LineupAuthority(enabled=True, min_gain=0.0),
-        goalie_starts_so_far=0,
+        authority=LineupAuthority(enabled=True, min_gain=0.0, min_goalie_p_start=0.5),
+        goalie_starts_so_far=so_far,
     )
-    assert any("goalie minimum" in n for n in p.notes)
+
+
+def test_the_weekly_goalie_minimum_overrides_the_probability_floor(db_with_games):
+    """Yahoo enforces it; falling short forfeits the category. A 20% backup in
+    an otherwise empty G slot is the only way left to reach it."""
+    p = _minimum_plan(db_with_games, p_start=0.2, so_far=0)
+    assert [m.describe() for m in p.moves] == ["START Backup in G"]
+    assert any("goalie minimum" in n and "mandatory" in n for n in p.notes)
+
+
+def test_a_forced_start_is_not_reported_as_a_million_point_night(db_with_games):
+    p = _minimum_plan(db_with_games, p_start=0.2, so_far=0, value=10.0)
+    assert p.gain == pytest.approx(2.0)  # 10.0 x 0.2, the bump excluded
+
+
+def test_the_minimum_is_not_forced_while_later_games_cover_it(db_with_games):
+    """Two likely games left in the week: tonight's 20% backup is a choice."""
+    p = _minimum_plan(db_with_games, 0.2, 0, later=("2026-10-09", "2026-10-10"))
+    assert p.is_noop
+    assert not any("goalie minimum" in n for n in p.notes)
+
+
+def test_a_minimum_already_met_forces_nothing(db_with_games):
+    p = _minimum_plan(db_with_games, p_start=0.2, so_far=1)
+    assert p.is_noop
+
+
+def test_an_unknown_count_is_said_rather_than_guessed(db_with_games):
+    """The old fallback counted goalie slot-days - two a day whether anyone
+    played - and read the minimum as met by the second day."""
+    p = _minimum_plan(db_with_games, p_start=0.2, so_far=None)
+    assert p.is_noop
+    assert any("not being checked" in n for n in p.notes)
+
+
+def test_a_waived_week_has_no_minimum(db_with_games):
+    p = _minimum_plan(db_with_games, p_start=0.2, so_far=0, waived=2)
+    assert p.is_noop
+    assert not any("minimum" in n for n in p.notes)
+
+
+def test_a_forced_night_with_no_goalie_playing_says_so(db_with_games):
+    p = _minimum_plan(db_with_games, p_start=0.9, so_far=0, date="2026-10-10")
+    assert any("at risk" in n for n in p.notes)
+
+
+def test_yahoos_count_for_another_week_is_refused():
+    from puckpilot.season.today import yahoo_goalie_games
+
+    r = TeamRoster(
+        league_key="999.l.1",
+        team_key="999.l.1.t.5",
+        date=DATE,
+        players=(),
+        goalie_games=2,
+        goalie_games_week=1,
+    )
+    assert yahoo_goalie_games(r, runtime(), DATE) is None  # DATE is in week 2
+    same = TeamRoster(**{**r.__dict__, "goalie_games_week": 2})
+    assert yahoo_goalie_games(same, runtime(), DATE) == 2
 
 
 # -- the diff ---------------------------------------------------------------
@@ -439,3 +514,31 @@ def test_no_games_means_no_deadline(db_with_games):
     p = plan(db_with_games, roster(player("p.1", "Idle", 1, "VAN", "C", "C")), {1: 5.0})
     assert p.lock_utc == ""
     assert p.deadline() == ""
+
+
+def test_the_chance_of_reaching_the_minimum_is_counted_exactly():
+    from puckpilot.season.today import _p_at_least
+
+    assert _p_at_least([0.9, 0.9], 1) == pytest.approx(0.99)
+    assert _p_at_least([0.9, 0.9], 2) == pytest.approx(0.81)
+    assert _p_at_least([0.5, 0.5, 0.5], 2) == pytest.approx(0.5)
+    assert _p_at_least([], 1) == 0.0
+    assert _p_at_least([0.3], 0) == 1.0
+
+
+def test_one_likely_game_left_is_not_enough_to_skip_tonight(db_with_games):
+    """The Saturday case the calendar-day rule got wrong: a 70% chance later
+    in the week is a 30% chance of forfeiting the category."""
+    p = build_plan(
+        db_with_games,
+        runtime(min_games_played="1"),
+        roster(player("p.1", "Backup", 1, "TOR", "G", "BN")),
+        Values({1: 1.0}),
+        StaticGoalieSource({DATE: {1: 0.2}, "2026-10-09": {1: 0.7}}),
+        DATE,
+        manager="test",
+        authority=LineupAuthority(enabled=True, min_gain=0.0),
+        goalie_starts_so_far=0,
+    )
+    # No game on 10-09 in this fixture: the only later chance is none at all.
+    assert [m.describe() for m in p.moves] == ["START Backup in G"]

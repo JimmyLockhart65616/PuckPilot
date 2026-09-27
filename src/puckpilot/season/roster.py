@@ -93,6 +93,14 @@ class TeamRoster:
     team_name: str = ""
     is_editable: bool = True
     unmapped: tuple[str, ...] = field(default=())
+    # Yahoo's own counters, None when the payload did not carry them. They are
+    # the authority: our snapshots record slots, not who actually played, and
+    # counting goalie slot-days read the weekly minimum as met by Tuesday.
+    goalie_games: int | None = None
+    goalie_games_week: int | None = None
+    adds_this_week: int | None = None
+    adds_week: int | None = None
+    moves_season: int | None = None
 
     def __len__(self) -> int:
         return len(self.players)
@@ -204,9 +212,13 @@ def parse_roster(
     if not isinstance(node, dict):
         raise RosterError(f"no roster node for {team_key}")
 
-    # The team's own name sits in the header section, beside its key.
+    # The team's own name sits in the header section, beside its key - and so
+    # do the acquisition counters.
     head = next((x for x in team if isinstance(x, list)), [])
-    team_name = str(_fields(head).get("name", "")) if head else ""
+    header = _fields(head) if head else {}
+    team_name = str(header.get("name", ""))
+    adds = header.get("roster_adds")
+    minimum = node.get("minimum_games")
 
     players_node = node.get("0", {}).get("players")
     players: list[RosterPlayer] = []
@@ -229,4 +241,21 @@ def parse_roster(
         team_name=team_name,
         is_editable=bool(int(node.get("is_editable", 1) or 0)),
         unmapped=tuple(unmapped),
+        goalie_games=_count(minimum, "value"),
+        goalie_games_week=_count(minimum, "coverage_value"),
+        adds_this_week=_count(adds, "value"),
+        adds_week=_count(adds, "coverage_value"),
+        moves_season=_int(header.get("number_of_moves")),
     )
+
+
+def _int(v: Any) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _count(node: Any, key: str) -> int | None:
+    """One number out of Yahoo's `{coverage_type, coverage_value, value}` blocks."""
+    return _int(node.get(key)) if isinstance(node, dict) else None
