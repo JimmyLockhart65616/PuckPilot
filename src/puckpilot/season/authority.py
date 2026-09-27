@@ -135,6 +135,10 @@ class TransactionAuthority:
     # noise in either season, which was the bar set before running it - while
     # making about 30% fewer adds (504 v 727, 539 v 744). So "share" stays the
     # default and "odds" is a manager's choice, with that on the record.
+    # Replicated afterwards on three more drafts (seeds 7, 42, 99) x both
+    # seasons: all eight leagues favour odds, pooled +0.22 +/- 0.03 categories
+    # a week (4 of 8 clear 2 SE alone), ~28% fewer adds in every one. The
+    # default waits on the manager; the evidence says switch.
     add_scoring: str = "share"
     # Under "odds", the least an add must raise expected categories won.
     min_expected_gain: float = 0.1
