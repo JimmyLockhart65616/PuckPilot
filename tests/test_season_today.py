@@ -542,3 +542,121 @@ def test_one_likely_game_left_is_not_enough_to_skip_tonight(db_with_games):
     )
     # No game on 10-09 in this fixture: the only later chance is none at all.
     assert [m.describe() for m in p.moves] == ["START Backup in G"]
+
+
+# -- IR ---------------------------------------------------------------------
+
+
+def _ir_runtime():
+    """C1 RW1 D1 G1, two bench, one IR and two IR+: eight active spots."""
+    return runtime(
+        slots=[
+            {"roster_position": {"position": p, "count": c, "is_starting_position": s}}
+            for p, c, s in (
+                ("C", 1, 1),
+                ("RW", 1, 1),
+                ("D", 1, 1),
+                ("G", 1, 1),
+                ("BN", 2, 0),
+                ("IR", 1, 0),
+                ("IR+", 2, 0),
+            )
+        ]
+    )
+
+
+def _ir_plan(db, *players, manage=True):
+    return build_plan(
+        db,
+        _ir_runtime(),
+        roster(*players),
+        Values({1: 5.0, 2: 3.0, 3: 4.0}),
+        StaticGoalieSource(),
+        DATE,
+        manager="test",
+        authority=LineupAuthority(enabled=True, min_gain=0.0, manage_ir=manage),
+    )
+
+
+def test_an_out_player_moves_to_a_free_ir_slot_rather_than_the_bench(db_with_games):
+    """Sanderson's case: out, IR+-eligible, sitting in an active D slot. Benching
+    him keeps a roster spot dead; IR+ frees it."""
+    p = _ir_plan(
+        db_with_games,
+        player("p.1", "Hurt D", 1, "TOR", "D", "D", eligible=("D", "IR+", "Util"), status="O"),
+        player("p.2", "Spare D", 2, "TOR", "D", "BN"),
+    )
+    assert [m.describe() for m in p.ir_moves] == ["IR    Hurt D D -> IR+"]
+    # His slot is freed by the IR move, so nobody has to bench him first.
+    assert [m.describe() for m in p.moves] == ["START Spare D in D"]
+    assert p.ir_within_authority is True
+
+
+def test_the_most_restrictive_ir_slot_is_used_first(db_with_games):
+    p = _ir_plan(
+        db_with_games,
+        player("p.1", "Long Term", 1, "VAN", "C", "C", eligible=("C", "IR", "IR+"), status="IR"),
+    )
+    assert [m.to_slot for m in p.ir_moves] == ["IR"]
+
+
+def test_no_ir_move_without_eligibility_or_room(db_with_games):
+    full = _ir_plan(
+        db_with_games,
+        player("p.1", "Out A", 1, "VAN", "C", "C", eligible=("C", "IR+"), status="O"),
+        player("p.2", "On IR", 2, "VAN", "RW", "IR+", eligible=("RW", "IR+"), status="O"),
+        player("p.3", "On IR 2", 3, "VAN", "D", "IR+", eligible=("D", "IR+"), status="O"),
+    )
+    assert full.ir_moves == ()
+    ineligible = _ir_plan(
+        db_with_games, player("p.1", "Out B", 1, "VAN", "C", "C", eligible=("C",), status="O")
+    )
+    assert ineligible.ir_moves == ()
+
+
+def test_a_day_to_day_player_is_never_sent_to_ir(db_with_games):
+    """DTD players play most nights; IR is for players who cannot."""
+    p = _ir_plan(
+        db_with_games,
+        player("p.1", "Sore", 1, "VAN", "C", "C", eligible=("C", "IR+"), status="DTD"),
+    )
+    assert p.ir_moves == ()
+
+
+def test_a_healthy_player_left_in_ir_is_activated_when_there_is_room(db_with_games):
+    p = _ir_plan(
+        db_with_games,
+        player("p.1", "Back", 1, "VAN", "C", "IR+", eligible=("C", "Util")),
+    )
+    assert [m.describe() for m in p.ir_moves] == ["ACTIVATE Back IR+ -> BN"]
+    assert p.ir_alerts == ()
+
+
+def test_an_activated_player_with_a_game_goes_straight_into_the_lineup(db_with_games):
+    p = _ir_plan(
+        db_with_games,
+        player("p.1", "Back", 1, "TOR", "C", "IR+", eligible=("C", "Util")),
+    )
+    assert p.ir_moves == ()
+    assert [m.describe() for m in p.moves] == ["ACTIVATE Back IR+ -> C"]
+
+
+def test_an_illegal_ir_with_no_room_is_an_alert_not_a_move(db_with_games):
+    """Yahoo refuses every add and drop while it stands, so it is said first."""
+    healthy = [player(f"p.{i}", f"Body {i}", 10 + i, "VAN", "C", "BN") for i in range(8)]
+    p = _ir_plan(
+        db_with_games,
+        *healthy,
+        player("p.9", "Back", 1, "VAN", "C", "IR+", eligible=("C", "Util")),
+    )
+    assert p.ir_moves == ()
+    assert len(p.ir_alerts) == 1 and "drop has to come first" in p.ir_alerts[0]
+
+
+def test_ir_moves_are_recommendations_until_agreed(db_with_games):
+    p = _ir_plan(
+        db_with_games,
+        player("p.1", "Hurt", 1, "VAN", "D", "D", eligible=("D", "IR+"), status="O"),
+        manage=False,
+    )
+    assert p.ir_moves and p.ir_within_authority is False

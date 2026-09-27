@@ -1773,7 +1773,13 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
     print()
     print(plan.text())
     print()
-    if args.propose and plan.targets:
+    stuck = ours.illegal_ir()
+    if args.propose and plan.targets and stuck:
+        print(
+            "  Not queued: " + ", ".join(p.name for p in stuck) + " must come off IR first -"
+            " Yahoo refuses every add and drop until then."
+        )
+    elif args.propose and plan.targets:
         from puckpilot.season import proposals
 
         made = proposals.propose(

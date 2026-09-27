@@ -117,6 +117,14 @@ class TeamRoster:
     def injured(self) -> tuple[RosterPlayer, ...]:
         return tuple(p for p in self.players if p.is_out)
 
+    def illegal_ir(self) -> tuple[RosterPlayer, ...]:
+        """Players in an IR slot they are no longer eligible for.
+
+        Yahoo treats that as an illegal roster and refuses every add and drop
+        until it is fixed, so anything proposed meanwhile cannot be made.
+        """
+        return tuple(p for p in self.players if p.on_ir and p.selected_slot not in p.yahoo_eligible)
+
     def slotted(self) -> dict[str, str]:
         """player_key -> the slot Yahoo currently has him in."""
         return {p.player_key: p.selected_slot for p in self.players}

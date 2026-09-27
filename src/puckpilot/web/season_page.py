@@ -60,6 +60,8 @@ PAGE = """<!doctype html>
   .tag.start { background:rgba(61,220,132,.16); color:var(--ok); }
   .tag.bench { background:rgba(255,92,92,.14); color:var(--bad); }
   .tag.move  { background:rgba(91,157,255,.16); color:var(--accent); }
+  .tag.ir, .tag.activate { background:rgba(255,196,0,.16); color:var(--warn); }
+  .alert { color:var(--bad); font-weight:600; margin:6px 0; }
   .name { flex:1; }
   .sub { font-size:13px; color:var(--dim); }
   table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
@@ -105,6 +107,7 @@ function ageText(sec) {
 function renderMoves(root, s) {
   h2(root, 'Tonight' + (s.date ? ' \\u00b7 ' + s.date : ''));
   var c = card(root);
+  (s.alerts || []).forEach(function (a) { c.appendChild(el('div', 'alert', a)); });
   var moves = s.moves || [];
   if (!moves.length) {
     c.appendChild(el('div', null, s.playing ? 'Lineup is already right.' : 'Nothing to do.'));

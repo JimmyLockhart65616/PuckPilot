@@ -32,7 +32,7 @@ from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.season import calendar
 from puckpilot.season.authority import LineupAuthority
 from puckpilot.season.roster import RosterPlayer, TeamRoster
-from puckpilot.season.settings import YAHOO_TO_POS, LeagueRuntime
+from puckpilot.season.settings import IR_SLOTS, YAHOO_TO_POS, LeagueRuntime
 from puckpilot.season.values import ValueModel
 
 # Yahoo's slot name for a benched player, and the engine's name for the flex.
@@ -74,21 +74,37 @@ class Move:
     from_slot: str
 
     @property
+    def is_ir(self) -> bool:
+        """Onto an IR slot - off the active roster."""
+        return self.to_slot in IR_SLOTS
+
+    @property
+    def is_activation(self) -> bool:
+        """Off an IR slot and back onto the active roster."""
+        return self.from_slot in IR_SLOTS and self.to_slot not in IR_SLOTS
+
+    @property
     def is_start(self) -> bool:
-        return self.to_slot != BENCH
+        return self.to_slot != BENCH and not self.is_ir
 
     @property
     def is_bench(self) -> bool:
-        return self.to_slot == BENCH
+        return self.to_slot == BENCH and not self.is_activation
 
     @property
     def kind_order(self) -> int:
-        """Starts first: they are the reason for the message."""
+        """Roster moves first - they change who is available - then starts."""
+        if self.is_ir or self.is_activation:
+            return -1
         if self.is_bench:
             return 2
         return 0 if self.from_slot in (BENCH, "?") else 1
 
     def describe(self) -> str:
+        if self.is_ir:
+            return f"IR    {self.player.name} {self.from_slot} -> {self.to_slot}"
+        if self.is_activation:
+            return f"ACTIVATE {self.player.name} {self.from_slot} -> {self.to_slot}"
         if self.is_bench:
             return f"BENCH {self.player.name}  (was {self.from_slot})"
         if self.from_slot in (BENCH, "?"):
@@ -113,10 +129,15 @@ class LineupPlan:
     empty_slots: tuple[str, ...] = field(default=())
     lock_utc: str = ""
     lock_team: str = ""
+    # IR is kept apart from the lineup diff: it gains nothing tonight, so the
+    # min_gain test cannot judge it, and its authority is `manage_ir`.
+    ir_moves: tuple[Move, ...] = ()
+    ir_alerts: tuple[str, ...] = ()
+    ir_within_authority: bool = False
 
     @property
     def is_noop(self) -> bool:
-        return not self.moves
+        return not self.moves and not self.ir_moves
 
     def deadline(self, tz: str = "America/Toronto") -> str:
         """When the first of tonight's games locks a slot, in local time.
@@ -141,14 +162,21 @@ class LineupPlan:
 
     def text(self) -> str:
         lines = [f"{self.date}  {self.manager}  ({self.team_key})"]
-        if self.is_noop:
+        for a in self.ir_alerts:
+            lines.append(f"  !! {a}")
+        if self.ir_moves:
             lines.append("")
-            lines.append("  Lineup is already optimal - nothing to change.")
-        else:
-            lines.append("")
+            how = "will make" if self.ir_within_authority else "recommended"
+            lines.append(f"  Roster ({how}):")
+            for m in self.ir_moves:
+                lines.append(f"    {m.describe()}")
+        lines.append("")
+        if self.moves:
             lines.append(f"  {len(self.moves)} change(s), worth {self.gain:+.2f} today:")
             for m in self.moves:
                 lines.append(f"    {m.describe()}")
+        else:
+            lines.append("  Lineup is already optimal - nothing to change.")
         if self.empty_slots:
             lines.append("")
             lines.append("  Scoring nothing tonight: " + ", ".join(self.empty_slots))
@@ -236,6 +264,9 @@ def build_plan(
     p_starts = goalie_source.starts(date) if goalie_source else {}
 
     notes: list[str] = []
+    ir_moves, ir_alerts = ir_changes(runtime, roster)
+    vacating = frozenset(m.player.player_key for m in ir_moves if m.is_ir)
+    activating = frozenset(m.player.player_key for m in ir_moves if m.is_activation)
     forced = False
     if auth.enforce_min_games and runtime.min_games_played:
         forced, why = _minimum_forces_a_start(
@@ -256,6 +287,10 @@ def build_plan(
     for p in roster.players:
         if p.is_out:
             out.append(p)
+            continue
+        if p.on_ir and p.player_key not in activating:
+            # Cannot play from IR, and there is no room to bring him back.
+            idle.append(p)
             continue
         if not p.is_editable:
             locked.append(p)
@@ -329,7 +364,7 @@ def build_plan(
         incumbent=incumbent,
     )
 
-    moves, gain = _diff(roster, candidates, assignment, shape)
+    moves, gain = _diff(roster, candidates, assignment, shape, vacating)
     empty = _empty_slots(shape, assignment)
 
     # Leave a lineup alone when the change is not worth making. Churning for
@@ -340,6 +375,10 @@ def build_plan(
             f"below the agreed {auth.min_gain:.2f} - left alone."
         )
         moves, gain = [], 0.0
+
+    # Activated straight into tonight's lineup: that move replaces "to BN".
+    straight_in = {m.player.player_key for m in moves if m.is_activation}
+    ir_moves = [m for m in ir_moves if m.player.player_key not in straight_in]
 
     lock = calendar.first_lock(conn, [p.team for p in roster.players if p.team], date, season)
     within, reason = _check_authority(auth, moves, notes)
@@ -359,7 +398,61 @@ def build_plan(
         empty_slots=tuple(empty),
         lock_utc=lock[1] if lock else "",
         lock_team=lock[0] if lock else "",
+        ir_moves=tuple(ir_moves),
+        ir_alerts=tuple(ir_alerts),
+        ir_within_authority=auth.enabled and auth.manage_ir,
     )
+
+
+def ir_changes(runtime: LeagueRuntime, roster: TeamRoster) -> tuple[list[Move], list[str]]:
+    """Roster moves between IR and the active roster, and what blocks them.
+
+    Out players go onto a free IR slot they are eligible for - Yahoo's own
+    `eligible_positions` says which, so no status table is kept here. That
+    frees an active roster spot, which an add can then fill without a drop.
+
+    The reverse matters more. A player still in an IR slot once he is no longer
+    eligible for it makes the roster illegal, and Yahoo refuses every add and
+    drop until it is fixed: he is activated when an active spot is free, and
+    otherwise the alert says a drop has to come first.
+    """
+    cap = {s.position: s.count for s in runtime.slots if s.position in IR_SLOTS}
+    free = dict(cap)
+    for p in roster.players:
+        if p.selected_slot in free:
+            free[p.selected_slot] -= 1
+    active_cap = sum(s.count for s in runtime.slots if s.position not in IR_SLOTS)
+    active = sum(1 for p in roster.players if not p.on_ir)
+
+    moves: list[Move] = []
+    # Most restrictive slot first, so the flexible ones stay open for later.
+    order = [s for s in ("IR", "IR-LT", "NA", "IR+") if s in cap] + sorted(
+        s for s in cap if s not in ("IR", "IR-LT", "NA", "IR+")
+    )
+    for p in roster.players:
+        if not p.is_out or p.on_ir or not p.is_editable:
+            continue
+        slot = next((s for s in order if s in p.yahoo_eligible and free.get(s, 0) > 0), None)
+        if slot is None:
+            continue
+        moves.append(Move(player=p, to_slot=slot, from_slot=p.selected_slot))
+        free[slot] -= 1
+        active -= 1
+
+    alerts: list[str] = []
+    for p in roster.players:
+        if not p.on_ir or p.selected_slot in p.yahoo_eligible:
+            continue
+        if active < active_cap:
+            moves.append(Move(player=p, to_slot=BENCH, from_slot=p.selected_slot))
+            active += 1
+        else:
+            alerts.append(
+                f"{p.name} is no longer eligible for {p.selected_slot}, which makes the "
+                f"roster illegal - Yahoo blocks every add and drop until he is back on "
+                f"the active roster, and there is no free spot: a drop has to come first."
+            )
+    return moves, alerts
 
 
 def _demote_questionable(candidates: list[Candidate]) -> None:
@@ -461,7 +554,9 @@ def _p_at_least(chances: list[float], k: int) -> float:
     return sum(dist[k:])
 
 
-def _diff(roster, candidates, assignment, shape) -> tuple[list[Move], float]:
+def _diff(
+    roster, candidates, assignment, shape, vacating: frozenset[str] = frozenset()
+) -> tuple[list[Move], float]:
     """What must change in Yahoo, and what today's lineup gains by it.
 
     Two things this is careful about.
@@ -496,10 +591,11 @@ def _diff(roster, candidates, assignment, shape) -> tuple[list[Move], float]:
         if have != want:
             moves.append(Move(player=by_key[key].player, to_slot=want, from_slot=have))
 
-    # Anyone still in a starting slot the new lineup needs has to step aside.
+    # Anyone still in a starting slot the new lineup needs has to step aside -
+    # except a player going to IR, whose slot is freed by that move instead.
     for p in roster.players:
         key = p.player_key
-        if key in target or p.on_bench or p.on_ir:
+        if key in target or p.on_bench or p.on_ir or key in vacating:
             continue
         have = current.get(key, "?")
         if capacity.get(have, 0) <= 0:

@@ -54,10 +54,24 @@ def move_reasons(conn: sqlite3.Connection, runtime: LeagueRuntime, plan) -> dict
     by_key = {c.player.player_key: c for c in plan.playing}
     out: dict[str, str] = {}
 
+    for m in getattr(plan, "ir_moves", ()):
+        p = m.player
+        if m.is_ir:
+            why = p.injury_note or p.status_full or p.status
+            out[p.player_key] = f"out ({why}) - {m.to_slot} frees a roster spot for an add."
+        else:
+            out[p.player_key] = f"no longer eligible for {m.from_slot} - back on the roster."
+
     for m in plan.moves:
         p = m.player
         cand = by_key.get(p.player_key)
         where = games.get(p.team, "")
+        if getattr(m, "is_activation", False):
+            out[p.player_key] = (
+                f"no longer eligible for {m.from_slot} - back on the roster and "
+                f"playing tonight ({where})."
+            )
+            continue
         if m.is_bench:
             if p.team not in games:
                 out[p.player_key] = f"{p.team} are not playing tonight."
@@ -98,7 +112,12 @@ def plan_story(conn: sqlite3.Connection, runtime: LeagueRuntime, plan) -> list[s
         f"{_pretty(plan.date)} - {n_games} NHL games, and {playing} of your {total} "
         f"players are in one."
     ]
-    if plan.is_noop:
+    lines += list(getattr(plan, "ir_alerts", ()))
+    ir = getattr(plan, "ir_moves", ())
+    if ir:
+        verb = "Moving" if getattr(plan, "ir_within_authority", False) else "Move"
+        lines.append(f"{verb} " + "; ".join(m.describe().split(None, 1)[1] for m in ir) + ".")
+    if not plan.moves:
         if playing == 0:
             lines.append("Nobody you own plays tonight, so there is nothing to set.")
         else:

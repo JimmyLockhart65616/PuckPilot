@@ -23,12 +23,20 @@ DEFAULT_TZ = "America/Toronto"
 
 
 def _move_kind(m) -> str:
+    if getattr(m, "is_ir", False):
+        return "ir"
+    if getattr(m, "is_activation", False):
+        return "activate"
     if m.is_bench:
         return "bench"
     return "start" if m.from_slot in ("BN", "?") else "move"
 
 
 def _move_detail(m) -> str:
+    if getattr(m, "is_ir", False):
+        return f"{m.from_slot} to {m.to_slot} - frees a roster spot"
+    if getattr(m, "is_activation", False):
+        return f"off {m.from_slot}, into {m.to_slot}"
     if m.is_bench:
         return f"was {m.from_slot}"
     if m.from_slot in ("BN", "?"):
@@ -65,10 +73,12 @@ def build(
         "protocol": None,
         "week": None,
         "roster": [],
+        "alerts": [],
     }
 
     if plan is not None:
         snap["date"] = plan.date
+        # Roster moves first: they decide who is available to the rest.
         snap["moves"] = [
             {
                 "kind": _move_kind(m),
@@ -77,8 +87,9 @@ def build(
                 # instruction, but the reason is what makes it checkable.
                 "detail": (reasons or {}).get(m.player.player_key) or _move_detail(m),
             }
-            for m in plan.moves
+            for m in (*getattr(plan, "ir_moves", ()), *plan.moves)
         ]
+        snap["alerts"] = list(getattr(plan, "ir_alerts", ()))
         snap["out"] = [p.label() for p in plan.out]
         snap["lock_local"] = plan.deadline(tz)
         snap["playing"] = len(plan.playing)

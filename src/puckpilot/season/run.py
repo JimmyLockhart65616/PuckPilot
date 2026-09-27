@@ -399,7 +399,13 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report):
         stance = protocol_mod.save(conn, stance)
         lines.append(f"protocol #{stance.id} proposed - approve it on the page")
 
-    if propose and plan.targets:
+    stuck = ours.illegal_ir()
+    if propose and plan.targets and stuck:
+        lines.append(
+            "no proposals: " + ", ".join(p.name for p in stuck) + " must leave IR first - "
+            "Yahoo refuses every add and drop until then"
+        )
+    elif propose and plan.targets:
         made = proposals_mod.propose(
             conn,
             manager.name,

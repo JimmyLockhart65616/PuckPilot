@@ -58,6 +58,11 @@ class LineupAuthority:
     # bounds the day is the lock, which is a clock, not a count.
     # Names, because a person thinks in names. Config, never code.
     never_bench: tuple[str, ...] = ()
+    # Move a player Yahoo lists as out, and eligible for a free IR slot, into
+    # it. That frees an active roster spot, which is worth something only once
+    # an add fills it - and the add is still a proposal. Off unless agreed:
+    # it is a roster move a person may want to make themselves.
+    manage_ir: bool = False
     # Whether an approved week protocol also re-weights the daily lineup.
     #
     # OFF, on measurement. Scored by categories won per week - the only metric
@@ -93,6 +98,8 @@ class LineupAuthority:
             f"  never start a goalie below {self.min_goalie_p_start:.0%} to start",
             f"  players flagged day-to-day: {self.start_questionable.replace('_', ' ')}",
             f"  weekly goalie minimum enforced: {'yes' if self.enforce_min_games else 'no'}",
+            "  out players moved to a free IR slot: "
+            + ("yes" if self.manage_ir else "no (recommended, not made)"),
             "  changes are unlimited until each player's game starts",
             "  week protocol steers the lineup: "
             + ("yes" if self.follow_protocol else "no (measured inert; it steers adds)"),

@@ -278,6 +278,18 @@ def check_roster(roster) -> Check:
     ]
     if roster.injured():
         lines.append("out: " + ", ".join(p.label() for p in roster.injured()))
+    stuck = getattr(roster, "illegal_ir", lambda: ())()
+    if stuck:
+        return Check(
+            "roster",
+            FAIL,
+            "illegal IR: " + ", ".join(f"{p.name} ({p.selected_slot})" for p in stuck),
+            lines
+            + [
+                "no longer IR-eligible; Yahoo blocks every add and drop until activated",
+                "activate them (drop someone first if the active roster is full)",
+            ],
+        )
     if roster.unmapped:
         return Check(
             "roster",

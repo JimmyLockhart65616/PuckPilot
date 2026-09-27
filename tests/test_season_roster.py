@@ -188,7 +188,9 @@ def test_league_key_is_derived_from_the_team_key():
 def _with_counters(payload, minimum=None, adds=None, moves=None):
     team = payload["fantasy_content"]["team"]
     if adds is not None:
-        team[0].append({"roster_adds": {"coverage_type": "week", "coverage_value": 2, "value": adds}})
+        team[0].append(
+            {"roster_adds": {"coverage_type": "week", "coverage_value": 2, "value": adds}}
+        )
     if moves is not None:
         team[0].append({"number_of_moves": moves})
     if minimum is not None:

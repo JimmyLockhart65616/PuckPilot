@@ -122,6 +122,7 @@ class SeasonState:
                 "roster": [],
                 "week": None,
                 "protocol": None,
+                "alerts": [],
             }
         age = time.time() - at
         out = dict(snap)

@@ -141,3 +141,34 @@ def test_decisions_are_applied_in_the_order_they_were_made(db):
     )
     # seq 1 wins and seq 2 finds it already decided
     assert proposals_mod.get(db, a.id).status == "approved"
+
+
+def test_roster_moves_come_first_with_their_own_kinds(db):
+    """Unkinded, an IR move rendered as "START Sanderson in IR+"."""
+    p = LineupPlan(
+        date="2026-10-07",
+        team_key="999.l.1.t.5",
+        manager="jimmy",
+        moves=(Move(player=player("Started"), to_slot="D", from_slot="BN"),),
+        ir_moves=(
+            Move(player=player("Hurt", slot="D", status="O"), to_slot="IR+", from_slot="D"),
+            Move(player=player("Back", slot="IR+"), to_slot="BN", from_slot="IR+"),
+        ),
+        ir_alerts=("Someone is stuck in IR",),
+    )
+    s = snapshot.build(db, "jimmy", "999.l.1", "Home Team", plan=p)
+    assert [m["kind"] for m in s["moves"]] == ["ir", "activate", "start"]
+    assert "frees a roster spot" in s["moves"][0]["detail"]
+    assert s["alerts"] == ["Someone is stuck in IR"]
+
+
+def test_the_cold_payload_carries_every_key_a_snapshot_does(db):
+    """The contract: a key a snapshot has and a cold relay lacks renders as
+    "undefined" on a fresh URL."""
+    from puckpilot.web.season_relay import SeasonState
+
+    cold = SeasonState().get("jimmy")
+    for key in snapshot.build(db, "jimmy", "999.l.1", "Home Team"):
+        if key in ("team", "date", "out", "lock_local", "playing", "rostered"):
+            continue  # optional on the page by design
+        assert key in cold, key

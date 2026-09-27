@@ -268,8 +268,11 @@ def _scoring(**over):
 
     return runtime(
         stat_categories=_cats(
-            _stat(1, "G"), _stat(19, "W"), _stat(25, "SV"),
-            _stat(24, "SA", display_only="1"), _stat(26, "SV%"),
+            _stat(1, "G"),
+            _stat(19, "W"),
+            _stat(25, "SV"),
+            _stat(24, "SA", display_only="1"),
+            _stat(26, "SV%"),
         ),
         **over,
     )
@@ -298,3 +301,20 @@ def test_an_old_cache_without_categories_warns_with_the_fix():
     c = pf.check_categories(runtime(), _league("G"))
     assert c.status == WARN
     assert "season settings --refresh" in c.detail
+
+
+def test_a_healthy_player_left_in_ir_fails_the_roster_check():
+    """Yahoo blocks every add and drop while it stands."""
+    back = RosterPlayer(
+        player_key="p.3",
+        yahoo_id="3",
+        name="Back From Injury",
+        team="NYI",
+        primary_position="C",
+        yahoo_eligible=frozenset({"C", "Util"}),
+        selected_slot="IR+",
+        nhl_player_id=3,
+    )
+    c = pf.check_roster(TeamRoster(league_key="l", team_key="t", date="d", players=(back,)))
+    assert c.status == FAIL
+    assert "illegal IR" in c.detail and "Back From Injury" in c.detail
