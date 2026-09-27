@@ -2620,6 +2620,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A Windows console (and a scheduled task's) is not UTF-8, and one player
+    # name it cannot encode must not crash a run after the work is done.
+    # Unencodable characters print as "?"; the log file stays UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError):
+            stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
     return args.func(args)
 

@@ -1096,7 +1096,7 @@ def _odds_moved(before, after, limit: int = 3) -> tuple[str, ...]:
             continue
         d = a.expected - b.expected
         if d > 0.005:
-            moves.append((d, f"{b.category.label} {b.expected:.0%}\u2192{a.expected:.0%}"))
+            moves.append((d, f"{b.category.label} {b.expected:.0%} -> {a.expected:.0%}"))
     moves.sort(key=lambda x: -x[0])
     return tuple(label for _, label in moves[:limit])
 
