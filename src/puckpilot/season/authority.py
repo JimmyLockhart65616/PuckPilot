@@ -129,7 +129,12 @@ class TransactionAuthority:
     max_pending: int = 5
     # How an add is priced: "share" of each live gap it closes (the original),
     # or "odds" - the change in expected categories won this week, from the
-    # calibrated model. Stays "share" until gate G2 says otherwise.
+    # calibrated model. Gate G2 (`ppilot season add-gate`, 12 teams x 22 weeks,
+    # rivals frozen): odds-weekly against share-weekly +0.15 +/- 0.09 (2025-26)
+    # and +0.02 +/- 0.11 (2024-25) categories a week - never worse, not clear of
+    # noise in either season, which was the bar set before running it - while
+    # making about 30% fewer adds (504 v 727, 539 v 744). So "share" stays the
+    # default and "odds" is a manager's choice, with that on the record.
     add_scoring: str = "share"
     # Under "odds", the least an add must raise expected categories won.
     min_expected_gain: float = 0.1

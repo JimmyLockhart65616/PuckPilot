@@ -456,3 +456,64 @@ def log_week(conn, manager: str, league_key: str, team_key: str, plan, day: str)
     )
     conn.commit()
     return True
+
+
+# -- tonight's goalies ------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GoalieChoice:
+    """Which of tonight's goalies to start, and what each choice was worth."""
+
+    start: frozenset[int]  # goalies to start tonight
+    expected: float  # expected goalie categories won with that choice
+    by_subset: dict[frozenset[int], float]  # every choice considered
+
+    def cost_of(self, other: frozenset[int]) -> float:
+        """Expected categories given up by choosing `other` instead."""
+        return self.expected - self.by_subset.get(other, float("-inf"))
+
+
+def choose_goalies(
+    model: OddsModel,
+    cats: tuple[Category, ...],
+    ours: Side,
+    tonight: dict[int, GoalieGame],
+    theirs: Side,
+    slots: int,
+    at_least: int = 0,
+) -> GoalieChoice:
+    """The set of tonight's goalies that maximises expected categories won.
+
+    `ours` holds everything except tonight's goalie games - banked totals,
+    remaining skaters, later goalie games - so each candidate set is scored by
+    adding just its own games. Only goalie categories can change, so only they
+    are evaluated. `at_least` is a floor from the weekly minimum: sets smaller
+    than it are not considered. Starting everyone who plays is not always best:
+    with wins and saves settled and save percentage close, another start can
+    only cost the one category still open.
+
+    Measured, and NOT wired into the live lineup: gate G2's goalie-odds arm (12
+    teams x 22 weeks, as-of throughout) changed 96 and 68 goalie-nights a season
+    - about one in twenty - for +0.000 +/- 0.010 and +0.015 +/- 0.010
+    categories a week. Ratio protection is real in a single week and invisible
+    over a season. Re-measure before using it.
+    """
+    from itertools import combinations
+
+    goalie_cats = tuple(c for c in cats if c.kind == "goalie")
+    names = sorted(tonight)
+    by_subset: dict[frozenset[int], float] = {}
+    for k in range(min(max(at_least, 0), len(names), slots), min(slots, len(names)) + 1):
+        for combo in combinations(names, k):
+            s = frozenset(combo)
+            side = Side(
+                banked=ours.banked,
+                skaters=ours.skaters,
+                goalies=list(ours.goalies) + [tonight[pid] for pid in combo],
+            )
+            by_subset[s] = model.week(goalie_cats, side, theirs).expected
+    if not by_subset:
+        return GoalieChoice(frozenset(), 0.0, {})
+    best = max(by_subset, key=lambda s: (by_subset[s], len(s)))
+    return GoalieChoice(best, by_subset[best], by_subset)

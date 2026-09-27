@@ -671,6 +671,7 @@ def build_week_plan(
     min_expected_gain: float = 0.1,
     playoff_reserve: int = 0,
     stream_spots: int = 2,
+    measure_room: bool = True,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -728,21 +729,35 @@ def build_week_plan(
         if runtime.max_weekly_adds is None
         else max(runtime.max_weekly_adds - adds_used_week, 0)
     )
-    reach = headroom(
-        conn, runtime, week, ours.players, goalie_source, values, rates, cats, our_rest, days=days
-    )
-    adds = add_headroom(
-        conn,
-        runtime,
-        week,
-        ours,
-        pool,
-        rates,
-        cats,
-        league,
-        adds_left=adds_left_week if adds_left_week is not None else 1,
-        days=days,
-    )
+    reach: dict[str, float | None] = {}
+    adds: dict[str, float | None] = {}
+    # How far the lineup and the adds left could move each category. Feeds only
+    # "out of reach"; a replay pricing thousands of adds can skip it.
+    if measure_room:
+        reach = headroom(
+            conn,
+            runtime,
+            week,
+            ours.players,
+            goalie_source,
+            values,
+            rates,
+            cats,
+            our_rest,
+            days=days,
+        )
+        adds = add_headroom(
+            conn,
+            runtime,
+            week,
+            ours,
+            pool,
+            rates,
+            cats,
+            league,
+            adds_left=adds_left_week if adds_left_week is not None else 1,
+            days=days,
+        )
 
     def sd(key: str) -> float | None:
         if key in DERIVED and key != "save_pct":
@@ -833,7 +848,10 @@ def build_week_plan(
             base_totals=our_rest,
             days=days,
             odds_ctx=ctx,
-            adds_left=adds_left_week,
+            adds_left=_fewest(
+                adds_left_week,
+                None if adds_left_season is None else adds_left_season - playoff_reserve,
+            ),
             stream_spots=stream_spots,
         )
 
@@ -1061,6 +1079,12 @@ def _targets(
         base_players.append(best.player)
         base_starts, base_totals, base_odds = evaluate(base_players)
     return tuple(chosen)
+
+
+def _fewest(*limits: int | None) -> int | None:
+    """The tightest of several caps, any of which may be absent (None)."""
+    known = [max(x, 0) for x in limits if x is not None]
+    return min(known) if known else None
 
 
 def _odds_moved(before, after, limit: int = 3) -> tuple[str, ...]:

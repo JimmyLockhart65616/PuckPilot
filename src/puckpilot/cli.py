@@ -1575,6 +1575,28 @@ def _cmd_season_calibrate(args: argparse.Namespace) -> int:
     return 0 if report.text.rstrip().endswith("PASS") else 1
 
 
+def _cmd_season_add_gate(args: argparse.Namespace) -> int:
+    """Gate G2 for adds: which way of choosing pickups takes more categories?"""
+    from puckpilot.data import store
+    from puckpilot.season.add_gate import ARMS, add_gate_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    for season in args.season:
+        report = add_gate_report(
+            conn,
+            _league(args),
+            season=season,
+            n_tested=args.teams,
+            seed=args.seed,
+            arms=tuple(args.arms.split(",")) if args.arms else ARMS,
+            progress=print if args.verbose else None,
+        )
+        print()
+        print(report.text)
+    return 0
+
+
 def _cmd_season_preflight(args: argparse.Namespace) -> int:
     from puckpilot.season import cli_support
     from puckpilot.season import preflight as pf
@@ -2463,6 +2485,16 @@ def build_parser() -> argparse.ArgumentParser:
     s_cal.add_argument("--seed", type=int, default=20261)
     s_cal.add_argument("--verbose", action="store_true")
     s_cal.set_defaults(func=_cmd_season_calibrate)
+
+    s_ag = season_sub.add_parser(
+        "add-gate", help="Gate G2 for adds: which way of choosing pickups wins more categories?"
+    )
+    s_ag.add_argument("--season", nargs="+", default=["20242025", "20252026"])
+    s_ag.add_argument("--teams", type=int, default=12)
+    s_ag.add_argument("--seed", type=int, default=20261)
+    s_ag.add_argument("--arms", default="", help="comma list; default all")
+    s_ag.add_argument("--verbose", action="store_true")
+    s_ag.set_defaults(func=_cmd_season_add_gate)
 
     s_run = season_sub.add_parser(
         "run",

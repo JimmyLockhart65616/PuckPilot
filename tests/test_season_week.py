@@ -734,3 +734,34 @@ def test_the_days_first_run_is_the_one_that_searches(db):
     assert not pool_read_on(db, "l", "2026-10-06")
     save_pool(db, "l", "2026-10-06", [PoolPlayer("k", "A", "TOR", "C", frozenset({"C"}), 1)])
     assert pool_read_on(db, "l", "2026-10-06") and not pool_read_on(db, "l", "2026-10-07")
+
+
+def test_the_season_cap_limits_a_week_that_still_has_adds(db):
+    """One acquisition left for the season and three for the week: one."""
+    got = _targets_for(
+        db,
+        (
+            _rp("p.1", "Mid", 1, "TOR", "C"),
+            _rp("p.2", "Depth", 2, "TOR", "C"),
+            _rp("p.3", "Also Depth", 3, "TOR", "C"),
+        ),
+        (("C", 3, 1),),
+        pool=[_fa("fa.1", "Streamer", 9), _fa("fa.2", "Streamer Two", 10)],
+        rates={
+            1: {"goals": 0.4},
+            2: {"goals": 0.1},
+            3: {"goals": 0.1},
+            9: {"goals": 0.5},
+            10: {"goals": 0.45},
+        },
+        per_game={1: 1.2, 2: 0.3, 3: 0.35, 9: 1.1, 10: 1.0},
+        adds_left=1,
+    )
+    assert len(got) == 1
+
+
+def test_the_fewest_cap_wins_and_absent_caps_are_ignored():
+    from puckpilot.season.week import _fewest
+
+    assert _fewest(3, 1) == 1 and _fewest(None, 2) == 2 and _fewest(None, None) is None
+    assert _fewest(3, -2) == 0

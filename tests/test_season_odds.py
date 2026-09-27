@@ -162,3 +162,55 @@ def test_a_side_is_built_from_starts_and_goalie_games():
     assert [g.p_start for g in s.goalies] == [0.6, 0.7]
     assert s.goalies[0].save_pct == pytest.approx(24.5 / 27.0)
     assert math.isclose(s.banked["goals"], 3.0)
+
+
+# -- tonight's goalies --------------------------------------------------------
+
+
+def _goalie_cats():
+    return (resolve("W"), resolve("SV"), resolve("SV%"))
+
+
+def test_with_everything_open_every_goalie_who_plays_starts():
+    from puckpilot.season.odds import choose_goalies
+
+    got = choose_goalies(
+        OddsModel(),
+        _goalie_cats(),
+        Side(),
+        {1: _g(p=0.9), 2: _g(p=0.8)},
+        Side(goalies=[_g()] * 3),
+        slots=2,
+    )
+    assert got.start == frozenset({1, 2})
+
+
+def test_a_settled_week_protects_a_close_save_percentage():
+    """Wins and saves locked up, save percentage a narrow lead: one more start
+    can only cost the one category still open, so he sits."""
+    from puckpilot.season.odds import choose_goalies
+
+    ours = Side(banked={"wins": 5.0, "saves": 230.0, "shots_against": 250.0})  # .920
+    theirs = Side(banked={"wins": 1.0, "saves": 91.0, "shots_against": 100.0})  # .910
+    got = choose_goalies(
+        OddsModel(), _goalie_cats(), ours, {1: _g(p=0.95, sv=0.905)}, theirs, slots=2
+    )
+    assert got.start == frozenset()
+    assert got.cost_of(frozenset({1})) > 0
+
+
+def test_the_weekly_minimum_is_a_floor_on_the_choice():
+    from puckpilot.season.odds import choose_goalies
+
+    ours = Side(banked={"wins": 5.0, "saves": 230.0, "shots_against": 250.0})
+    theirs = Side(banked={"wins": 1.0, "saves": 91.0, "shots_against": 100.0})
+    got = choose_goalies(
+        OddsModel(),
+        _goalie_cats(),
+        ours,
+        {1: _g(p=0.95, sv=0.905)},
+        theirs,
+        slots=2,
+        at_least=1,
+    )
+    assert got.start == frozenset({1})

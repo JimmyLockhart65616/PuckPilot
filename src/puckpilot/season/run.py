@@ -183,7 +183,7 @@ def run_day(
     from puckpilot.season import cli_support, explain, publish, snapshot
     from puckpilot.season.fetch import discover_team_key, fetch_live, fetch_roster, save_roster
     from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
-    from puckpilot.season.today import build_plan, yahoo_goalie_games
+    from puckpilot.season.today import build_plan, open_roster_spots, yahoo_goalie_games
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
 
@@ -314,9 +314,20 @@ def run_day(
             "week",
             lambda: _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, models),
         )
-    elif models and week is not None and not pool_read_on(conn, league_key, day):
-        # The day's first run searches for adds: a Wednesday pickup for
-        # Thursday to Sunday is worth pricing on Wednesday, not next Monday.
+    elif (
+        models
+        and week is not None
+        and roster is not None
+        and not pool_read_on(conn, league_key, day)
+        and open_roster_spots(runtime, roster) > 0
+    ):
+        # Mid-week, the search runs again only when a roster spot has opened -
+        # a player gone to IR, a drop. Searching every morning regardless was
+        # measured (gate G2, 12 teams x 22 weeks x two seasons) and won nothing
+        # over once a week: -0.06 +/- 0.06 and -0.06 +/- 0.08 categories a week,
+        # with more adds spent. The replay never frees a spot mid-week, so this
+        # one trigger is judgement, not measurement: an open spot is an add that
+        # costs no drop, and it should not wait for Monday.
         week_plan = _guard(
             report,
             "week",
