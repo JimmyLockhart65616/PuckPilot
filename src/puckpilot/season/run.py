@@ -314,6 +314,25 @@ def run_day(
             "week",
             lambda: _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, models),
         )
+    elif models and week is not None and not pool_read_on(conn, league_key, day):
+        # The day's first run searches for adds: a Wednesday pickup for
+        # Thursday to Sunday is worth pricing on Wednesday, not next Monday.
+        week_plan = _guard(
+            report,
+            "week",
+            lambda: _weekly(
+                conn,
+                manager,
+                league_key,
+                runtime,
+                day,
+                propose,
+                report,
+                ctx,
+                models,
+                start_of_week=False,
+            ),
+        )
     elif models and ctx.roster is not None and ctx.theirs is not None and week is not None:
         week_plan = _guard(
             report,
@@ -515,8 +534,20 @@ def _week_line(plan) -> str:
     )
 
 
-def _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, models):
-    """The week's first run: the full plan, the add search, and the protocol.
+def pool_read_on(conn, league_key: str, day: str) -> bool:
+    """Has today's free-agent pool been read - i.e. has today's add search run?"""
+    row = conn.execute(
+        "SELECT 1 FROM yahoo_fa_snapshots WHERE league_key = ? AND date = ? LIMIT 1",
+        (league_key, day),
+    ).fetchone()
+    return row is not None
+
+
+def _weekly(
+    conn, manager, league_key, runtime, day, propose, report, ctx, models, start_of_week=True
+):
+    """The full plan with the add search - daily - and on a week's first day,
+    the weekly upkeep and the protocol too.
 
     Reuses what this run already read - our roster, theirs, the live score -
     and falls back to reading the matchups itself when the score read failed.
@@ -553,7 +584,8 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, model
         fa = pool.fetch_pool(session, league_key, "FA", limit=150, player_map=pmap)
         return week, opp_name, ours, theirs, fa
 
-    _guard(report, "upkeep", lambda: _upkeep(conn, manager, league_key, season, report))
+    if start_of_week:
+        _guard(report, "upkeep", lambda: _upkeep(conn, manager, league_key, season, report))
 
     got = cli_support.run_session(manager, _read)
     if got is None:
@@ -582,18 +614,23 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, model
         adds_used_season=used_season,
         min_gain=manager.authority.transactions.min_weekly_gain,
         odds_model=OddsModel(),
+        add_scoring=manager.authority.transactions.add_scoring,
+        min_expected_gain=manager.authority.transactions.min_expected_gain,
+        playoff_reserve=manager.authority.transactions.playoff_reserve,
+        stream_spots=manager.authority.transactions.stream_spots,
         **live_inputs(conn, runtime, week, live, day),
     )
     log_week(conn, manager.name, league_key, ours.team_key, plan, day)
     lines = [ln for ln in explain.week_story(plan, runtime) if ln]
 
-    stance = protocol_mod.derive(
-        plan.outlook, manager.name, league_key, ours.team_key, plan.week, opp_name
-    )
-    existing = protocol_mod.load(conn, manager.name, league_key, plan.week)
-    if not (existing and existing.status == protocol_mod.APPROVED):
-        stance = protocol_mod.save(conn, stance)
-        lines.append(f"protocol #{stance.id} proposed - approve it on the page")
+    if start_of_week:
+        stance = protocol_mod.derive(
+            plan.outlook, manager.name, league_key, ours.team_key, plan.week, opp_name
+        )
+        existing = protocol_mod.load(conn, manager.name, league_key, plan.week)
+        if not (existing and existing.status == protocol_mod.APPROVED):
+            stance = protocol_mod.save(conn, stance)
+            lines.append(f"protocol #{stance.id} proposed - approve it on the page")
 
     stuck = ours.illegal_ir()
     if propose and plan.targets and stuck:
@@ -612,7 +649,8 @@ def _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, model
             max_pending=manager.authority.transactions.max_pending,
         )
         lines += [p.describe() for p in made] or ["nothing new to propose"]
-    report.add("week", True, f"week {plan.week} vs {opp_name}", lines)
+    head = _week_line(plan) if not start_of_week else f"week {plan.week} vs {opp_name}"
+    report.add("week", True, head, lines)
     return plan
 
 

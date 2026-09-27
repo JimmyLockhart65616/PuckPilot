@@ -158,6 +158,9 @@ def build(
 def _why(p) -> str:
     """The net effect, in the league's own units - not an abstract score."""
     bits = []
+    gain = p.reason.get("expected_gain")
+    if gain is not None:
+        bits.append(f"+{float(gain):.2f} categories expected")
     extra = p.reason.get("extra_starts")
     if extra is not None:
         bits.append(f"{float(extra):+g} starts this week")

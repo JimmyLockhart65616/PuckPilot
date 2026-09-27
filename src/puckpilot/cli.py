@@ -1794,6 +1794,10 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         min_gain=manager.authority.transactions.min_weekly_gain,
         max_targets=args.top,
         odds_model=OddsModel(),
+        add_scoring=manager.authority.transactions.add_scoring,
+        min_expected_gain=manager.authority.transactions.min_expected_gain,
+        playoff_reserve=manager.authority.transactions.playoff_reserve,
+        stream_spots=manager.authority.transactions.stream_spots,
         **live_inputs(conn, runtime, m.as_week(), live, today),
     )
     log_week(conn, manager.name, league_key, ours.team_key, plan, today)

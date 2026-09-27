@@ -135,6 +135,8 @@ def propose(
             # `gain` is a share of the live gap now, not an abstract value
             # number - adds are priced by re-slotting the week and subtracting.
             "gain": round(t.score, 3),
+            # Under odds pricing: expected categories won this week, added.
+            "expected_gain": None if getattr(t, "gain", None) is None else round(t.gain, 3),
             "starts": round(t.starts, 2),
             "drop_starts": round(t.drop_starts, 2),
             "extra_starts": round(t.extra_starts, 2),

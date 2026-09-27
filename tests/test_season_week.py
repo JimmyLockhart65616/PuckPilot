@@ -311,9 +311,21 @@ def _rp(key, name, pid, team, slot, status="", eligible=("C", "Util")):
     )
 
 
-def _targets_for(db, players, slots):
-    from puckpilot.league import LeagueConfig
+def _fa(key, name, pid, team="TOR"):
     from puckpilot.season.pool import PoolPlayer
+
+    return PoolPlayer(
+        player_key=key,
+        name=name,
+        team=team,
+        primary_position="C",
+        yahoo_eligible=frozenset({"C", "Util"}),
+        nhl_player_id=pid,
+    )
+
+
+def _targets_for(db, players, slots, pool=None, rates=None, per_game=None, **kw):
+    from puckpilot.league import LeagueConfig
     from puckpilot.season.roster import TeamRoster
     from puckpilot.season.week import _targets
     from tests.test_season_settings import _slots
@@ -321,14 +333,6 @@ def _targets_for(db, players, slots):
     _week_games(db)
     rt = _runtime_for_week(roster_positions=_slots(*slots))
     ours = TeamRoster(league_key="999.l.1", team_key="t", date="2026-10-05", players=players)
-    streamer = PoolPlayer(
-        player_key="fa.1",
-        name="Streamer",
-        team="TOR",
-        primary_position="C",
-        yahoo_eligible=frozenset({"C", "Util"}),
-        nhl_player_id=9,
-    )
     goals = resolve("G")
     return _targets(
         db,
@@ -336,13 +340,14 @@ def _targets_for(db, players, slots):
         LeagueConfig(skater_cats=(goals,), goalie_cats=()),
         rt.week(1),
         ours,
-        [streamer],
-        {1: {"goals": 0.5}, 2: {"goals": 0.2}, 9: {"goals": 0.3}},
+        pool if pool is not None else [_fa("fa.1", "Streamer", 9)],
+        rates or {1: {"goals": 0.5}, 2: {"goals": 0.2}, 9: {"goals": 0.3}},
         {},
         None,
-        _PerGame({1: 1.5, 2: 0.5, 9: 1.0}),
+        _PerGame(per_game or {1: 1.5, 2: 0.5, 9: 1.0}),
         0.0,
         5,
+        **kw,
     )
 
 
@@ -486,7 +491,7 @@ def _live_week(db, **kw):
         frame,
         None,
         _PerGame({1: 1.0, 2: 1.0}),
-        find_targets=False,
+        find_targets=kw.pop("find_targets", False),
         **kw,
     )
 
@@ -630,3 +635,102 @@ def test_every_run_logs_what_the_odds_said(db):
     assert row["week"] == 1 and row["days_left"] == 2
     assert row["expected"] == pytest.approx(p.expected, abs=1e-4)
     assert json.loads(row["cats_json"])["goals"][0] == pytest.approx(p.outlook[0].p_win, abs=1e-4)
+
+
+# -- a set of adds that can all be made --------------------------------------
+
+
+def test_the_adds_proposed_never_share_a_drop(db):
+    """Priced one at a time, every candidate named the same cheapest drop, and
+    approving one made the rest impossible."""
+    got = _targets_for(
+        db,
+        (
+            _rp("p.1", "Mid", 1, "TOR", "C"),
+            _rp("p.2", "Depth", 2, "TOR", "C"),
+            _rp("p.3", "Also Depth", 3, "TOR", "C"),
+        ),
+        (("C", 3, 1),),
+        pool=[_fa("fa.1", "Streamer", 9), _fa("fa.2", "Streamer Two", 10)],
+        rates={
+            1: {"goals": 0.4},
+            2: {"goals": 0.1},
+            3: {"goals": 0.1},
+            9: {"goals": 0.5},
+            10: {"goals": 0.45},
+        },
+        per_game={1: 1.2, 2: 0.3, 3: 0.35, 9: 1.1, 10: 1.0},
+    )
+    drops = [t.drop.name for t in got]
+    assert len(got) == 2 and len(set(drops)) == 2
+
+
+def test_a_streamer_never_costs_a_regular(db):
+    """Only the bottom stream_spots rotate. With one, the second add would have
+    had to cut Mid - a regular - so it is not proposed at all."""
+    got = _targets_for(
+        db,
+        (_rp("p.1", "Mid", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+        (("C", 2, 1),),
+        pool=[_fa("fa.1", "Streamer", 9), _fa("fa.2", "Streamer Two", 10)],
+        rates={1: {"goals": 0.3}, 2: {"goals": 0.1}, 9: {"goals": 0.5}, 10: {"goals": 0.45}},
+        per_game={1: 1.5, 2: 0.3, 9: 0.2, 10: 0.2},
+        stream_spots=1,
+    )
+    assert [t.drop.name for t in got] == ["Depth"]
+
+
+def test_an_add_that_is_an_upgrade_may_replace_anyone(db):
+    """Worth more over the rest of the season than the player it replaces:
+    not streaming, just a better player."""
+    got = _targets_for(
+        db,
+        (_rp("p.1", "Mid", 1, "TOR", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+        (("C", 2, 1),),
+        pool=[_fa("fa.1", "Star FA", 9), _fa("fa.2", "Star FA Two", 10)],
+        rates={1: {"goals": 0.2}, 2: {"goals": 0.1}, 9: {"goals": 0.9}, 10: {"goals": 0.8}},
+        per_game={1: 0.6, 2: 0.3, 9: 3.0, 10: 2.5},
+        stream_spots=1,
+    )
+    assert sorted(t.drop.name for t in got) == ["Depth", "Mid"]
+
+
+def test_priced_by_the_odds_an_add_says_what_it_moves(db):
+    from puckpilot.season.odds import OddsModel, Side
+    from puckpilot.season.week import OddsContext
+
+    ctx = OddsContext(
+        model=OddsModel(p_play=1.0),
+        banked={"goals": 2.0},
+        theirs=Side(banked={"goals": 3.0}, skaters={"goals": 1.2}),
+        cats=(resolve("G"),),
+    )
+    got = _targets_for(
+        db,
+        (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+        (("C", 2, 1), ("BN", 1, 0)),
+        odds_ctx=ctx,
+    )
+    assert got and got[0].gain > 0 and got[0].score == got[0].gain
+    assert got[0].helps and got[0].helps[0].startswith("G ")
+
+
+def test_the_last_acquisitions_are_held_for_the_playoffs(db):
+    p = _live_week(db, adds_used_season=60, playoff_reserve=6, find_targets=True)
+    assert p.targets == () and any("playoffs" in n for n in p.notes)
+
+
+def test_a_misspelt_pricing_is_refused():
+    from puckpilot.season.authority import AuthorityError, TransactionAuthority
+
+    with pytest.raises(AuthorityError):
+        TransactionAuthority(add_scoring="vibes")
+
+
+def test_the_days_first_run_is_the_one_that_searches(db):
+    from puckpilot.season.pool import PoolPlayer, save_pool
+    from puckpilot.season.run import pool_read_on
+
+    assert not pool_read_on(db, "l", "2026-10-06")
+    save_pool(db, "l", "2026-10-06", [PoolPlayer("k", "A", "TOR", "C", frozenset({"C"}), 1)])
+    assert pool_read_on(db, "l", "2026-10-06") and not pool_read_on(db, "l", "2026-10-07")

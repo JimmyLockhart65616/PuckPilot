@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 
 # How to treat a player Yahoo flags but does not rule out (DTD and friends).
 QUESTIONABLE_MODES = ("never", "only_if_needed", "always")
+# How an add is priced (see TransactionAuthority.add_scoring).
+ADD_SCORING = ("share", "odds")
 
 
 class AuthorityError(ValueError):
@@ -125,6 +127,27 @@ class TransactionAuthority:
     min_weekly_gain: float = 0.25
     # More pending proposals than this means the tool is guessing, not advising.
     max_pending: int = 5
+    # How an add is priced: "share" of each live gap it closes (the original),
+    # or "odds" - the change in expected categories won this week, from the
+    # calibrated model. Stays "share" until gate G2 says otherwise.
+    add_scoring: str = "share"
+    # Under "odds", the least an add must raise expected categories won.
+    min_expected_gain: float = 0.1
+    # Acquisitions kept back for the playoffs: once the season's remaining
+    # count falls to this, the regular season stops proposing.
+    playoff_reserve: int = 6
+    # Roster spots that rotate: only the players worth least over the rest of
+    # the season may be dropped for a streamer (an upgrade can replace anyone).
+    stream_spots: int = 2
+
+    def __post_init__(self) -> None:
+        if self.add_scoring not in ADD_SCORING:
+            raise AuthorityError(
+                f"authority.transactions.add_scoring must be one of {', '.join(ADD_SCORING)}; "
+                f"got {self.add_scoring!r}"
+            )
+        if self.playoff_reserve < 0:
+            raise AuthorityError("authority.transactions.playoff_reserve cannot be negative")
 
     @property
     def requires_approval(self) -> bool:
@@ -134,8 +157,13 @@ class TransactionAuthority:
     def describe(self) -> list[str]:
         return [
             "Transactions (add / drop / claim): APPROVAL REQUIRED, always.",
-            f"  proposed only when it closes {self.min_weekly_gain:.0%} of a live gap",
+            (
+                f"  proposed only when it adds {self.min_expected_gain:.2f} expected categories"
+                if self.add_scoring == "odds"
+                else f"  proposed only when it closes {self.min_weekly_gain:.0%} of a live gap"
+            ),
             f"  at most {self.max_pending} awaiting your decision at once",
+            f"  {self.playoff_reserve} acquisition(s) held back for the playoffs",
         ]
 
 
