@@ -46,6 +46,11 @@ MAX_PUSH_BYTES = 4 * 1024 * 1024
 # seconds because the in-season job runs on a schedule, not continuously.
 STALE_AFTER_S = 3 * 3600.0
 
+# When a push says when the next run is due, the page is stale only once that
+# moment has passed by this much - a run takes a minute or two, and a quiet
+# night with nothing left to run is not a dead one.
+NEXT_RUN_GRACE_S = 45 * 60.0
+
 # More than this waiting to be drained means nobody is collecting them, which
 # is worth failing loudly about rather than growing without bound.
 MAX_PENDING_DECISIONS = 200
@@ -83,6 +88,20 @@ def parse_keys(spec: str) -> dict[str, str]:
         if name and key:
             out[key] = name
     return out
+
+
+def _stale(snap: dict, age: float, stale_after: float) -> bool:
+    """Overdue, not merely old: judged against the next run the push promised."""
+    due = snap.get("next_run_utc")
+    if due:
+        from datetime import datetime
+
+        try:
+            when = datetime.fromisoformat(str(due).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return age > stale_after
+        return time.time() > when + NEXT_RUN_GRACE_S
+    return age > stale_after
 
 
 class SeasonState:
@@ -123,13 +142,15 @@ class SeasonState:
                 "week": None,
                 "protocol": None,
                 "alerts": [],
+                "next_run_utc": None,
+                "next_local": "",
             }
         age = time.time() - at
         out = dict(snap)
         out["manager"] = manager
         out["empty"] = False
         out["age_seconds"] = round(age, 1)
-        out["stale"] = age > self.stale_after
+        out["stale"] = _stale(snap, age, self.stale_after)
         return out
 
     # -- the return path ---------------------------------------------------

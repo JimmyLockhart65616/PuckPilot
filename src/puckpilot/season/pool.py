@@ -185,6 +185,16 @@ def _page(session, path: str, player_map, ownership_type: str = "") -> list[Pool
 def save_pool(
     conn: sqlite3.Connection, league_key: str, date: str, players: list[PoolPlayer]
 ) -> int:
+    """Record the pool as read on `date`, replacing any earlier read of that day.
+
+    Replacing rather than merging: rows of players since picked up would
+    otherwise linger as free agents. The old code also dated reads by the
+    week's start - three future dates were already on file by the 28th - and a
+    merge would have mixed those into the real day's pool.
+    """
+    conn.execute(
+        "DELETE FROM yahoo_fa_snapshots WHERE league_key = ? AND date = ?", (league_key, date)
+    )
     conn.executemany(
         "INSERT OR REPLACE INTO yahoo_fa_snapshots "
         "(league_key, date, player_key, nhl_player_id, name, team_abbrev, positions, "

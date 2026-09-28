@@ -281,8 +281,13 @@ def run_day(
                 "lineup",
                 True,
                 f"{len(got.moves)} change(s), {got.gain:+.2f}"
+                + (f", {len(got.ir_moves)} roster move(s)" if got.ir_moves else "")
                 + (f", locks {got.deadline()}" if got.lock_utc else ""),
-                [f"{m.describe()} - {reasons.get(m.player.player_key, '')}" for m in got.moves],
+                [f"!! {a}" for a in got.ir_alerts]
+                + [
+                    f"{m.describe()} - {reasons.get(m.player.player_key, '')}"
+                    for m in (*got.ir_moves, *got.moves)
+                ],
             )
             proposals_mod.record_action(
                 conn,
@@ -365,6 +370,7 @@ def run_day(
                 roster=roster,
                 reasons=reasons if plan else None,
                 week_no=week.number if week is not None else None,
+                next_run=_next_run(conn, manager, runtime, day, roster),
             )
             publish.push(manager.page.url, page_key, snap)
             report.add("page", True, manager.page.url)
@@ -382,6 +388,19 @@ def run_day(
 
     say(report.text)
     return report
+
+
+def _next_run(conn, manager, runtime, day, roster):
+    """When the scheduler will next run, for the page's freshness line."""
+    from puckpilot.season import locks, schedule
+
+    try:
+        own = manager.team_key or getattr(roster, "team_key", "")
+        return locks.next_run(
+            conn, manager.name, runtime.nhl_season, day, own, anchor=schedule.ANCHOR_TIMES[0]
+        )
+    except Exception:  # noqa: BLE001 - freshness is advisory; never fail the push
+        return None
 
 
 def _plan_rest_of_day(conn, manager, runtime, day, report, team_key: str = ""):
@@ -658,6 +677,7 @@ def _weekly(
             plan.targets,
             plan.week,
             max_pending=manager.authority.transactions.max_pending,
+            supersede=True,
         )
         lines += [p.describe() for p in made] or ["nothing new to propose"]
     head = _week_line(plan) if not start_of_week else f"week {plan.week} vs {opp_name}"

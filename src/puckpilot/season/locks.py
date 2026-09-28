@@ -146,6 +146,38 @@ def upcoming(
     return [x for x in locks if x.run_at(lead) > at]
 
 
+def next_run(
+    conn: sqlite3.Connection,
+    manager: str,
+    season: str,
+    day: str,
+    team_key: str = "",
+    anchor: str = "11:00",
+    now: datetime | None = None,
+    tz: str = DEFAULT_TZ,
+    lead: int = LEAD_MINUTES,
+) -> datetime:
+    """When the next scheduled run is due, as of `now`.
+
+    The earliest of: a lock run still ahead today, today's anchor run if it
+    has not happened yet, and tomorrow's anchor. It is what tells the page the
+    difference between quiet and dead: on a night with nothing left to run, a
+    push from ten hours ago is not stale - one missing at 11:30 is.
+    """
+    zone = ZoneInfo(tz)
+    at = now or datetime.now(zone)
+    teams = roster_teams(conn, manager, team_key, day)
+    ahead = [x.run_at(lead) for x in upcoming(locks_for(conn, season, day, teams, tz), at, lead)]
+    hh, mm = (int(x) for x in anchor.split(":"))
+    base = datetime.fromisoformat(day).replace(tzinfo=zone)
+    candidates = [
+        *ahead,
+        base.replace(hour=hh, minute=mm),
+        (base + timedelta(days=1)).replace(hour=hh, minute=mm),
+    ]
+    return min(c for c in candidates if c > at)
+
+
 def run_times(locks: list[Lock], lead: int = LEAD_MINUTES) -> list[str]:
     """HH:MM local, one per distinct lock, de-duplicated and ordered."""
     seen: list[str] = []

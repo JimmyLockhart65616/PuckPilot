@@ -300,3 +300,28 @@ def test_the_odds_render_as_percentages_with_the_expected_total():
     assert_clean(out)
     for expected in ("Expect 5.4 of 11 categories", "win", "38%", "0%", "–"):
         assert expected in out["app"], expected
+
+
+def test_the_freshness_line_says_when_the_next_update_is():
+    from datetime import UTC, datetime, timedelta
+
+    state = SeasonState(stale_after=0.0)
+    ahead = (datetime.now(UTC) + timedelta(hours=10)).isoformat()
+    state.push(
+        "jimmy", {"team": "T", "moves": [], "next_run_utc": ahead, "next_local": "Tue 11:00 AM"}
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    assert "next Tue 11:00 AM" in out["fresh"] and "NOT LIVE" not in out["fresh"]
+
+
+def test_a_missed_run_says_which_one():
+    from datetime import UTC, datetime, timedelta
+
+    state = SeasonState()
+    missed = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    state.push(
+        "jimmy", {"team": "T", "moves": [], "next_run_utc": missed, "next_local": "Tue 11:00 AM"}
+    )
+    out = run_page(state.get("jimmy"))
+    assert "NOT LIVE" in out["fresh"] and "a run was due Tue 11:00 AM" in out["fresh"]

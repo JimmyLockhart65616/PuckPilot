@@ -252,3 +252,34 @@ def test_the_deploy_script_refuses_a_permissive_dockerignore():
     assert "refusing to build" in script
     head = (root / ".dockerignore").read_text(encoding="utf-8").splitlines()[:20]
     assert "*" in [ln.strip() for ln in head]
+
+
+# -- stale means overdue, not merely old -------------------------------------
+
+
+def test_an_old_push_is_not_stale_while_its_next_run_is_still_ahead():
+    """A quiet night: last pushed at 11:00, nothing to run until tomorrow."""
+    from datetime import UTC, datetime, timedelta
+
+    state = SeasonState(stale_after=0.0)  # the flat rule would call it stale
+    later = (datetime.now(UTC) + timedelta(hours=10)).isoformat()
+    state.push("jimmy", {"team": "X", "next_run_utc": later})
+    assert state.get("jimmy")["stale"] is False
+
+
+def test_a_run_that_was_due_and_did_not_come_makes_it_stale():
+    from datetime import UTC, datetime, timedelta
+
+    state = SeasonState()
+    missed = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    state.push("jimmy", {"team": "X", "next_run_utc": missed})
+    assert state.get("jimmy")["stale"] is True
+
+
+def test_within_the_grace_a_late_run_is_not_yet_stale():
+    from datetime import UTC, datetime, timedelta
+
+    state = SeasonState()
+    just = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    state.push("jimmy", {"team": "X", "next_run_utc": just})
+    assert state.get("jimmy")["stale"] is False

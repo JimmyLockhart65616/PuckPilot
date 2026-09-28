@@ -1391,6 +1391,18 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
     return 0
 
 
+def _next_scheduled_run(manager, conn, league_key, roster):
+    """When the scheduler runs next, so a manual push does not read as stale."""
+    try:
+        from puckpilot.season import cli_support
+        from puckpilot.season.run import _next_run
+
+        runtime = cli_support.load_rules(conn, league_key)
+        return _next_run(conn, manager, runtime, cli_support.today_str(), roster)
+    except Exception:  # noqa: BLE001 - freshness is advisory; never block a push
+        return None
+
+
 def _season_publish(
     manager, conn, league_key, plan=None, week_plan=None, roster=None, reasons=None, quiet=False
 ):
@@ -1418,6 +1430,7 @@ def _season_publish(
             week_plan=week_plan,
             roster=roster,
             reasons=reasons,
+            next_run=_next_scheduled_run(manager, conn, league_key, roster),
         )
         publish.push(manager.page.url, key, snap)
         if not quiet:
@@ -1848,6 +1861,7 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
             plan.targets,
             plan.week,
             max_pending=manager.authority.transactions.max_pending,
+            supersede=True,
         )
         if made:
             print(f"  Queued {len(made)} proposal(s) for your decision:")

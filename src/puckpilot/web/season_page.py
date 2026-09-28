@@ -250,9 +250,13 @@ function renderRoster(root, rows) {
 
 function render(s) {
   var fresh = document.getElementById('fresh');
-  fresh.textContent = ageText(s.age_seconds) + (s.manager ? ' \\u00b7 ' + s.manager : '');
+  var next = s.next_local ? ' \\u00b7 next ' + s.next_local : '';
+  fresh.textContent = ageText(s.age_seconds) + next + (s.manager ? ' \\u00b7 ' + s.manager : '');
   fresh.className = 'freshness' + (s.stale ? ' stale' : '');
-  if (s.stale) fresh.textContent = 'NOT LIVE \\u2013 ' + ageText(s.age_seconds);
+  if (s.stale) {
+    fresh.textContent = 'NOT LIVE \\u2013 ' + ageText(s.age_seconds) +
+      (s.next_local ? ' \\u00b7 a run was due ' + s.next_local : '');
+  }
 
   var app = document.getElementById('app');
   app.textContent = '';

@@ -259,6 +259,9 @@ ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "drop_player_key": "TEXT",
         "decided_at": "TEXT",
         "executed_at": "TEXT",
+        # Withdrawn by a newer search. A column rather than a status, because
+        # the status CHECK cannot change without rewriting the table.
+        "superseded_at": "TEXT",
     },
 }
 

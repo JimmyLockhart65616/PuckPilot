@@ -55,6 +55,7 @@ def build(
     reasons: dict[str, str] | None = None,
     tz: str = DEFAULT_TZ,
     week_no: int | None = None,
+    next_run=None,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -75,7 +76,18 @@ def build(
         "week": None,
         "roster": [],
         "alerts": [],
+        # When the next run is due. The relay judges staleness against it: a
+        # page with nothing to do until 11:00 is quiet, not dead.
+        "next_run_utc": None,
+        "next_local": "",
     }
+    if next_run is not None:
+        from datetime import UTC
+        from zoneinfo import ZoneInfo
+
+        local = next_run.astimezone(ZoneInfo(tz))
+        snap["next_run_utc"] = next_run.astimezone(UTC).isoformat(timespec="seconds")
+        snap["next_local"] = local.strftime("%a %I:%M %p").replace(" 0", " ")
 
     if plan is not None:
         snap["date"] = plan.date

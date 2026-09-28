@@ -234,3 +234,50 @@ def test_a_new_week_reconsiders_a_refusal(db):
     proposals.decide(db, p.id, False)
     again = proposals.propose(db, "jimmy", "999.l.1", "999.l.1.t.5", [target()], week=3)
     assert len(again) == 1
+
+
+# -- a newer search replaces the queue ---------------------------------------
+
+
+def _five_stale(db):
+    return make(
+        db,
+        *(target(name=f"Stale {i}", key=f"p.s{i}", pid=100 + i) for i in range(5)),
+    )
+
+
+def test_stale_proposals_no_longer_block_a_new_search(db):
+    """The real case, 2026-09-28: five from the pre-fix engine filled
+    max_pending, and the season's first search would have proposed nothing."""
+    _five_stale(db)
+    blocked = make(db, target(name="New", key="p.new", pid=200))
+    assert blocked == []  # the old behaviour: no room
+    made = make(db, target(name="New", key="p.new", pid=200), supersede=True)
+    assert [p.add_name for p in made] == ["New"]
+    assert [p.add_name for p in proposals.pending(db, "jimmy", "999.l.1")] == ["New"]
+
+
+def test_a_withdrawn_proposal_cannot_be_approved(db):
+    [old] = make(db, target(name="Old", key="p.old", pid=300))
+    make(db, target(name="New", key="p.new", pid=301), supersede=True)
+    with pytest.raises(ProposalError, match="withdrawn by a newer search"):
+        proposals.decide(db, old.id, True)
+
+
+def test_a_proposal_the_new_search_repeats_is_kept_not_duplicated(db):
+    [kept] = make(db, target(name="Same", key="p.same", pid=400))
+    made = make(db, target(name="Same", key="p.same", pid=400), supersede=True)
+    assert made == []
+    [still] = proposals.pending(db, "jimmy", "999.l.1")
+    assert still.id == kept.id
+
+
+def test_a_withdrawn_player_can_be_proposed_again_but_a_refused_one_cannot(db):
+    [old] = make(db, target(name="Back", key="p.back", pid=500))
+    make(db, target(name="Other", key="p.other", pid=501), supersede=True)  # withdraws Back
+    again = make(db, target(name="Back", key="p.back", pid=500))
+    assert [p.add_name for p in again] == ["Back"]
+
+    [no] = make(db, target(name="No", key="p.no", pid=502))
+    proposals.decide(db, no.id, False)
+    assert make(db, target(name="No", key="p.no", pid=502), supersede=True) == []

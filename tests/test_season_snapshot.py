@@ -228,3 +228,13 @@ def test_the_week_card_shows_calibrated_odds_when_there_are_some(db):
     w = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_plan=wp)["week"]
     assert w["expected"] == 0.6 and w["of"] == 1
     assert w["cats"][0]["chance"] == 62
+
+
+def test_the_snapshot_says_when_the_next_update_is(db):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    nxt = datetime(2026, 9, 29, 11, 0, tzinfo=ZoneInfo("America/Toronto"))
+    s = snapshot.build(db, "jimmy", "999.l.1", "Home Team", next_run=nxt)
+    assert s["next_run_utc"] == "2026-09-29T15:00:00+00:00"
+    assert s["next_local"] == "Tue 11:00 AM"

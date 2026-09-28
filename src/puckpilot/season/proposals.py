@@ -50,6 +50,13 @@ class Proposal:
     created_at: str = ""
     decided_at: str = ""
     executed_at: str = ""
+    # Set when a newer search withdrew it before anyone decided: no longer
+    # shown, counted or approvable.
+    superseded_at: str = ""
+
+    @property
+    def is_live(self) -> bool:
+        return self.status == PENDING and not self.superseded_at
 
     @property
     def add_name(self) -> str:
@@ -95,6 +102,9 @@ def _row_to_proposal(r: sqlite3.Row) -> Proposal:
         created_at=r["created_at"] or "",
         decided_at=r["decided_at"] or "",
         executed_at=r["executed_at"] or "",
+        # sqlite3.Row's `in` tests values, not column names - hence keys().
+        superseded_at=(r["superseded_at"] if "superseded_at" in r.keys() else None)  # noqa: SIM118
+        or "",
     )
 
 
@@ -107,6 +117,7 @@ def propose(
     week: int,
     max_pending: int = 5,
     kind: str = "add_drop",
+    supersede: bool = False,
 ) -> list[Proposal]:
     """Record add/drop targets as pending proposals.
 
@@ -116,7 +127,21 @@ def propose(
     this week - asking again the same week about a player you said no to is
     exactly the notification that teaches someone to stop reading them. A new
     week reconsiders, because by then the schedule and the standings have moved.
+
+    With `supersede`, the search's answer replaces the queue: anything still
+    pending that it did not propose again is withdrawn. Without it, stale
+    proposals accumulate - on 2026-09-28 five from the pre-fix engine (all
+    dropping Tuch or Malkin) filled `max_pending` and would have left the new
+    engine no room to propose anything on the season's first day.
     """
+    if supersede:
+        keep = {(t.player.player_key, t.drop.player_key if t.drop else "") for t in targets}
+        now = _now()
+        for p in pending(conn, manager, league_key):
+            if (p.add_player_key, p.drop_player_key) not in keep:
+                conn.execute(
+                    "UPDATE waiver_proposals SET superseded_at = ? WHERE id = ?", (now, p.id)
+                )
     existing = _already_asked(conn, manager, league_key, week)
     # The cap is on what is awaiting a decision. A refusal from earlier this
     # week stops that player coming back, but it is not clutter in the queue,
@@ -176,7 +201,7 @@ def _already_asked(conn: sqlite3.Connection, manager: str, league_key: str, week
     """Adds not to raise again: open ones, and ones refused this week."""
     out: set[str] = set()
     for p in listing(conn, manager, league_key, limit=200):
-        open_already = p.status in (PENDING, APPROVED)
+        open_already = p.is_live or p.status == APPROVED
         refused_this_week = p.status == REJECTED and p.reason.get("week") == week
         if open_already or refused_this_week:
             out.add(p.add_player_key)
@@ -208,6 +233,8 @@ def listing(
     if status:
         sql += " AND status = ?"
         args.append(status)
+    if status == PENDING:
+        sql += " AND superseded_at IS NULL"
     sql += " ORDER BY id DESC LIMIT ?"
     args.append(limit)
     return [_row_to_proposal(r) for r in conn.execute(sql, args)]
@@ -222,6 +249,10 @@ def decide(conn: sqlite3.Connection, proposal_id: int, approve: bool) -> Proposa
     p = get(conn, proposal_id)
     if p.status != PENDING:
         raise ProposalError(f"proposal #{proposal_id} is already {p.status}")
+    if p.superseded_at:
+        raise ProposalError(
+            f"proposal #{proposal_id} was withdrawn by a newer search - decide on the current ones"
+        )
     conn.execute(
         "UPDATE waiver_proposals SET status = ?, decided_at = ? WHERE id = ?",
         (APPROVED if approve else REJECTED, _now(), proposal_id),

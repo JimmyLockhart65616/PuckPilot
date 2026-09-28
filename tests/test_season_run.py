@@ -347,3 +347,30 @@ def test_a_game_already_under_way_is_banked_not_projected(db):
     db.commit()
     at_six = datetime(2026, 10, 4, 22, 0, tzinfo=UTC)
     assert started_clubs(db, "20262027", "2026-10-04", now=at_six) == {"DET", "NYR"}
+
+
+# -- when the next run is due, for the page's freshness line ------------------
+
+
+def test_the_next_run_is_the_next_lock_run_or_the_next_anchor(db):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from puckpilot.season import locks
+
+    _sched(db)  # 2026-10-04 locks at 13:00, 18:00, 20:00 for this roster
+    tz = ZoneInfo("America/Toronto")
+
+    def at(h, m, day=4):
+        return datetime(2026, 10, day, h, m, tzinfo=tz)
+
+    def nxt(now, day="2026-10-04"):
+        return locks.next_run(db, "jimmy", "20262027", day, now=now)
+
+    assert nxt(at(9, 0)) == at(11, 0)  # today's anchor comes first
+    assert nxt(at(12, 0)) == at(12, 40)  # then the 13:00 lock, 20 min early
+    assert nxt(at(19, 30)) == at(19, 40)  # the 20:00 lock's run
+    assert nxt(at(19, 45)) == at(11, 0, day=5)  # just missed it: tomorrow
+    assert nxt(at(21, 0)) == at(11, 0, day=5)  # nothing left today: tomorrow 11:00
+    # A day with no games for this roster: just the anchors.
+    assert nxt(at(12, 0, day=6), "2026-10-06") == at(11, 0, day=7)
