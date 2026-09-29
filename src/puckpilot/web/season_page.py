@@ -77,6 +77,11 @@ PAGE = """<!doctype html>
   button.no  { background:transparent; color:var(--dim); }
   button:disabled { opacity:.45; }
   .err { color:var(--bad); }
+  .why { margin-top:10px; }
+  .why summary { color:var(--accent); font-size:14px; font-weight:600; cursor:pointer; }
+  .why-title { font-size:12px; letter-spacing:.04em; text-transform:uppercase;
+               color:var(--dim); font-weight:600; margin:12px 0 3px; }
+  .why-line { font-size:13px; padding:2px 0; }
 </style>
 </head>
 <body>
@@ -180,8 +185,25 @@ function renderProposals(root, list) {
     c.appendChild(el('div', null, 'Add ' + p.add + (p.drop ? '  \\u2013  drop ' + p.drop : '')));
     if (p.why) c.appendChild(el('div', 'sub', p.why));
     if (p.timing) c.appendChild(el('div', 'sub', p.timing));
+    renderReasons(c, p);
     decisionButtons(c, 'proposal', p.id);
   });
+}
+
+// The page redraws every 20 s; an opened "why" has to stay open through it.
+var opened = {};
+function renderReasons(c, p) {
+  var sections = p.detail || [];
+  if (!sections.length) return;
+  var d = el('details', 'why');
+  d.open = !!opened[p.id];
+  d.addEventListener('toggle', function () { opened[p.id] = d.open; });
+  d.appendChild(el('summary', null, 'Why \\u2013 day by day, odds, ranges, season'));
+  sections.forEach(function (s) {
+    d.appendChild(el('div', 'why-title', s.title));
+    (s.lines || []).forEach(function (line) { d.appendChild(el('div', 'why-line', line)); });
+  });
+  c.appendChild(d);
 }
 
 function pair(a, b) {

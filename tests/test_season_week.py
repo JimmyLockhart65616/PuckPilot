@@ -663,6 +663,13 @@ def test_the_adds_proposed_never_share_a_drop(db):
     )
     drops = [t.drop.name for t in got]
     assert len(got) == 2 and len(set(drops)) == 2
+    # The second is priced on the roster the first leaves, and says so.
+    assert (
+        got[1]
+        .detail["week"][0]
+        .startswith(f"Priced as if the add above is made too ({got[0].player.name}")
+    )
+    assert not got[0].detail["week"][0].startswith("Priced")
 
 
 def test_a_streamer_never_costs_a_regular(db):
@@ -765,3 +772,48 @@ def test_the_fewest_cap_wins_and_absent_caps_are_ignored():
 
     assert _fewest(3, 1) == 1 and _fewest(None, 2) == 2 and _fewest(None, None) is None
     assert _fewest(3, -2) == 0
+
+
+# -- the reasons behind an add ------------------------------------------------
+
+
+def test_a_player_ruled_out_is_never_proposed_as_a_drop(db):
+    """J.T. Miller on opening day: NA, no IR spot for it, and the cheapest
+    player on the roster by the numbers. Whether NA means a night or a season is
+    a person's call - it is never the model's reason to cut him."""
+    got = _targets_for(
+        db,
+        (
+            _rp("p.1", "Star", 1, "MTL", "C"),
+            _rp("p.2", "Unsure", 2, "TOR", "C", status="NA"),
+        ),
+        (("C", 2, 1),),
+    )
+    assert all(t.drop is None or t.drop.name != "Unsure" for t in got)
+
+
+def test_an_add_explains_itself_day_by_day(db):
+    from puckpilot.season.odds import OddsModel, Side
+    from puckpilot.season.week import OddsContext
+
+    ctx = OddsContext(
+        model=OddsModel(p_play=1.0),
+        banked={"goals": 2.0},
+        theirs=Side(banked={"goals": 3.0}, skaters={"goals": 1.2}),
+        cats=(resolve("G"),),
+    )
+    [t, *_] = _targets_for(
+        db,
+        (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+        (("C", 2, 1), ("BN", 1, 0)),
+        odds_ctx=ctx,
+    )
+    week = t.detail["week"]
+    # The starts are the lineup's, not the schedule's: which slot, over whom.
+    assert week[0].startswith("Your lineup as it stands leaves 3 slot-games empty")
+    assert "4 games left this week, 4 in your lineup" in week[1]
+    assert "Mon 5: Streamer fills an empty C" in week
+    assert "Thu 8: Streamer starts (C); Depth to the bench" in week
+    assert t.detail["odds"] == ["G 28% -> 51%"]
+    assert t.detail["range"][0].startswith("Streamer, 4 starts: G ")
+    assert list(t.detail) == ["week", "odds", "range", "per_game", "season"]

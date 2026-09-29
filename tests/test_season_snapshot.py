@@ -238,3 +238,23 @@ def test_the_snapshot_says_when_the_next_update_is(db):
     s = snapshot.build(db, "jimmy", "999.l.1", "Home Team", next_run=nxt)
     assert s["next_run_utc"] == "2026-09-29T15:00:00+00:00"
     assert s["next_local"] == "Tue 11:00 AM"
+
+
+def test_a_proposals_reasons_reach_the_page_as_titled_sections(db):
+    from dataclasses import replace
+
+    detail = {
+        "season": ["Add Me would rank 9 of 16 on your roster"],
+        "week": ["Mon 5: Add Me fills an empty C"],
+    }
+    make(db, replace(target(), detail=detail))
+    [p] = snapshot.build(db, "jimmy", "999.l.1", "T")["proposals"]
+    # Reading order is fixed here, whatever order they were stored in.
+    assert [s["title"] for s in p["detail"]] == ["This week, day by day", "Rest of season"]
+    assert p["detail"][0]["lines"] == ["Mon 5: Add Me fills an empty C"]
+
+
+def test_a_proposal_made_before_reasons_were_kept_has_none(db):
+    make(db, target())
+    [p] = snapshot.build(db, "jimmy", "999.l.1", "T")["proposals"]
+    assert p["detail"] == []

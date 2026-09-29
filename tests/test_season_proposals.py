@@ -281,3 +281,17 @@ def test_a_withdrawn_player_can_be_proposed_again_but_a_refused_one_cannot(db):
     [no] = make(db, target(name="No", key="p.no", pid=502))
     proposals.decide(db, no.id, False)
     assert make(db, target(name="No", key="p.no", pid=502), supersede=True) == []
+
+
+def test_a_proposal_keeps_its_reasons_and_a_rerun_refreshes_them(db):
+    """The numbers behind a pending add move every day; the card must not show
+    Monday's reasons on Wednesday."""
+    from dataclasses import replace
+
+    [p] = make(db, replace(target(), detail={"week": ["Mon 5: Add Me fills an empty C"]}))
+    assert p.reason["detail"] == {"week": ["Mon 5: Add Me fills an empty C"]}
+    fresh = replace(target(), detail={"week": ["Wed 7: Add Me fills an empty C"]})
+    assert make(db, fresh, supersede=True) == []
+    [live] = proposals.pending(db, "jimmy")
+    assert live.id == p.id
+    assert live.reason["detail"] == {"week": ["Wed 7: Add Me fills an empty C"]}

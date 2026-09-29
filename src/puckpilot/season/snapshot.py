@@ -116,6 +116,7 @@ def build(
             "drop": p.drop_name if p.drop_player_key else "",
             "why": _why(p),
             "timing": str(p.reason.get("timing", "")),
+            "detail": _reasons(p.reason.get("detail")),
         }
         for p in pending
     ]
@@ -179,6 +180,23 @@ def _why(p) -> str:
     if p.reason.get("moved"):
         bits.append(str(p.reason["moved"]))
     return " · ".join(bits)
+
+
+def _reasons(detail) -> list[dict]:
+    """A proposal's reasons as titled sections, in reading order.
+
+    Titles are resolved here so the page stays a renderer: a proposal made
+    before reasons were recorded simply has none.
+    """
+    from puckpilot.season.add_story import SECTIONS
+
+    if not isinstance(detail, dict):
+        return []
+    return [
+        {"title": title, "lines": [str(x) for x in detail[key]]}
+        for key, title in SECTIONS
+        if isinstance(detail.get(key), list) and detail[key]
+    ]
 
 
 def _protocol(live) -> dict | None:

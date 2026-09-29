@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import math
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from statistics import NormalDist
 
 from puckpilot.engine.categories import CATALOG, Category
 from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.league import LeagueConfig
 from puckpilot.season import calendar
+from puckpilot.season.add_story import SECTIONS
 from puckpilot.season.pool import PoolPlayer
 from puckpilot.season.roster import RosterPlayer, TeamRoster
 from puckpilot.season.settings import LeagueRuntime, Week
@@ -201,6 +202,8 @@ class AddTarget:
     labels: dict[str, str] = field(default_factory=dict)
     # Change in expected categories won this week, when priced by the odds.
     gain: float | None = None
+    # The reasons, section -> lines (season/add_story.py).
+    detail: dict = field(default_factory=dict)
 
     def moved(self, limit: int = 4) -> str:
         """The biggest category changes, in the league's own units and labels."""
@@ -316,6 +319,10 @@ class WeekPlan:
                 if t.helps:
                     lines.append(f"      closes: {', '.join(t.helps)}")
                 lines.append(f"      {t.timing}")
+                for key, title in SECTIONS:
+                    if t.detail.get(key):
+                        lines.append(f"      {title}:")
+                        lines.extend(f"        {line}" for line in t.detail[key])
         for n in self.notes:
             lines.append(f"  ! {n}")
         return "\n".join(lines)
@@ -940,12 +947,15 @@ def _targets(
     # Going to IR is not the same as being worth dropping: an injured regular
     # is put on IR, which frees his spot, rather than cut for a streamer.
     to_ir = {m.player.player_key for m in ir_changes(runtime, ours)[0] if m.is_ir}
+    # An injured or not-active player is never proposed as a drop: whether
+    # "NA" or "O" is a night or a season is a person's call, not a model's.
     droppable = [
         p
         for p in ours.players
         if not p.is_undroppable
         and p.nhl_player_id is not None
         and not p.on_ir
+        and not p.is_out
         and p.player_key not in to_ir
     ]
     counts: dict[str, int] = {}
@@ -1011,6 +1021,7 @@ def _targets(
     used_drops: set[str] = set()
     for _ in range(max(steps, 0)):
         best: AddTarget | None = None
+        best_after = None
         for cand in screened:
             if any(t.player.player_key == cand.player_key for t in chosen):
                 continue
@@ -1063,8 +1074,27 @@ def _targets(
             )
             if best is None or t.score > best.score:
                 best = t
+                best_after = (after, after_starts, after_odds)
         if best is None:
             break
+        best = replace(
+            best,
+            detail=_explain(
+                conn,
+                runtime,
+                days,
+                base_players,
+                best,
+                best_after,
+                base_odds,
+                goalie_source,
+                values,
+                rates,
+                odds_ctx,
+                season_left,
+                chosen,
+            ),
+        )
         chosen.append(best)
         # Make it, and price the next one against the roster it leaves.
         if best.drop is None:
@@ -1079,6 +1109,45 @@ def _targets(
         base_players.append(best.player)
         base_starts, base_totals, base_odds = evaluate(base_players)
     return tuple(chosen)
+
+
+def _explain(
+    conn,
+    runtime,
+    days,
+    base_players,
+    best,
+    best_after,
+    base_odds,
+    goalie_source,
+    values,
+    rates,
+    odds_ctx,
+    season_left,
+    prior=(),
+) -> dict:
+    """The chosen add's reasons, from the numbers it was priced with."""
+    from puckpilot.season import add_story
+    from puckpilot.season.odds import OddsModel
+
+    after, _after_starts, after_odds = best_after
+    return add_story.explain(
+        conn,
+        runtime,
+        days,
+        base_players,
+        after,
+        best.player,
+        best.drop,
+        goalie_source,
+        values,
+        rates,
+        odds_ctx.model if odds_ctx is not None else OddsModel(),
+        base_odds=base_odds,
+        after_odds=after_odds,
+        season_left=season_left,
+        prior=prior,
+    )
 
 
 def _fewest(*limits: int | None) -> int | None:

@@ -44,6 +44,7 @@ function node(tag) {
       if (i >= 0) this.children[i] = a; else this.children.push(a);
     },
     querySelectorAll() { return []; },
+    addEventListener() {},
     get parentNode() { return this._parent || node('div'); },
     set parentNode(v) { this._parent = v; },
   };
@@ -325,3 +326,43 @@ def test_a_missed_run_says_which_one():
     )
     out = run_page(state.get("jimmy"))
     assert "NOT LIVE" in out["fresh"] and "a run was due Tue 11:00 AM" in out["fresh"]
+
+
+def test_a_proposal_shows_its_reasons():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [
+                {
+                    "id": 6,
+                    "add": "Marco Rossi",
+                    "drop": "Nick Cousins",
+                    "why": "+0.58 categories expected",
+                    "timing": "free agent",
+                    "detail": [
+                        {
+                            "title": "This week, day by day",
+                            "lines": ["Tue 29: Marco Rossi fills an empty C"],
+                        },
+                        {"title": "Likely range this week (middle 80%)", "lines": ["SOG 4-11"]},
+                    ],
+                },
+                # Made before reasons were kept: no section, and nothing broken.
+                {"id": 7, "add": "Old One", "drop": "", "why": "", "timing": ""},
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    for expected in (
+        "Why",
+        "This week, day by day",
+        "Tue 29: Marco Rossi fills an empty C",
+        "Likely range this week (middle 80%)",
+        "SOG 4-11",
+        "Old One",
+    ):
+        assert expected in out["app"], expected

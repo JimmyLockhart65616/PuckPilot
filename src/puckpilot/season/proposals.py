@@ -135,12 +135,19 @@ def propose(
     engine no room to propose anything on the season's first day.
     """
     if supersede:
-        keep = {(t.player.player_key, t.drop.player_key if t.drop else "") for t in targets}
+        fresh = {(t.player.player_key, t.drop.player_key if t.drop else ""): t for t in targets}
         now = _now()
         for p in pending(conn, manager, league_key):
-            if (p.add_player_key, p.drop_player_key) not in keep:
+            t = fresh.get((p.add_player_key, p.drop_player_key))
+            if t is None:
                 conn.execute(
                     "UPDATE waiver_proposals SET superseded_at = ? WHERE id = ?", (now, p.id)
+                )
+            else:
+                # Kept, with today's reasons: the numbers move every day.
+                conn.execute(
+                    "UPDATE waiver_proposals SET reason_json = ? WHERE id = ?",
+                    (json.dumps(_reason(t, week)), p.id),
                 )
     existing = _already_asked(conn, manager, league_key, week)
     # The cap is on what is awaiting a decision. A refusal from earlier this
@@ -155,23 +162,7 @@ def propose(
             continue
         if t.player.nhl_player_id is None:
             continue
-        reason = {
-            "week": week,
-            # `gain` is a share of the live gap now, not an abstract value
-            # number - adds are priced by re-slotting the week and subtracting.
-            "gain": round(t.score, 3),
-            # Under odds pricing: expected categories won this week, added.
-            "expected_gain": None if getattr(t, "gain", None) is None else round(t.gain, 3),
-            "starts": round(t.starts, 2),
-            "drop_starts": round(t.drop_starts, 2),
-            "extra_starts": round(t.extra_starts, 2),
-            "moved": t.moved(),
-            "helps": list(t.helps),
-            "timing": t.timing,
-            "add_name": t.player.name,
-            "add_team": t.player.team,
-            "drop_name": t.drop.name if t.drop else "",
-        }
+        reason = _reason(t, week)
         cur = conn.execute(
             "INSERT INTO waiver_proposals "
             "(manager, league_key, team_key, kind, add_pid, drop_pid, "
@@ -195,6 +186,28 @@ def propose(
         room -= 1
     conn.commit()
     return made
+
+
+def _reason(t, week: int) -> dict:
+    """What a proposal records about why it was made."""
+    return {
+        "week": week,
+        # `gain` is a share of the live gap under share pricing; under odds
+        # pricing it is the change in expected categories (`expected_gain`).
+        "gain": round(t.score, 3),
+        "expected_gain": None if getattr(t, "gain", None) is None else round(t.gain, 3),
+        "starts": round(t.starts, 2),
+        "drop_starts": round(t.drop_starts, 2),
+        "extra_starts": round(t.extra_starts, 2),
+        "moved": t.moved(),
+        "helps": list(t.helps),
+        "timing": t.timing,
+        "add_name": t.player.name,
+        "add_team": t.player.team,
+        "drop_name": t.drop.name if t.drop else "",
+        # The reasons behind it, section -> lines (season/add_story.py).
+        "detail": getattr(t, "detail", {}) or {},
+    }
 
 
 def _already_asked(conn: sqlite3.Connection, manager: str, league_key: str, week: int) -> set[str]:
