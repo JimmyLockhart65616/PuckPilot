@@ -36,7 +36,17 @@ UTIL_SLOTS = {"Util", "UTIL", "W", "F"}
 # Statuses that mean the player cannot play tonight no matter what the schedule
 # says. DTD is deliberately absent: day-to-day players play most nights, and
 # treating them as out would bench half a roster every February.
-OUT_STATUSES = {"IR", "IR-LT", "IR-R", "O", "NA", "SUSP"}
+OUT_STATUSES = {"IR", "IR-LT", "IR-R", "IR-NR", "O", "NA", "SUSP"}
+
+
+def is_out_status(status: str) -> bool:
+    """Whether a Yahoo status rules a player out tonight.
+
+    Every IR designation does, including ones not listed: IR-NR (non-roster)
+    reached a real roster on opening day unlisted, which would have let the add
+    search read an injured free agent as available.
+    """
+    return status in OUT_STATUSES or status.startswith("IR")
 
 
 class SettingsError(RuntimeError):

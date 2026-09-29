@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from puckpilot.season.roster import _fields, _positions
-from puckpilot.season.settings import OUT_STATUSES, YAHOO_TO_POS
+from puckpilot.season.settings import YAHOO_TO_POS, is_out_status
 from puckpilot.yahoo.playermap import _team
 
 Progress = Callable[[str], None]
@@ -64,7 +64,7 @@ class PoolPlayer:
 
     @property
     def is_out(self) -> bool:
-        return self.status in OUT_STATUSES
+        return is_out_status(self.status)
 
     @property
     def on_waivers(self) -> bool:

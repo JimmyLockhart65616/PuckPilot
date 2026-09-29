@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from puckpilot.season.settings import BENCH_SLOTS, IR_SLOTS, OUT_STATUSES, YAHOO_TO_POS
+from puckpilot.season.settings import BENCH_SLOTS, IR_SLOTS, YAHOO_TO_POS, is_out_status
 from puckpilot.yahoo.playermap import _team
 
 
@@ -61,7 +61,7 @@ class RosterPlayer:
     @property
     def is_out(self) -> bool:
         """Cannot play tonight regardless of the schedule. DTD is not out."""
-        return self.status in OUT_STATUSES
+        return is_out_status(self.status)
 
     @property
     def is_questionable(self) -> bool:

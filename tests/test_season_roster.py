@@ -220,3 +220,24 @@ def test_absent_counters_are_unknown_not_zero():
     assert r.goalie_games is None
     assert r.adds_this_week is None
     assert r.moves_season is None
+
+
+def test_every_ir_designation_is_out_and_day_to_day_is_not():
+    """IR-NR reached a real roster on opening day, unlisted; read as healthy, an
+    injured free agent could have been proposed as an add."""
+    from puckpilot.season.pool import PoolPlayer
+
+    for status, out in (
+        ("IR-NR", True),
+        ("IR-LT", True),
+        ("IR-XYZ", True),
+        ("NA", True),
+        ("O", True),
+        ("DTD", False),
+        ("", False),
+    ):
+        assert (
+            parse_player(player(status=(status, status, "") if status else None)).is_out is out
+        ), status
+        fa = PoolPlayer("k", "A", "TOR", "C", frozenset({"C"}), 1, status=status)
+        assert fa.is_out is out, status
