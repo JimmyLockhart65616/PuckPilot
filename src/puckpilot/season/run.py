@@ -24,7 +24,7 @@ from __future__ import annotations
 import sqlite3
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 from puckpilot.season import proposals as proposals_mod
 from puckpilot.season.preflight import age_days as _age_days
@@ -259,6 +259,7 @@ def run_day(
         ),
     )
     plan = None
+    acted = None
     if roster is not None:
         save_roster(conn, manager.name, roster)
         report.add("roster", True, f"{len(roster)} players", list(roster.unmapped))
@@ -307,6 +308,10 @@ def run_day(
 
         got = _guard(report, "lineup", _plan) if models else None
         plan, reasons = got if got else (None, {})
+        if plan is not None:
+            acted = _guard(
+                report, "act", lambda: act(conn, manager, league_key, roster, plan, report)
+            )
 
     # 4. The week: the full plan, with adds, on the day it turns over; where it
     # stands - banked plus what is left - on every other run.
@@ -371,6 +376,7 @@ def run_day(
                 reasons=reasons if plan else None,
                 week_no=week.number if week is not None else None,
                 next_run=_next_run(conn, manager, runtime, day, roster),
+                acted=acted,
             )
             publish.push(manager.page.url, page_key, snap)
             report.add("page", True, manager.page.url)
@@ -388,6 +394,48 @@ def run_day(
 
     say(report.text)
     return report
+
+
+def act(conn, manager, league_key, roster, plan, report, apply=None) -> dict | None:
+    """Make tonight's changes in Yahoo, where standing authority covers them.
+
+    The published tool stops at the plan: making a change needs an actuator,
+    and none ships with it. Without one this says so - on the page too, so
+    "will act automatically" never stands in for a change nobody made. With
+    one, every attempt lands in `season_actions` with what happened, because
+    criteria granted in advance can only be argued with from a record.
+
+    IR moves go first, as their own phase: tonight's lineup was planned on the
+    roster they leave, so the lineup is not attempted if they do not finish.
+    """
+    phases = []
+    if plan.ir_within_authority and plan.ir_moves:
+        phases.append(list(plan.ir_moves))
+    if plan.within_authority and plan.moves:
+        phases.append(list(plan.moves))
+    if not phases:
+        return None
+    if apply is None:
+        try:  # Optional local actuator; a clone without one gets recommendations.
+            from puckpilot.local.act import apply_lineup as apply
+        except ImportError:
+            report.add("act", True, "not made - no actuator installed")
+            return {"ok": False, "message": "Not made automatically - make these in Yahoo."}
+    result = apply(manager, roster.team_key, plan.date, phases)
+    moves = [m.describe() for phase in phases for m in phase]
+    proposals_mod.record_action(
+        conn,
+        manager.name,
+        league_key,
+        roster.team_key,
+        plan.date,
+        "lineup",
+        {"moves": moves, "steps": list(result.lines)},
+        outcome="executed" if result.ok else "failed",
+        message=result.message,
+    )
+    report.add("act", result.ok, result.message, list(result.lines))
+    return {"ok": bool(result.ok), "message": result.message, "at": datetime.now(UTC)}
 
 
 def _next_run(conn, manager, runtime, day, roster):

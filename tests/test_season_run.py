@@ -118,9 +118,10 @@ def test_the_preview_warns_when_the_page_key_is_not_set():
     assert "WARNING" not in schedule.describe(items, key_set=True)
 
 
-def test_the_preview_says_nothing_is_written_to_yahoo():
+def test_the_preview_says_what_is_and_is_not_written_to_yahoo():
     text = schedule.describe(schedule.tasks("jimmy", Path(".")), key_set=True)
-    assert "Nothing is written to Yahoo" in text
+    assert "No add, drop or claim is ever made" in text
+    assert "only under" in text and "standing authority" in text
 
 
 def test_custom_times_are_honoured():
@@ -374,3 +375,79 @@ def test_the_next_run_is_the_next_lock_run_or_the_next_anchor(db):
     assert nxt(at(21, 0)) == at(11, 0, day=5)  # nothing left today: tomorrow 11:00
     # A day with no games for this roster: just the anchors.
     assert nxt(at(12, 0, day=6), "2026-10-06") == at(11, 0, day=7)
+
+
+# -- making the changes ---------------------------------------------------------
+
+
+def _act_plan(within=True, ir_within=True, moves=("START A in LW",), ir_moves=()):
+    from types import SimpleNamespace
+
+    def mv(text):
+        return SimpleNamespace(describe=lambda: text)
+
+    return SimpleNamespace(
+        date="2026-10-10",
+        within_authority=within,
+        ir_within_authority=ir_within,
+        moves=[mv(t) for t in moves],
+        ir_moves=[mv(t) for t in ir_moves],
+    )
+
+
+def _act(db, plan, apply=None):
+    from types import SimpleNamespace
+
+    from puckpilot.season.run import RunReport, act
+
+    report = RunReport(date=plan.date, manager="jimmy")
+    manager = SimpleNamespace(name="jimmy")
+    roster = SimpleNamespace(team_key="999.l.1.t.5")
+    return act(db, manager, "999.l.1", roster, plan, report, apply=apply), report
+
+
+class _Applied:
+    def __init__(self, ok=True, message="made 1 change(s)", lines=()):
+        self.calls = []
+        self.ok, self.message, self.lines = ok, message, list(lines)
+
+    def __call__(self, manager, team_key, date, phases):
+        self.calls.append([[m.describe() for m in phase] for phase in phases])
+        return self
+
+
+def test_changes_are_made_ir_first_and_recorded(db):
+    from puckpilot.season import proposals
+
+    fake = _Applied(lines=["A BN -> LW, B LW -> BN"])
+    got, report = _act(db, _act_plan(ir_moves=("IR    S D -> IR+",)), apply=fake)
+    assert fake.calls == [[["IR    S D -> IR+"], ["START A in LW"]]]
+    assert got["ok"] and "made 1 change" in got["message"]
+    [row] = proposals.actions(db, "jimmy")
+    assert row["outcome"] == "executed" and row["kind"] == "lineup"
+    assert "B LW -> BN" in row["detail_json"]
+    assert not report.failed
+
+
+def test_nothing_is_made_without_standing_authority(db):
+    fake = _Applied()
+    got, _ = _act(db, _act_plan(within=False, ir_within=False), apply=fake)
+    assert got is None and fake.calls == []
+
+
+def test_a_failed_change_is_loud_and_recorded(db):
+    from puckpilot.season import proposals
+
+    fake = _Applied(ok=False, message="the lineup changed since it was read - left alone")
+    got, report = _act(db, _act_plan(), apply=fake)
+    assert got["ok"] is False
+    assert report.failed
+    assert proposals.actions(db, "jimmy")[0]["outcome"] == "failed"
+
+
+def test_without_an_actuator_the_page_says_the_changes_were_not_made(db):
+    """A published clone has none: "will act automatically" must not stand in
+    for a change nobody made."""
+    got, report = _act(db, _act_plan())
+    assert got == {"ok": False, "message": "Not made automatically - make these in Yahoo."}
+    assert not report.failed

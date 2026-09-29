@@ -1,8 +1,19 @@
 import json
+import sys
 
 import pytest
 
 from puckpilot.data import store
+
+
+@pytest.fixture(autouse=True)
+def _no_actuator(monkeypatch):
+    """No test ever reaches a real lineup actuator, whatever is installed here.
+
+    `season.run.act` imports one when standing authority covers a plan; a
+    machine that has one would otherwise act on a real league from a unit test.
+    """
+    monkeypatch.setitem(sys.modules, "puckpilot.local.act", None)
 
 
 @pytest.fixture

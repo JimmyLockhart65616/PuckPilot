@@ -77,6 +77,7 @@ PAGE = """<!doctype html>
   button.no  { background:transparent; color:var(--dim); }
   button:disabled { opacity:.45; }
   .err { color:var(--bad); }
+  .done { color:var(--ok); font-weight:600; margin-top:8px; }
   .why { margin-top:10px; }
   .why summary { color:var(--accent); font-size:14px; font-weight:600; cursor:pointer; }
   .why-title { font-size:12px; letter-spacing:.04em; text-transform:uppercase;
@@ -132,6 +133,9 @@ function renderMoves(root, s) {
   if (s.playing !== undefined) bits.push(s.playing + ' of ' + s.rostered + ' play');
   if (bits.length) c.appendChild(el('div', 'sub', bits.join(' \\u00b7 ')));
   if (s.out && s.out.length) c.appendChild(el('div', 'sub', 'Out: ' + s.out.join(', ')));
+  if (s.acted && s.acted.text) {
+    c.appendChild(el('div', s.acted.ok ? 'done' : 'alert', s.acted.text));
+  }
 }
 
 function decide(kind, id, approve, btn) {

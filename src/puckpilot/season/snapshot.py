@@ -56,6 +56,7 @@ def build(
     tz: str = DEFAULT_TZ,
     week_no: int | None = None,
     next_run=None,
+    acted: dict | None = None,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -80,6 +81,9 @@ def build(
         # page with nothing to do until 11:00 is quiet, not dead.
         "next_run_utc": None,
         "next_local": "",
+        # Whether tonight's changes were made in Yahoo, and when - so a plan
+        # nobody carried out never reads as done.
+        "acted": None,
     }
     if next_run is not None:
         from datetime import UTC
@@ -107,6 +111,9 @@ def build(
         snap["lock_local"] = plan.deadline(tz)
         snap["playing"] = len(plan.playing)
         snap["rostered"] = len(plan.playing) + len(plan.idle) + len(plan.out)
+
+    if acted is not None:
+        snap["acted"] = _acted(acted, tz)
 
     # In the order they were proposed: the search's best first, and a later
     # card's "assumes ... is made too" refers to one above it.
@@ -168,6 +175,19 @@ def build(
             for p in roster.players
         ]
     return snap
+
+
+def _acted(acted: dict, tz: str) -> dict:
+    from zoneinfo import ZoneInfo
+
+    ok = bool(acted.get("ok"))
+    at = acted.get("at")
+    when = ""
+    if at is not None:
+        when = " at " + at.astimezone(ZoneInfo(tz)).strftime("%I:%M %p").lstrip("0")
+    head = f"Made in Yahoo{when}" if ok else f"NOT made{when}"
+    msg = str(acted.get("message", ""))
+    return {"ok": ok, "text": f"{head} - {msg}" if msg else head}
 
 
 def _why(p) -> str:

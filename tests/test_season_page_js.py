@@ -366,3 +366,18 @@ def test_a_proposal_shows_its_reasons():
         "Old One",
     ):
         assert expected in out["app"], expected
+
+
+def test_the_page_says_whether_the_changes_were_made():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [{"kind": "start", "name": "Kyle Connor", "detail": "into LW"}],
+            "acted": {"ok": False, "text": "NOT made at 6:41 PM - the lineup changed"},
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    assert "NOT made at 6:41 PM - the lineup changed" in out["app"]

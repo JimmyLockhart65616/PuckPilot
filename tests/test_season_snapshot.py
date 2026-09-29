@@ -258,3 +258,16 @@ def test_a_proposal_made_before_reasons_were_kept_has_none(db):
     make(db, target())
     [p] = snapshot.build(db, "jimmy", "999.l.1", "T")["proposals"]
     assert p["detail"] == []
+
+
+def test_the_page_says_whether_tonights_changes_were_made(db):
+    from datetime import UTC, datetime
+
+    at = datetime(2026, 10, 10, 15, 2, tzinfo=UTC)
+    s = snapshot.build(
+        db, "jimmy", "999.l.1", "T", acted={"ok": True, "message": "made 2 change(s)", "at": at}
+    )
+    assert s["acted"] == {"ok": True, "text": "Made in Yahoo at 11:02 AM - made 2 change(s)"}
+    s = snapshot.build(db, "jimmy", "999.l.1", "T", acted={"ok": False, "message": "locked"})
+    assert s["acted"] == {"ok": False, "text": "NOT made - locked"}
+    assert snapshot.build(db, "jimmy", "999.l.1", "T")["acted"] is None
