@@ -108,7 +108,9 @@ def build(
         snap["playing"] = len(plan.playing)
         snap["rostered"] = len(plan.playing) + len(plan.idle) + len(plan.out)
 
-    pending = proposals_mod.pending(conn, manager, league_key)
+    # In the order they were proposed: the search's best first, and a later
+    # card's "assumes ... is made too" refers to one above it.
+    pending = sorted(proposals_mod.pending(conn, manager, league_key), key=lambda p: p.id)
     snap["proposals"] = [
         {
             "id": p.id,

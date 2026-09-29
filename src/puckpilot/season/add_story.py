@@ -90,7 +90,7 @@ def explain(
             f"{t.player.name}" + (f" for {t.drop.name}" if t.drop is not None else "")
             for t in prior
         )
-        out["week"].insert(0, f"Priced as if the add above is made too ({swaps}).")
+        out["week"].insert(0, f"Assumes {swaps} is made too - priced on the roster that leaves.")
     if drop is not None:
         out["range"].append(range_line(drop, before, rates.get(drop.nhl_player_id) or {}, model))
         out["per_game"].append(per_game_line(drop, rates.get(drop.nhl_player_id) or {}))

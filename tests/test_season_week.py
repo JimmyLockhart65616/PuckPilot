@@ -664,12 +664,8 @@ def test_the_adds_proposed_never_share_a_drop(db):
     drops = [t.drop.name for t in got]
     assert len(got) == 2 and len(set(drops)) == 2
     # The second is priced on the roster the first leaves, and says so.
-    assert (
-        got[1]
-        .detail["week"][0]
-        .startswith(f"Priced as if the add above is made too ({got[0].player.name}")
-    )
-    assert not got[0].detail["week"][0].startswith("Priced")
+    assert got[1].detail["week"][0].startswith(f"Assumes {got[0].player.name} for")
+    assert not got[0].detail["week"][0].startswith("Assumes")
 
 
 def test_a_streamer_never_costs_a_regular(db):
