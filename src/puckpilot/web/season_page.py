@@ -194,6 +194,16 @@ function renderProposals(root, list) {
   });
 }
 
+function renderWithdrawn(root, list) {
+  if (!list || !list.length) return;
+  h2(root, 'Withdrawn');
+  var c = card(root);
+  list.forEach(function (w) {
+    var head = 'Add ' + w.add + (w.drop ? ' \\u2013 drop ' + w.drop : '');
+    c.appendChild(el('div', 'sub', head + (w.why ? ': ' + w.why : '')));
+  });
+}
+
 // The page redraws every 20 s; an opened "why" has to stay open through it.
 var opened = {};
 function renderReasons(c, p) {
@@ -294,6 +304,7 @@ function render(s) {
   app.appendChild(el('h1', null, s.team || 'PuckPilot'));
   renderMoves(app, s);
   renderProposals(app, s.proposals);
+  renderWithdrawn(app, s.withdrawn);
   renderProtocol(app, s.protocol);
   renderWeek(app, s.week);
   renderRoster(app, s.roster);

@@ -74,6 +74,11 @@ class PoolPlayer:
     def is_free_agent(self) -> bool:
         return self.ownership_type == FREE_AGENT
 
+    @property
+    def is_available(self) -> bool:
+        """Anyone can still get him: a free agent, or on waivers."""
+        return self.ownership_type in (FREE_AGENT, WAIVERS)
+
     def timing(self, waiver_days: int = 1) -> str:
         """Whether this one has to be raced for, in plain words."""
         if self.on_waivers:
@@ -167,6 +172,29 @@ def fetch_pool(
             break
         start += PAGE
     return out[:limit]
+
+
+def fetch_players(
+    session,
+    league_key: str,
+    player_keys: list[str],
+    player_map: Mapping[str, int] | None = None,
+) -> list[PoolPlayer]:
+    """Named players as they stand now, with who owns each.
+
+    One request, however many are pending - where a pool read is several pages
+    and still might not reach a player proposed a week ago. `ownership_type`
+    comes back "freeagents", "waivers" or "team".
+    """
+    if not player_keys:
+        return []
+    out: list[PoolPlayer] = []
+    for start in range(0, len(player_keys), PAGE):
+        keys = ",".join(player_keys[start : start + PAGE])
+        out.extend(
+            _page(session, f"league/{league_key}/players;player_keys={keys}/ownership", player_map)
+        )
+    return out
 
 
 def _page(session, path: str, player_map, ownership_type: str = "") -> list[PoolPlayer]:

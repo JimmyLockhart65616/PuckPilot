@@ -271,3 +271,13 @@ def test_the_page_says_whether_tonights_changes_were_made(db):
     s = snapshot.build(db, "jimmy", "999.l.1", "T", acted={"ok": False, "message": "locked"})
     assert s["acted"] == {"ok": False, "text": "NOT made - locked"}
     assert snapshot.build(db, "jimmy", "999.l.1", "T")["acted"] is None
+
+
+def test_a_withdrawn_proposal_says_why_for_a_day(db):
+    [p] = make(db, target(name="Marco Rossi"))
+    proposals_mod.refresh(db, {}, {p.id: "Marco Rossi is no longer available"})
+    s = snapshot.build(db, "jimmy", "999.l.1", "T")
+    assert s["proposals"] == []
+    assert s["withdrawn"] == [
+        {"add": "Marco Rossi", "drop": "Drop Me", "why": "Marco Rossi is no longer available"}
+    ]

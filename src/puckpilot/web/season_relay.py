@@ -145,6 +145,7 @@ class SeasonState:
                 "next_run_utc": None,
                 "next_local": "",
                 "acted": None,
+                "withdrawn": [],
             }
         age = time.time() - at
         out = dict(snap)

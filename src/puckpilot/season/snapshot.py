@@ -84,6 +84,9 @@ def build(
         # Whether tonight's changes were made in Yahoo, and when - so a plan
         # nobody carried out never reads as done.
         "acted": None,
+        # Proposals withdrawn undecided in the last day, and why - a card that
+        # just vanishes reads as a bug.
+        "withdrawn": [],
     }
     if next_run is not None:
         from datetime import UTC
@@ -129,6 +132,7 @@ def build(
         }
         for p in pending
     ]
+    snap["withdrawn"] = _withdrawn(conn, manager, league_key)
 
     # The protocol card shows on every run, not only the one that derived it -
     # a push replaces the whole page, and an Approve button that vanishes on
@@ -188,6 +192,20 @@ def _acted(acted: dict, tz: str) -> dict:
     head = f"Made in Yahoo{when}" if ok else f"NOT made{when}"
     msg = str(acted.get("message", ""))
     return {"ok": ok, "text": f"{head} - {msg}" if msg else head}
+
+
+def _withdrawn(conn, manager: str, league_key: str) -> list[dict]:
+    from datetime import UTC, datetime, timedelta
+
+    since = (datetime.now(UTC) - timedelta(days=1)).isoformat(timespec="seconds")
+    return [
+        {
+            "add": p.add_name,
+            "drop": p.drop_name if p.drop_player_key else "",
+            "why": str(p.reason.get("withdrawn", "")),
+        }
+        for p in proposals_mod.withdrawn_since(conn, manager, league_key, since)
+    ]
 
 
 def _why(p) -> str:

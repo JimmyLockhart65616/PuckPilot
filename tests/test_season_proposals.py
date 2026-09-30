@@ -295,3 +295,26 @@ def test_a_proposal_keeps_its_reasons_and_a_rerun_refreshes_them(db):
     [live] = proposals.pending(db, "jimmy")
     assert live.id == p.id
     assert live.reason["detail"] == {"week": ["Wed 7: Add Me fills an empty C"]}
+
+
+def test_a_recheck_refreshes_what_pays_and_withdraws_the_rest_with_a_reason(db):
+    from dataclasses import replace
+
+    [a] = make(db, target(name="A", key="p.a", pid=9101))
+    [b] = make(db, target(name="B", key="p.b", pid=9102))
+    [c] = make(db, target(name="C", key="p.c", pid=9103))
+    proposals.decide(db, c.id, True)  # decided meanwhile: left alone
+    fresh = replace(target(name="A", key="p.a", pid=9101), detail={"week": ["Thu 1: A"]})
+    proposals.refresh(db, {a.id: fresh}, {b.id: "B is no longer available", c.id: "x"})
+    assert proposals.get(db, a.id).reason["detail"] == {"week": ["Thu 1: A"]}
+    assert proposals.get(db, a.id).reason["week"] == 2
+    assert [p.id for p in proposals.pending(db, "jimmy")] == [a.id]
+    [gone] = proposals.withdrawn_since(db, "jimmy", "999.l.1", "2000-01-01")
+    assert gone.id == b.id and gone.reason["withdrawn"] == "B is no longer available"
+    assert proposals.get(db, c.id).status == APPROVED
+
+
+def test_a_search_that_drops_a_proposal_says_so(db):
+    [p] = make(db, target())
+    make(db, target(name="Other", key="p.other", pid=9002), supersede=True)
+    assert proposals.get(db, p.id).reason["withdrawn"] == "a newer search no longer proposes it"

@@ -358,7 +358,9 @@ def run_day(
         week_plan = _guard(
             report,
             "week",
-            lambda: _outlook(conn, manager, league_key, runtime, day, report, ctx, models),
+            lambda: _outlook(
+                conn, manager, league_key, runtime, day, report, ctx, models, propose=propose
+            ),
         )
 
     # 5. Publish whatever we managed to work out.
@@ -562,11 +564,21 @@ def _log_week(conn, manager, league_key, ctx, report):
     report.add("score", True, f"week {t.week} vs {t.theirs.name} ({t.status}){left}")
 
 
-def _outlook(conn, manager, league_key, runtime, day, report, ctx, models):
-    """Where the week stands on a run that is not the week's first.
+def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propose=True):
+    """Where the week stands on a run that is not the week's first - and
+    whether what is waiting for a decision still pays.
 
     Banked plus what is left, both sides, from the rosters just read - no add
     search, which is the weekly job's, and no new protocol, which Monday's.
+
+    The queue is re-checked, though. A proposal is priced once, by the search,
+    and midweek the search runs again only when a roster spot opens; on
+    2026-09-30 the cards still argued from Tuesday morning - before J.T.
+    Miller's NA cleared and before a night was banked - with "Tue 29: fills an
+    empty C" on a day already played. So every such run re-prices each pending
+    swap as the search would today, in the order proposed, and withdraws, with
+    the reason, any whose player is gone, whose drop is no longer droppable, or
+    that no longer clears the floor. Nothing new is searched for.
     """
     from puckpilot.draft.sim import build_universe
     from puckpilot.season import pool as pool_mod
@@ -577,6 +589,13 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models):
     season = runtime.nhl_season
     universe = build_universe(conn, season, _train_seasons(season), manager.league)
     used_week, used_season = adds_used(ctx.roster, ctx.week)
+    waiting = (
+        sorted(proposals_mod.pending(conn, manager.name, league_key), key=lambda p: p.id)
+        if propose
+        else []
+    )
+    workable, lapsed = _workable(conn, manager, league_key, ctx, waiting) if waiting else ([], {})
+    terms = manager.authority.transactions
     plan = weekmod.build_week_plan(
         conn,
         runtime,
@@ -593,11 +612,90 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models):
         adds_used_season=used_season,
         find_targets=False,
         odds_model=OddsModel(),
+        min_gain=terms.min_weekly_gain,
+        add_scoring=terms.add_scoring,
+        min_expected_gain=terms.min_expected_gain,
+        playoff_reserve=terms.playoff_reserve,
+        stream_spots=terms.stream_spots,
+        reprice=[(add, drop) for _, add, drop in workable] if waiting else None,
         **live_inputs(conn, runtime, ctx.week, ctx.live, day),
     )
     log_week(conn, manager.name, league_key, ctx.roster.team_key, plan, day)
-    report.add("week", True, _week_line(plan))
+    lines = _recheck(conn, workable, lapsed, plan, terms) if waiting else []
+    report.add("week", True, _week_line(plan), lines)
     return plan
+
+
+def _workable(conn, manager, league_key, ctx, waiting):
+    """(proposal, add, drop) for those still possible, and {id: why} for the rest.
+
+    One read of the pending players' ownership - a pool read is several pages
+    and might not reach a player proposed days ago.
+    """
+    from dataclasses import replace
+
+    from puckpilot.season import cli_support
+    from puckpilot.season import pool as pool_mod
+    from puckpilot.yahoo import playermap
+
+    pmap = playermap.load_map(conn, league_key)
+    keys = [p.add_player_key for p in waiting]
+    found = cli_support.run_session(
+        manager, lambda s: pool_mod.fetch_players(s, league_key, keys, player_map=pmap)
+    )
+    now = {a.player_key: a for a in found}
+    mine = {p.player_key: p for p in ctx.roster.players}
+    workable, lapsed = [], {}
+    for p in waiting:
+        add = now.get(p.add_player_key)
+        drop = mine.get(p.drop_player_key) if p.drop_player_key else None
+        if add is None or not add.is_available:
+            lapsed[p.id] = f"{p.add_name} is no longer available"
+        elif add.is_out:
+            lapsed[p.id] = f"{p.add_name} is now listed {add.status}"
+        elif p.drop_player_key and drop is None:
+            lapsed[p.id] = f"{p.drop_name} is no longer on your roster"
+        elif drop is not None and (drop.is_out or drop.on_ir):
+            lapsed[p.id] = (
+                f"{p.drop_name} is now {drop.status or drop.selected_slot} - "
+                f"not a player to drop on that"
+            )
+        else:
+            if add.nhl_player_id is None:
+                add = replace(add, nhl_player_id=p.add_pid)
+            workable.append((p, add, drop))
+    return workable, lapsed
+
+
+def _recheck(conn, workable, lapsed, plan, terms) -> list[str]:
+    """Write a re-check back to the queue, and say what it did."""
+    by_pair = {(t.player.player_key, t.drop.player_key if t.drop else ""): t for t in plan.targets}
+    low = {(t.player.player_key, t.drop.player_key if t.drop else ""): t for t in plan.lapsed}
+    odds = terms.add_scoring == "odds"
+    floor = terms.min_expected_gain if odds else terms.min_weekly_gain
+    kept: dict[int, object] = {}
+    lapsed = dict(lapsed)
+    if plan.adds_left_week == 0:
+        lapsed.update({p.id: "no acquisitions left this week" for p, _, _ in workable})
+        workable = []
+    lines = []
+    for p, _, _ in workable:
+        pair = (p.add_player_key, p.drop_player_key)
+        t = by_pair.get(pair)
+        was = p.reason.get("expected_gain") if odds else p.reason.get("gain")
+        if t is not None:
+            kept[p.id] = t
+            now = t.gain if odds and t.gain is not None else t.score
+            before = f" (was {float(was):+.2f})" if was is not None else ""
+            lines.append(f"#{p.id} {p.add_name} for {p.drop_name}: still {now:+.2f}{before}")
+            continue
+        t = low.get(pair)
+        now = (t.gain if odds and t.gain is not None else t.score) if t is not None else 0.0
+        unit = " categories expected" if odds else ""
+        lapsed[p.id] = f"now worth {now:+.2f}{unit}, below the {floor:.2f} floor"
+    proposals_mod.refresh(conn, kept, lapsed)
+    lines += [f"#{pid} withdrawn: {why}" for pid, why in lapsed.items()]
+    return lines
 
 
 def _week_line(plan) -> str:

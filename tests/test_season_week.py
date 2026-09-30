@@ -813,3 +813,61 @@ def test_an_add_explains_itself_day_by_day(db):
     assert t.detail["odds"] == ["G 28% -> 51%"]
     assert t.detail["range"][0].startswith("Streamer, 4 starts: G ")
     assert list(t.detail) == ["week", "odds", "range", "per_game", "season"]
+
+
+# -- re-checking what is already proposed -----------------------------------------
+
+
+def _reprice_for(db, players, slots, pairs, min_gain=0.0, exclude=None, **kw):
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season.roster import TeamRoster
+    from puckpilot.season.week import _reprice
+    from tests.test_season_settings import _slots
+
+    _week_games(db)
+    rt = _runtime_for_week(roster_positions=_slots(*slots))
+    ours = TeamRoster(league_key="999.l.1", team_key="t", date="2026-10-05", players=players)
+    return _reprice(
+        db,
+        rt,
+        LeagueConfig(skater_cats=(resolve("G"),), goalie_cats=()),
+        rt.week(1),
+        ours,
+        pairs,
+        kw.get("rates") or {1: {"goals": 0.5}, 2: {"goals": 0.2}, 9: {"goals": 0.3}, 10: {}},
+        {},
+        None,
+        _PerGame(kw.get("per_game") or {1: 1.5, 2: 0.5, 9: 1.0, 10: 0.0}),
+        min_gain,
+        exclude=exclude,
+    )
+
+
+def test_a_pending_add_that_still_pays_is_kept_with_fresh_reasons(db):
+    roster = (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C"))
+    kept, lapsed = _reprice_for(
+        db, roster, (("C", 2, 1), ("BN", 1, 0)), [(_fa("fa.1", "S", 9), None)]
+    )
+    assert [t.player.name for t in kept] == ["S"] and lapsed == ()
+    assert kept[0].detail["week"]
+
+
+def test_a_pending_add_below_the_floor_lapses_and_the_next_is_priced_without_it(db):
+    roster = (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C"))
+    useless, good = _fa("fa.0", "Nobody", 10), _fa("fa.1", "S", 9)
+    kept, lapsed = _reprice_for(
+        db, roster, (("C", 2, 1), ("BN", 2, 0)), [(useless, None), (good, None)], min_gain=0.01
+    )
+    assert [t.player.name for t in lapsed] == ["Nobody"]
+    assert [t.player.name for t in kept] == ["S"]
+    assert not kept[0].detail["week"][0].startswith("Assumes")
+
+
+def test_a_game_already_under_way_is_not_an_add_s_to_gain(db):
+    """At a 7:40 PM run the 7:00 game is banked: the add cannot play in it."""
+    roster = (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C"))
+    pair = [(_fa("fa.1", "S", 9), None)]
+    slots = (("C", 2, 1), ("BN", 1, 0))
+    [whole], _ = _reprice_for(db, roster, slots, pair)
+    [evening], _ = _reprice_for(db, roster, slots, pair, exclude={"2026-10-05": {"TOR"}})
+    assert evening.starts == whole.starts - 1

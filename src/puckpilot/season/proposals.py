@@ -140,9 +140,7 @@ def propose(
         for p in pending(conn, manager, league_key):
             t = fresh.get((p.add_player_key, p.drop_player_key))
             if t is None:
-                conn.execute(
-                    "UPDATE waiver_proposals SET superseded_at = ? WHERE id = ?", (now, p.id)
-                )
+                _withdraw(conn, p, "a newer search no longer proposes it", now)
             else:
                 # Kept, with today's reasons: the numbers move every day.
                 conn.execute(
@@ -186,6 +184,51 @@ def propose(
         room -= 1
     conn.commit()
     return made
+
+
+def refresh(conn: sqlite3.Connection, kept: dict[int, object], lapsed: dict[int, str]) -> None:
+    """Apply a re-check of the queue: fresh reasons for what still pays, and
+    withdrawal, with the reason, of what no longer does.
+
+    Only proposals still awaiting a decision are touched - one approved or
+    rejected while the run was working keeps its decision.
+    """
+    now = _now()
+    for pid, t in kept.items():
+        p = get(conn, pid)
+        if not p.is_live:
+            continue
+        reason = _reason(t, int(p.reason.get("week", 0)))
+        reason["checked_at"] = now
+        conn.execute(
+            "UPDATE waiver_proposals SET reason_json = ? WHERE id = ?", (json.dumps(reason), pid)
+        )
+    for pid, why in lapsed.items():
+        p = get(conn, pid)
+        if p.is_live:
+            _withdraw(conn, p, why, now)
+    conn.commit()
+
+
+def _withdraw(conn: sqlite3.Connection, p: Proposal, why: str, now: str) -> None:
+    reason = dict(p.reason)
+    reason["withdrawn"] = why
+    conn.execute(
+        "UPDATE waiver_proposals SET superseded_at = ?, reason_json = ? WHERE id = ?",
+        (now, json.dumps(reason), p.id),
+    )
+
+
+def withdrawn_since(
+    conn: sqlite3.Connection, manager: str, league_key: str, since: str
+) -> list[Proposal]:
+    """Proposals withdrawn undecided since `since` (UTC ISO), newest first."""
+    rows = conn.execute(
+        "SELECT * FROM waiver_proposals WHERE manager = ? AND league_key = ? "
+        "AND status = ? AND superseded_at IS NOT NULL AND superseded_at >= ? ORDER BY id DESC",
+        (manager, league_key, PENDING, since),
+    )
+    return [_row_to_proposal(r) for r in rows]
 
 
 def _reason(t, week: int) -> dict:

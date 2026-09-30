@@ -381,3 +381,22 @@ def test_the_page_says_whether_the_changes_were_made():
     out = run_page(state.get("jimmy"))
     assert_clean(out)
     assert "NOT made at 6:41 PM - the lineup changed" in out["app"]
+
+
+def test_a_withdrawn_proposal_is_shown_with_its_reason():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "withdrawn": [
+                {"add": "Marco Rossi", "drop": "John Gibson", "why": "now worth +0.03"},
+                {"add": "Sean Durzi", "drop": "", "why": ""},
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    assert "Withdrawn" in out["app"]
+    assert "Marco Rossi" in out["app"] and "now worth +0.03" in out["app"]

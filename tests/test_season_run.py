@@ -451,3 +451,71 @@ def test_without_an_actuator_the_page_says_the_changes_were_not_made(db):
     got, report = _act(db, _act_plan())
     assert got == {"ok": False, "message": "Not made automatically - make these in Yahoo."}
     assert not report.failed
+
+
+# -- re-checking the queue ------------------------------------------------------
+
+
+def test_the_recheck_keeps_what_pays_and_says_why_the_rest_went(db):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from puckpilot.season import proposals
+    from puckpilot.season.run import _recheck
+    from tests.test_season_proposals import make, target
+
+    [a] = make(db, target(name="Rossi", key="p.a", pid=9101))
+    [b] = make(db, target(name="Durzi", key="p.b", pid=9102))
+    keep = replace(target(name="Rossi", key="p.a", pid=9101), gain=0.41, score=0.41)
+    low = replace(target(name="Durzi", key="p.b", pid=9102), gain=0.03, score=0.03)
+    plan = SimpleNamespace(targets=(keep,), lapsed=(low,), adds_left_week=2)
+    terms = SimpleNamespace(add_scoring="odds", min_expected_gain=0.1, min_weekly_gain=0.25)
+    lines = _recheck(db, [(a, None, None), (b, None, None)], {}, plan, terms)
+    assert [p.id for p in proposals.pending(db, "jimmy")] == [a.id]
+    why = proposals.get(db, b.id).reason["withdrawn"]
+    assert why == "now worth +0.03 categories expected, below the 0.10 floor"
+    assert any("still +0.41" in ln for ln in lines)
+
+
+def test_with_no_acquisitions_left_this_week_everything_waiting_is_withdrawn(db):
+    from types import SimpleNamespace
+
+    from puckpilot.season import proposals
+    from puckpilot.season.run import _recheck
+    from tests.test_season_proposals import make, target
+
+    [a] = make(db, target())
+    plan = SimpleNamespace(targets=(target(),), lapsed=(), adds_left_week=0)
+    terms = SimpleNamespace(add_scoring="odds", min_expected_gain=0.1, min_weekly_gain=0.25)
+    _recheck(db, [(a, None, None)], {}, plan, terms)
+    assert proposals.get(db, a.id).reason["withdrawn"] == "no acquisitions left this week"
+
+
+def test_a_player_taken_or_a_drop_ruled_out_ends_the_proposal(db, monkeypatch):
+    from types import SimpleNamespace
+
+    from puckpilot.season import cli_support
+    from puckpilot.season import pool as pool_mod
+    from puckpilot.season.pool import FREE_AGENT, PoolPlayer
+    from puckpilot.season.run import _workable
+    from tests.test_season_proposals import make, target
+    from tests.test_season_week import _rp
+
+    [taken] = make(db, target(name="Taken", key="p.t", pid=9101))
+    [hurt] = make(db, target(name="Fine", key="p.f", pid=9102))
+    [ok] = make(db, target(name="Good", key="p.g", pid=9103))
+
+    def fa(key, name, own):
+        return PoolPlayer(key, name, "TOR", "C", frozenset({"C"}), 1, ownership_type=own)
+
+    now = [fa("p.t", "Taken", "team"), fa("p.f", "Fine", FREE_AGENT), fa("p.g", "Good", FREE_AGENT)]
+    monkeypatch.setattr(cli_support, "run_session", lambda m, fn: fn(None))
+    monkeypatch.setattr(pool_mod, "fetch_players", lambda s, lk, keys, player_map=None: now)
+    # "Drop Me" is on the roster, and out - never a drop on that.
+    roster = SimpleNamespace(players=[_rp("p.drop", "Drop Me", 8001, "MTL", "C", status="NA")])
+    workable, lapsed = _workable(
+        db, SimpleNamespace(), "999.l.1", SimpleNamespace(roster=roster), [taken, hurt, ok]
+    )
+    assert lapsed[taken.id] == "Taken is no longer available"
+    assert lapsed[hurt.id].startswith("Drop Me is now NA")
+    assert workable == []

@@ -70,6 +70,7 @@ def explain(
     after_odds=None,
     season_left=None,
     prior=(),
+    exclude=None,
 ) -> dict[str, list[str]]:
     """section -> lines, for one add priced as `after` against `base`.
 
@@ -77,8 +78,8 @@ def explain(
     `base` already has them made, and the card has to say so - approving this
     one alone would not leave the roster these numbers describe.
     """
-    before = {d: _day_lineup(conn, runtime, d, base, goalie_source, values) for d in days}
-    now = {d: _day_lineup(conn, runtime, d, after, goalie_source, values) for d in days}
+    before = {d: _day_lineup(conn, runtime, d, base, goalie_source, values, exclude) for d in days}
+    now = {d: _day_lineup(conn, runtime, d, after, goalie_source, values, exclude) for d in days}
     out: dict[str, list[str]] = {
         "week": [open_slots_line(runtime, before)]
         + week_lines(before, now, base, after, cand, drop),
@@ -104,14 +105,19 @@ def explain(
 # -- the week ---------------------------------------------------------------
 
 
-def _day_lineup(conn, runtime, day, players, goalie_source, values) -> tuple[dict, dict, set]:
+def _day_lineup(
+    conn, runtime, day, players, goalie_source, values, exclude=None
+) -> tuple[dict, dict, set]:
     """(skater key -> slot, goalie key -> P(start), clubs playing) for one day.
 
     The same assignment `week.expected_starts` makes: skaters by the lineup
     optimizer, goalies by value times P(start) into as many G slots as there are.
+    A club whose game is already under way (`exclude`) is not playing for this.
     """
     shape = runtime.shape()
-    playing = calendar.teams_playing(conn, day, runtime.nhl_season)
+    playing = calendar.teams_playing(conn, day, runtime.nhl_season) - (exclude or {}).get(
+        day, set()
+    )
     p_starts = goalie_source.starts(day) if goalie_source else {}
     skaters, goalies = [], []
     for p in players:

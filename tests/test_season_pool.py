@@ -202,3 +202,24 @@ def test_after_the_last_week_there_is_nothing_to_look_forward_to():
         our_team_key="999.l.1.t.5",
     )
     assert current_or_next(ms, "2027-06-01") is None
+
+
+def test_named_players_come_back_with_who_owns_them():
+    from puckpilot.season.pool import FREE_AGENT, fetch_players
+
+    def player(key, own):
+        core = [{"player_key": key}, {"name": {"full": key}}, {"editorial_team_abbr": "VAN"}]
+        return [core, {"ownership": own}]
+
+    class Session:
+        def get(self, path):
+            assert ";player_keys=p.1,p.2/ownership" in path
+            players = {
+                "count": 2,
+                "0": {"player": player("p.1", {"ownership_type": FREE_AGENT})},
+                "1": {"player": player("p.2", {"ownership_type": "team", "owner_team_key": "t"})},
+            }
+            return {"fantasy_content": {"league": [{"league_key": "l"}, {"players": players}]}}
+
+    got = fetch_players(Session(), "l", ["p.1", "p.2"])
+    assert [(p.player_key, p.is_available) for p in got] == [("p.1", True), ("p.2", False)]

@@ -231,6 +231,8 @@ class WeekPlan:
     days_left: int = 0
     banked: bool = False
     odds: object | None = None  # season.odds.WeekOdds
+    # Proposed swaps a re-check priced below the floor (build_week_plan `reprice`).
+    lapsed: tuple[AddTarget, ...] = ()
 
     @property
     def expected(self) -> float | None:
@@ -679,6 +681,7 @@ def build_week_plan(
     playoff_reserve: int = 0,
     stream_spots: int = 2,
     measure_room: bool = True,
+    reprice=None,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -690,6 +693,10 @@ def build_week_plan(
     Everything that compares two projections - the lineup headroom, the add
     deltas - works on the remainder alone: a banked total on one side of a
     difference would be counted as something an add could change.
+
+    `reprice` - (add, drop) pairs already proposed - prices exactly those
+    instead of searching: `targets` is the ones that still pay, `lapsed` the
+    ones that no longer do (season/run.py re-checks the queue this way).
     """
     cats = league.all_cats
     rates = per_game_rates(frame, cats)
@@ -833,12 +840,31 @@ def build_week_plan(
             f"Holding the last {adds_left_season} acquisition(s) for the playoffs - "
             f"nothing proposed."
         )
-    if find_targets and days and not holding:
-        ctx = None
-        floor = min_gain
-        if add_scoring == "odds" and odds is not None and their_side is not None:
-            ctx = OddsContext(model=odds_model, banked=base_ours, theirs=their_side, cats=cats)
-            floor = min_expected_gain
+    ctx = None
+    floor = min_gain
+    if add_scoring == "odds" and odds is not None and their_side is not None:
+        ctx = OddsContext(model=odds_model, banked=base_ours, theirs=their_side, cats=cats)
+        floor = min_expected_gain
+    lapsed: tuple[AddTarget, ...] = ()
+    if reprice is not None and days:
+        targets, lapsed = _reprice(
+            conn,
+            runtime,
+            league,
+            week,
+            ours,
+            list(reprice),
+            rates,
+            close_by_key,
+            goalie_source,
+            values,
+            floor,
+            base_totals=our_rest,
+            days=days,
+            odds_ctx=ctx,
+            exclude=exclude,
+        )
+    elif find_targets and days and not holding:
         targets = _targets(
             conn,
             runtime,
@@ -860,6 +886,7 @@ def build_week_plan(
                 None if adds_left_season is None else adds_left_season - playoff_reserve,
             ),
             stream_spots=stream_spots,
+            exclude=exclude,
         )
 
     return WeekPlan(
@@ -879,6 +906,7 @@ def build_week_plan(
         adds_left_week=adds_left_week,
         adds_left_season=adds_left_season,
         notes=tuple(notes),
+        lapsed=lapsed,
     )
 
 
@@ -911,6 +939,7 @@ def _targets(
     odds_ctx: OddsContext | None = None,
     adds_left: int | None = None,
     stream_spots: int = 2,
+    exclude: dict[str, set[str]] | None = None,
 ) -> tuple[AddTarget, ...]:
     """Adds that move a category in play, priced by re-slotting the actual week.
 
@@ -939,7 +968,6 @@ def _targets(
     Each step costs an optimizer pass per candidate, so the pool is screened
     cheaply first and only the shortlist is priced properly.
     """
-    from puckpilot.season import odds as odds_mod
     from puckpilot.season.today import ir_changes, open_roster_spots
 
     cats = league.all_cats
@@ -964,24 +992,9 @@ def _targets(
             counts[p.position] = counts.get(p.position, 0) + 1
     rules = league.draft_rules()
     spots = open_roster_spots(runtime, ours)
-
-    def evaluate(players):
-        ggames: dict[int, list[float]] = {}
-        starts = expected_starts(
-            conn, runtime, week, players, goalie_source, values, days=days, goalie_games=ggames
-        )
-        totals = project_totals(starts, rates, cats)
-        odds = None
-        if odds_ctx is not None:
-            skate = {p.nhl_player_id for p in players if p.position != "G"}
-            side = odds_mod.side(
-                odds_ctx.banked,
-                {pid: n for pid, n in starts.items() if pid in skate},
-                ggames,
-                rates,
-            )
-            odds = odds_ctx.model.week(odds_ctx.cats, side, odds_ctx.theirs)
-        return starts, totals, odds
+    evaluate = _evaluator(
+        conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx, exclude
+    )
 
     base_players = list(ours.players)
     base_starts, first_totals, base_odds = evaluate(base_players)
@@ -1038,43 +1051,23 @@ def _targets(
                 )
                 if drop is None:
                     continue
-            after = [p for p in base_players if drop is None or p.player_key != drop.player_key]
-            after.append(cand)
-            after_starts, after_totals, after_odds = evaluate(after)
-
-            deltas = {
-                c.key: after_totals.get(c.key, 0.0) - base_totals.get(c.key, 0.0)
-                for c in cats
-                if c.key not in DERIVED
-            }
-            gain = None
-            if after_odds is not None and base_odds is not None:
-                gain = after_odds.expected - base_odds.expected
-                helps = _odds_moved(base_odds, after_odds)
-                score = gain
-            else:
-                helps = _helped_by(deltas, close_by_key)
-                if close_by_key and not helps:
-                    continue
-                score = _score(deltas, close_by_key)
-            if score < min_gain:
-                continue
-            lost = base_starts.get(drop.nhl_player_id, 0.0) if drop is not None else 0.0
-            t = AddTarget(
-                player=cand,
-                starts=after_starts.get(cand.nhl_player_id, 0.0),
-                drop_starts=lost,
-                deltas=deltas,
-                helps=helps,
-                drop=drop,
-                score=score,
-                labels={c.key: c.label for c in cats},
-                timing=cand.timing(runtime.waiver_days),
-                gain=gain,
+            t, after_week = _price(
+                runtime,
+                cats,
+                evaluate,
+                base_players,
+                base_starts,
+                base_totals,
+                base_odds,
+                close_by_key,
+                cand,
+                drop,
             )
+            if not _pays(t, min_gain, close_by_key):
+                continue
             if best is None or t.score > best.score:
                 best = t
-                best_after = (after, after_starts, after_odds)
+                best_after = after_week
         if best is None:
             break
         best = replace(
@@ -1093,6 +1086,7 @@ def _targets(
                 odds_ctx,
                 season_left,
                 chosen,
+                exclude,
             ),
         )
         chosen.append(best)
@@ -1111,6 +1105,175 @@ def _targets(
     return tuple(chosen)
 
 
+def _reprice(
+    conn,
+    runtime,
+    league,
+    week,
+    ours,
+    pairs,
+    rates,
+    close_by_key,
+    goalie_source,
+    values,
+    min_gain,
+    base_totals=None,
+    days: list[str] | None = None,
+    odds_ctx: OddsContext | None = None,
+    exclude: dict[str, set[str]] | None = None,
+) -> tuple[tuple[AddTarget, ...], tuple[AddTarget, ...]]:
+    """(still pays, no longer pays) for swaps already proposed, priced as the
+    search would price them today.
+
+    In the order they were proposed, each against the roster the ones kept
+    before it leave - the search's own greedy order, so a later card still
+    assumes the earlier add. One that no longer pays is not made, and those
+    after it are priced without it. No drop is re-chosen: the card is "add X,
+    drop Y", and a different drop would be a different proposal.
+    """
+    cats = league.all_cats
+    days = days if days is not None else week.dates()
+    evaluate = _evaluator(
+        conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx, exclude
+    )
+    base_players = list(ours.players)
+    base_starts, first_totals, base_odds = evaluate(base_players)
+    if base_totals is None:
+        base_totals = first_totals
+    season_left = calendar.games_by_team(conn, days[0], runtime.end_date, runtime.nhl_season)
+    kept: list[AddTarget] = []
+    lapsed: list[AddTarget] = []
+    for cand, drop in pairs:
+        t, after_week = _price(
+            runtime,
+            cats,
+            evaluate,
+            base_players,
+            base_starts,
+            base_totals,
+            base_odds,
+            close_by_key,
+            cand,
+            drop,
+        )
+        if not _pays(t, min_gain, close_by_key):
+            lapsed.append(t)
+            continue
+        t = replace(
+            t,
+            detail=_explain(
+                conn,
+                runtime,
+                days,
+                base_players,
+                t,
+                after_week,
+                base_odds,
+                goalie_source,
+                values,
+                rates,
+                odds_ctx,
+                season_left,
+                kept,
+                exclude,
+            ),
+        )
+        kept.append(t)
+        base_players = after_week[0]
+        base_starts, base_totals, base_odds = evaluate(base_players)
+    return tuple(kept), tuple(lapsed)
+
+
+def _evaluator(
+    conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx=None, exclude=None
+):
+    """players -> (expected starts, remaining totals, odds) over `days`.
+
+    Games already under way (`exclude`) are banked, so they are no more
+    available to an add than to anyone else.
+    """
+    from puckpilot.season import odds as odds_mod
+
+    def evaluate(players):
+        ggames: dict[int, list[float]] = {}
+        starts = expected_starts(
+            conn,
+            runtime,
+            week,
+            players,
+            goalie_source,
+            values,
+            days=days,
+            exclude=exclude,
+            goalie_games=ggames,
+        )
+        totals = project_totals(starts, rates, cats)
+        odds = None
+        if odds_ctx is not None:
+            skate = {p.nhl_player_id for p in players if p.position != "G"}
+            side = odds_mod.side(
+                odds_ctx.banked,
+                {pid: n for pid, n in starts.items() if pid in skate},
+                ggames,
+                rates,
+            )
+            odds = odds_ctx.model.week(odds_ctx.cats, side, odds_ctx.theirs)
+        return starts, totals, odds
+
+    return evaluate
+
+
+def _price(
+    runtime,
+    cats,
+    evaluate,
+    base_players,
+    base_starts,
+    base_totals,
+    base_odds,
+    close_by_key,
+    cand,
+    drop,
+):
+    """One swap against a roster: its AddTarget, and the week it leaves."""
+    after = [p for p in base_players if drop is None or p.player_key != drop.player_key]
+    after.append(cand)
+    after_starts, after_totals, after_odds = evaluate(after)
+    deltas = {
+        c.key: after_totals.get(c.key, 0.0) - base_totals.get(c.key, 0.0)
+        for c in cats
+        if c.key not in DERIVED
+    }
+    gain = None
+    if after_odds is not None and base_odds is not None:
+        gain = after_odds.expected - base_odds.expected
+        helps = _odds_moved(base_odds, after_odds)
+        score = gain
+    else:
+        helps = _helped_by(deltas, close_by_key)
+        score = _score(deltas, close_by_key)
+    t = AddTarget(
+        player=cand,
+        starts=after_starts.get(cand.nhl_player_id, 0.0),
+        drop_starts=base_starts.get(drop.nhl_player_id, 0.0) if drop is not None else 0.0,
+        deltas=deltas,
+        helps=helps,
+        drop=drop,
+        score=score,
+        labels={c.key: c.label for c in cats},
+        timing=cand.timing(runtime.waiver_days),
+        gain=gain,
+    )
+    return t, (after, after_starts, after_odds)
+
+
+def _pays(t: AddTarget, min_gain: float, close_by_key) -> bool:
+    """Worth proposing: over the floor, and priced by shares, moving a close category."""
+    if t.gain is None and close_by_key and not t.helps:
+        return False
+    return t.score >= min_gain
+
+
 def _explain(
     conn,
     runtime,
@@ -1125,6 +1288,7 @@ def _explain(
     odds_ctx,
     season_left,
     prior=(),
+    exclude=None,
 ) -> dict:
     """The chosen add's reasons, from the numbers it was priced with."""
     from puckpilot.season import add_story
@@ -1147,6 +1311,7 @@ def _explain(
         after_odds=after_odds,
         season_left=season_left,
         prior=prior,
+        exclude=exclude,
     )
 
 
