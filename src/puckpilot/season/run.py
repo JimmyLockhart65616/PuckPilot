@@ -263,6 +263,7 @@ def run_day(
     if roster is not None:
         save_roster(conn, manager.name, roster)
         report.add("roster", True, f"{len(roster)} players", list(roster.unmapped))
+        _guard(report, "statuses", lambda: _statuses(conn, roster, report, "yours"))
 
         def _plan():
             values, goalies = models
@@ -557,11 +558,26 @@ def _log_week(conn, manager, league_key, ctx, report):
     save_live(conn, manager.name, league_key, ctx.live, ctx.raw)
     if ctx.theirs is not None:
         save_roster(conn, manager.name, ctx.theirs)
+        _statuses(conn, ctx.theirs, report, "theirs")
     t = ctx.live
     left = ""
     if t.ours.remaining_games is not None:
         left = f", Yahoo counts {t.ours.remaining_games} games left vs {t.theirs.remaining_games}"
     report.add("score", True, f"week {t.week} vs {t.theirs.name} ({t.status}){left}")
+
+
+def _statuses(conn, roster, report, whose: str) -> None:
+    """Log injury and availability tags as this run saw them (season/status_log.py)."""
+    from puckpilot.season import status_log
+
+    changes = status_log.record(conn, roster)
+    if changes:
+        report.add(
+            f"tags ({whose})",
+            True,
+            f"{len(changes)} change(s)",
+            [c.describe() for c in changes],
+        )
 
 
 def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propose=True):

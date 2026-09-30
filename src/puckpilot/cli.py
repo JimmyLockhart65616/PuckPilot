@@ -1468,6 +1468,34 @@ def _cmd_season_locks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_statuses(args: argparse.Namespace) -> int:
+    """Every tag seen since logging began, what followed, and the play rate by tag."""
+    from puckpilot.season import cli_support, status_log
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    results = status_log.outcomes(
+        conn, league_key, runtime.nhl_season, args.date or cli_support.today_str()
+    )
+    if not results:
+        print("No injury or availability tags seen yet.")
+        return 0
+    for o in results:
+        seen = o.change.new_seen_at[:16].replace("T", " ")
+        nxt = f"next game {o.game_date}: {o.result}" if o.game_date else o.result
+        late = f"  [tag came after the {o.missed_game} game started]" if o.missed_game else ""
+        print(f"  {seen}Z  {o.change.describe()}  - {nxt}{late}")
+    print()
+    for line in status_log.summary(results):
+        print(f"  {line}")
+    return 0
+
+
 def _cmd_season_schedule(args: argparse.Namespace) -> int:
     """Register (or show, or remove) the daily runs."""
     import os
@@ -2549,6 +2577,13 @@ def build_parser() -> argparse.ArgumentParser:
         "locks", parents=[seasonal], help="When today's slots close, player by player"
     )
     s_locks.set_defaults(func=_cmd_season_locks)
+
+    s_tags = season_sub.add_parser(
+        "statuses",
+        parents=[seasonal],
+        help="Injury tags the runs have seen, and whether the player then played",
+    )
+    s_tags.set_defaults(func=_cmd_season_statuses)
 
     s_week = season_sub.add_parser(
         "week", parents=[seasonal], help="This week's category plan and add targets"

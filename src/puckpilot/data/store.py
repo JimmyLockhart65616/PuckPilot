@@ -243,6 +243,34 @@ CREATE TABLE IF NOT EXISTS week_odds_log (
     cats_json  TEXT NOT NULL,
     PRIMARY KEY (manager, team_key, week, logged_at)
 );
+
+-- The tag each rostered player was last seen with (season/status_log.py);
+-- '' is healthy. Kept because roster snapshots are overwritten every run.
+CREATE TABLE IF NOT EXISTS player_status (
+    league_key   TEXT NOT NULL,
+    player_key   TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    since_at     TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (league_key, player_key)
+);
+
+-- Every change of tag, between the last run that saw the old one and the first
+-- that saw the new. old_status NULL: the player's first sighting, already tagged.
+CREATE TABLE IF NOT EXISTS player_status_changes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    league_key    TEXT NOT NULL,
+    team_key      TEXT NOT NULL,
+    player_key    TEXT NOT NULL,
+    nhl_player_id INTEGER,
+    name          TEXT,
+    team_abbrev   TEXT,
+    old_status    TEXT,
+    new_status    TEXT NOT NULL,
+    injury_note   TEXT,
+    old_seen_at   TEXT,
+    new_seen_at   TEXT NOT NULL
+);
 """
 
 # `waiver_proposals` predates the in-season work and shipped without a manager,
