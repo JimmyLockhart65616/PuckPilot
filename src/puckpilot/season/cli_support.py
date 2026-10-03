@@ -117,18 +117,36 @@ def _refuse_if_busy(profile: Path) -> None:
         )
 
 
-def run_session(manager: Manager, work, settings: Settings | None = None):
+# How long to wait before the one retry when the browser dies under a read.
+BROWSER_RETRY_WAIT_S = 45.0
+
+
+def run_session(manager: Manager, work, settings: Settings | None = None, sleep=None):
     """Run `work(session)`, turning the fallback's retirement into an instruction.
 
     `YahooSession` refuses to start once OAuth answers 200, which is correct -
     the documented API should win the moment it is available - but to a
     scheduled job it looks like an unexplained failure on an ordinary morning.
+
+    A browser that dies under it is retried once, after a wait. On 2026-10-02
+    Chrome updated itself at 8:42 PM: a read died mid-page and the next launch
+    exited at once, while a lock run was due within the hour. Every `work`
+    passed here only reads, so running it again is safe.
     """
+    import time
+
     from puckpilot.yahoo.session import FallbackNoLongerNeeded
 
     try:
-        with open_session(manager, settings) as session:
-            return work(session)
+        try:
+            with open_session(manager, settings) as session:
+                return work(session)
+        except Exception as e:  # noqa: BLE001 - narrowed just below
+            if type(e).__name__ != "TargetClosedError":
+                raise
+            (sleep or time.sleep)(BROWSER_RETRY_WAIT_S)
+            with open_session(manager, settings) as session:
+                return work(session)
     except FallbackNoLongerNeeded as e:
         raise SeasonCliError(
             f"{e}\n"

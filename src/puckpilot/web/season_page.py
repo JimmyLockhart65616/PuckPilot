@@ -146,10 +146,14 @@ function decide(kind, id, approve, btn) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ kind: kind, id: id, approve: approve })
   }).then(function (r) { return r.json(); }).then(function (out) {
+    // An approved pickup is a record, not an action: nothing makes the add
+    // for you. Saying "applied" here once let a decision read as done.
+    var said = approve ? 'Approved' : 'Rejected';
+    var then = kind === 'proposal' && approve
+      ? ' \\u2013 now make it in Yahoo. PuckPilot records it but makes no adds or drops.'
+      : ' \\u2013 recorded on the next run.';
     box.parentNode.replaceChild(
-      el('div', 'sub', out.error ? 'Failed: ' + out.error
-                                 : (approve ? 'Approved.' : 'Rejected.') +
-                                   ' Applied on the next run.'),
+      el('div', 'sub', out.error ? 'Failed: ' + out.error : said + then),
       box);
   }).catch(function () {
     box.parentNode.replaceChild(el('div', 'sub err', 'Could not reach the server.'), box);
@@ -189,6 +193,8 @@ function renderProposals(root, list) {
     c.appendChild(el('div', null, 'Add ' + p.add + (p.drop ? '  \\u2013  drop ' + p.drop : '')));
     if (p.why) c.appendChild(el('div', 'sub', p.why));
     if (p.timing) c.appendChild(el('div', 'sub', p.timing));
+    c.appendChild(el('div', 'sub',
+                     'Make it in Yahoo yourself \\u2013 PuckPilot never adds or drops.'));
     renderReasons(c, p);
     decisionButtons(c, 'proposal', p.id);
   });

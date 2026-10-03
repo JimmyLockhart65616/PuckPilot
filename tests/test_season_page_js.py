@@ -364,6 +364,8 @@ def test_a_proposal_shows_its_reasons():
         "Likely range this week (middle 80%)",
         "SOG 4-11",
         "Old One",
+        # Approving records a decision; it never makes the add.
+        "Make it in Yahoo yourself",
     ):
         assert expected in out["app"], expected
 

@@ -110,3 +110,62 @@ def test_describe_never_prints_a_key(home):
 def test_a_bare_manager_falls_back_to_the_default_database():
     m = Manager(name="x")
     assert m.resolved_db().name.endswith(".db")
+
+
+# -- the browser dying under a read -------------------------------------------
+
+
+class TargetClosedError(Exception):
+    """Stands in for playwright's, which run_session recognises by name."""
+
+
+def _sessions(monkeypatch, failures):
+    import contextlib
+
+    from puckpilot.season import cli_support
+
+    opened = []
+
+    @contextlib.contextmanager
+    def fake_open(manager, settings=None):
+        opened.append(1)
+        if len(opened) <= failures:
+            raise TargetClosedError("Target page, context or browser has been closed")
+        yield "session"
+
+    monkeypatch.setattr(cli_support, "open_session", fake_open)
+    return cli_support, opened
+
+
+def test_a_browser_that_dies_under_a_read_is_retried_once(monkeypatch):
+    cli_support, opened = _sessions(monkeypatch, failures=1)
+    waited = []
+    got = cli_support.run_session(None, lambda s: f"read with {s}", sleep=waited.append)
+    assert got == "read with session" and len(opened) == 2
+    assert waited == [cli_support.BROWSER_RETRY_WAIT_S]
+
+
+def test_it_is_retried_only_once(monkeypatch):
+    import pytest
+
+    cli_support, opened = _sessions(monkeypatch, failures=2)
+    with pytest.raises(TargetClosedError):
+        cli_support.run_session(None, lambda s: s, sleep=lambda _s: None)
+    assert len(opened) == 2
+
+
+def test_any_other_failure_is_not_retried(monkeypatch):
+    import contextlib
+
+    import pytest
+
+    from puckpilot.season import cli_support
+
+    @contextlib.contextmanager
+    def broken(manager, settings=None):
+        raise ValueError("not a browser problem")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(cli_support, "open_session", broken)
+    with pytest.raises(ValueError):
+        cli_support.run_session(None, lambda s: s, sleep=lambda _s: pytest.fail("retried"))
