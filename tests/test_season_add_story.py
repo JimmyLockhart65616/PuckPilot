@@ -90,3 +90,62 @@ def test_the_season_view_ranks_both_on_the_roster():
     assert got[0] == "Pickup would rank 2 of 3 on your roster"
     assert got[1] == "Low ranks 3 of 3 - your lowest"
     assert "worth more" in got[2]
+
+
+# -- who they are ------------------------------------------------------------------
+
+
+def test_a_skater_is_summed_from_his_game_logs_and_boxscores(db):
+    from tests.conftest import add_skater_game
+
+    add_skater_game(
+        db, 7, "20252026", 1, goals=1, assists=1, points=2, shots=4, toi="18:30", hits=3, blocks=1
+    )
+    add_skater_game(
+        db, 7, "20252026", 2, assists=1, points=1, powerPlayPoints=1, shots=2, toi="17:30", hits=2
+    )
+    p = SimpleNamespace(nhl_player_id=7, position="C")
+    assert add_story.form_line(p, db, "20252026") == (
+        "25-26: 2 GP, 1-2-3, 1 PPP, 6 SOG, 5 HIT, 1 BLK, 18.0 min a game"
+    )
+    assert add_story.form_line(p, db, "20262027") == "26-27: no games"
+
+
+def test_a_goalie_is_sized_up_by_wins_and_save_percentage(db):
+    from tests.conftest import add_skater_game
+
+    add_skater_game(db, 8, "20252026", 1, shotsAgainst=30, goalsAgainst=2, decision="W")
+    add_skater_game(db, 8, "20252026", 2, shotsAgainst=20, goalsAgainst=3, decision="L")
+    p = SimpleNamespace(nhl_player_id=8, position="G")
+    assert add_story.form_line(p, db, "20252026") == (
+        "25-26: 2 GP, 1 W, 0.900 SV%, 25.0 shots faced a game"
+    )
+
+
+def test_the_profile_names_both_players_with_age_and_both_seasons(db):
+    db.execute("INSERT INTO nhl_player_bio (player_id, birth_date) VALUES (7, '2000-06-15')")
+    rt = SimpleNamespace(nhl_season="20262027", week_of=lambda d: 1, week=lambda n: _no_week())
+    cand = SimpleNamespace(
+        name="Martin Pospisil",
+        team="CGY",
+        yahoo_eligible=frozenset({"C", "RW", "Util"}),
+        nhl_player_id=7,
+        position="C",
+        player_key="p.add",
+    )
+    drop = SimpleNamespace(
+        name="John Gibson",
+        team="DET",
+        yahoo_eligible=frozenset({"G"}),
+        nhl_player_id=8,
+        position="G",
+        player_key="p.drop",
+    )
+    got = add_story.profile_lines(db, rt, cand, drop, "2026-10-02")
+    assert got[0] == "Martin Pospisil (CGY, C/RW, age 26)"
+    assert got[1].startswith("  25-26: ") and got[2].startswith("  26-27: ")
+    assert got[3] == "John Gibson (DET, G)"
+
+
+def _no_week():
+    raise KeyError("no next week")

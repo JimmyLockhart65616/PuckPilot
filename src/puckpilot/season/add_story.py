@@ -19,6 +19,7 @@ the search priced the add with - nothing here is a second opinion.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from datetime import date as _date
 
@@ -48,6 +49,7 @@ LOW, HIGH = 0.10, 0.90
 SECTIONS = (
     ("week", "This week, day by day"),
     ("odds", "Category odds, before -> after"),
+    ("profile", "Who they are"),
     ("range", "Likely range this week (middle 80%)"),
     ("per_game", "Projected per game"),
     ("season", "Rest of season"),
@@ -99,6 +101,8 @@ def explain(
         out["odds"] = odds_lines(base_odds, after_odds)
     if season_left is not None and days:
         out["season"] = season_lines(cand, drop, base, values, season_left, days[0])
+    if days:
+        out["profile"] = profile_lines(conn, runtime, cand, drop, days[0])
     return {k: out[k] for k, _ in SECTIONS if k in out}
 
 
@@ -306,6 +310,133 @@ def per_game_line(player, rates: dict) -> str:
     if player.position == "G" and rates.get("shots_against", 0.0) > 0:
         parts.append(f"SV% {rates.get('saves', 0.0) / rates['shots_against']:.3f}")
     return f"{player.name}: " + (", ".join(parts) or "nothing measurable")
+
+
+# -- who they are -------------------------------------------------------------
+
+
+def _form(conn, pid: int, season: str) -> dict[str, float]:
+    """One player's regular-season totals from the game logs (and boxscores)."""
+    import json
+
+    tot = dict.fromkeys(
+        ("gp", "goals", "assists", "points", "ppp", "sog", "hits", "blocks", "toi", "wins"), 0.0
+    )
+    tot.update(sa=0.0, ga=0.0)
+    rows = conn.execute(
+        "SELECT l.stats_json, b.stats_json FROM nhl_game_logs l "
+        "LEFT JOIN nhl_boxscore_stats b ON b.game_id = l.game_id AND b.player_id = l.player_id "
+        "WHERE l.player_id = ? AND l.season = ? AND l.game_type = 2",
+        (pid, season),
+    )
+    for log_json, box_json in rows:
+        s = json.loads(log_json)
+        b = json.loads(box_json) if box_json else {}
+        tot["gp"] += 1
+        for key, src in (
+            ("goals", "goals"),
+            ("assists", "assists"),
+            ("points", "points"),
+            ("ppp", "powerPlayPoints"),
+            ("sog", "shots"),
+        ):
+            tot[key] += float(s.get(src) or 0)
+        tot["hits"] += float(b.get("hits") or 0)
+        tot["blocks"] += float(b.get("blockedShots") or 0)
+        tot["sa"] += float(s.get("shotsAgainst") or 0)
+        tot["ga"] += float(s.get("goalsAgainst") or 0)
+        tot["wins"] += 1.0 if s.get("decision") == "W" else 0.0
+        mins, _, secs = str(s.get("toi") or "0:0").partition(":")
+        with contextlib.suppress(ValueError):
+            tot["toi"] += int(mins) + int(secs or 0) / 60.0
+    return tot
+
+
+def _season_label(season: str) -> str:
+    return f"{season[2:4]}-{season[6:8]}"
+
+
+def form_line(player, conn, season: str) -> str:
+    """ "25-26: 82 GP, 20-30-50, 12 PPP, 210 SOG, 150 HIT, 40 BLK, 17.5 min" - or a goalie's."""
+    pid = player.nhl_player_id
+    t = _form(conn, pid, season) if pid is not None else {"gp": 0.0}
+    gp = int(t["gp"])
+    label = _season_label(season)
+    if not gp:
+        return f"{label}: no games"
+    if player.position == "G":
+        sv = (t["sa"] - t["ga"]) / t["sa"] if t["sa"] else 0.0
+        return (
+            f"{label}: {gp} GP, {int(t['wins'])} W, {sv:.3f} SV%, "
+            f"{t['sa'] / gp:.1f} shots faced a game"
+        )
+    return (
+        f"{label}: {gp} GP, {int(t['goals'])}-{int(t['assists'])}-{int(t['points'])}, "
+        f"{int(t['ppp'])} PPP, {int(t['sog'])} SOG, {int(t['hits'])} HIT, {int(t['blocks'])} BLK, "
+        f"{t['toi'] / gp:.1f} min a game"
+    )
+
+
+def _age(conn, pid, day: str) -> str:
+    if pid is None:
+        return ""
+    row = conn.execute(
+        "SELECT birth_date FROM nhl_player_bio WHERE player_id = ?", (pid,)
+    ).fetchone()
+    if not row or not row[0]:
+        return ""
+    born = _date.fromisoformat(str(row[0])[:10])
+    on = _date.fromisoformat(day)
+    return str(on.year - born.year - ((on.month, on.day) < (born.month, born.day)))
+
+
+def _rostered(conn, player, day: str) -> str:
+    row = conn.execute(
+        "SELECT percent_owned, date FROM yahoo_fa_snapshots WHERE player_key = ? AND date <= ? "
+        "ORDER BY date DESC LIMIT 1",
+        (player.player_key, day),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return ""
+    return f"rostered in {float(row[0]):.0f}% of Yahoo leagues"
+
+
+def _next_week_games(conn, runtime, team: str, day: str) -> str:
+    try:
+        nxt = runtime.week(runtime.week_of(day) + 1)
+    except Exception:  # noqa: BLE001 - the calendar's last week has no next one
+        return ""
+    games = sum(
+        1 for d in nxt.dates() if team in calendar.teams_playing(conn, d, runtime.nhl_season)
+    )
+    return f"{_plural(games, 'game')} next week"
+
+
+def profile_lines(conn, runtime, cand, drop, day: str) -> list[str]:
+    """Each player as a person would size him up: who, how he played, what is next."""
+    season = runtime.nhl_season
+    last = f"{int(season[:4]) - 1}{season[:4]}"
+    out: list[str] = []
+    for p in (cand, drop):
+        if p is None:
+            continue
+        bits = [p.team, "/".join(sorted(p.yahoo_eligible - {"Util", "BN", "IR", "IR+", "NA"}))]
+        age = _age(conn, p.nhl_player_id, day)
+        if age:
+            bits.append(f"age {age}")
+        head = f"{p.name} ({', '.join(b for b in bits if b)})"
+        extra = [
+            x
+            for x in (
+                _rostered(conn, p, day) if p is cand else "",
+                _next_week_games(conn, runtime, p.team, day),
+            )
+            if x
+        ]
+        out.append(head + (": " + "; ".join(extra) if extra else ""))
+        out.append(f"  {form_line(p, conn, last)}")
+        out.append(f"  {form_line(p, conn, season)}")
+    return out
 
 
 # -- the season ---------------------------------------------------------------

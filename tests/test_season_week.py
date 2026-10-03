@@ -812,7 +812,7 @@ def test_an_add_explains_itself_day_by_day(db):
     assert "Thu 8: Streamer starts (C); Depth to the bench" in week
     assert t.detail["odds"] == ["G 28% -> 51%"]
     assert t.detail["range"][0].startswith("Streamer, 4 starts: G ")
-    assert list(t.detail) == ["week", "odds", "range", "per_game", "season"]
+    assert list(t.detail) == ["week", "odds", "profile", "range", "per_game", "season"]
 
 
 # -- re-checking what is already proposed -----------------------------------------

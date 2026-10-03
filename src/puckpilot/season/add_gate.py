@@ -13,6 +13,11 @@ per week against the real schedule of opponents.
     goalie-odds    no adds; tonight's goalies chosen by expected categories
                    (`odds.choose_goalies`) instead of starting whoever plays
 
+Any search arm takes a `-s<n>` suffix - `odds-weekly-s3` - to let the bottom
+`n` players by rest-of-season value rotate for a streamer instead of the run's
+`stream_spots`. Asked after week 1 of 2026-27, when 30-46 empty slot-games went
+with two adds proposed and the third acquisition unused.
+
 Every input is as-of the morning it is used: the value model and the goalie
 start model are clamped to that date (`AsOfValues`, `AsOfGoalieSource`), a
 player who has missed two straight team games is out until he plays again,
@@ -37,6 +42,15 @@ from puckpilot.league import LeagueConfig
 from puckpilot.season.calibration import _components, _result, drop_known_absences
 
 ARMS = ("none", "share-weekly", "share-daily", "odds-weekly", "odds-daily", "goalie-odds")
+
+
+def split_arm(arm: str, stream_spots: int) -> tuple[str, int]:
+    """("odds-weekly-s3", 2) -> ("odds-weekly", 3); no suffix keeps the default."""
+    base, _, tail = arm.rpartition("-s")
+    if base and tail.isdigit():
+        return base, int(tail)
+    return arm, stream_spots
+
 
 # Free agents offered to the search each morning, best projections first - the
 # live run reads Yahoo's top 150 by the same measure.
@@ -324,6 +338,7 @@ def add_gate_report(
     tested = list(range(min(n_tested, len(rosters))))
     for t in tested:
         for arm in arms:
+            kind, spots = split_arm(arm, stream_spots)
             roster = list(rosters[t])
             adds_season = 0
             for wi, w in enumerate(weeks):
@@ -336,8 +351,8 @@ def add_gate_report(
                 g = np.zeros(G_WIDTH)
                 for k, i in enumerate(days):
                     date = data.dates[i]
-                    search = arm not in ("none", "goalie-odds") and (
-                        arm.endswith("daily") or k == 0
+                    search = kind not in ("none", "goalie-odds") and (
+                        kind.endswith("daily") or k == 0
                     )
                     cap_w = runtime.max_weekly_adds or 99
                     if search and adds_week < cap_w:
@@ -367,7 +382,7 @@ def add_gate_report(
                             g_day[opp, opp_done].sum(0) if opp_done else np.zeros(G_WIDTH),
                             skater_keys,
                         )
-                        odds_arm = arm.startswith("odds")
+                        odds_arm = kind.startswith("odds")
                         plan = build_week_plan(
                             conn,
                             runtime,
@@ -392,7 +407,7 @@ def add_gate_report(
                             add_scoring="odds" if odds_arm else "share",
                             min_expected_gain=min_expected_gain,
                             playoff_reserve=0,
-                            stream_spots=stream_spots,
+                            stream_spots=spots,
                             measure_room=False,
                         )
                         for target in plan.targets:
@@ -436,6 +451,10 @@ def add_gate_report(
         pairs.append(("odds-daily", "odds-weekly"))
     if "odds-weekly" in arms and "share-weekly" in arms:
         pairs.append(("odds-weekly", "share-weekly"))
+    pairs += [
+        (a, split_arm(a, stream_spots)[0]) for a in arms if split_arm(a, stream_spots)[0] != a
+    ]
+    pairs = [(a, b) for a, b in pairs if b in arms]
     for a, b in pairs:
         m, se = report.paired(a, b)
         verdict = "clears 2 SE" if se == se and m > 2 * se else "within noise"

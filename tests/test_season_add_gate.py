@@ -53,3 +53,11 @@ def test_banked_components_round_trip_through_yahoos_labels():
     for k in ("goals", "assists", "wins", "saves", "shots_against", "goals_against"):
         assert back[k] == comp[k]
     assert back["toi_hours"] == 5.0
+
+
+def test_an_arm_can_name_its_own_stream_spots():
+    from puckpilot.season.add_gate import split_arm
+
+    assert split_arm("odds-weekly-s3", 2) == ("odds-weekly", 3)
+    assert split_arm("odds-weekly", 2) == ("odds-weekly", 2)
+    assert split_arm("goalie-odds", 2) == ("goalie-odds", 2)
