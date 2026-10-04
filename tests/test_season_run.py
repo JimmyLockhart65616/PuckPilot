@@ -78,9 +78,9 @@ def test_every_task_runs_the_same_idempotent_command():
 
 def test_the_fixed_schedule_is_only_an_anchor():
     """Coverage comes from lock-timed one-shots, not from guessing times. The
-    anchor exists to start that chain: exactly one game day in 185 begins
-    before 11:00."""
-    assert schedule.DEFAULT_TIMES == ("11:00",)
+    anchor starts that chain - before every game day's first puck drop - and is
+    the morning read, done before a manager checks the scores at breakfast."""
+    assert schedule.DEFAULT_TIMES == ("07:00",)
     assert len(schedule.tasks("jimmy", Path("."))) == 1
 
 
@@ -369,13 +369,13 @@ def test_the_next_run_is_the_next_lock_run_or_the_next_anchor(db):
     def nxt(now, day="2026-10-04"):
         return locks.next_run(db, "jimmy", "20262027", day, now=now)
 
-    assert nxt(at(9, 0)) == at(11, 0)  # today's anchor comes first
-    assert nxt(at(12, 0)) == at(12, 40)  # then the 13:00 lock, 20 min early
+    assert nxt(at(6, 0)) == at(7, 0)  # today's anchor comes first
+    assert nxt(at(9, 0)) == at(12, 40)  # then the 13:00 lock, 20 min early
     assert nxt(at(19, 30)) == at(19, 40)  # the 20:00 lock's run
-    assert nxt(at(19, 45)) == at(11, 0, day=5)  # just missed it: tomorrow
-    assert nxt(at(21, 0)) == at(11, 0, day=5)  # nothing left today: tomorrow 11:00
+    assert nxt(at(19, 45)) == at(7, 0, day=5)  # just missed it: tomorrow
+    assert nxt(at(21, 0)) == at(7, 0, day=5)  # nothing left today: tomorrow 07:00
     # A day with no games for this roster: just the anchors.
-    assert nxt(at(12, 0, day=6), "2026-10-06") == at(11, 0, day=7)
+    assert nxt(at(12, 0, day=6), "2026-10-06") == at(7, 0, day=7)
 
 
 # -- making the changes ---------------------------------------------------------

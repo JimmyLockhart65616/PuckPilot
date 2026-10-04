@@ -152,7 +152,7 @@ def next_run(
     season: str,
     day: str,
     team_key: str = "",
-    anchor: str = "11:00",
+    anchor: str | None = None,
     now: datetime | None = None,
     tz: str = DEFAULT_TZ,
     lead: int = LEAD_MINUTES,
@@ -164,11 +164,13 @@ def next_run(
     difference between quiet and dead: on a night with nothing left to run, a
     push from ten hours ago is not stale - one missing at 11:30 is.
     """
+    from puckpilot.season.schedule import ANCHOR_TIMES
+
     zone = ZoneInfo(tz)
     at = now or datetime.now(zone)
     teams = roster_teams(conn, manager, team_key, day)
     ahead = [x.run_at(lead) for x in upcoming(locks_for(conn, season, day, teams, tz), at, lead)]
-    hh, mm = (int(x) for x in anchor.split(":"))
+    hh, mm = (int(x) for x in (anchor or ANCHOR_TIMES[0]).split(":"))
     base = datetime.fromisoformat(day).replace(tzinfo=zone)
     candidates = [
         *ahead,

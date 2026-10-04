@@ -30,8 +30,14 @@ LOCK_TAG = "lock"
 # The one fixed run. Everything else is planned from the schedule, because a
 # player locks when his own game starts and 41% of game days have a game before
 # 18:45 - so any fixed evening time is too late two days in five. This anchor
-# exists to start that chain: exactly one game day in 185 begins before 11:00.
-ANCHOR_TIMES = ("11:00",)
+# starts that chain, and it is also the morning read: last night's results,
+# the week's score and any new pickup to decide on. It was 11:00 until
+# 2026-10-04, when the manager said he checks before 9:00 - and 07:00 is
+# still after the night's last game and Yahoo's overnight processing, still
+# before every game day's first puck drop (one day in 185 starts before
+# 11:00, none before 07:00), and first to a free agent everyone else wakes
+# up to.
+ANCHOR_TIMES = ("07:00",)
 DEFAULT_TIMES = ANCHOR_TIMES
 
 
