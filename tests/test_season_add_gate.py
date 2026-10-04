@@ -71,6 +71,7 @@ def test_an_arm_names_its_options():
         0.25,
         1,
     )
+    assert parse_arm("odds-daily-h-f25-x1", 2).skip_last == 1
     with pytest.raises(ValueError, match="unknown option"):
         parse_arm("odds-weekly-zz", 2)
     with pytest.raises(ValueError, match="unknown arm"):

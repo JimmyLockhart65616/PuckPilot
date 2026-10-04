@@ -612,3 +612,60 @@ def test_a_late_add_that_pays_over_both_weeks_is_kept_and_says_so(db):
     [live] = proposals.pending(db, "jimmy")
     assert live.reason["detail"]["week"][0].startswith("Next week too: +0.20 categories expected")
     assert any("kept" in ln for ln in lines)
+
+
+# -- mid-week swaps -----------------------------------------------------------------------
+
+
+def test_mid_week_swaps_are_off_until_a_manager_turns_them_on():
+    import pytest
+
+    from puckpilot.season.authority import AuthorityError, TransactionAuthority
+
+    terms = TransactionAuthority()
+    assert terms.mid_week_floor is None and terms.mid_week_horizon
+    with pytest.raises(AuthorityError, match="mid_week_floor"):
+        TransactionAuthority(mid_week_floor=-0.1)
+
+
+def test_a_mid_week_swap_must_pay_over_this_week_and_next(monkeypatch):
+    """Priced over the days left it may clear the bar; priced over next week
+    too it may not - a pickup who helps until Sunday and costs the week after."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    import puckpilot.draft.sim as sim
+    import puckpilot.season.week as weekmod
+    from puckpilot.season.run import _pays_both
+    from tests.test_season_proposals import target
+
+    good = replace(target(name="Lasts", key="p.1", pid=1), gain=0.20, score=0.20)
+    brief = replace(target(name="Brief", key="p.2", pid=2), gain=0.30, score=0.30)
+    later = {
+        "p.1": replace(good, gain=0.10, score=0.10),
+        "p.2": replace(brief, gain=-0.20, score=-0.20),
+    }
+    monkeypatch.setattr(sim, "build_universe", lambda *a, **k: SimpleNamespace(frame=None))
+    monkeypatch.setattr(
+        weekmod,
+        "build_week_plan",
+        lambda *a, reprice=(), **k: SimpleNamespace(
+            targets=tuple(later[p.player_key] for p, _ in reprice), lapsed=()
+        ),
+    )
+    manager = SimpleNamespace(
+        league=None,
+        authority=SimpleNamespace(
+            transactions=SimpleNamespace(add_scoring="odds", playoff_reserve=6, stream_spots=2)
+        ),
+    )
+    runtime = SimpleNamespace(nhl_season="20262027")
+    kept, notes = _pays_both(
+        None, runtime, manager, None, (None, "Rival FC", None), [good, brief], 0.25, (None, None)
+    )
+    assert [t.player.name for t in kept] == ["Lasts"]
+    assert kept[0].detail["week"][0].startswith("Next week too: +0.10 categories expected")
+    assert notes == [
+        "not proposed: Brief for Drop Me - +0.30 this week but -0.20 next week, "
+        "+0.10 together, below 0.25"
+    ]

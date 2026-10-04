@@ -350,6 +350,9 @@ def run_day(
     ahead_search = last_days(terms.preload_days)
     ahead_check = last_days(terms.look_ahead_days)
     ahead = ahead_search or ahead_check
+    # A morning search on the days between: Monday has its weekly search and
+    # the week's last days the look-ahead rules (`mid_week_floor`).
+    mid_week = terms.mid_week_floor is not None and not ahead
     if weekly and models:
         week_plan = _guard(
             report,
@@ -362,15 +365,15 @@ def run_day(
         and week is not None
         and roster is not None
         and not pool_read_on(conn, league_key, day)
-        and open_roster_spots(runtime, roster) > 0
+        and (mid_week or open_roster_spots(runtime, roster) > 0)
     ):
-        # Mid-week, the search runs again only when a roster spot has opened -
-        # a player gone to IR, a drop. Searching every morning regardless was
-        # measured (gate G2, 12 teams x 22 weeks x two seasons) and won nothing
-        # over once a week: -0.06 +/- 0.06 and -0.06 +/- 0.08 categories a week,
-        # with more adds spent. The replay never frees a spot mid-week, so this
-        # one trigger is judgement, not measurement: an open spot is an add that
-        # costs no drop, and it should not wait for Monday.
+        # Mid-week the search runs again on the morning's first run when
+        # `mid_week_floor` is set - a swap there must clear that bar, and
+        # (`mid_week_horizon`) pay over next week too - and otherwise only when
+        # a roster spot has opened (an add that costs no drop should not wait
+        # for Monday; judgement - the replay never frees a spot mid-week). A
+        # plain daily search at the usual floor churned too much to beat once a
+        # week (gate G2: -0.06 +/- 0.06 and -0.06 +/- 0.08 categories a week).
         week_plan = _guard(
             report,
             "week",
@@ -385,6 +388,8 @@ def run_day(
                 ctx,
                 models,
                 start_of_week=False,
+                floor=terms.mid_week_floor if mid_week else None,
+                horizon=mid_week and terms.mid_week_horizon,
             ),
         )
     elif models and ctx.roster is not None and ctx.theirs is not None and week is not None:
@@ -1044,13 +1049,28 @@ def pool_read_on(conn, league_key: str, day: str) -> bool:
 
 
 def _weekly(
-    conn, manager, league_key, runtime, day, propose, report, ctx, models, start_of_week=True
+    conn,
+    manager,
+    league_key,
+    runtime,
+    day,
+    propose,
+    report,
+    ctx,
+    models,
+    start_of_week=True,
+    floor=None,
+    horizon=False,
 ):
     """The full plan with the add search - daily - and on a week's first day,
     the weekly upkeep and the protocol too.
 
     Reuses what this run already read - our roster, theirs, the live score -
     and falls back to reading the matchups itself when the score read failed.
+
+    Mid-week (`mid_week_floor`), a swap must clear `floor` expected
+    categories, and with `horizon` it is also priced against the next week,
+    the two together clearing the floor.
     """
     from puckpilot.draft.sim import build_universe
     from puckpilot.season import cli_support, explain, pool
@@ -1082,7 +1102,17 @@ def _weekly(
         if theirs is None:
             theirs = fetch_roster(session, opp_key, when, player_map=pmap) if opp_key else ours
         fa = pool.fetch_pool(session, league_key, "FA", limit=150, player_map=pmap)
-        return week, opp_name, ours, theirs, fa
+        ahead = None
+        if horizon:
+            nxt = _following(runtime, week)
+            mn = current_or_next(fetch_matchups(session, team_key), nxt.start) if nxt else None
+            if mn is not None:
+                ahead = (
+                    nxt,
+                    mn.opponent_name,
+                    fetch_roster(session, mn.opponent_key, nxt.start, player_map=pmap),
+                )
+        return week, opp_name, ours, theirs, fa, ahead
 
     if start_of_week:
         _guard(report, "upkeep", lambda: _upkeep(conn, manager, league_key, season, report))
@@ -1091,8 +1121,10 @@ def _weekly(
     if got is None:
         report.add("week", False, f"no matchup covering {day} and none after it")
         return None
-    week, opp_name, ours, theirs, fa = got
+    week, opp_name, ours, theirs, fa, ahead = got
     pool.save_pool(conn, league_key, day, fa)
+    terms = manager.authority.transactions
+    bar = terms.min_expected_gain if floor is None else max(floor, terms.min_expected_gain)
 
     values, goalies = models
     universe = build_universe(conn, season, _train_seasons(season), manager.league)
@@ -1112,16 +1144,20 @@ def _weekly(
         values,
         adds_used_week=used_week,
         adds_used_season=used_season,
-        min_gain=manager.authority.transactions.min_weekly_gain,
+        min_gain=terms.min_weekly_gain,
         odds_model=OddsModel(),
-        add_scoring=manager.authority.transactions.add_scoring,
-        min_expected_gain=manager.authority.transactions.min_expected_gain,
-        playoff_reserve=manager.authority.transactions.playoff_reserve,
-        stream_spots=manager.authority.transactions.stream_spots,
+        add_scoring=terms.add_scoring,
+        min_expected_gain=bar,
+        playoff_reserve=terms.playoff_reserve,
+        stream_spots=terms.stream_spots,
         **live_inputs(conn, runtime, week, live, day),
     )
     log_week(conn, manager.name, league_key, ours.team_key, plan, day)
     lines = [ln for ln in explain.week_story(plan, runtime) if ln]
+    targets = list(plan.targets)
+    if horizon and ahead is not None and targets:
+        targets, notes = _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models)
+        lines += notes
 
     if start_of_week:
         stance = protocol_mod.derive(
@@ -1133,26 +1169,110 @@ def _weekly(
             lines.append(f"protocol #{stance.id} proposed - approve it on the page")
 
     stuck = ours.illegal_ir()
-    if propose and plan.targets and stuck:
+    if propose and targets and stuck:
         lines.append(
             "no proposals: " + ", ".join(p.name for p in stuck) + " must leave IR first - "
             "Yahoo refuses every add and drop until then"
         )
-    elif propose and plan.targets:
+    elif propose and targets:
         made = proposals_mod.propose(
             conn,
             manager.name,
             league_key,
             ours.team_key,
-            plan.targets,
+            targets,
             plan.week,
-            max_pending=manager.authority.transactions.max_pending,
+            max_pending=terms.max_pending,
             supersede=True,
         )
         lines += [p.describe() for p in made] or ["nothing new to propose"]
     head = _week_line(plan) if not start_of_week else f"week {plan.week} vs {opp_name}"
     report.add("week", True, head, lines)
     return plan
+
+
+def _following(runtime, week):
+    """The fantasy week after `week`, or None at the end of the calendar."""
+    from puckpilot.season.settings import SettingsError
+
+    try:
+        return runtime.week(week.number + 1)
+    except SettingsError:
+        return None
+
+
+def _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models):
+    """Keep the swaps that pay over the rest of this week and next week together.
+
+    The search priced each over the days left this week; here each is priced
+    over the next week too (no floor - the total is judged here), and kept only
+    if the two clear `bar`. A pickup who helps until Sunday and costs the week
+    after is not one to make on a Wednesday.
+    """
+    from dataclasses import replace
+
+    from puckpilot.draft.sim import build_universe
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.odds import OddsModel
+
+    nxt, opp_name, theirs = ahead
+    terms = manager.authority.transactions
+    values, goalies = models
+    universe = build_universe(
+        conn, runtime.nhl_season, _train_seasons(runtime.nhl_season), manager.league
+    )
+    later = weekmod.build_week_plan(
+        conn,
+        runtime,
+        manager.league,
+        nxt,
+        opp_name,
+        ours,
+        theirs,
+        [],
+        universe.frame,
+        goalies,
+        values,
+        find_targets=False,
+        reprice=[(t.player, t.drop) for t in targets],
+        odds_model=OddsModel(),
+        add_scoring=terms.add_scoring,
+        min_gain=-1e9,
+        min_expected_gain=-1e9,
+        playoff_reserve=terms.playoff_reserve,
+        stream_spots=terms.stream_spots,
+        measure_room=False,
+        horizon="next week",
+    )
+
+    def key(t):
+        return (t.player.player_key, t.drop.player_key if t.drop else "")
+
+    def worth(t) -> float:
+        return t.gain if t.gain is not None else t.score
+
+    next_of = {key(t): t for t in (*later.targets, *later.lapsed)}
+    kept, notes = [], []
+    for t in targets:
+        n = next_of.get(key(t))
+        b = worth(n) if n is not None else 0.0
+        a = worth(t)
+        what = f"{t.player.name}" + (f" for {t.drop.name}" if t.drop else "")
+        if a + b < bar:
+            notes.append(
+                f"not proposed: {what} - {a:+.2f} this week but {b:+.2f} next week, "
+                f"{a + b:+.2f} together, below {bar:.2f}"
+            )
+            continue
+        line = f"Next week too: {b:+.2f} categories expected" + (
+            f" - {t.player.name} {n.starts:g} starts, {t.drop.name} {n.drop_starts:g}"
+            if n is not None and t.drop is not None
+            else ""
+        )
+        detail = dict(t.detail)
+        detail["week"] = [line, *detail.get("week", [])]
+        kept.append(replace(t, detail=detail))
+    return kept, notes
 
 
 def _train_seasons(season: str) -> tuple[str, ...]:

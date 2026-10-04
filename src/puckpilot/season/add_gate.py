@@ -32,6 +32,8 @@ Asked for after week 1, and tested the same way:
              one together (daily arms; Monday's search is unchanged)
     -f<nn>   a mid-week move must clear nn hundredths of a category, not the
              usual floor (daily arms)
+    -x<n>    no search on the week's last n days (daily arms) - the live run,
+             where Sunday follows the queue rule instead
 
 `versus` compares every arm with one named arm - the live baseline.
 
@@ -73,6 +75,7 @@ class ArmSpec:
     queue: int = 0
     horizon: bool = False  # -h: a mid-week move must pay over this week's rest + next week
     mid_floor: float | None = None  # -fNN: mid-week bar, in hundredths of a category
+    skip_last: int = 0  # -xN: no search on the week's last N days (the live run's Sunday)
 
 
 def _swap(roster: list[int], target) -> None:
@@ -101,7 +104,7 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
     for tok in arm[len(base) :].split("-")[1:]:
         if tok == "h":
             spec.horizon = True
-        elif len(tok) > 1 and tok[0] in "spqf" and tok[1:].isdigit():
+        elif len(tok) > 1 and tok[0] in "spqfx" and tok[1:].isdigit():
             n = int(tok[1:])
             if tok[0] == "s":
                 spec.spots = n
@@ -109,6 +112,8 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
                 spec.preload = n
             elif tok[0] == "q":
                 spec.queue = n
+            elif tok[0] == "x":
+                spec.skip_last = n
             else:
                 spec.mid_floor = n / 100
         else:
@@ -421,8 +426,10 @@ def add_gate_report(
                 g = np.zeros(G_WIDTH)
                 for k, i in enumerate(days):
                     date = data.dates[i]
-                    search = kind not in ("none", "goalie-odds") and (
-                        kind.endswith("daily") or k == 0
+                    search = (
+                        kind not in ("none", "goalie-odds")
+                        and (kind.endswith("daily") or k == 0)
+                        and not (spec.skip_last and k > 0 and k >= len(days) - spec.skip_last)
                     )
                     cap_w = runtime.max_weekly_adds or 99
                     # The week's last days: prepare for the next one.

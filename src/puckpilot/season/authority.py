@@ -170,9 +170,22 @@ class TransactionAuthority:
     # week, spending this week's leftover acquisitions. Measured in the add
     # gate (12 teams x 22 weeks) against the plain weekly search: +0.05 +/-
     # 0.07 (2024-25) and -0.33 +/- 0.07 (2025-26) categories a week, with ~20%
-    # more adds - it drops players who still play that last day, and Monday's
-    # search churns the new ones out again. Off by default.
+    # more adds. Queued until the rosters unlock (a drop who plays that day
+    # keeps his game) it was still -0.04 +/- 0.09 and -0.28 +/- 0.08: the cost
+    # is the churn, not the lost Sunday game. Off by default.
     preload_days: int = 0
+    # A search on every morning of the week but its first (Monday's weekly
+    # search) and the look-ahead days: a swap that gets more of the rest of
+    # the week's empty slots filled, made mid-week rather than waiting for
+    # Monday - asked for after week 1. None = off: mid-week, the search runs
+    # only when a roster spot opens. A mid-week move must clear this many
+    # expected categories, not `min_expected_gain` - a plain daily search
+    # churned too much to beat once a week.
+    mid_week_floor: float | None = None
+    # A mid-week move must also pay over the next week, the two together
+    # clearing `mid_week_floor` - a pickup that only lasts until Sunday costs
+    # the roster spot a week later.
+    mid_week_horizon: bool = True
 
     def __post_init__(self) -> None:
         if self.add_scoring not in ADD_SCORING:
@@ -185,6 +198,8 @@ class TransactionAuthority:
         for name in ("preload_days", "look_ahead_days"):
             if not 0 <= getattr(self, name) <= 6:
                 raise AuthorityError(f"authority.transactions.{name} must be between 0 and 6")
+        if self.mid_week_floor is not None and self.mid_week_floor < 0:
+            raise AuthorityError("authority.transactions.mid_week_floor cannot be negative")
 
     @property
     def requires_approval(self) -> bool:
@@ -212,6 +227,13 @@ class TransactionAuthority:
                 f"against next week (measured worse - off by default)"
                 if self.preload_days
                 else "  the search prices against the current week"
+            ),
+            (
+                f"  mid-week: a search every morning; a swap must add "
+                f"{self.mid_week_floor:.2f} expected categories"
+                + (" over the rest of this week and next together" if self.mid_week_horizon else "")
+                if self.mid_week_floor is not None
+                else "  mid-week: a search only when a roster spot opens"
             ),
         ]
 
