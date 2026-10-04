@@ -106,8 +106,9 @@ def test_task_names_are_recognisable_and_unique():
 
 
 def test_the_command_runs_from_the_repo_so_relative_paths_resolve():
-    t = schedule.tasks("jimmy", Path("C:/repo/puckpilot"))[0]
-    assert 'cd /d "C:' in t.command
+    repo = Path("C:/repo/puckpilot")
+    t = schedule.tasks("jimmy", repo)[0]
+    assert f'cd /d "{repo}"' in t.command
 
 
 def test_the_preview_warns_when_the_page_key_is_not_set():
