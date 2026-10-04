@@ -177,6 +177,39 @@ def test_a_locked_player_is_reported_not_moved(db_with_games):
     assert [x.name for x in p.locked] == ["Started"]
 
 
+def test_a_locked_starter_keeps_his_slot_against_anyone_worth_more(db_with_games):
+    """2026-10-04, 5:40 PM: Gibson's game had started and Wolf was worth more,
+    so the plan benched Gibson - a move Yahoo refuses - and the run failed. A
+    player whose game has started holds his slot: nobody moves him, nobody
+    takes it."""
+    g = StaticGoalieSource({DATE: {1: 1.0, 2: 1.0}})
+    p = plan(
+        db_with_games,
+        roster(
+            player("p.1", "Playing Now", 1, "TOR", "G", "G", editable=False),
+            player("p.2", "Worth More", 2, "MTL", "G", "BN"),
+        ),
+        {1: 1.0, 2: 9.0},
+        goalies=g,
+    )
+    assert p.is_noop
+    assert [x.name for x in p.locked] == ["Playing Now"]
+
+
+def test_a_locked_starter_does_not_stop_the_rest_of_the_lineup(db_with_games):
+    p = plan(
+        db_with_games,
+        roster(
+            player("p.1", "Playing Now", 1, "TOR", "C", "C", editable=False),
+            player("p.2", "Bench C", 2, "MTL", "C", "BN"),
+            player("p.3", "Bench RW", 3, "MTL", "RW", "BN"),
+        ),
+        {1: 1.0, 2: 9.0, 3: 5.0},
+    )
+    # The C slot is held, so the better centre waits; the empty RW is filled.
+    assert [m.describe() for m in p.moves] == ["START Bench RW in RW"]
+
+
 def test_an_unmapped_player_is_flagged_and_left_alone(db_with_games):
     r = roster(player("p.1", "Call Up", None, "TOR", "C", "BN"))
     p = plan(db_with_games, r, {})

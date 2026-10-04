@@ -26,7 +26,7 @@ from Yahoo's own roster payload, never from our snapshots.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.season import calendar
@@ -342,6 +342,12 @@ def build_plan(
 
     _demote_questionable(candidates)
 
+    # A player whose game has started holds his slot: nobody can move him and
+    # nobody can take it. Planned as if the slot were free, Wolf took it on
+    # 2026-10-04 and the diff benched Gibson mid-game - a move Yahoo refuses,
+    # which failed the 5:40 PM run.
+    shape = _without_held(shape, locked)
+
     # A goalie below the floor fills a G slot only if nobody above it will:
     # one who does not start then scores what the empty slot would have.
     g_slots = sum(n for pos, n in shape.slots if pos == "G")
@@ -627,10 +633,11 @@ def _diff(
             moves.append(Move(player=by_key[key].player, to_slot=want, from_slot=have))
 
     # Anyone still in a starting slot the new lineup needs has to step aside -
-    # except a player going to IR, whose slot is freed by that move instead.
+    # except a player going to IR, whose slot is freed by that move instead,
+    # and one whose game has started, whose slot is not in `shape` at all.
     for p in roster.players:
         key = p.player_key
-        if key in target or p.on_bench or p.on_ir or key in vacating:
+        if key in target or p.on_bench or p.on_ir or key in vacating or not p.is_editable:
             continue
         have = current.get(key, "?")
         if capacity.get(have, 0) <= 0:
@@ -642,6 +649,24 @@ def _diff(
     old_total = sum(c.value for c in candidates if not c.player.on_bench and not c.player.on_ir)
     moves.sort(key=lambda m: (m.kind_order, m.player.name))
     return moves, new_total - old_total
+
+
+def _without_held(shape, locked) -> object:
+    """The slots still open tonight: the shape less every slot a locked
+    starter is sitting in."""
+    counts = dict(shape.slots)
+    util = shape.util_slots
+    for p in locked:
+        slot = _engine_slot(p.selected_slot)
+        if slot is None or p.on_bench or p.on_ir:
+            continue
+        if slot == UTIL:
+            util = max(util - 1, 0)
+        elif slot in counts:
+            counts[slot] = max(counts[slot] - 1, 0)
+    return replace(
+        shape, slots=tuple((pos, counts[pos]) for pos, _ in shape.slots), util_slots=util
+    )
 
 
 def _empty_slots(shape, assignment) -> list[str]:
