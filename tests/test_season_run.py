@@ -541,11 +541,54 @@ def test_the_last_week_of_the_calendar_has_nothing_to_prepare_for():
     assert not preloads(rt, "2026-10-11", 1)
 
 
-def test_preload_days_is_bounded():
+def test_the_look_ahead_is_on_and_the_measured_worse_search_is_off():
     import pytest
 
     from puckpilot.season.authority import AuthorityError, TransactionAuthority
 
-    assert TransactionAuthority().preload_days == 1
+    terms = TransactionAuthority()
+    assert terms.look_ahead_days == 1 and terms.preload_days == 0
     with pytest.raises(AuthorityError, match="preload_days"):
         TransactionAuthority(preload_days=7)
+    with pytest.raises(AuthorityError, match="look_ahead_days"):
+        TransactionAuthority(look_ahead_days=-1)
+
+
+def _both(db, now_gain, next_gain):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from puckpilot.season.run import _recheck_both
+    from tests.test_season_proposals import make, target
+
+    [p] = make(db, target(name="Matty Beniers", key="p.b", pid=9102))
+    t = target(name="Matty Beniers", key="p.b", pid=9102)
+    now = SimpleNamespace(
+        targets=(replace(t, gain=now_gain, score=now_gain),), lapsed=(), adds_left_week=3
+    )
+    nxt = SimpleNamespace(
+        targets=(replace(t, gain=next_gain, score=next_gain),), lapsed=(), adds_left_week=3
+    )
+    terms = SimpleNamespace(add_scoring="odds", min_expected_gain=0.1, min_weekly_gain=0.25)
+    lines = _recheck_both(db, [(p, None, None)], {}, now, nxt, terms)
+    return p, lines
+
+
+def test_a_late_add_that_hurts_next_week_is_withdrawn_with_both_numbers(db):
+    """#10 on 2026-10-04: +0.25 for the day left, -0.32 the week after."""
+    from puckpilot.season import proposals
+
+    p, _ = _both(db, 0.25, -0.32)
+    assert proposals.pending(db, "jimmy") == []
+    assert proposals.get(db, p.id).reason["withdrawn"] == (
+        "+0.25 for the rest of this week, -0.32 next week - -0.07 together, below the 0.10 floor"
+    )
+
+
+def test_a_late_add_that_pays_over_both_weeks_is_kept_and_says_so(db):
+    from puckpilot.season import proposals
+
+    p, lines = _both(db, 0.05, 0.20)
+    [live] = proposals.pending(db, "jimmy")
+    assert live.reason["detail"]["week"][0].startswith("Next week too: +0.20 categories expected")
+    assert any("kept" in ln for ln in lines)

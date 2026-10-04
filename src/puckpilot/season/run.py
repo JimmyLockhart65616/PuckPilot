@@ -338,11 +338,18 @@ def run_day(
     week_plan = None
     if weekly is None:
         weekly = starts_a_week(runtime, day)
-    ahead = (
-        not weekly
-        and week is not None
-        and preloads(runtime, day, manager.authority.transactions.preload_days)
-    )
+    terms = manager.authority.transactions
+
+    def last_days(n: int) -> bool:
+        return not weekly and week is not None and preloads(runtime, day, n)
+
+    # The week's last days look at the next one: waiting adds are judged over
+    # the rest of this week and the next together (`look_ahead_days`), and -
+    # only if a manager turns it on - the search itself prices against next
+    # week (`preload_days`; measured worse, so off by default).
+    ahead_search = last_days(terms.preload_days)
+    ahead_check = last_days(terms.look_ahead_days)
+    ahead = ahead_search or ahead_check
     if weekly and models:
         week_plan = _guard(
             report,
@@ -351,7 +358,7 @@ def run_day(
         )
     elif (
         models
-        and not ahead
+        and not ahead_search
         and week is not None
         and roster is not None
         and not pool_read_on(conn, league_key, day)
@@ -393,8 +400,8 @@ def run_day(
                 report,
                 ctx,
                 models,
-                # On the week's last day the queue is judged against next week.
-                propose=propose and not ahead,
+                # On the week's last days the queue is judged with next week in.
+                propose=propose and not ahead_check,
             ),
         )
     if ahead and models and ctx.roster is not None:
@@ -402,7 +409,17 @@ def run_day(
             report,
             "next week",
             lambda: _next_week(
-                conn, manager, league_key, runtime, day, propose, report, ctx, models
+                conn,
+                manager,
+                league_key,
+                runtime,
+                day,
+                propose,
+                report,
+                ctx,
+                models,
+                search_ahead=ahead_search,
+                check_ahead=ahead_check,
             ),
         )
 
@@ -684,19 +701,38 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propo
     return plan
 
 
-def _next_week(conn, manager, league_key, runtime, day, propose, report, ctx, models):
-    """The week's last day: judge adds against the week to come.
+def _next_week(
+    conn,
+    manager,
+    league_key,
+    runtime,
+    day,
+    propose,
+    report,
+    ctx,
+    models,
+    search_ahead=False,
+    check_ahead=True,
+):
+    """The week's last days: judge adds with the week to come in view.
 
-    Acquisitions are counted per week and this week's expire tonight, while a
-    player added today plays all of the next. On 2026-10-03 and 04 two adds
-    were chosen - and approved - for the last two days of a lost week; against
-    the next week both cost categories (-0.32 and -0.12), because Gibson and
-    Malkin each had more games coming than the players replacing them.
+    A player added late in a week plays all of the next one. On 2026-10-03
+    and 04 two adds were chosen - and approved - for the last two days of a
+    lost week; against the next week both cost categories (-0.32 and -0.12),
+    because Gibson and Malkin each had more games coming than the players
+    replacing them.
 
-    So on the last `preload_days` the search prices against next week - its
-    opponent, its schedule, nothing banked - spending only what is left of
-    this week's acquisitions; the first run of the day searches, later ones
-    re-check whatever is waiting against next week the same way.
+    `check_ahead` (the default; `look_ahead_days`): anything still waiting
+    must pay over what is left of this week AND next week together - today's
+    games still count, and so does everything after. It only ever withdraws.
+
+    `search_ahead` (`preload_days`, off by default): the first run of the day
+    also searches against next week, spending this week's leftover
+    acquisitions. Measured in the add gate (12 teams x 22 weeks): +0.05 +/-
+    0.07 (2024-25) and -0.33 +/- 0.07 (2025-26) categories a week against the
+    plain weekly search, with ~20% more adds - it drops players who still play
+    on the week's last day, and Monday's search churns the new ones straight
+    back out. Kept for a manager who wants it, not on by default.
     """
     from puckpilot.draft.sim import build_universe
     from puckpilot.season import cli_support, pool
@@ -710,10 +746,15 @@ def _next_week(conn, manager, league_key, runtime, day, propose, report, ctx, mo
     terms = manager.authority.transactions
     used_week, used_season = adds_used(ctx.roster, ctx.week)
     left = None if runtime.max_weekly_adds is None else runtime.max_weekly_adds - used_week
-    search = propose and not pool_read_on(conn, league_key, day) and (left is None or left > 0)
+    search = (
+        search_ahead
+        and propose
+        and not pool_read_on(conn, league_key, day)
+        and (left is None or left > 0)
+    )
     waiting = (
         sorted(proposals_mod.pending(conn, manager.name, league_key), key=lambda p: p.id)
-        if propose and not search
+        if check_ahead and propose and not search and ctx.theirs is not None
         else []
     )
     if not search and not waiting:
@@ -743,6 +784,18 @@ def _next_week(conn, manager, league_key, runtime, day, propose, report, ctx, mo
     universe = build_universe(
         conn, runtime.nhl_season, _train_seasons(runtime.nhl_season), manager.league
     )
+    common = dict(
+        adds_used_week=used_week,
+        adds_used_season=used_season,
+        odds_model=OddsModel(),
+        add_scoring=terms.add_scoring,
+        playoff_reserve=terms.playoff_reserve,
+        stream_spots=terms.stream_spots,
+    )
+    pairs = [(add, drop) for _, add, drop in workable]
+    # Re-checks price every pair whatever it is worth (no floor); the
+    # combined total is judged afterwards, in `_recheck_both`.
+    no_floor = dict(min_gain=-1e9, min_expected_gain=-1e9, measure_room=False)
     plan = weekmod.build_week_plan(
         conn,
         runtime,
@@ -755,17 +808,15 @@ def _next_week(conn, manager, league_key, runtime, day, propose, report, ctx, mo
         universe.frame,
         goalies,
         values,
-        adds_used_week=used_week,
-        adds_used_season=used_season,
-        min_gain=terms.min_weekly_gain,
-        odds_model=OddsModel(),
-        add_scoring=terms.add_scoring,
-        min_expected_gain=terms.min_expected_gain,
-        playoff_reserve=terms.playoff_reserve,
-        stream_spots=terms.stream_spots,
         find_targets=search,
-        reprice=[(add, drop) for _, add, drop in workable] if waiting else None,
+        reprice=pairs if waiting else None,
         horizon="next week",
+        **common,
+        **(
+            no_floor
+            if waiting
+            else dict(min_gain=terms.min_weekly_gain, min_expected_gain=terms.min_expected_gain)
+        ),
     )
     expect = f" - expect {plan.expected:.1f} of {len(plan.outlook)}" if plan.expected else ""
     head = f"week {nxt.number} vs {m.opponent_name}{expect} as the roster stands"
@@ -790,7 +841,25 @@ def _next_week(conn, manager, league_key, runtime, day, propose, report, ctx, mo
         else:
             lines.append(f"nothing worth making{spare} - Monday's search starts fresh")
     else:
-        lines += _recheck(conn, workable, lapsed, plan, terms)
+        now_plan = weekmod.build_week_plan(
+            conn,
+            runtime,
+            manager.league,
+            ctx.week,
+            ctx.live.theirs.name if ctx.live is not None else "",
+            ctx.roster,
+            ctx.theirs,
+            [],
+            universe.frame,
+            goalies,
+            values,
+            find_targets=False,
+            reprice=pairs,
+            **common,
+            **no_floor,
+            **live_inputs(conn, runtime, ctx.week, ctx.live, day),
+        )
+        lines += _recheck_both(conn, workable, lapsed, now_plan, plan, terms)
     report.add("next week", True, head, lines)
     return plan
 
@@ -862,6 +931,59 @@ def _recheck(conn, workable, lapsed, plan, terms) -> list[str]:
         now = (t.gain if odds and t.gain is not None else t.score) if t is not None else 0.0
         unit = " categories expected" if odds else ""
         lapsed[p.id] = f"now worth {now:+.2f}{unit}, below the {floor:.2f} floor"
+    proposals_mod.refresh(conn, kept, lapsed)
+    lines += [f"#{pid} withdrawn: {why}" for pid, why in lapsed.items()]
+    return lines
+
+
+def _recheck_both(conn, workable, lapsed, now_plan, next_plan, terms) -> list[str]:
+    """A waiting add, late in a week: worth it over the rest of this week and
+    the next one together, or withdrawn with both numbers.
+
+    On 2026-10-04 at 11:02 #10 (Beniers for Gibson) was +0.25 for the day
+    that was left and -0.32 for the week after: kept by a this-week check,
+    withdrawn by this one.
+    """
+    from dataclasses import replace
+
+    odds = terms.add_scoring == "odds"
+    floor = terms.min_expected_gain if odds else terms.min_weekly_gain
+
+    def key(t):
+        return (t.player.player_key, t.drop.player_key if t.drop else "")
+
+    def worth(t) -> float:
+        if t is None:
+            return 0.0
+        return t.gain if odds and t.gain is not None else t.score
+
+    now = {key(t): t for t in (*now_plan.targets, *now_plan.lapsed)}
+    nxt = {key(t): t for t in (*next_plan.targets, *next_plan.lapsed)}
+    kept: dict[int, object] = {}
+    lapsed = dict(lapsed)
+    if now_plan.adds_left_week == 0:
+        lapsed.update({p.id: "no acquisitions left this week" for p, _, _ in workable})
+        workable = []
+    lines = []
+    for p, _, _ in workable:
+        pair = (p.add_player_key, p.drop_player_key)
+        t_now, t_next = now.get(pair), nxt.get(pair)
+        a, b = worth(t_now), worth(t_next)
+        both = f"{a:+.2f} for the rest of this week, {b:+.2f} next week"
+        if a + b >= floor and (t_now or t_next) is not None:
+            t = t_now or t_next
+            ahead = (
+                f"Next week too: {b:+.2f} categories expected - {p.add_name} "
+                f"{t_next.starts:g} starts, {p.drop_name} {t_next.drop_starts:g}"
+                if t_next is not None and p.drop_player_key
+                else f"Next week too: {b:+.2f} categories expected"
+            )
+            detail = dict(t.detail)
+            detail["week"] = [ahead, *detail.get("week", [])]
+            kept[p.id] = replace(t, detail=detail)
+            lines.append(f"#{p.id} {p.add_name} for {p.drop_name}: {both} - kept")
+            continue
+        lapsed[p.id] = f"{both} - {a + b:+.2f} together, below the {floor:.2f} floor"
     proposals_mod.refresh(conn, kept, lapsed)
     lines += [f"#{pid} withdrawn: {why}" for pid, why in lapsed.items()]
     return lines
