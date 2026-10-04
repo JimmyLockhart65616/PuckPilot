@@ -118,6 +118,7 @@ def propose(
     max_pending: int = 5,
     kind: str = "add_drop",
     supersede: bool = False,
+    horizon: str = "",
 ) -> list[Proposal]:
     """Record add/drop targets as pending proposals.
 
@@ -145,7 +146,7 @@ def propose(
                 # Kept, with today's reasons: the numbers move every day.
                 conn.execute(
                     "UPDATE waiver_proposals SET reason_json = ? WHERE id = ?",
-                    (json.dumps(_reason(t, week)), p.id),
+                    (json.dumps(_reason(t, week, horizon)), p.id),
                 )
     existing = _already_asked(conn, manager, league_key, week)
     # The cap is on what is awaiting a decision. A refusal from earlier this
@@ -160,7 +161,7 @@ def propose(
             continue
         if t.player.nhl_player_id is None:
             continue
-        reason = _reason(t, week)
+        reason = _reason(t, week, horizon)
         cur = conn.execute(
             "INSERT INTO waiver_proposals "
             "(manager, league_key, team_key, kind, add_pid, drop_pid, "
@@ -198,7 +199,7 @@ def refresh(conn: sqlite3.Connection, kept: dict[int, object], lapsed: dict[int,
         p = get(conn, pid)
         if not p.is_live:
             continue
-        reason = _reason(t, int(p.reason.get("week", 0)))
+        reason = _reason(t, int(p.reason.get("week", 0)), str(p.reason.get("horizon", "")))
         reason["checked_at"] = now
         conn.execute(
             "UPDATE waiver_proposals SET reason_json = ? WHERE id = ?", (json.dumps(reason), pid)
@@ -232,9 +233,9 @@ def withdrawn_since(
     return [_row_to_proposal(r) for r in rows]
 
 
-def _reason(t, week: int) -> dict:
+def _reason(t, week: int, horizon: str = "") -> dict:
     """What a proposal records about why it was made."""
-    return {
+    out = {
         "week": week,
         # `gain` is a share of the live gap under share pricing; under odds
         # pricing it is the change in expected categories (`expected_gain`).
@@ -252,6 +253,10 @@ def _reason(t, week: int) -> dict:
         # The reasons behind it, section -> lines (season/add_story.py).
         "detail": getattr(t, "detail", {}) or {},
     }
+    if horizon:
+        # Priced against another week than the one under way ("next week").
+        out["horizon"] = horizon
+    return out
 
 
 def _already_asked(conn: sqlite3.Connection, manager: str, league_key: str, week: int) -> set[str]:

@@ -519,3 +519,33 @@ def test_a_player_taken_or_a_drop_ruled_out_ends_the_proposal(db, monkeypatch):
     assert lapsed[taken.id] == "Taken is no longer available"
     assert lapsed[hurt.id].startswith("Drop Me is now NA")
     assert workable == []
+
+
+# -- the week's last day looks at the next one ---------------------------------------
+
+
+def test_the_last_day_of_a_week_prices_adds_against_the_next():
+    from puckpilot.season.run import preloads
+
+    rt = _rt([(1, "2026-09-29", "2026-10-04"), (2, "2026-10-05", "2026-10-11")])
+    assert preloads(rt, "2026-10-04", 1)  # Sunday
+    assert not preloads(rt, "2026-10-03", 1)  # Saturday, by default
+    assert preloads(rt, "2026-10-03", 2)  # if asked for two days
+    assert not preloads(rt, "2026-10-04", 0)  # switched off
+
+
+def test_the_last_week_of_the_calendar_has_nothing_to_prepare_for():
+    from puckpilot.season.run import preloads
+
+    rt = _rt([(1, "2026-09-29", "2026-10-04"), (2, "2026-10-05", "2026-10-11")])
+    assert not preloads(rt, "2026-10-11", 1)
+
+
+def test_preload_days_is_bounded():
+    import pytest
+
+    from puckpilot.season.authority import AuthorityError, TransactionAuthority
+
+    assert TransactionAuthority().preload_days == 1
+    with pytest.raises(AuthorityError, match="preload_days"):
+        TransactionAuthority(preload_days=7)

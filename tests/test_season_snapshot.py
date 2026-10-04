@@ -250,7 +250,7 @@ def test_a_proposals_reasons_reach_the_page_as_titled_sections(db):
     make(db, replace(target(), detail=detail))
     [p] = snapshot.build(db, "jimmy", "999.l.1", "T")["proposals"]
     # Reading order is fixed here, whatever order they were stored in.
-    assert [s["title"] for s in p["detail"]] == ["This week, day by day", "Rest of season"]
+    assert [s["title"] for s in p["detail"]] == ["Day by day", "Rest of season"]
     assert p["detail"][0]["lines"] == ["Mon 5: Add Me fills an empty C"]
 
 
@@ -281,3 +281,20 @@ def test_a_withdrawn_proposal_says_why_for_a_day(db):
     assert s["withdrawn"] == [
         {"add": "Marco Rossi", "drop": "Drop Me", "why": "Marco Rossi is no longer available"}
     ]
+
+
+def test_a_pickup_priced_for_next_week_says_next_week(db):
+    from dataclasses import replace
+
+    proposals_mod.propose(
+        db,
+        "jimmy",
+        "999.l.1",
+        "999.l.1.t.5",
+        [replace(target(), gain=0.31)],
+        week=2,
+        horizon="next week",
+    )
+    [p] = snapshot.build(db, "jimmy", "999.l.1", "T")["proposals"]
+    assert "+0.31 categories expected next week" in p["why"]
+    assert "+2 starts next week" in p["why"]

@@ -211,12 +211,16 @@ def _withdrawn(conn, manager: str, league_key: str) -> list[dict]:
 def _why(p) -> str:
     """The net effect, in the league's own units - not an abstract score."""
     bits = []
+    # Which week it was priced for: on a week's last day, the next one.
+    when = str(p.reason.get("horizon") or "this week")
     gain = p.reason.get("expected_gain")
     if gain is not None:
-        bits.append(f"+{float(gain):.2f} categories expected")
+        bits.append(
+            f"+{float(gain):.2f} categories expected" + ("" if when == "this week" else f" {when}")
+        )
     extra = p.reason.get("extra_starts")
     if extra is not None:
-        bits.append(f"{float(extra):+g} starts this week")
+        bits.append(f"{float(extra):+g} starts {when}")
     if p.reason.get("moved"):
         bits.append(str(p.reason["moved"]))
     return " · ".join(bits)

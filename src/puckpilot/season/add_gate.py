@@ -18,6 +18,10 @@ Any search arm takes a `-s<n>` suffix - `odds-weekly-s3` - to let the bottom
 `stream_spots`. Asked after week 1 of 2026-27, when 30-46 empty slot-games went
 with two adds proposed and the third acquisition unused.
 
+And a `-p<n>` suffix - `odds-weekly-p1` - searches on each week's last `n` days
+against the NEXT week (its opponent, its schedule), spending what is left of
+this week's acquisitions: the live run's `preload_days`.
+
 Every input is as-of the morning it is used: the value model and the goalie
 start model are clamped to that date (`AsOfValues`, `AsOfGoalieSource`), a
 player who has missed two straight team games is out until he plays again,
@@ -44,12 +48,20 @@ from puckpilot.season.calibration import _components, _result, drop_known_absenc
 ARMS = ("none", "share-weekly", "share-daily", "odds-weekly", "odds-daily", "goalie-odds")
 
 
-def split_arm(arm: str, stream_spots: int) -> tuple[str, int]:
-    """("odds-weekly-s3", 2) -> ("odds-weekly", 3); no suffix keeps the default."""
-    base, _, tail = arm.rpartition("-s")
-    if base and tail.isdigit():
-        return base, int(tail)
-    return arm, stream_spots
+def split_arm(arm: str, stream_spots: int, preload_days: int = 0) -> tuple[str, int, int]:
+    """("odds-weekly-s3-p1", 2) -> ("odds-weekly", 3, 1); a missing suffix keeps
+    the default."""
+    kind, spots, pre = arm, stream_spots, preload_days
+    while True:
+        base, _, tail = kind.rpartition("-")
+        if base and len(tail) > 1 and tail[0] in "sp" and tail[1:].isdigit():
+            if tail[0] == "s":
+                spots = int(tail[1:])
+            else:
+                pre = int(tail[1:])
+            kind = base
+            continue
+        return kind, spots, pre
 
 
 # Free agents offered to the search each morning, best projections first - the
@@ -338,7 +350,7 @@ def add_gate_report(
     tested = list(range(min(n_tested, len(rosters))))
     for t in tested:
         for arm in arms:
-            kind, spots = split_arm(arm, stream_spots)
+            kind, spots, pre = split_arm(arm, stream_spots)
             roster = list(rosters[t])
             adds_season = 0
             for wi, w in enumerate(weeks):
@@ -355,6 +367,75 @@ def add_gate_report(
                         kind.endswith("daily") or k == 0
                     )
                     cap_w = runtime.max_weekly_adds or 99
+                    # The week's last days: spend what is left on the next week.
+                    nxt_wi = wi + 1
+                    ahead = (
+                        pre > 0
+                        and k >= len(days) - pre
+                        and k > 0
+                        and nxt_wi < len(weeks)
+                        and kind not in ("none", "goalie-odds")
+                        and adds_week < cap_w
+                    )
+                    if ahead:
+                        nw = weeks[nxt_wi]
+                        nopp = next(
+                            (b if a == t else a for a, b in schedule[nxt_wi] if t in (a, b)), None
+                        )
+                        if nopp is not None and week_days.get(nw.number):
+                            ours = TeamRoster(
+                                league_key=runtime.league_key,
+                                team_key="us",
+                                date=date,
+                                players=tuple(rp(pid, i) for pid in roster),
+                            )
+                            theirs = TeamRoster(
+                                league_key=runtime.league_key,
+                                team_key="them",
+                                date=date,
+                                players=tuple(rp(pid, i) for pid in rosters[nopp]),
+                            )
+                            taken = frozen_pids | set(roster)
+                            pool = [
+                                fa(pid, i)
+                                for pid in by_value
+                                if pid not in taken and not out_on(pid, i)
+                            ][:POOL_SIZE]
+                            odds_arm = kind.startswith("odds")
+                            plan = build_week_plan(
+                                conn,
+                                runtime,
+                                league,
+                                nw,
+                                "opp",
+                                ours,
+                                theirs,
+                                pool,
+                                u.frame,
+                                AsOfGoalieSource(policy, date),
+                                AsOfValues(values, date),
+                                adds_used_week=adds_week,
+                                adds_used_season=adds_season,
+                                min_gain=min_gain,
+                                max_targets=cap_w,
+                                find_targets=True,
+                                odds_model=OddsModel() if odds_arm else None,
+                                add_scoring="odds" if odds_arm else "share",
+                                min_expected_gain=min_expected_gain,
+                                playoff_reserve=0,
+                                stream_spots=spots,
+                                measure_room=False,
+                            )
+                            for target in plan.targets:
+                                if adds_week >= cap_w:
+                                    break
+                                if target.drop is not None:
+                                    roster.remove(int(target.drop.player_key))
+                                roster.append(int(target.player.player_key))
+                                adds_week += 1
+                                adds_season += 1
+                                made[arm] += 1
+                        search = False
                     if search and adds_week < cap_w:
                         opp_done = days[:k]
                         ours = TeamRoster(
@@ -454,7 +535,7 @@ def add_gate_report(
     pairs += [
         (a, split_arm(a, stream_spots)[0]) for a in arms if split_arm(a, stream_spots)[0] != a
     ]
-    pairs = [(a, b) for a, b in pairs if b in arms]
+    pairs = [(a, b) for a, b in pairs if b in arms and a != b]
     for a, b in pairs:
         m, se = report.paired(a, b)
         verdict = "clears 2 SE" if se == se and m > 2 * se else "within noise"

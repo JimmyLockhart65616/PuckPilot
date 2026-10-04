@@ -871,3 +871,17 @@ def test_a_game_already_under_way_is_not_an_add_s_to_gain(db):
     [whole], _ = _reprice_for(db, roster, slots, pair)
     [evening], _ = _reprice_for(db, roster, slots, pair, exclude={"2026-10-05": {"TOR"}})
     assert evening.starts == whole.starts - 1
+
+
+def test_a_card_priced_for_next_week_says_so(db):
+    """On a week's last day the search prices against the next one, and the
+    reasons must not read as if they were about the week that is ending."""
+    [t, *_] = _targets_for(
+        db,
+        (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+        (("C", 2, 1), ("BN", 1, 0)),
+        horizon="next week",
+    )
+    week = t.detail["week"]
+    assert "slot-games empty over the 4 days of next week" in week[0]
+    assert "4 games next week, 4 in your lineup" in week[1]

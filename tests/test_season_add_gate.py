@@ -58,6 +58,8 @@ def test_banked_components_round_trip_through_yahoos_labels():
 def test_an_arm_can_name_its_own_stream_spots():
     from puckpilot.season.add_gate import split_arm
 
-    assert split_arm("odds-weekly-s3", 2) == ("odds-weekly", 3)
-    assert split_arm("odds-weekly", 2) == ("odds-weekly", 2)
-    assert split_arm("goalie-odds", 2) == ("goalie-odds", 2)
+    assert split_arm("odds-weekly-s3", 2) == ("odds-weekly", 3, 0)
+    assert split_arm("odds-weekly", 2) == ("odds-weekly", 2, 0)
+    assert split_arm("goalie-odds", 2) == ("goalie-odds", 2, 0)
+    assert split_arm("odds-weekly-s3-p1", 2) == ("odds-weekly", 3, 1)
+    assert split_arm("share-daily-p2", 2) == ("share-daily", 2, 2)

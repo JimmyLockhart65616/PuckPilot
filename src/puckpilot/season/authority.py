@@ -156,7 +156,15 @@ class TransactionAuthority:
     playoff_reserve: int = 6
     # Roster spots that rotate: only the players worth least over the rest of
     # the season may be dropped for a streamer (an upgrade can replace anyone).
+    # Measured 2 v 3 v 4 after week 1 (add gate, both seasons): neither 3 nor 4
+    # was positive in both and clear of noise, so it stays 2.
     stream_spots: int = 2
+    # The last days of a week on which adds are priced against the NEXT week,
+    # spending what is left of this week's acquisitions (they expire with the
+    # week; a player added on Sunday plays all of the next one). 1 = Sunday,
+    # 0 = never. Asked for on 2026-10-04, after two adds approved for a lost
+    # week's last two days turned out to cost categories the week after.
+    preload_days: int = 1
 
     def __post_init__(self) -> None:
         if self.add_scoring not in ADD_SCORING:
@@ -166,6 +174,8 @@ class TransactionAuthority:
             )
         if self.playoff_reserve < 0:
             raise AuthorityError("authority.transactions.playoff_reserve cannot be negative")
+        if not 0 <= self.preload_days <= 6:
+            raise AuthorityError("authority.transactions.preload_days must be between 0 and 6")
 
     @property
     def requires_approval(self) -> bool:
@@ -182,6 +192,12 @@ class TransactionAuthority:
             ),
             f"  at most {self.max_pending} awaiting your decision at once",
             f"  {self.playoff_reserve} acquisition(s) held back for the playoffs",
+            (
+                f"  on the week's last {self.preload_days} day(s), adds are judged against "
+                f"next week, spending this week's leftover acquisitions"
+                if self.preload_days
+                else "  adds are always judged against the current week"
+            ),
         ]
 
 

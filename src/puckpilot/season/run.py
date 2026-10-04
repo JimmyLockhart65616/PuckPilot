@@ -90,6 +90,25 @@ def starts_a_week(runtime, day: str) -> bool:
         return False
 
 
+def preloads(runtime, day: str, last_days: int) -> bool:
+    """Whether `day` is one of its week's last `last_days`, with a week after it.
+
+    Then what is left of this week's acquisitions is better spent on the next
+    week: they expire with this one, and a player added today plays all of the
+    next.
+    """
+    from puckpilot.season.settings import SettingsError
+
+    if last_days <= 0:
+        return False
+    try:
+        w = runtime.week(runtime.week_of(day))
+        runtime.week(w.number + 1)
+    except SettingsError:
+        return False
+    return day in w.dates()[-last_days:]
+
+
 def week_for(runtime, day: str):
     """The week `day` falls in, or the next one to start.
 
@@ -319,6 +338,11 @@ def run_day(
     week_plan = None
     if weekly is None:
         weekly = starts_a_week(runtime, day)
+    ahead = (
+        not weekly
+        and week is not None
+        and preloads(runtime, day, manager.authority.transactions.preload_days)
+    )
     if weekly and models:
         week_plan = _guard(
             report,
@@ -327,6 +351,7 @@ def run_day(
         )
     elif (
         models
+        and not ahead
         and week is not None
         and roster is not None
         and not pool_read_on(conn, league_key, day)
@@ -360,7 +385,24 @@ def run_day(
             report,
             "week",
             lambda: _outlook(
-                conn, manager, league_key, runtime, day, report, ctx, models, propose=propose
+                conn,
+                manager,
+                league_key,
+                runtime,
+                day,
+                report,
+                ctx,
+                models,
+                # On the week's last day the queue is judged against next week.
+                propose=propose and not ahead,
+            ),
+        )
+    if ahead and models and ctx.roster is not None:
+        _guard(
+            report,
+            "next week",
+            lambda: _next_week(
+                conn, manager, league_key, runtime, day, propose, report, ctx, models
             ),
         )
 
@@ -639,6 +681,117 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propo
     log_week(conn, manager.name, league_key, ctx.roster.team_key, plan, day)
     lines = _recheck(conn, workable, lapsed, plan, terms) if waiting else []
     report.add("week", True, _week_line(plan), lines)
+    return plan
+
+
+def _next_week(conn, manager, league_key, runtime, day, propose, report, ctx, models):
+    """The week's last day: judge adds against the week to come.
+
+    Acquisitions are counted per week and this week's expire tonight, while a
+    player added today plays all of the next. On 2026-10-03 and 04 two adds
+    were chosen - and approved - for the last two days of a lost week; against
+    the next week both cost categories (-0.32 and -0.12), because Gibson and
+    Malkin each had more games coming than the players replacing them.
+
+    So on the last `preload_days` the search prices against next week - its
+    opponent, its schedule, nothing banked - spending only what is left of
+    this week's acquisitions; the first run of the day searches, later ones
+    re-check whatever is waiting against next week the same way.
+    """
+    from puckpilot.draft.sim import build_universe
+    from puckpilot.season import cli_support, pool
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.fetch import fetch_matchups, fetch_roster
+    from puckpilot.season.matchups import current_or_next
+    from puckpilot.season.odds import OddsModel
+    from puckpilot.yahoo import playermap
+
+    nxt = runtime.week(ctx.week.number + 1)
+    terms = manager.authority.transactions
+    used_week, used_season = adds_used(ctx.roster, ctx.week)
+    left = None if runtime.max_weekly_adds is None else runtime.max_weekly_adds - used_week
+    search = propose and not pool_read_on(conn, league_key, day) and (left is None or left > 0)
+    waiting = (
+        sorted(proposals_mod.pending(conn, manager.name, league_key), key=lambda p: p.id)
+        if propose and not search
+        else []
+    )
+    if not search and not waiting:
+        return None
+    pmap = playermap.load_map(conn, league_key)
+    team_key = ctx.roster.team_key
+
+    def _read(session):
+        m = current_or_next(fetch_matchups(session, team_key), nxt.start)
+        if m is None:
+            return None
+        theirs = fetch_roster(session, m.opponent_key, nxt.start, player_map=pmap)
+        fa = (
+            pool.fetch_pool(session, league_key, "FA", limit=150, player_map=pmap) if search else []
+        )
+        return m, theirs, fa
+
+    got = cli_support.run_session(manager, _read)
+    if got is None:
+        report.add("next week", False, f"no matchup for week {nxt.number}")
+        return None
+    m, theirs, fa = got
+    if search:
+        pool.save_pool(conn, league_key, day, fa)
+    workable, lapsed = _workable(conn, manager, league_key, ctx, waiting) if waiting else ([], {})
+    values, goalies = models
+    universe = build_universe(
+        conn, runtime.nhl_season, _train_seasons(runtime.nhl_season), manager.league
+    )
+    plan = weekmod.build_week_plan(
+        conn,
+        runtime,
+        manager.league,
+        nxt,
+        m.opponent_name,
+        ctx.roster,
+        theirs,
+        fa,
+        universe.frame,
+        goalies,
+        values,
+        adds_used_week=used_week,
+        adds_used_season=used_season,
+        min_gain=terms.min_weekly_gain,
+        odds_model=OddsModel(),
+        add_scoring=terms.add_scoring,
+        min_expected_gain=terms.min_expected_gain,
+        playoff_reserve=terms.playoff_reserve,
+        stream_spots=terms.stream_spots,
+        find_targets=search,
+        reprice=[(add, drop) for _, add, drop in workable] if waiting else None,
+        horizon="next week",
+    )
+    expect = f" - expect {plan.expected:.1f} of {len(plan.outlook)}" if plan.expected else ""
+    head = f"week {nxt.number} vs {m.opponent_name}{expect} as the roster stands"
+    lines: list[str] = []
+    if search:
+        made = proposals_mod.propose(
+            conn,
+            manager.name,
+            league_key,
+            team_key,
+            plan.targets,
+            nxt.number,
+            max_pending=terms.max_pending,
+            supersede=True,
+            horizon="next week",
+        )
+        spare = "" if left is None else f" with this week's {left} leftover acquisition(s)"
+        if made:
+            lines += [p.describe() for p in made]
+        elif plan.targets:
+            lines.append("nothing new to propose")
+        else:
+            lines.append(f"nothing worth making{spare} - Monday's search starts fresh")
+    else:
+        lines += _recheck(conn, workable, lapsed, plan, terms)
+    report.add("next week", True, head, lines)
     return plan
 
 

@@ -47,10 +47,10 @@ LABELS = {
 LOW, HIGH = 0.10, 0.90
 # The order sections are shown in, with their headings.
 SECTIONS = (
-    ("week", "This week, day by day"),
+    ("week", "Day by day"),
     ("odds", "Category odds, before -> after"),
     ("profile", "Who they are"),
-    ("range", "Likely range this week (middle 80%)"),
+    ("range", "Likely range (middle 80%)"),
     ("per_game", "Projected per game"),
     ("season", "Rest of season"),
 )
@@ -73,6 +73,7 @@ def explain(
     season_left=None,
     prior=(),
     exclude=None,
+    horizon: str = "this week",
 ) -> dict[str, list[str]]:
     """section -> lines, for one add priced as `after` against `base`.
 
@@ -83,9 +84,9 @@ def explain(
     before = {d: _day_lineup(conn, runtime, d, base, goalie_source, values, exclude) for d in days}
     now = {d: _day_lineup(conn, runtime, d, after, goalie_source, values, exclude) for d in days}
     out: dict[str, list[str]] = {
-        "week": [open_slots_line(runtime, before)]
-        + week_lines(before, now, base, after, cand, drop),
-        "range": [range_line(cand, now, rates.get(cand.nhl_player_id) or {}, model)],
+        "week": [open_slots_line(runtime, before, horizon)]
+        + week_lines(before, now, base, after, cand, drop, horizon),
+        "range": [range_line(cand, now, rates.get(cand.nhl_player_id) or {}, model, horizon)],
         "per_game": [per_game_line(cand, rates.get(cand.nhl_player_id) or {})],
     }
     if prior:
@@ -95,7 +96,9 @@ def explain(
         )
         out["week"].insert(0, f"Assumes {swaps} is made too - priced on the roster that leaves.")
     if drop is not None:
-        out["range"].append(range_line(drop, before, rates.get(drop.nhl_player_id) or {}, model))
+        out["range"].append(
+            range_line(drop, before, rates.get(drop.nhl_player_id) or {}, model, horizon)
+        )
         out["per_game"].append(per_game_line(drop, rates.get(drop.nhl_player_id) or {}))
     if base_odds is not None and after_odds is not None:
         out["odds"] = odds_lines(base_odds, after_odds)
@@ -154,7 +157,12 @@ def _short(day: str) -> str:
     return _date.fromisoformat(day).strftime("%a %d").replace(" 0", " ")
 
 
-def open_slots_line(runtime, lineups: dict) -> str:
+def _span(days: str, horizon: str) -> str:
+    """ "the 5 days left" this week; "the 7 days of next week" ahead."""
+    return f"the {days} left" if horizon == "this week" else f"the {days} of {horizon}"
+
+
+def open_slots_line(runtime, lineups: dict, horizon: str = "this week") -> str:
     """How many starting slots the roster as it stands leaves empty this week."""
     shape = runtime.shape()
     skater_slots = [s for s in slot_instances(shape) if s != "G"]
@@ -175,7 +183,8 @@ def open_slots_line(runtime, lineups: dict) -> str:
     days = _plural(len(lineups), "day")
     if not total:
         return (
-            f"Your lineup has no empty slots over the {days} left - an add must displace someone."
+            f"Your lineup has no empty slots over {_span(days, horizon)} - "
+            f"an add must displace someone."
         )
     order = ["C", "L", "R", "D", "UTIL", "G"]
     parts = ", ".join(
@@ -183,11 +192,14 @@ def open_slots_line(runtime, lineups: dict) -> str:
         for s in sorted(empty, key=lambda s: order.index(s) if s in order else 9)
     )
     return (
-        f"Your lineup as it stands leaves {total} slot-games empty over the {days} left ({parts})."
+        f"Your lineup as it stands leaves {total} slot-games empty over "
+        f"{_span(days, horizon)} ({parts})."
     )
 
 
-def week_lines(before: dict, after: dict, base, roster_after, cand, drop) -> list[str]:
+def week_lines(
+    before: dict, after: dict, base, roster_after, cand, drop, horizon: str = "this week"
+) -> list[str]:
     """One line per remaining day: what the swap changes in that day's lineup."""
     names = {p.player_key: p.name for p in list(base) + list(roster_after)}
     key = cand.player_key
@@ -223,7 +235,8 @@ def week_lines(before: dict, after: dict, base, roster_after, cand, drop) -> lis
                 bits.append(f"{drop.name} loses a {b_g[drop_key]:.0%} chance to start in goal")
         if bits:
             lines.append(f"{_short(day)}: " + "; ".join(bits))
-    head = f"{cand.name}: {_plural(games, 'game')} left this week, {in_lineup} in your lineup"
+    when = "left this week" if horizon == "this week" else horizon
+    head = f"{cand.name}: {_plural(games, 'game')} {when}, {in_lineup} in your lineup"
     if not lines:
         return [head, "Neither plays again this week."]
     return [head] + lines
@@ -261,7 +274,7 @@ def _mixed(p_starts: list[float], per_start: np.ndarray) -> np.ndarray:
     return dist
 
 
-def range_line(player, lineups: dict, rates: dict, model) -> str:
+def range_line(player, lineups: dict, rates: dict, model, horizon: str = "this week") -> str:
     """ "Rossi, 4 starts: SOG 6-14, P 1-4, ..." - the middle 80% of his week.
 
     Skaters: games in the lineup, each played with the model's P(play), with
@@ -276,7 +289,7 @@ def range_line(player, lineups: dict, rates: dict, model) -> str:
         n = sum(p_starts)
         who = f"{player.name}, {n:.1f} expected starts"
         if not p_starts:
-            return f"{player.name}: no starts left this week"
+            return f"{player.name}: no starts {_left(horizon)}"
         w = min(max(rates.get("wins", 0.0), 0.0), 1.0)
         lo, hi = _quantiles(trials_pmf([p * w for p in p_starts]))
         bits = [f"W {lo}-{hi}"]
@@ -288,7 +301,7 @@ def range_line(player, lineups: dict, rates: dict, model) -> str:
     starts = sum(1 for sk, _, _ in lineups.values() if key in sk)
     who = f"{player.name}, {_plural(starts, 'start')}"
     if not starts:
-        return f"{player.name}: no starts left this week"
+        return f"{player.name}: no starts {_left(horizon)}"
     bits = []
     for k in RANGE_KEYS:
         mean = rates.get(k, 0.0) * starts * model.p_play
@@ -302,6 +315,10 @@ def range_line(player, lineups: dict, rates: dict, model) -> str:
         lo, hi = _quantiles(pmf)
         bits.append(f"{LABELS[k]} {lo}-{hi}")
     return f"{who}: " + (", ".join(bits) if bits else "little in any category")
+
+
+def _left(horizon: str) -> str:
+    return "left this week" if horizon == "this week" else horizon
 
 
 def per_game_line(player, rates: dict) -> str:

@@ -682,6 +682,7 @@ def build_week_plan(
     stream_spots: int = 2,
     measure_room: bool = True,
     reprice=None,
+    horizon: str = "this week",
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -863,6 +864,7 @@ def build_week_plan(
             days=days,
             odds_ctx=ctx,
             exclude=exclude,
+            horizon=horizon,
         )
     elif find_targets and days and not holding:
         targets = _targets(
@@ -887,6 +889,7 @@ def build_week_plan(
             ),
             stream_spots=stream_spots,
             exclude=exclude,
+            horizon=horizon,
         )
 
     return WeekPlan(
@@ -940,6 +943,7 @@ def _targets(
     adds_left: int | None = None,
     stream_spots: int = 2,
     exclude: dict[str, set[str]] | None = None,
+    horizon: str = "this week",
 ) -> tuple[AddTarget, ...]:
     """Adds that move a category in play, priced by re-slotting the actual week.
 
@@ -1087,6 +1091,7 @@ def _targets(
                 season_left,
                 chosen,
                 exclude,
+                horizon,
             ),
         )
         chosen.append(best)
@@ -1121,6 +1126,7 @@ def _reprice(
     days: list[str] | None = None,
     odds_ctx: OddsContext | None = None,
     exclude: dict[str, set[str]] | None = None,
+    horizon: str = "this week",
 ) -> tuple[tuple[AddTarget, ...], tuple[AddTarget, ...]]:
     """(still pays, no longer pays) for swaps already proposed, priced as the
     search would price them today.
@@ -1176,6 +1182,7 @@ def _reprice(
                 season_left,
                 kept,
                 exclude,
+                horizon,
             ),
         )
         kept.append(t)
@@ -1289,6 +1296,7 @@ def _explain(
     season_left,
     prior=(),
     exclude=None,
+    horizon="this week",
 ) -> dict:
     """The chosen add's reasons, from the numbers it was priced with."""
     from puckpilot.season import add_story
@@ -1312,6 +1320,7 @@ def _explain(
         season_left=season_left,
         prior=prior,
         exclude=exclude,
+        horizon=horizon,
     )
 
 
