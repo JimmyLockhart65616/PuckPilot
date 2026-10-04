@@ -180,7 +180,13 @@ class TransactionAuthority:
     # Monday - asked for after week 1. None = off: mid-week, the search runs
     # only when a roster spot opens. A mid-week move must clear this many
     # expected categories, not `min_expected_gain` - a plain daily search
-    # churned too much to beat once a week.
+    # churned too much to beat once a week. Measured at 0.25 with the horizon
+    # and no search on the look-ahead day (add gate `odds-daily-h-f25-x1`, 4
+    # drafts x 2 seasons, against the weekly search alone): ahead in 6 of 8
+    # leagues, clearly in 4, none clearly behind (worst -0.13 +/- 0.07);
+    # pooled +0.12 +/- 0.02 categories a week, ~6 more adds a season. Not
+    # positive in both seasons for any one draft, so the default waits on the
+    # manager; the evidence says turn it on.
     mid_week_floor: float | None = None
     # A mid-week move must also pay over the next week, the two together
     # clearing `mid_week_floor` - a pickup that only lasts until Sunday costs
