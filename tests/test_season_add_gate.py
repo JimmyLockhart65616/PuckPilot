@@ -55,11 +55,23 @@ def test_banked_components_round_trip_through_yahoos_labels():
     assert back["toi_hours"] == 5.0
 
 
-def test_an_arm_can_name_its_own_stream_spots():
-    from puckpilot.season.add_gate import split_arm
+def test_an_arm_names_its_options():
+    import pytest
 
-    assert split_arm("odds-weekly-s3", 2) == ("odds-weekly", 3, 0)
-    assert split_arm("odds-weekly", 2) == ("odds-weekly", 2, 0)
-    assert split_arm("goalie-odds", 2) == ("goalie-odds", 2, 0)
-    assert split_arm("odds-weekly-s3-p1", 2) == ("odds-weekly", 3, 1)
-    assert split_arm("share-daily-p2", 2) == ("share-daily", 2, 2)
+    from puckpilot.season.add_gate import parse_arm
+
+    plain = parse_arm("odds-weekly", 2)
+    assert (plain.kind, plain.spots, plain.preload, plain.queue) == ("odds-weekly", 2, 0, 0)
+    assert parse_arm("odds-weekly-s3", 2).spots == 3
+    assert parse_arm("goalie-odds", 2).kind == "goalie-odds"
+    combo = parse_arm("odds-daily-h-f25-q1", 2)
+    assert (combo.kind, combo.horizon, combo.mid_floor, combo.queue) == (
+        "odds-daily",
+        True,
+        0.25,
+        1,
+    )
+    with pytest.raises(ValueError, match="unknown option"):
+        parse_arm("odds-weekly-zz", 2)
+    with pytest.raises(ValueError, match="unknown arm"):
+        parse_arm("weekly-odds", 2)

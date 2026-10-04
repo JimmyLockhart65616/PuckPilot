@@ -554,7 +554,7 @@ def test_the_look_ahead_is_on_and_the_measured_worse_search_is_off():
         TransactionAuthority(look_ahead_days=-1)
 
 
-def _both(db, now_gain, next_gain):
+def _both(db, now_gain, next_gain, playing_today=frozenset()):
     from dataclasses import replace
     from types import SimpleNamespace
 
@@ -570,8 +570,28 @@ def _both(db, now_gain, next_gain):
         targets=(replace(t, gain=next_gain, score=next_gain),), lapsed=(), adds_left_week=3
     )
     terms = SimpleNamespace(add_scoring="odds", min_expected_gain=0.1, min_weekly_gain=0.25)
-    lines = _recheck_both(db, [(p, None, None)], {}, now, nxt, terms)
+    lines = _recheck_both(
+        db, [(p, None, t.drop)], {}, now, nxt, terms, playing_today=frozenset(playing_today)
+    )
     return p, lines
+
+
+def test_a_move_whose_drop_plays_today_is_queued_and_judged_on_next_week(db):
+    """Yahoo will not drop a player who has played that day (Error #174), and
+    dropping him before his game gives it away: the move waits for the unlock,
+    so today's value does not count - only next week's."""
+    from puckpilot.season import proposals
+
+    # "Drop Me" plays for MTL, and MTL plays today.
+    p, _ = _both(db, 0.40, 0.05, playing_today={"MTL"})
+    assert (
+        proposals.get(db, p.id)
+        .reason["withdrawn"]
+        .startswith("+0.05 next week (queued - Drop Me plays today)")
+    )
+    p2, _ = _both(db, 0.0, 0.30, playing_today={"MTL"})
+    [live] = proposals.pending(db, "jimmy")
+    assert "queued - make it after tonight's games, once rosters unlock" in live.reason["timing"]
 
 
 def test_a_late_add_that_hurts_next_week_is_withdrawn_with_both_numbers(db):

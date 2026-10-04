@@ -1632,6 +1632,7 @@ def _cmd_season_add_gate(args: argparse.Namespace) -> int:
             seed=args.seed,
             arms=tuple(args.arms.split(",")) if args.arms else ARMS,
             progress=print if args.verbose else None,
+            versus=args.versus,
         )
         print()
         print(report.text)
@@ -2537,6 +2538,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_ag.add_argument("--teams", type=int, default=12)
     s_ag.add_argument("--seed", type=int, default=20261)
     s_ag.add_argument("--arms", default="", help="comma list; default all")
+    s_ag.add_argument("--versus", default="", help="compare every arm with this one")
     s_ag.add_argument("--verbose", action="store_true")
     s_ag.set_defaults(func=_cmd_season_add_gate)
 

@@ -22,6 +22,19 @@ And a `-p<n>` suffix - `odds-weekly-p1` - searches on each week's last `n` days
 against the NEXT week (its opponent, its schedule), spending what is left of
 this week's acquisitions: the live run's `preload_days`.
 
+Asked for after week 1, and tested the same way:
+
+    -q<n>    the same search, but a move whose drop plays that day waits for the
+             rosters to unlock after the day's games (and so counts against
+             the next week's acquisitions); one whose drop is idle is made at
+             once from what is left of this week's
+    -h       a MID-WEEK move must pay over the rest of this week and the next
+             one together (daily arms; Monday's search is unchanged)
+    -f<nn>   a mid-week move must clear nn hundredths of a category, not the
+             usual floor (daily arms)
+
+`versus` compares every arm with one named arm - the live baseline.
+
 Every input is as-of the morning it is used: the value model and the goalie
 start model are clamped to that date (`AsOfValues`, `AsOfGoalieSource`), a
 player who has missed two straight team games is out until he plays again,
@@ -48,20 +61,59 @@ from puckpilot.season.calibration import _components, _result, drop_known_absenc
 ARMS = ("none", "share-weekly", "share-daily", "odds-weekly", "odds-daily", "goalie-odds")
 
 
-def split_arm(arm: str, stream_spots: int, preload_days: int = 0) -> tuple[str, int, int]:
-    """("odds-weekly-s3-p1", 2) -> ("odds-weekly", 3, 1); a missing suffix keeps
-    the default."""
-    kind, spots, pre = arm, stream_spots, preload_days
-    while True:
-        base, _, tail = kind.rpartition("-")
-        if base and len(tail) > 1 and tail[0] in "sp" and tail[1:].isdigit():
-            if tail[0] == "s":
-                spots = int(tail[1:])
+@dataclass
+class ArmSpec:
+    """One arm: a base policy, and what its suffixes change about it."""
+
+    kind: str
+    spots: int = 2  # -sN: the bottom N by rest-of-season value may be dropped
+    preload: int = 0  # -pN: last N days search next week; moves made at once
+    # -qN: last N days search next week; a move whose drop plays that day waits
+    # for the rosters to unlock after the day's games (and counts next week).
+    queue: int = 0
+    horizon: bool = False  # -h: a mid-week move must pay over this week's rest + next week
+    mid_floor: float | None = None  # -fNN: mid-week bar, in hundredths of a category
+
+
+def _swap(roster: list[int], target) -> None:
+    if target.drop is not None:
+        roster.remove(int(target.drop.player_key))
+    roster.append(int(target.player.player_key))
+
+
+def _pair(target) -> tuple[str, str]:
+    return (target.player.player_key, target.drop.player_key if target.drop else "")
+
+
+def _worth(target) -> float:
+    return target.gain if target.gain is not None else target.score
+
+
+def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
+    """ "odds-daily-h-f25" -> odds-daily, horizon on, mid-week floor 0.25."""
+    base = next(
+        (b for b in sorted(ARMS, key=len, reverse=True) if arm == b or arm.startswith(b + "-")),
+        None,
+    )
+    if base is None:
+        raise ValueError(f"unknown arm {arm!r}")
+    spec = ArmSpec(kind=base, spots=stream_spots)
+    for tok in arm[len(base) :].split("-")[1:]:
+        if tok == "h":
+            spec.horizon = True
+        elif len(tok) > 1 and tok[0] in "spqf" and tok[1:].isdigit():
+            n = int(tok[1:])
+            if tok[0] == "s":
+                spec.spots = n
+            elif tok[0] == "p":
+                spec.preload = n
+            elif tok[0] == "q":
+                spec.queue = n
             else:
-                pre = int(tail[1:])
-            kind = base
-            continue
-        return kind, spots, pre
+                spec.mid_floor = n / 100
+        else:
+            raise ValueError(f"unknown option {tok!r} in arm {arm!r}")
+    return spec
 
 
 # Free agents offered to the search each morning, best projections first - the
@@ -137,6 +189,7 @@ def add_gate_report(
     min_expected_gain: float = 0.1,
     stream_spots: int = 2,
     progress: Callable[[str], None] | None = None,
+    versus: str = "",
 ) -> AddGateReport:
     from puckpilot.draft.engine import RosterValuePolicy
     from puckpilot.draft.h2h import round_robin_schedule
@@ -350,15 +403,20 @@ def add_gate_report(
     tested = list(range(min(n_tested, len(rosters))))
     for t in tested:
         for arm in arms:
-            kind, spots, pre = split_arm(arm, stream_spots)
+            spec = parse_arm(arm, stream_spots)
+            kind, spots = spec.kind, spec.spots
+            last_n = max(spec.preload, spec.queue)
             roster = list(rosters[t])
             adds_season = 0
+            # Moves queued at the end of a week for the rosters' unlock are made
+            # the next morning, so they count against the week that starts then.
+            carry = 0
             for wi, w in enumerate(weeks):
                 days = week_days[w.number]
                 opp = next((b if a == t else a for a, b in schedule[wi] if t in (a, b)), None)
                 if opp is None or not days:
                     continue
-                adds_week = 0
+                adds_week, carry = carry, 0
                 sk = np.zeros(len(skater_keys))
                 g = np.zeros(G_WIDTH)
                 for k, i in enumerate(days):
@@ -367,15 +425,16 @@ def add_gate_report(
                         kind.endswith("daily") or k == 0
                     )
                     cap_w = runtime.max_weekly_adds or 99
-                    # The week's last days: spend what is left on the next week.
+                    # The week's last days: prepare for the next one.
                     nxt_wi = wi + 1
+                    queued: list = []
                     ahead = (
-                        pre > 0
-                        and k >= len(days) - pre
+                        last_n > 0
+                        and k >= len(days) - last_n
                         and k > 0
                         and nxt_wi < len(weeks)
                         and kind not in ("none", "goalie-odds")
-                        and adds_week < cap_w
+                        and (adds_week < cap_w or (spec.queue > 0 and carry < cap_w))
                     )
                     if ahead:
                         nw = weeks[nxt_wi]
@@ -414,7 +473,8 @@ def add_gate_report(
                                 u.frame,
                                 AsOfGoalieSource(policy, date),
                                 AsOfValues(values, date),
-                                adds_used_week=adds_week,
+                                # Queued moves are paid for next week, not now.
+                                adds_used_week=0 if spec.queue else adds_week,
                                 adds_used_season=adds_season,
                                 min_gain=min_gain,
                                 max_targets=cap_w,
@@ -427,12 +487,21 @@ def add_gate_report(
                                 measure_room=False,
                             )
                             for target in plan.targets:
-                                if adds_week >= cap_w:
-                                    break
-                                if target.drop is not None:
-                                    roster.remove(int(target.drop.player_key))
-                                roster.append(int(target.player.player_key))
-                                adds_week += 1
+                                drop = target.drop
+                                plays = drop is not None and teams.get(
+                                    int(drop.player_key), [""] * n_days
+                                )[i] in plays_on.get(i, set())
+                                if spec.queue and (plays or adds_week >= cap_w):
+                                    # His last game of the week comes first.
+                                    if carry >= cap_w:
+                                        continue
+                                    queued.append(target)
+                                    carry += 1
+                                else:
+                                    if adds_week >= cap_w:
+                                        break
+                                    _swap(roster, target)
+                                    adds_week += 1
                                 adds_season += 1
                                 made[arm] += 1
                         search = False
@@ -464,6 +533,12 @@ def add_gate_report(
                             skater_keys,
                         )
                         odds_arm = kind.startswith("odds")
+                        mid = k > 0
+                        floor_now = (
+                            spec.mid_floor
+                            if mid and spec.mid_floor is not None
+                            else min_expected_gain
+                        )
                         plan = build_week_plan(
                             conn,
                             runtime,
@@ -486,17 +561,60 @@ def add_gate_report(
                             find_targets=True,
                             odds_model=OddsModel() if odds_arm else None,
                             add_scoring="odds" if odds_arm else "share",
-                            min_expected_gain=min_expected_gain,
+                            min_expected_gain=floor_now,
                             playoff_reserve=0,
                             stream_spots=spots,
                             measure_room=False,
                         )
-                        for target in plan.targets:
+                        targets = list(plan.targets)
+                        nopp = (
+                            next(
+                                (b if a == t else a for a, b in schedule[nxt_wi] if t in (a, b)),
+                                None,
+                            )
+                            if nxt_wi < len(weeks)
+                            else None
+                        )
+                        if mid and spec.horizon and targets and nopp is not None:
+                            # A mid-week move must pay over the rest of this
+                            # week and the next one together.
+                            nplan = build_week_plan(
+                                conn,
+                                runtime,
+                                league,
+                                weeks[nxt_wi],
+                                "opp",
+                                ours,
+                                TeamRoster(
+                                    league_key=runtime.league_key,
+                                    team_key="them",
+                                    date=date,
+                                    players=tuple(rp(pid, i) for pid in rosters[nopp]),
+                                ),
+                                [],
+                                u.frame,
+                                AsOfGoalieSource(policy, date),
+                                AsOfValues(values, date),
+                                find_targets=False,
+                                reprice=[(x.player, x.drop) for x in targets],
+                                odds_model=OddsModel() if odds_arm else None,
+                                add_scoring="odds" if odds_arm else "share",
+                                min_gain=-1e9,
+                                min_expected_gain=-1e9,
+                                playoff_reserve=0,
+                                stream_spots=spots,
+                                measure_room=False,
+                            )
+                            later = {_pair(x): _worth(x) for x in (*nplan.targets, *nplan.lapsed)}
+                            targets = [
+                                x
+                                for x in targets
+                                if _worth(x) + later.get(_pair(x), 0.0) >= floor_now
+                            ]
+                        for target in targets:
                             if adds_week >= cap_w:
                                 break
-                            if target.drop is not None:
-                                roster.remove(int(target.drop.player_key))
-                            roster.append(int(target.player.player_key))
+                            _swap(roster, target)
                             adds_week += 1
                             adds_season += 1
                             made[arm] += 1
@@ -505,6 +623,9 @@ def add_gate_report(
                     else:
                         assigned = lineup(roster, i)
                     realise(assigned, i, sk, g)
+                    # After the day's games the rosters unlock: queued moves are made.
+                    for target in queued:
+                        _swap(roster, target)
                 ours_final = _components(sk, g, skater_keys)
                 theirs_final = _components(
                     sk_day[opp, days].sum(0), g_day[opp, days].sum(0), skater_keys
@@ -532,13 +653,20 @@ def add_gate_report(
         pairs.append(("odds-daily", "odds-weekly"))
     if "odds-weekly" in arms and "share-weekly" in arms:
         pairs.append(("odds-weekly", "share-weekly"))
-    pairs += [
-        (a, split_arm(a, stream_spots)[0]) for a in arms if split_arm(a, stream_spots)[0] != a
-    ]
-    pairs = [(a, b) for a, b in pairs if b in arms and a != b]
+    pairs += [(a, parse_arm(a, stream_spots).kind) for a in arms]
+    if versus:
+        pairs += [(a, versus) for a in arms]
+    pairs = [(a, b) for a, b in dict.fromkeys(pairs) if b in arms and a != b]
     for a, b in pairs:
         m, se = report.paired(a, b)
-        verdict = "clears 2 SE" if se == se and m > 2 * se else "within noise"
+        # Both ways: a loss clear of noise is a finding too - 2025-26's -0.33
+        # +/- 0.07 for the Sunday search was once labelled "within noise".
+        if se == se and m > 2 * se:
+            verdict = "clears 2 SE"
+        elif se == se and m < -2 * se:
+            verdict = "WORSE by more than 2 SE"
+        else:
+            verdict = "within noise"
         lines.append(f"{a} - {b}: {m:+.3f} +/- {se:.3f}  ({verdict})")
     report.text = "\n".join(lines)
     return report

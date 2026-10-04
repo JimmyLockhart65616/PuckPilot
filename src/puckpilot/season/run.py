@@ -859,7 +859,17 @@ def _next_week(
             **no_floor,
             **live_inputs(conn, runtime, ctx.week, ctx.live, day),
         )
-        lines += _recheck_both(conn, workable, lapsed, now_plan, plan, terms)
+        from puckpilot.season import calendar
+
+        lines += _recheck_both(
+            conn,
+            workable,
+            lapsed,
+            now_plan,
+            plan,
+            terms,
+            playing_today=calendar.teams_playing(conn, day, runtime.nhl_season),
+        )
     report.add("next week", True, head, lines)
     return plan
 
@@ -936,13 +946,21 @@ def _recheck(conn, workable, lapsed, plan, terms) -> list[str]:
     return lines
 
 
-def _recheck_both(conn, workable, lapsed, now_plan, next_plan, terms) -> list[str]:
+def _recheck_both(
+    conn, workable, lapsed, now_plan, next_plan, terms, playing_today=frozenset()
+) -> list[str]:
     """A waiting add, late in a week: worth it over the rest of this week and
     the next one together, or withdrawn with both numbers.
 
     On 2026-10-04 at 11:02 #10 (Beniers for Gibson) was +0.25 for the day
     that was left and -0.32 for the week after: kept by a this-week check,
     withdrawn by this one.
+
+    A move whose drop plays today is queued until the rosters unlock: Yahoo
+    refuses to drop a player who has played that day ("A player has already
+    played and is no longer editable for today", Error #174), and dropping him
+    before his game gives the game away. So it changes nothing this week - it
+    is worth next week alone, and counts against next week's acquisitions.
     """
     from dataclasses import replace
 
@@ -965,12 +983,27 @@ def _recheck_both(conn, workable, lapsed, now_plan, next_plan, terms) -> list[st
         lapsed.update({p.id: "no acquisitions left this week" for p, _, _ in workable})
         workable = []
     lines = []
-    for p, _, _ in workable:
+    for p, _, drop in workable:
         pair = (p.add_player_key, p.drop_player_key)
         t_now, t_next = now.get(pair), nxt.get(pair)
-        a, b = worth(t_now), worth(t_next)
-        both = f"{a:+.2f} for the rest of this week, {b:+.2f} next week"
-        if a + b >= floor and (t_now or t_next) is not None:
+        queued = drop is not None and drop.team in playing_today
+        a, b = (0.0 if queued else worth(t_now)), worth(t_next)
+        both = (
+            f"{b:+.2f} next week (queued - {p.drop_name} plays today)"
+            if queued
+            else f"{a:+.2f} for the rest of this week, {b:+.2f} next week"
+        )
+        if a + b >= floor and queued and t_next is not None:
+            # Its reasons are next week's, and so is its timing.
+            kept[p.id] = replace(
+                t_next,
+                timing=f"{t_next.timing}; queued - make it after tonight's games, once rosters "
+                f"unlock ({p.drop_name} plays today, and Yahoo locks a player for the day "
+                f"once he has played)",
+            )
+            lines.append(f"#{p.id} {p.add_name} for {p.drop_name}: {both} - kept")
+            continue
+        if a + b >= floor and not queued and (t_now or t_next) is not None:
             t = t_now or t_next
             ahead = (
                 f"Next week too: {b:+.2f} categories expected - {p.add_name} "
