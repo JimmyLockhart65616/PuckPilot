@@ -318,3 +318,24 @@ def test_a_search_that_drops_a_proposal_says_so(db):
     [p] = make(db, target())
     make(db, target(name="Other", key="p.other", pid=9002), supersede=True)
     assert proposals.get(db, p.id).reason["withdrawn"] == "a newer search no longer proposes it"
+
+
+def test_an_approved_move_can_be_cancelled_and_then_never_executed(db):
+    [p] = make(db, target())
+    proposals.decide(db, p.id, True)
+    gone = proposals.cancel(db, p.id, "worse for next week (-0.32 categories)")
+    assert gone.status == REJECTED
+    assert gone.reason["cancelled"] == "worse for next week (-0.32 categories)"
+    with pytest.raises(ProposalError, match="not approved"):
+        proposals.take_for_execution(db, p.id)
+    # Shown with its reason, like any withdrawal.
+    [shown] = proposals.withdrawn_since(db, "jimmy", "999.l.1", "2000-01-01")
+    assert shown.reason["withdrawn"].startswith("cancelled - worse for next week")
+
+
+def test_a_made_move_cannot_be_cancelled(db):
+    [p] = make(db, target())
+    proposals.decide(db, p.id, True)
+    proposals.mark_executed(db, p.id, "made")
+    with pytest.raises(ProposalError, match="nothing to cancel"):
+        proposals.cancel(db, p.id, "too late")

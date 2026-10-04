@@ -1764,10 +1764,12 @@ def _cmd_season_proposals(args: argparse.Namespace) -> int:
             print(proposals.decide(conn, pid, True).describe())
         for pid in args.reject or []:
             print(proposals.decide(conn, pid, False).describe())
+        for pid in args.cancel or []:
+            print(proposals.cancel(conn, pid, args.why).describe())
     except proposals.ProposalError as e:
         print(f"puckpilot: {e}")
         return 2
-    if args.approve or args.reject:
+    if args.approve or args.reject or args.cancel:
         return 0
 
     rows = proposals.listing(conn, manager.name, league_key, status=args.status)
@@ -2603,6 +2605,10 @@ def build_parser() -> argparse.ArgumentParser:
     s_prop.add_argument("--status", default=None, help="pending / approved / rejected / executed")
     s_prop.add_argument("--approve", type=int, nargs="*", metavar="ID")
     s_prop.add_argument("--reject", type=int, nargs="*", metavar="ID")
+    s_prop.add_argument(
+        "--cancel", type=int, nargs="*", metavar="ID", help="Call off a waiting or approved move"
+    )
+    s_prop.add_argument("--why", default="cancelled by you", help="Reason recorded with --cancel")
     s_prop.set_defaults(func=_cmd_season_proposals)
 
     s_proto = season_sub.add_parser(

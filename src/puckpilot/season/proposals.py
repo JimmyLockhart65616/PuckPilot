@@ -222,11 +222,12 @@ def _withdraw(conn: sqlite3.Connection, p: Proposal, why: str, now: str) -> None
 def withdrawn_since(
     conn: sqlite3.Connection, manager: str, league_key: str, since: str
 ) -> list[Proposal]:
-    """Proposals withdrawn undecided since `since` (UTC ISO), newest first."""
+    """Proposals withdrawn or cancelled since `since` (UTC ISO), newest first."""
     rows = conn.execute(
         "SELECT * FROM waiver_proposals WHERE manager = ? AND league_key = ? "
-        "AND status = ? AND superseded_at IS NOT NULL AND superseded_at >= ? ORDER BY id DESC",
-        (manager, league_key, PENDING, since),
+        "AND status IN (?, ?) AND superseded_at IS NOT NULL AND superseded_at >= ? "
+        "ORDER BY id DESC",
+        (manager, league_key, PENDING, REJECTED, since),
     )
     return [_row_to_proposal(r) for r in rows]
 
@@ -312,6 +313,30 @@ def decide(conn: sqlite3.Connection, proposal_id: int, approve: bool) -> Proposa
     conn.execute(
         "UPDATE waiver_proposals SET status = ?, decided_at = ? WHERE id = ?",
         (APPROVED if approve else REJECTED, _now(), proposal_id),
+    )
+    conn.commit()
+    return get(conn, proposal_id)
+
+
+def cancel(conn: sqlite3.Connection, proposal_id: int, why: str) -> Proposal:
+    """Call off a move that is waiting or approved but not yet made.
+
+    A person's instruction, carried out: on 2026-10-04 two adds approved for
+    the week's last two days were to be judged against the next week instead,
+    and cancelled if they did not hold up there - both cost categories. It
+    ends as rejected, so nothing can execute it, with the reason kept and shown
+    on the page for a day like any withdrawal. A move already made cannot be
+    cancelled here; only another move undoes it.
+    """
+    p = get(conn, proposal_id)
+    if p.status not in (PENDING, APPROVED):
+        raise ProposalError(f"proposal #{proposal_id} is {p.status} - nothing to cancel")
+    now = _now()
+    reason = {**p.reason, "cancelled": why, "withdrawn": f"cancelled - {why}"}
+    conn.execute(
+        "UPDATE waiver_proposals SET status = ?, decided_at = ?, superseded_at = ?, "
+        "reason_json = ? WHERE id = ?",
+        (REJECTED, now, now, json.dumps(reason), proposal_id),
     )
     conn.commit()
     return get(conn, proposal_id)
