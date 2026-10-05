@@ -61,6 +61,8 @@ class ValueModel:
     # per_game from `form` for skaters rather than the 14-day blend; None
     # follows `form.FORM_VALUE`
     form_value: bool | None = None
+    # streaks.StreakFinder: who is hot in what, for the cards and `season hot`
+    streaks: object | None = None
 
     def day_index(self, date: str) -> int:
         """Dates strictly before `date`. No lookahead by construction."""
@@ -194,14 +196,20 @@ def build_value_model(
     live = build_replay_data(conn, season, skater_keys)
     proj_pg = projected_pg_values(universe.frame, vm, skater_keys)
     from puckpilot.season.form import FORM_USAGE, FormRates, Usage
+    from puckpilot.season.streaks import STREAK_MOMENTUM, StreakFinder
     from puckpilot.season.week import per_game_rates
 
     skaters = {int(p) for p, pos in universe.frame["position"].items() if pos != "G"}
+    prior = per_game_rates(universe.frame, league.all_cats)
+    usage = Usage(conn, season, live.dates)
+    streaks = StreakFinder(live, prior, usage=usage)
     form = FormRates(
         live,
-        per_game_rates(universe.frame, league.all_cats),
+        prior,
         skaters=skaters,
-        usage=Usage(conn, season, live.dates) if FORM_USAGE else None,
+        usage=usage if FORM_USAGE else None,
+        streaks=streaks,
+        momentum=STREAK_MOMENTUM,
     )
 
     workload = None
@@ -221,4 +229,5 @@ def build_value_model(
         frame=universe.frame,
         workload=workload,
         form=form,
+        streaks=streaks,
     )

@@ -107,7 +107,9 @@ def explain(
     if season_left is not None and days:
         out["season"] = season_lines(cand, drop, base, values, season_left, days[0])
     if days:
-        out["profile"] = profile_lines(conn, runtime, cand, drop, days[0])
+        out["profile"] = profile_lines(
+            conn, runtime, cand, drop, days[0], streaks=getattr(values, "streaks", None)
+        )
     board = getattr(values, "keepers", None)
     if board is not None:
         from puckpilot.season.keeper_value import card_lines
@@ -499,8 +501,12 @@ def _next_week_games(conn, runtime, team: str, day: str) -> str:
     return f"{_plural(games, 'game')} next week"
 
 
-def profile_lines(conn, runtime, cand, drop, day: str) -> list[str]:
-    """Each player as a person would size him up: who, how he played, what is next."""
+def profile_lines(conn, runtime, cand, drop, day: str, streaks=None) -> list[str]:
+    """Each player as a person would size him up: who, how he played, what is next.
+
+    With `streaks` (`season.streaks.StreakFinder`), any category he is hot in,
+    and what streaks like it have been worth: a role change, luck, or a fade.
+    """
     season = runtime.nhl_season
     last = f"{int(season[:4]) - 1}{season[:4]}"
     out: list[str] = []
@@ -526,6 +532,9 @@ def profile_lines(conn, runtime, cand, drop, day: str) -> list[str]:
         usage = usage_line(conn, p, season, day)
         if usage:
             out.append(f"  {usage}")
+        if streaks is not None:
+            for s in streaks.streaks(p.nhl_player_id, day)[:3]:
+                out.append(f"  hot - {s.describe()}")
     return out
 
 

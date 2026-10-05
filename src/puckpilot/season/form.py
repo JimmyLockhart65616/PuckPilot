@@ -180,11 +180,17 @@ class FormRates:
         k: dict[str, float] | None = None,
         skaters: set[int] | None = None,
         usage: Usage | None = None,
+        streaks=None,
+        momentum: bool = False,
     ):
         self.data = data
         self.prior = prior
         # Scales the prior by recent ice time (`Usage`); None leaves it alone.
         self.usage = usage
+        # `streaks.StreakFinder`: with `momentum`, a hot category's rate is
+        # raised (or, for a fading one, lowered) by its measured next-week effect.
+        self.streaks = streaks
+        self.momentum = momentum
         # Who is a skater: the prior's rows carry every category, zero where it
         # does not apply, so it cannot say. None: anyone with a skater line.
         self.skaters = skaters
@@ -223,6 +229,10 @@ class FormRates:
                     k = self.k[c]
                     prior = base[key] * u**USAGE_GAMMA * (pp**PP_GAMMA if key == "ppp" else 1.0)
                     rates[key] = (cum[n][c] + k * prior) / (n + k)
+            if self.momentum and self.streaks is not None:
+                for key, mult in self.streaks.multipliers(pid, date).items():
+                    if key in rates:
+                        rates[key] *= mult
             out[pid] = rates
         self._cache[t] = out
         return out

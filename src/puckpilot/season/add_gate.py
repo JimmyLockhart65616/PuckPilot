@@ -91,6 +91,9 @@ class ArmSpec:
     # -u: those rates scaled by recent ice time and power-play time
     # (`form.Usage`).
     usage: bool = False
+    # -m: a hot player's rates moved by his streak's measured next-week effect
+    # (`season.streaks`), from a table the other seasons measured.
+    momentum: bool = False
     # -kN: next season's best n_keepers + N are never dropped, ranked each
     # Monday by `keeper_value` as of the latest month's start (no contracts:
     # every player eligible). None: no protection.
@@ -133,6 +136,8 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.form_value = True
         elif tok == "u":
             spec.usage = True
+        elif tok == "m":
+            spec.momentum = True
         elif len(tok) > 1 and tok[0] in "spqfxk" and tok[1:].isdigit():
             n = int(tok[1:])
             if tok[0] == "k":
@@ -289,24 +294,32 @@ def add_gate_report(
         form=form,
         form_value=False,
     )
-    form_u = (
-        FormRates(
-            data,
-            per_game_rates(u.frame, cats),
-            skaters=skaters,
-            usage=Usage(conn, season, data.dates),
-        )
-        if any(parse_arm(a, stream_spots).usage for a in arms)
-        else None
-    )
-    by_kind: dict[tuple[bool, bool], ValueModel] = {(False, False): values}
+    wanted = [parse_arm(a, stream_spots) for a in arms]
+    usage = Usage(conn, season, data.dates) if any(x.usage or x.momentum for x in wanted) else None
+    finder = None
+    if any(x.momentum for x in wanted):
+        from puckpilot.season.streak_gate import SEASONS as STREAK_SEASONS
+        from puckpilot.season.streak_gate import momentum_table
+        from puckpilot.season.streaks import StreakFinder
+
+        others = tuple(x for x in STREAK_SEASONS if x != season)
+        table = momentum_table(conn, league, others)
+        say(f"{season}: streak momentum from {', '.join(others)}: {table}")
+        finder = StreakFinder(data, per_game_rates(u.frame, cats), usage=usage, momentum=table)
+    by_kind: dict[tuple[bool, bool, bool], ValueModel] = {(False, False, False): values}
 
     def values_for(spec: ArmSpec) -> ValueModel:
-        key = (spec.form_value, spec.usage)
+        key = (spec.form_value, spec.usage, spec.momentum)
         if key not in by_kind:
-            by_kind[key] = replace(
-                values, form=form_u if spec.usage else form, form_value=spec.form_value, _tilts={}
+            rates_now = FormRates(
+                data,
+                per_game_rates(u.frame, cats),
+                skaters=skaters,
+                usage=usage if spec.usage else None,
+                streaks=finder,
+                momentum=spec.momentum,
             )
+            by_kind[key] = replace(values, form=rates_now, form_value=spec.form_value, _tilts={})
         return by_kind[key]
 
     opponents = _default_opponents(rng, league)

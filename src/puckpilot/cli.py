@@ -1545,6 +1545,86 @@ def _cmd_season_keepers(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_hot(args: argparse.Namespace) -> int:
+    """Hot streaks on your roster and among the free agents, with what each is worth."""
+    from puckpilot.season import calendar, cli_support
+    from puckpilot.season import keeper_value as kv
+    from puckpilot.season import streaks as st
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.run import _train_seasons, week_for
+    from puckpilot.season.values import build_value_model
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    season = runtime.nhl_season
+    day = args.date or cli_support.today_str()
+    values = build_value_model(conn, season, _train_seasons(season), manager.league)
+    finder = values.streaks
+    rates = values.rates(manager.league.all_cats, day)
+    week = week_for(runtime, day)
+    end = week.end if week is not None else day
+    games = calendar.games_by_team(conn, day, end, season)
+    scale = dict(zip(values.data.skater_keys, values.vm.sk_sd, strict=False))
+
+    print(
+        f"Hot streaks as of {day}: a player's last {st.STREAK_GAMES} games beat what the model "
+        f"expected going in, by a margin chance gives {st.STREAK_ALPHA:.0%} of the time. "
+        f"Judged from his {st.MIN_GAMES}th game (the range measured)."
+    )
+    print(
+        "  With more ice time a streak is a role change and lasts; without it, mostly luck - "
+        "but hits streaks last about two weeks either way, and PIM fades. "
+        "(`ppilot season streak-check`)"
+    )
+    mine = kv.saved_roster(conn, manager.name, manager.team_key)
+    snaps = conn.execute(
+        "SELECT name, team_abbrev, nhl_player_id FROM yahoo_roster_snapshots WHERE manager = ? "
+        "AND date = (SELECT MAX(date) FROM yahoo_roster_snapshots WHERE manager = ?)",
+        (manager.name, manager.name),
+    ).fetchall()
+    teams = {r[2]: r[1] for r in snaps}
+    roster = [(p.name, teams.get(p.nhl_player_id, ""), "", p.nhl_player_id, None) for p in mine]
+    print()
+    print("Your roster:")
+    ours = st.hot_players(roster, finder, day, rates, games, scale)
+    for h in ours:
+        for s in h.streaks:
+            print(f"  {h.name} ({h.team}): {s.describe()}")
+    if not ours:
+        print("  nobody hot")
+    row = conn.execute(
+        "SELECT MAX(date) FROM yahoo_fa_snapshots WHERE league_key = ? AND date <= ?",
+        (league_key, day),
+    ).fetchone()
+    if not row or not row[0]:
+        print()
+        print("No free-agent read on file yet - the weekly run saves one.")
+        return 0
+    fas = conn.execute(
+        "SELECT name, team_abbrev, positions, nhl_player_id, percent_owned FROM "
+        "yahoo_fa_snapshots WHERE league_key = ? AND date = ? AND nhl_player_id IS NOT NULL",
+        (league_key, row[0]),
+    ).fetchall()
+    hot = [h for h in st.hot_players(fas, finder, day, rates, games, scale) if h.score > 0]
+    print()
+    print(f"Free agents (read {row[0]}), most useful this week first:")
+    for h in hot[: args.top]:
+        owned = f", {h.owned:.0f}% owned" if h.owned is not None else ""
+        adds = ", ".join(
+            f"{v:+.1f} {st.LABELS.get(k, k)}" for k, v in sorted(h.extra.items()) if v > 0
+        )
+        print(f"  {h.name} ({h.team} {h.positions}{owned}) - this week about {adds} over his rate")
+        for s in h.streaks:
+            print(f"      {s.describe()}")
+    if not hot:
+        print("  none with a streak worth anything this week")
+    return 0
+
+
 def _cmd_season_schedule(args: argparse.Namespace) -> int:
     """Register (or show, or remove) the daily runs."""
     import os
@@ -1742,6 +1822,21 @@ def _cmd_season_form_check(args: argparse.Namespace) -> int:
         _league(args),
         seasons=tuple(args.season),
         progress=print if args.verbose else None,
+    )
+    print()
+    print(report.text)
+    return 0
+
+
+def _cmd_season_streak_check(args: argparse.Namespace) -> int:
+    """How long hot streaks last, per category, measured on past seasons."""
+    from puckpilot.data import store
+    from puckpilot.season.streak_gate import streak_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = streak_report(
+        conn, _league(args), seasons=tuple(args.season), progress=print if args.verbose else None
     )
     print()
     print(report.text)
@@ -2720,6 +2815,13 @@ def build_parser() -> argparse.ArgumentParser:
     s_fc.add_argument("--verbose", action="store_true")
     s_fc.set_defaults(func=_cmd_season_form_check)
 
+    s_sc = season_sub.add_parser(
+        "streak-check", help="How long hot streaks last, per category (past seasons)"
+    )
+    s_sc.add_argument("--season", nargs="+", default=["20232024", "20242025", "20252026"])
+    s_sc.add_argument("--verbose", action="store_true")
+    s_sc.set_defaults(func=_cmd_season_streak_check)
+
     s_run = season_sub.add_parser(
         "run",
         parents=[seasonal],
@@ -2773,6 +2875,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Next season's keepers on your roster, and which are protected from a drop",
     )
     s_keep.set_defaults(func=_cmd_season_keepers)
+
+    s_hot = season_sub.add_parser(
+        "hot",
+        parents=[seasonal],
+        help="Hot streaks on your roster and among free agents, and which ones last",
+    )
+    s_hot.add_argument("--top", type=int, default=10, help="Free agents to list")
+    s_hot.set_defaults(func=_cmd_season_hot)
 
     s_week = season_sub.add_parser(
         "week", parents=[seasonal], help="This week's category plan and add targets"
