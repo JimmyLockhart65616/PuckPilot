@@ -192,6 +192,13 @@ class TransactionAuthority:
     # clearing `mid_week_floor` - a pickup that only lasts until Sunday costs
     # the roster spot a week later.
     mid_week_horizon: bool = True
+    # Never propose dropping one of next season's best keepers: the top
+    # n_keepers + keeper_margin eligible players by projected value next
+    # season, less what keeping costs (`season.keeper_value`). Decided once a
+    # week, so the line does not move under a waiting proposal. A league
+    # without keepers protects nobody.
+    protect_keepers: bool = False
+    keeper_margin: int = 1
 
     def __post_init__(self) -> None:
         if self.add_scoring not in ADD_SCORING:
@@ -206,6 +213,8 @@ class TransactionAuthority:
                 raise AuthorityError(f"authority.transactions.{name} must be between 0 and 6")
         if self.mid_week_floor is not None and self.mid_week_floor < 0:
             raise AuthorityError("authority.transactions.mid_week_floor cannot be negative")
+        if self.keeper_margin < 0:
+            raise AuthorityError("authority.transactions.keeper_margin cannot be negative")
 
     @property
     def requires_approval(self) -> bool:
@@ -240,6 +249,12 @@ class TransactionAuthority:
                 + (" over the rest of this week and next together" if self.mid_week_horizon else "")
                 if self.mid_week_floor is not None
                 else "  mid-week: a search only when a roster spot opens"
+            ),
+            (
+                f"  next season's best keepers, and {self.keeper_margin} more, are never "
+                f"proposed as a drop"
+                if self.protect_keepers
+                else "  next season's keepers are not protected from a drop"
             ),
         ]
 

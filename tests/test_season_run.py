@@ -670,3 +670,33 @@ def test_a_mid_week_swap_must_pay_over_this_week_and_next(monkeypatch):
         "not proposed: Brief for Drop Me - +0.30 this week but -0.20 next week, "
         "+0.10 together, below 0.25"
     ]
+
+
+def test_goalies_tagged_out_on_a_roster_are_out_of_the_start_model():
+    """The model learns of an absence only after two games not dressed; the
+    tag says so the day it appears, and the partner's share should rise then."""
+    from types import SimpleNamespace
+
+    from puckpilot.season.run import _out_goalies
+
+    def p(pid, pos, out):
+        return SimpleNamespace(nhl_player_id=pid, position=pos, is_out=out)
+
+    ours = SimpleNamespace(players=[p(1, "G", True), p(2, "G", False), p(3, "C", True)])
+    theirs = SimpleNamespace(players=[p(4, "G", True), p(None, "G", True)])
+    assert _out_goalies(ours, theirs) == {1, 4}
+    assert _out_goalies(None, None) == set()
+
+
+def test_only_untagged_goalies_count_as_known_healthy():
+    from types import SimpleNamespace
+
+    from puckpilot.season.run import _healthy_goalies
+
+    def p(pid, pos, status):
+        return SimpleNamespace(nhl_player_id=pid, position=pos, status=status)
+
+    ours = SimpleNamespace(
+        players=[p(1, "G", ""), p(2, "G", "DTD"), p(3, "G", "IR"), p(4, "C", "")]
+    )
+    assert _healthy_goalies(ours, None) == {1}

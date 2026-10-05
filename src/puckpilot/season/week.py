@@ -33,7 +33,7 @@ from puckpilot.engine.categories import CATALOG, Category
 from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.league import LeagueConfig
 from puckpilot.season import calendar
-from puckpilot.season.add_story import SECTIONS
+from puckpilot.season.add_story import SECTIONS, SeasonLeft, games_left, share_of
 from puckpilot.season.pool import PoolPlayer
 from puckpilot.season.roster import RosterPlayer, TeamRoster
 from puckpilot.season.settings import LeagueRuntime, Week
@@ -598,6 +598,7 @@ def add_headroom(
     league,
     adds_left: int = 1,
     days: list[str] | None = None,
+    workload=None,
 ) -> dict[str, float | None]:
     """The most the acquisitions left this week could add to each category.
 
@@ -618,6 +619,13 @@ def add_headroom(
     from puckpilot.season.today import ir_changes, open_roster_spots
 
     games = team_games_in(conn, runtime, week, days)
+    if workload is not None:
+        goalies = {
+            p.nhl_player_id
+            for p in (*ours.players, *pool)
+            if p.position == "G" and p.nhl_player_id is not None
+        }
+        games = SeasonLeft(games, workload.shares((days or week.dates())[0], sorted(goalies)))
     to_ir = {m.player.player_key for m in ir_changes(runtime, ours)[0] if m.is_ir}
     droppable = [
         p
@@ -626,6 +634,7 @@ def add_headroom(
         and p.nhl_player_id is not None
         and not p.on_ir
         and p.player_key not in to_ir
+        and not getattr(p, "keeper_protected", False)
     ]
     free = open_roster_spots(runtime, ours)
     n = max(int(adds_left), 0)
@@ -639,7 +648,7 @@ def add_headroom(
             continue
 
         def week_total(p, key=c.key):
-            return rates.get(p.nhl_player_id, {}).get(key, 0.0) * games.get(p.team, 0)
+            return rates.get(p.nhl_player_id, {}).get(key, 0.0) * games_left(games, p)
 
         give_up = sorted(week_total(p) for p in droppable)[: max(n - free, 0)]
         gain = sorted(
@@ -683,6 +692,7 @@ def build_week_plan(
     measure_room: bool = True,
     reprice=None,
     horizon: str = "this week",
+    workload=None,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -698,9 +708,15 @@ def build_week_plan(
     `reprice` - (add, drop) pairs already proposed - prices exactly those
     instead of searching: `targets` is the ones that still pay, `lapsed` the
     ones that no longer do (season/run.py re-checks the queue this way).
+
+    `workload` (`goalies.GoalieWorkload`) counts a goalie's games over the rest
+    of the season as his club's times his share of its starts, rather than all
+    of his club's; without it every number is as it was.
     """
     cats = league.all_cats
     rates = per_game_rates(frame, cats)
+    if workload is None:
+        workload = getattr(values, "workload", None)
     days = [d for d in week.dates() if from_day is None or d >= from_day]
     exclude = {days[0]: set(started)} if days and started else None
     base_ours = banked_components(banked_ours or {})
@@ -772,6 +788,7 @@ def build_week_plan(
             league,
             adds_left=adds_left_week if adds_left_week is not None else 1,
             days=days,
+            workload=workload,
         )
 
     def sd(key: str) -> float | None:
@@ -865,6 +882,7 @@ def build_week_plan(
             odds_ctx=ctx,
             exclude=exclude,
             horizon=horizon,
+            workload=workload,
         )
     elif find_targets and days and not holding:
         targets = _targets(
@@ -890,6 +908,7 @@ def build_week_plan(
             stream_spots=stream_spots,
             exclude=exclude,
             horizon=horizon,
+            workload=workload,
         )
 
     return WeekPlan(
@@ -944,6 +963,7 @@ def _targets(
     stream_spots: int = 2,
     exclude: dict[str, set[str]] | None = None,
     horizon: str = "this week",
+    workload=None,
 ) -> tuple[AddTarget, ...]:
     """Adds that move a category in play, priced by re-slotting the actual week.
 
@@ -989,6 +1009,8 @@ def _targets(
         and not p.on_ir
         and not p.is_out
         and p.player_key not in to_ir
+        # Next season's best keepers are not this week's to give away.
+        and not getattr(p, "keeper_protected", False)
     ]
     counts: dict[str, int] = {}
     for p in ours.players:
@@ -1008,7 +1030,7 @@ def _targets(
     playing = {d: calendar.teams_playing(conn, d, runtime.nhl_season) for d in days}
     # What each player is worth to the rest of the season, not to this week: a
     # regular with one game this week is still a regular.
-    season_left = calendar.games_by_team(conn, days[0], runtime.end_date, runtime.nhl_season)
+    season_left = _season_left(conn, runtime, days[0], [*ours.players, *pool], workload)
     keep = _season_value(droppable, values, season_left, days[0])
     cheapest = sorted(keep.values())
     stream_floor = (
@@ -1019,7 +1041,7 @@ def _targets(
         worth = keep.get(p.player_key, 0.0)
         if stream_floor is not None and worth <= stream_floor:
             return True
-        return worth <= values.per_game(cand.nhl_player_id, days[0]) * season_left.get(cand.team, 0)
+        return worth <= values.per_game(cand.nhl_player_id, days[0]) * games_left(season_left, cand)
 
     # Cheap screen: his rate times the games he would actually fill - days his
     # team plays AND a slot he can take is empty. Ranking by team games alone
@@ -1030,7 +1052,11 @@ def _targets(
             for c in pool
             if c.nhl_player_id is not None and not c.is_out and c.nhl_player_id in rates
         ),
-        key=lambda c: -values.per_game(c.nhl_player_id, days[0]) * _screen_games(c, holes, playing),
+        key=lambda c: (
+            -values.per_game(c.nhl_player_id, days[0])
+            * _screen_games(c, holes, playing)
+            * share_of(season_left, c)
+        ),
     )[: max(screen, max_targets)]
 
     steps = max_targets if adds_left is None else min(max_targets, adds_left)
@@ -1127,6 +1153,7 @@ def _reprice(
     odds_ctx: OddsContext | None = None,
     exclude: dict[str, set[str]] | None = None,
     horizon: str = "this week",
+    workload=None,
 ) -> tuple[tuple[AddTarget, ...], tuple[AddTarget, ...]]:
     """(still pays, no longer pays) for swaps already proposed, priced as the
     search would price them today.
@@ -1146,7 +1173,9 @@ def _reprice(
     base_starts, first_totals, base_odds = evaluate(base_players)
     if base_totals is None:
         base_totals = first_totals
-    season_left = calendar.games_by_team(conn, days[0], runtime.end_date, runtime.nhl_season)
+    season_left = _season_left(
+        conn, runtime, days[0], [*ours.players, *(c for c, _ in pairs)], workload
+    )
     kept: list[AddTarget] = []
     lapsed: list[AddTarget] = []
     for cand, drop in pairs:
@@ -1344,7 +1373,7 @@ def _odds_moved(before, after, limit: int = 3) -> tuple[str, ...]:
     return tuple(label for _, label in moves[:limit])
 
 
-def _season_value(droppable, values, games_left, day) -> dict[str, float]:
+def _season_value(droppable, values, season_left, day) -> dict[str, float]:
     """What letting each player go costs: his value over the rest of the season.
 
     This used to be his value over *this week* - rate times this week's games -
@@ -1353,9 +1382,19 @@ def _season_value(droppable, values, games_left, day) -> dict[str, float]:
     streamer.
     """
     return {
-        p.player_key: values.per_game(p.nhl_player_id, day) * games_left.get(p.team, 0)
+        p.player_key: values.per_game(p.nhl_player_id, day) * games_left(season_left, p)
         for p in droppable
     }
+
+
+def _season_left(conn, runtime, day: str, players, workload=None) -> SeasonLeft:
+    """Each club's games from `day` to the season's end, and - with a goalie
+    `workload` - each of these goalies' expected share of his club's."""
+    by_team = calendar.games_by_team(conn, day, runtime.end_date, runtime.nhl_season)
+    if workload is None:
+        return SeasonLeft(by_team)
+    goalies = {p.nhl_player_id for p in players if p.position == "G" and p.nhl_player_id}
+    return SeasonLeft(by_team, workload.shares(day, sorted(goalies)))
 
 
 def open_slot_days(conn, runtime, players, goalie_source, values, days) -> dict[str, set[str]]:

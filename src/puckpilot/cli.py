@@ -1496,6 +1496,55 @@ def _cmd_season_statuses(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_keepers(args: argparse.Namespace) -> int:
+    """Next season's keepers on the roster, best first, and which are protected."""
+    from puckpilot.season import cli_support
+    from puckpilot.season import keeper_value as kv
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    league = manager.league
+    if league.n_keepers <= 0:
+        print(f"{league.name} keeps nobody - there is nothing to protect.")
+        return 0
+    season = runtime.nhl_season
+    day = args.date or cli_support.today_str()
+    players = kv.saved_roster(conn, manager.name, manager.team_key)
+    if not players:
+        print("No saved roster yet - run `ppilot season run` first.")
+        return 1
+    path = Settings()._resolve(Path("data")) / f"keepers-{season}.json"
+    board = kv.board(conn, league, season, day, path)
+    terms = manager.authority.transactions
+    ranks = board.rank(players, margin=terms.keeper_margin)
+    print(
+        f"Next season's keepers for {manager.name}, as of {day}: you keep {league.n_keepers}, "
+        f"each in place of a {league.keeper_placement}-round pick worth {board.cost:+.1f} "
+        f"next season. Values below are over that pick."
+    )
+    if board.times_kept is None:
+        print(f"  (no {path.name}: every player taken as eligible)")
+    if not terms.protect_keepers:
+        print("  protect_keepers is off: these are not protected from a drop.")
+    print()
+    for k in ranks:
+        rank = f"{k.rank:>3}" if k.rank is not None else "  -"
+        if not k.eligible:
+            note = f"kept {k.times_kept}x - not eligible"
+        elif k.value is None:
+            note = "no projection for next season"
+        else:
+            note = f"{k.value:+6.1f}" + (f"  kept {k.times_kept}x" if k.times_kept else "")
+        flag = "  PROTECTED" if k.protected and terms.protect_keepers else ""
+        print(f"  {rank}  {k.name:26}{note}{flag}")
+    return 0
+
+
 def _cmd_season_schedule(args: argparse.Namespace) -> int:
     """Register (or show, or remove) the daily runs."""
     import os
@@ -1610,6 +1659,7 @@ def _cmd_season_calibrate(args: argparse.Namespace) -> int:
         test_season=args.test_season,
         seed=args.seed,
         progress=print if args.verbose else None,
+        goalies=args.goalies,
     )
     print()
     print(report.text)
@@ -1633,10 +1683,50 @@ def _cmd_season_add_gate(args: argparse.Namespace) -> int:
             arms=tuple(args.arms.split(",")) if args.arms else ARMS,
             progress=print if args.verbose else None,
             versus=args.versus,
+            goalies=args.goalies,
+            goalies_alt=args.goalies_alt,
         )
         print()
         print(report.text)
     return 0
+
+
+def _cmd_season_goalie_check(args: argparse.Namespace) -> int:
+    """How well the starting-goalie model names starters, tonight and ahead."""
+    from puckpilot.data import store
+    from puckpilot.season.goalie_gate import VARIANTS, goalie_gate_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = goalie_gate_report(
+        conn,
+        seasons=tuple(args.season),
+        variants=tuple(args.variants.split(",")) if args.variants else VARIANTS,
+        versus=args.versus,
+        shares=not args.no_shares,
+        progress=print if args.verbose else None,
+    )
+    print()
+    print(report.text)
+    return 0
+
+
+def _cmd_season_keeper_check(args: argparse.Namespace) -> int:
+    """Ranked on a date, which keepers would have been best the next season?"""
+    from puckpilot.data import store
+    from puckpilot.season.keeper_gate import keeper_gate_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = keeper_gate_report(
+        conn,
+        _league(args),
+        seasons=tuple(args.season),
+        progress=print if args.verbose else None,
+    )
+    print()
+    print(report.text)
+    return 0 if report.text.rstrip().endswith("PASS") else 1
 
 
 def _cmd_season_preflight(args: argparse.Namespace) -> int:
@@ -1955,6 +2045,7 @@ def _cmd_lineup_verify(args: argparse.Namespace) -> int:
         league=_league(args),
         min_gain=args.min_gain,
         progress=print,
+        goalies=args.goalies,
     )
     print()
     print(report.text)
@@ -2528,6 +2619,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_cal.add_argument("--fit-season", default="20242025")
     s_cal.add_argument("--test-season", default="20252026")
     s_cal.add_argument("--seed", type=int, default=20261)
+    s_cal.add_argument(
+        "--goalies",
+        default="",
+        help="Starting-goalie model, e.g. old or club-dw2-chain (default: current)",
+    )
     s_cal.add_argument("--verbose", action="store_true")
     s_cal.set_defaults(func=_cmd_season_calibrate)
 
@@ -2539,8 +2635,37 @@ def build_parser() -> argparse.ArgumentParser:
     s_ag.add_argument("--seed", type=int, default=20261)
     s_ag.add_argument("--arms", default="", help="comma list; default all")
     s_ag.add_argument("--versus", default="", help="compare every arm with this one")
+    s_ag.add_argument(
+        "--goalies",
+        default="",
+        help="Starting-goalie model, e.g. old or club-dw2-chain (default: current)",
+    )
+    s_ag.add_argument(
+        "--goalies-alt",
+        default="club-dw2-chain",
+        help="The goalie model -g arms give the tested team",
+    )
     s_ag.add_argument("--verbose", action="store_true")
     s_ag.set_defaults(func=_cmd_season_add_gate)
+
+    s_gc = season_sub.add_parser(
+        "goalie-check",
+        help="How often the goalie model names the starter, tonight and the week ahead",
+    )
+    s_gc.add_argument("--season", nargs="+", default=["20232024", "20242025", "20252026"])
+    s_gc.add_argument("--variants", default="", help="comma list, e.g. old,club-dw2-share")
+    s_gc.add_argument("--versus", default="old", help="compare every variant with this one")
+    s_gc.add_argument("--no-shares", action="store_true", help="Skip the remaining-share table")
+    s_gc.add_argument("--verbose", action="store_true")
+    s_gc.set_defaults(func=_cmd_season_goalie_check)
+
+    s_kc = season_sub.add_parser(
+        "keeper-check",
+        help="Ranked on a date, would these keepers have been best the next season?",
+    )
+    s_kc.add_argument("--season", nargs="+", default=["20232024", "20242025"])
+    s_kc.add_argument("--verbose", action="store_true")
+    s_kc.set_defaults(func=_cmd_season_keeper_check)
 
     s_run = season_sub.add_parser(
         "run",
@@ -2588,6 +2713,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Injury tags the runs have seen, and whether the player then played",
     )
     s_tags.set_defaults(func=_cmd_season_statuses)
+
+    s_keep = season_sub.add_parser(
+        "keepers",
+        parents=[seasonal],
+        help="Next season's keepers on your roster, and which are protected from a drop",
+    )
+    s_keep.set_defaults(func=_cmd_season_keepers)
 
     s_week = season_sub.add_parser(
         "week", parents=[seasonal], help="This week's category plan and add targets"
@@ -2638,6 +2770,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--drafts", type=int, default=1, help="Drafts to source rosters from")
     verify.add_argument("--seed", type=int, default=123)
     verify.add_argument("--min-gain", type=float, default=0.0)
+    verify.add_argument(
+        "--goalies",
+        default="",
+        help="Starting-goalie model, e.g. old or club-dw2-chain (default: current)",
+    )
     verify.set_defaults(func=_cmd_lineup_verify)
     replay = lineup_sub.add_parser(
         "replay", help="Bench-regret replay: optimizer vs hindsight vs set-and-forget"

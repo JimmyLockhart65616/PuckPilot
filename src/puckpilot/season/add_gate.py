@@ -76,6 +76,16 @@ class ArmSpec:
     horizon: bool = False  # -h: a mid-week move must pay over this week's rest + next week
     mid_floor: float | None = None  # -fNN: mid-week bar, in hundredths of a category
     skip_last: int = 0  # -xN: no search on the week's last N days (the live run's Sunday)
+    # -g: the tested team's lineups and plans use the `goalies_alt` start model
+    # while every other team keeps the base one, so the gain is ours alone.
+    goalies: bool = False
+    # -l: a goalie's rest-of-season games are his club's times his share of
+    # its starts (`goalies.GoalieWorkload`), not all of his club's.
+    workload: bool = False
+    # -kN: next season's best n_keepers + N are never dropped, ranked each
+    # Monday by `keeper_value` as of the latest month's start (no contracts:
+    # every player eligible). None: no protection.
+    keepers: int | None = None
 
 
 def _swap(roster: list[int], target) -> None:
@@ -104,9 +114,15 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
     for tok in arm[len(base) :].split("-")[1:]:
         if tok == "h":
             spec.horizon = True
-        elif len(tok) > 1 and tok[0] in "spqfx" and tok[1:].isdigit():
+        elif tok == "g":
+            spec.goalies = True
+        elif tok == "l":
+            spec.workload = True
+        elif len(tok) > 1 and tok[0] in "spqfxk" and tok[1:].isdigit():
             n = int(tok[1:])
-            if tok[0] == "s":
+            if tok[0] == "k":
+                spec.keepers = n
+            elif tok[0] == "s":
                 spec.spots = n
             elif tok[0] == "p":
                 spec.preload = n
@@ -120,6 +136,11 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             raise ValueError(f"unknown option {tok!r} in arm {arm!r}")
     return spec
 
+
+# The start model `-g` arms give the tested team: current club only, a goalie
+# out after two games not dressed, later games walked forward a game at a
+# time - the variant `season goalie-check` found best (STATUS.md).
+GOALIES_ALT = "club-dw2-chain"
 
 # Free agents offered to the search each morning, best projections first - the
 # live run reads Yahoo's top 150 by the same measure.
@@ -195,18 +216,26 @@ def add_gate_report(
     stream_spots: int = 2,
     progress: Callable[[str], None] | None = None,
     versus: str = "",
+    goalies: str = "",
+    goalies_alt: str = GOALIES_ALT,
 ) -> AddGateReport:
     from puckpilot.draft.engine import RosterValuePolicy
     from puckpilot.draft.h2h import round_robin_schedule
     from puckpilot.draft.replay import G_WIDTH, build_replay_data
     from puckpilot.draft.sim import _default_opponents, build_universe, keepers_for, run_draft
+    from puckpilot.engine.aggregate import season_games
     from puckpilot.engine.lineup import optimize_lineup
     from puckpilot.engine.lineup_replay import (
         GameValueModel,
         projected_pg_values,
         skater_availability,
     )
-    from puckpilot.season.goalies import AsOfGoalieSource, TrailingStartShareSource
+    from puckpilot.season.goalies import (
+        AsOfGoalieSource,
+        GoalieWorkload,
+        projected_shares,
+        trailing_model,
+    )
     from puckpilot.season.odds import OddsModel, Side, choose_goalies, goalie_game
     from puckpilot.season.pool import PoolPlayer
     from puckpilot.season.replay import POS_TO_YAHOO, runtime_for_replay, team_by_day
@@ -249,13 +278,24 @@ def add_gate_report(
     }
     avail = drop_known_absences(skater_availability(conn, season, data, everyone), played)
     teams = team_by_day(conn, season, data, everyone)
-    policy = TrailingStartShareSource(conn, season, fallback_season=train_seasons[0])
+    policy = trailing_model(conn, season, train_seasons[0], goalies)
+    specs = [parse_arm(a, stream_spots) for a in arms]
+    policy_alt = (
+        trailing_model(conn, season, train_seasons[0], goalies_alt)
+        if any(x.goalies for x in specs)
+        else policy
+    )
+    workload = (
+        GoalieWorkload(conn, season, priors=projected_shares(u.frame, season_games(conn, season)))
+        if any(x.workload for x in specs)
+        else None
+    )
     runtime = runtime_for_replay(league, season, data.dates)
     index = {d: i for i, d in enumerate(data.dates)}
 
-    def lineup(roster: list[int], i: int) -> dict[int, str]:
+    def lineup(roster: list[int], i: int, pol=None) -> dict[int, str]:
         """The morning lineup: schedule, projections, P(start). No forcing."""
-        p = policy.starts(data.dates[i])
+        p = (pol or policy).starts(data.dates[i])
         cands = []
         for pid in roster:
             if positions.get(pid) == "G":
@@ -373,6 +413,27 @@ def add_gate_report(
             and team in plays_on.get(i, set())
         )
 
+    # The tested team's protected keepers this week (-k arms); empty otherwise.
+    shield: set[int] = set()
+    boards: dict[str, object] = {}
+
+    def keeper_board(date: str):
+        """Next season's values as of the first of the month: no later games."""
+        from puckpilot.season.keeper_value import KeeperBoard, keeper_cost, project_next
+
+        month = date[:8] + "01"
+        if month not in boards:
+            vorp = project_next(conn, league, season, month)
+            boards[month] = KeeperBoard(
+                league=league,
+                season=season,
+                as_of=month,
+                vorp_next=vorp,
+                cost=keeper_cost(league, vorp),
+                times_kept=None,
+            )
+        return boards[month]
+
     def rp(pid: int, i: int) -> RosterPlayer:
         pos = POS_TO_YAHOO.get(positions.get(pid, "C"), "C")
         return RosterPlayer(
@@ -385,6 +446,7 @@ def add_gate_report(
             selected_slot="BN",
             nhl_player_id=pid,
             status="O" if out_on(pid, i) else "",
+            keeper_protected=pid in shield,
         )
 
     def fa(pid: int, i: int) -> PoolPlayer:
@@ -410,9 +472,12 @@ def add_gate_report(
         for arm in arms:
             spec = parse_arm(arm, stream_spots)
             kind, spots = spec.kind, spec.spots
+            pol = policy_alt if spec.goalies else policy
+            wl = workload if spec.workload else None
             last_n = max(spec.preload, spec.queue)
             roster = list(rosters[t])
             adds_season = 0
+            shield.clear()
             # Moves queued at the end of a week for the rosters' unlock are made
             # the next morning, so they count against the week that starts then.
             carry = 0
@@ -424,6 +489,11 @@ def add_gate_report(
                 adds_week, carry = carry, 0
                 sk = np.zeros(len(skater_keys))
                 g = np.zeros(G_WIDTH)
+                if spec.keepers is not None and league.n_keepers > 0:
+                    board = keeper_board(data.dates[days[0]])
+                    ranks = board.rank([rp(pid, days[0]) for pid in roster], margin=spec.keepers)
+                    shield.clear()
+                    shield.update(k.nhl_player_id for k in ranks if k.protected)
                 for k, i in enumerate(days):
                     date = data.dates[i]
                     search = (
@@ -478,7 +548,7 @@ def add_gate_report(
                                 theirs,
                                 pool,
                                 u.frame,
-                                AsOfGoalieSource(policy, date),
+                                AsOfGoalieSource(pol, date),
                                 AsOfValues(values, date),
                                 # Queued moves are paid for next week, not now.
                                 adds_used_week=0 if spec.queue else adds_week,
@@ -492,6 +562,7 @@ def add_gate_report(
                                 playoff_reserve=0,
                                 stream_spots=spots,
                                 measure_room=False,
+                                workload=wl,
                             )
                             for target in plan.targets:
                                 drop = target.drop
@@ -556,7 +627,7 @@ def add_gate_report(
                             theirs,
                             pool,
                             u.frame,
-                            AsOfGoalieSource(policy, date),
+                            AsOfGoalieSource(pol, date),
                             AsOfValues(values, date),
                             adds_used_week=adds_week,
                             adds_used_season=adds_season,
@@ -572,6 +643,7 @@ def add_gate_report(
                             playoff_reserve=0,
                             stream_spots=spots,
                             measure_room=False,
+                            workload=wl,
                         )
                         targets = list(plan.targets)
                         nopp = (
@@ -600,7 +672,7 @@ def add_gate_report(
                                 ),
                                 [],
                                 u.frame,
-                                AsOfGoalieSource(policy, date),
+                                AsOfGoalieSource(pol, date),
                                 AsOfValues(values, date),
                                 find_targets=False,
                                 reprice=[(x.player, x.drop) for x in targets],
@@ -611,6 +683,7 @@ def add_gate_report(
                                 playoff_reserve=0,
                                 stream_spots=spots,
                                 measure_room=False,
+                                workload=wl,
                             )
                             later = {_pair(x): _worth(x) for x in (*nplan.targets, *nplan.lapsed)}
                             targets = [
@@ -628,7 +701,7 @@ def add_gate_report(
                     if arm == "goalie-odds":
                         assigned = lineup_goalie_odds(roster, i, days[k:], sk, g, opp, days[:k])
                     else:
-                        assigned = lineup(roster, i)
+                        assigned = lineup(roster, i, pol)
                     realise(assigned, i, sk, g)
                     # After the day's games the rosters unlock: queued moves are made.
                     for target in queued:

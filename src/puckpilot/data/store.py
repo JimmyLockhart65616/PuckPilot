@@ -255,6 +255,25 @@ CREATE TABLE IF NOT EXISTS player_status (
     PRIMARY KEY (league_key, player_key)
 );
 
+-- Next season's keepers among a manager's players, decided once a fantasy week
+-- (season/keeper_value.py) so protection does not move under a waiting
+-- proposal. rank NULL: not eligible, or no projection for next season.
+CREATE TABLE IF NOT EXISTS keeper_ranks (
+    manager       TEXT NOT NULL,
+    week_start    TEXT NOT NULL,
+    player_key    TEXT NOT NULL,
+    nhl_player_id INTEGER,
+    name          TEXT,
+    vorp_next     REAL,
+    value         REAL,
+    times_kept    INTEGER NOT NULL,
+    eligible      INTEGER NOT NULL,
+    rank          INTEGER,
+    protected     INTEGER NOT NULL,
+    as_of         TEXT NOT NULL,
+    PRIMARY KEY (manager, week_start, player_key)
+);
+
 -- Every change of tag, between the last run that saw the old one and the first
 -- that saw the new. old_status NULL: the player's first sighting, already tagged.
 CREATE TABLE IF NOT EXISTS player_status_changes (

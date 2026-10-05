@@ -80,6 +80,9 @@ def test_a_keeper_is_not_reported_as_injured():
     p = parse_player(player(keeper=True))
     assert p.status == ""
     assert p.is_out is False
+    # ...but it is still a keeper, which next season's ranks cross-check.
+    assert p.kept is True
+    assert parse_player(player()).kept is False
 
 
 def test_the_selected_slot_is_not_read_off_eligible_positions_to_add():

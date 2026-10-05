@@ -266,6 +266,13 @@ def run_day(
         return roster
 
     roster = _guard(report, "roster", lambda: cli_support.run_session(manager, _read))
+    keepers = None
+    if roster is not None:
+        got = _guard(
+            report, "keepers", lambda: _keepers(conn, manager, runtime, roster, day, report)
+        )
+        if got is not None:
+            roster, keepers = got
     ctx.roster = roster
     _guard(report, "score", lambda: _log_week(conn, manager, league_key, ctx, report))
     train = _train_seasons(season)
@@ -274,9 +281,19 @@ def run_day(
         "model",
         lambda: (
             build_value_model(conn, season, train, manager.league),
-            ChainedGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0])),
+            ChainedGoalieSource(
+                TrailingStartShareSource(
+                    conn,
+                    season,
+                    fallback_season=train[0],
+                    unavailable=_out_goalies(roster, ctx.theirs),
+                    healthy=_healthy_goalies(roster, ctx.theirs),
+                )
+            ),
         ),
     )
+    if models is not None and keepers is not None:
+        models[0].keepers = keepers  # read by the add cards
     plan = None
     acted = None
     if roster is not None:
@@ -913,6 +930,11 @@ def _workable(conn, manager, league_key, ctx, waiting):
                 f"{p.drop_name} is now {drop.status or drop.selected_slot} - "
                 f"not a player to drop on that"
             )
+        elif drop is not None and drop.keeper_protected:
+            lapsed[p.id] = (
+                f"{p.drop_name} ranks {drop.keeper_rank} of your keepers for next season - "
+                f"not one to give away"
+            )
         else:
             if add.nhl_player_id is None:
                 add = replace(add, nhl_player_id=p.add_pid)
@@ -1273,6 +1295,75 @@ def _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models):
         detail["week"] = [line, *detail.get("week", [])]
         kept.append(replace(t, detail=detail))
     return kept, notes
+
+
+def _keepers(conn, manager, runtime, roster, day, report):
+    """(roster with next season's keepers ranked, the board), or None when off.
+
+    The ranks - and so the protection - are decided on the week's first run and
+    kept for the week: a player who moved from fourth to fifth on a Wednesday
+    would otherwise become droppable under a proposal already on the phone.
+    The board itself is rebuilt every run, for the cards.
+    """
+    from pathlib import Path
+
+    from puckpilot.config import Settings
+    from puckpilot.season import keeper_value as kv
+
+    terms = manager.authority.transactions
+    if not terms.protect_keepers or manager.league.n_keepers <= 0:
+        return None
+    season = runtime.nhl_season
+    path = Settings()._resolve(Path("data")) / f"keepers-{season}.json"
+    board = kv.board(conn, manager.league, season, day, path)
+    week = week_for(runtime, day)
+    week_start = week.start if week is not None else day
+    ranks = kv.load(conn, manager.name, week_start)
+    if not ranks:
+        ranks = board.rank(roster.players, margin=terms.keeper_margin)
+        kv.save(conn, manager.name, week_start, day, ranks)
+    safe = [k.name for k in ranks if k.protected]
+    notes = []
+    if board.times_kept is None:
+        notes.append(
+            f"no saved contracts ({path.name}) - every player taken as eligible; "
+            f"`ppilot yahoo keepers --season {season}` saves them"
+        )
+    report.add("keepers", True, f"protected for next season: {', '.join(safe) or 'nobody'}", notes)
+    return kv.annotate(roster, ranks), board
+
+
+def _out_goalies(*rosters) -> set[int]:
+    """Goalies on the rosters read this run whose tag rules them out.
+
+    The start model learns a goalie is out only once he has missed two games
+    he would have dressed for; an injury tag says so the day it appears, and
+    his partner's share should rise that day, not two games later.
+    """
+    return {
+        p.nhl_player_id
+        for roster in rosters
+        if roster is not None
+        for p in roster.players
+        if p.position == "G" and p.nhl_player_id is not None and p.is_out
+    }
+
+
+def _healthy_goalies(*rosters) -> set[int]:
+    """Goalies on the rosters read this run with no tag at all.
+
+    A goalie who has not dressed for two games is taken to be out, which is
+    right for an injury and wrong on the night he comes back from one. A clean
+    tag on a roster read this morning says which, and only for the goalies we
+    can see - the ones whose starts we are actually deciding.
+    """
+    return {
+        p.nhl_player_id
+        for roster in rosters
+        if roster is not None
+        for p in roster.players
+        if p.position == "G" and p.nhl_player_id is not None and not p.status
+    }
 
 
 def _train_seasons(season: str) -> tuple[str, ...]:

@@ -788,6 +788,27 @@ def test_a_player_ruled_out_is_never_proposed_as_a_drop(db):
     assert all(t.drop is None or t.drop.name != "Unsure" for t in got)
 
 
+def test_a_protected_keeper_is_never_proposed_as_a_drop(db):
+    """Depth is the cheapest player on the roster this season and one of next
+    season's keepers. A drop is forever, so he is never the one offered."""
+    from dataclasses import replace
+
+    depth = replace(_rp("p.2", "Depth", 2, "TOR", "C"), keeper_rank=2, keeper_protected=True)
+    players = (_rp("p.1", "Star", 1, "MTL", "C"), depth, _rp("p.3", "Filler", 3, "TOR", "C"))
+    rates = {1: {"goals": 0.5}, 2: {"goals": 0.2}, 3: {"goals": 0.22}, 9: {"goals": 0.3}}
+    pg = {1: 1.5, 2: 0.5, 3: 0.55, 9: 1.0}
+    unprotected = _targets_for(
+        db,
+        (*players[:1], replace(depth, keeper_protected=False), players[2]),
+        (("C", 3, 1),),
+        rates=rates,
+        per_game=pg,
+    )
+    assert unprotected and unprotected[0].drop.name == "Depth"  # the cheapest, otherwise
+    got = _targets_for(db, players, (("C", 3, 1),), rates=rates, per_game=pg)
+    assert got and all(t.drop is None or t.drop.name != "Depth" for t in got)
+
+
 def test_an_add_explains_itself_day_by_day(db):
     from puckpilot.season.odds import OddsModel, Side
     from puckpilot.season.week import OddsContext

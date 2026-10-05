@@ -111,3 +111,12 @@ def test_the_protocol_does_not_steer_the_lineup_unless_asked():
 def test_opting_in_is_possible_and_says_so():
     text = "\n".join(LineupAuthority(enabled=True, follow_protocol=True).describe())
     assert "week protocol steers the lineup: yes" in text
+
+
+def test_keeper_protection_is_read_from_config_and_checked():
+    a = Authority.from_config({"transactions": {"protect_keepers": True, "keeper_margin": 2}})
+    assert a.transactions.protect_keepers is True and a.transactions.keeper_margin == 2
+    with pytest.raises(AuthorityError, match="keeper_margin"):
+        Authority.from_config({"transactions": {"keeper_margin": -1}})
+    with pytest.raises(AuthorityError, match="unknown setting"):
+        Authority.from_config({"transactions": {"protect_keeper": True}})

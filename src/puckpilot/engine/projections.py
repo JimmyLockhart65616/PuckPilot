@@ -209,18 +209,29 @@ def project(
     target_season: str,
     train_seasons: list[str],
     weights: tuple[float, ...] = DEFAULT_WEIGHTS,
+    as_of: str | None = None,
+    target_games: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(skaters, goalies) projected category totals for target_season.
 
     train_seasons most recent first. Players with no NHL history (rookies)
     get no projection — see docs/STATUS.md for the measured size of that gap.
+
+    `as_of` (YYYY-MM-DD) trains only on games played before that date, so a
+    season still under way can be the most recent of the three: its games so
+    far carry their own weight in the rates, and its availability is games
+    played over games its club had played - not over a full schedule. That is
+    next season's projection as it can be made in January, which is when
+    keeper decisions are really taken. `target_games` replaces the target
+    season's schedule, which does not exist yet when the target is next year.
     """
-    target_games = season_games(conn, target_season)
+    if target_games is None:
+        target_games = season_games(conn, target_season)
     sk_frames: list[tuple[pd.DataFrame, int]] = []
     g_frames: list[tuple[pd.DataFrame, int]] = []
     for season in train_seasons:
-        skaters, goalies = season_aggregates(conn, season)
-        games = season_games(conn, season)
+        skaters, goalies = season_aggregates(conn, season, before=as_of)
+        games = season_games(conn, season, before=as_of)
         sk_frames.append((skaters, games))
         g_frames.append((goalies, games))
 

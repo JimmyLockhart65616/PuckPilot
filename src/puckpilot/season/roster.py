@@ -43,6 +43,13 @@ class RosterPlayer:
     injury_note: str = ""
     is_editable: bool = True
     is_undroppable: bool = False
+    # Yahoo's `is_keeper`: kept into this season's draft.
+    kept: bool = False
+    # Next season's keeper standing (`season.keeper_value`), set by the run:
+    # his rank among the roster's eligible keepers, and whether that protects
+    # him from ever being proposed as a drop.
+    keeper_rank: int | None = None
+    keeper_protected: bool = False
 
     @property
     def eligible(self) -> frozenset[str]:
@@ -183,6 +190,8 @@ def parse_player(entry: list[Any], player_map: Mapping[str, int] | None = None) 
 
     key = str(core.get("player_key", ""))
     name = core.get("name") or {}
+    keeper = core.get("is_keeper")
+    kept = isinstance(keeper, dict) and bool(keeper.get("status") or keeper.get("kept"))
     return RosterPlayer(
         player_key=key,
         yahoo_id=str(core.get("player_id", "")),
@@ -201,6 +210,7 @@ def parse_player(entry: list[Any], player_map: Mapping[str, int] | None = None) 
         injury_note=str(core.get("injury_note", "") or ""),
         is_editable=bool(int(tail.get("is_editable", 1) or 0)),
         is_undroppable=bool(int(core.get("is_undroppable", 0) or 0)),
+        kept=kept,
     )
 
 

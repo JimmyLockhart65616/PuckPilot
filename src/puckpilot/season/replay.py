@@ -52,7 +52,7 @@ from puckpilot.engine.lineup_replay import (
 )
 from puckpilot.league import DEFAULT_LEAGUE, LeagueConfig
 from puckpilot.season.authority import LineupAuthority
-from puckpilot.season.goalies import TrailingStartShareSource
+from puckpilot.season.goalies import trailing_model
 from puckpilot.season.roster import RosterPlayer, TeamRoster
 from puckpilot.season.settings import LeagueRuntime, RosterSlot, Week
 from puckpilot.season.today import BENCH, build_plan
@@ -225,8 +225,12 @@ def live_policy_report(
     league: LeagueConfig = DEFAULT_LEAGUE,
     min_gain: float = 0.0,
     progress: Callable[[str], None] | None = None,
+    goalies: str = "",
 ) -> LivePolicyReport:
-    """Replay drafted rosters under the live path and the validated policies."""
+    """Replay drafted rosters under the live path and the validated policies.
+
+    `goalies` is the starting-goalie model, as `goalies.parse_spec` reads it.
+    """
     from puckpilot.draft.engine import RosterValuePolicy
 
     rules = league.draft_rules()
@@ -263,7 +267,7 @@ def live_policy_report(
     avail = skater_availability(conn, season, data, all_pids)
     teams = team_by_day(conn, season, data, all_pids)
     hind_g = HindsightGoalieSource(conn, season)
-    model_g = TrailingStartShareSource(conn, season, fallback_season=train_seasons[0])
+    model_g = trailing_model(conn, season, train_seasons[0], goalies)
     values = ValueModel(vm=vm, data=data, proj_pg=pg_value, season=season, scale_season=season)
     auth = LineupAuthority(enabled=True, min_gain=min_gain, min_goalie_p_start=0.5)
 

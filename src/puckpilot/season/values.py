@@ -29,6 +29,11 @@ from puckpilot.engine.lineup_replay import GameValueModel, projected_pg_values
 from puckpilot.engine.waivers import blended_pg_value
 from puckpilot.league import DEFAULT_LEAGUE, LeagueConfig
 
+# Count a goalie's rest-of-season games as his share of his club's
+# (`goalies.GoalieWorkload`) rather than all of them. Off until the add gate
+# has judged it; see `season.goalie_gate` for how the share itself was tuned.
+GOALIE_WORKLOAD = False
+
 
 @dataclass
 class ValueModel:
@@ -41,6 +46,10 @@ class ValueModel:
     scale_season: str
     frame: object | None = None
     _tilts: dict = field(default_factory=dict)
+    # goalies.GoalieWorkload, when goalie workload is on
+    workload: object | None = None
+    # keeper_value.KeeperBoard, when the run ranked next season's keepers
+    keepers: object | None = None
 
     def day_index(self, date: str) -> int:
         """Dates strictly before `date`. No lookahead by construction."""
@@ -138,12 +147,13 @@ def build_value_model(
     train_seasons: tuple[str, ...],
     league: LeagueConfig = DEFAULT_LEAGUE,
     scale_season: str | None = None,
+    goalie_workload: bool | None = None,
 ) -> ValueModel:
     """Assemble the live value model.
 
     `scale_season` is the season whose game lines set the category scales;
     it defaults to the most recent training season, which is the most recent
-    completed one.
+    completed one. `goalie_workload` defaults to `GOALIE_WORKLOAD`.
     """
     from puckpilot.draft.sim import build_universe
 
@@ -157,6 +167,14 @@ def build_value_model(
     live = build_replay_data(conn, season, skater_keys)
     proj_pg = projected_pg_values(universe.frame, vm, skater_keys)
 
+    workload = None
+    if GOALIE_WORKLOAD if goalie_workload is None else goalie_workload:
+        from puckpilot.engine.aggregate import season_games
+        from puckpilot.season.goalies import GoalieWorkload, projected_shares
+
+        priors = projected_shares(universe.frame, season_games(conn, season))
+        workload = GoalieWorkload(conn, season, priors=priors)
+
     return ValueModel(
         vm=vm,
         data=live,
@@ -164,4 +182,5 @@ def build_value_model(
         season=season,
         scale_season=scale,
         frame=universe.frame,
+        workload=workload,
     )

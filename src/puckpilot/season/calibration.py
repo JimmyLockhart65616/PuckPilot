@@ -149,8 +149,12 @@ def build_cases(
     league: LeagueConfig,
     seed: int = 20261,
     progress: Callable[[str], None] | None = None,
+    goalies: str = "",
 ) -> list[Case]:
-    """Every matchup-morning of one replayed season, with how its week ended."""
+    """Every matchup-morning of one replayed season, with how its week ended.
+
+    `goalies` is the starting-goalie model, as `goalies.parse_spec` reads it.
+    """
     from puckpilot.draft.h2h import round_robin_schedule
     from puckpilot.draft.replay import G_WIDTH, build_replay_data
     from puckpilot.draft.sim import _default_opponents, build_universe, keepers_for, run_draft
@@ -160,7 +164,7 @@ def build_cases(
         projected_pg_values,
         skater_availability,
     )
-    from puckpilot.season.goalies import AsOfGoalieSource, TrailingStartShareSource
+    from puckpilot.season.goalies import AsOfGoalieSource, trailing_model
     from puckpilot.season.replay import _week_day_ranges
     from puckpilot.season.week import per_game_rates
 
@@ -193,7 +197,7 @@ def build_cases(
     all_pids = {p for r in rosters for p in r}
     played = {pid: set(data.skater.get(pid, {})) for pid in all_pids}
     avail = drop_known_absences(skater_availability(conn, season, data, all_pids), played)
-    policy = TrailingStartShareSource(conn, season, fallback_season=train_seasons[0])
+    policy = trailing_model(conn, season, train_seasons[0], goalies)
     g_slots = sum(n for pos, n in shape.slots if pos == "G")
 
     # Each team's season as the policy plays it: who started each day, and the
@@ -462,6 +466,7 @@ def calibration_report(
     test_season: str = "20252026",
     seed: int = 20261,
     progress: Callable[[str], None] | None = None,
+    goalies: str = "",
 ) -> CalibrationReport:
     say = progress or (lambda _m: None)
     cats = league.all_cats
@@ -470,8 +475,8 @@ def calibration_report(
         y = int(season[:4])
         return tuple(f"{y - i}{y - i + 1}" for i in range(1, 4))
 
-    fit_cases = build_cases(conn, fit_season, train(fit_season), league, seed, say)
-    test_cases = build_cases(conn, test_season, train(test_season), league, seed, say)
+    fit_cases = build_cases(conn, fit_season, train(fit_season), league, seed, say, goalies)
+    test_cases = build_cases(conn, test_season, train(test_season), league, seed, say, goalies)
     say("fitting")
     model = fit(fit_cases, cats, say)
     s_fit = score(fit_cases, model, cats)

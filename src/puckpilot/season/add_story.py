@@ -15,6 +15,7 @@ the search priced the add with - nothing here is a second opinion.
                outcomes, from the same distributions the odds use
     per_game   their projected lines
     season     where each ranks on the roster for the rest of the season
+    keepers    what the swap does to next season's keepers
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ SECTIONS = (
     ("range", "Likely range (middle 80%)"),
     ("per_game", "Projected per game"),
     ("season", "Rest of season"),
+    ("keepers", "Keepers next season"),
 )
 
 
@@ -106,6 +108,13 @@ def explain(
         out["season"] = season_lines(cand, drop, base, values, season_left, days[0])
     if days:
         out["profile"] = profile_lines(conn, runtime, cand, drop, days[0])
+    board = getattr(values, "keepers", None)
+    if board is not None:
+        from puckpilot.season.keeper_value import card_lines
+
+        lines = card_lines(cand, drop, base, board)
+        if lines:
+            out["keepers"] = lines
     return {k: out[k] for k, _ in SECTIONS if k in out}
 
 
@@ -459,17 +468,43 @@ def profile_lines(conn, runtime, cand, drop, day: str) -> list[str]:
 # -- the season ---------------------------------------------------------------
 
 
+class SeasonLeft(dict):
+    """team -> games its club has left, and each goalie's share of them.
+
+    A dict so everything that asks a club's games left still can. `shares`
+    is empty unless goalie workload is on, which leaves every number as it
+    was: a goalie then counted every game his club has left.
+    """
+
+    def __init__(self, by_team: dict[str, int], shares: dict[int, float] | None = None):
+        super().__init__(by_team)
+        self.shares = dict(shares or {})
+
+
+def share_of(season_left, p) -> float:
+    """The fraction of his club's games a player is expected to play: 1 for a
+    skater, and a goalie's workload share where one is known."""
+    if getattr(p, "position", "") != "G":
+        return 1.0
+    return getattr(season_left, "shares", {}).get(p.nhl_player_id, 1.0)
+
+
+def games_left(season_left, p) -> float:
+    """Games a player has left: his club's, times his share of them."""
+    return season_left.get(p.team, 0) * share_of(season_left, p)
+
+
 def season_lines(cand, drop, roster, values, season_left, day) -> list[str]:
     """Where each would rank on the roster over the rest of the season.
 
-    The same measure the drop was chosen by - value a game times the games his
-    club has left - so this is the reason a drop was allowed, not a new one.
+    The same measure the drop was chosen by - value a game times the games he
+    has left - so this is the reason a drop was allowed, not a new one.
     """
 
     def worth(p) -> float:
         if p.nhl_player_id is None:
             return 0.0
-        return values.per_game(p.nhl_player_id, day) * season_left.get(p.team, 0)
+        return values.per_game(p.nhl_player_id, day) * games_left(season_left, p)
 
     mates = [
         p
