@@ -324,7 +324,7 @@ def _fa(key, name, pid, team="TOR"):
     )
 
 
-def _targets_for(db, players, slots, pool=None, rates=None, per_game=None, **kw):
+def _targets_for(db, players, slots, pool=None, rates=None, per_game=None, values=None, **kw):
     from puckpilot.league import LeagueConfig
     from puckpilot.season.roster import TeamRoster
     from puckpilot.season.week import _targets
@@ -344,7 +344,7 @@ def _targets_for(db, players, slots, pool=None, rates=None, per_game=None, **kw)
         rates or {1: {"goals": 0.5}, 2: {"goals": 0.2}, 9: {"goals": 0.3}},
         {},
         None,
-        _PerGame(per_game or {1: 1.5, 2: 0.5, 9: 1.0}),
+        values or _PerGame(per_game or {1: 1.5, 2: 0.5, 9: 1.0}),
         0.0,
         5,
         **kw,
@@ -807,6 +807,32 @@ def test_a_protected_keeper_is_never_proposed_as_a_drop(db):
     assert unprotected and unprotected[0].drop.name == "Depth"  # the cheapest, otherwise
     got = _targets_for(db, players, (("C", 3, 1),), rates=rates, per_game=pg)
     assert got and all(t.drop is None or t.drop.name != "Depth" for t in got)
+
+
+def test_an_add_card_says_what_it_does_to_next_season_s_keepers(db):
+    import pandas as pd
+
+    from puckpilot.engine.valuation import LeagueShape
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season.keeper_value import KeeperBoard
+
+    values = _PerGame({1: 1.5, 2: 0.5, 9: 1.0})
+    values.keepers = KeeperBoard(
+        league=LeagueConfig(n_keepers=3, shape=LeagueShape(n_teams=2)),
+        season="20262027",
+        as_of="2026-10-05",
+        vorp_next=pd.Series({1: 8.0, 2: 1.0, 9: 3.0}),
+        cost=0.0,
+        times_kept=None,
+    )
+    [t, *_] = _targets_for(
+        db,
+        (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+        (("C", 2, 1),),
+        values=values,
+    )
+    assert t.detail["keepers"][0].startswith("Streamer projects +3.0 over replacement next season")
+    assert list(t.detail)[-1] == "keepers"
 
 
 def test_an_add_explains_itself_day_by_day(db):

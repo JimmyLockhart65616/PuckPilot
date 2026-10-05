@@ -172,7 +172,12 @@ class KeeperBoard:
         for p in players:
             pid = p.nhl_player_id
             v = self.value(pid)
-            rows.append((p, v, self.kept(pid), self.eligible(pid)))
+            kept = self.kept(pid)
+            if self.times_kept is None and getattr(p, "kept", False):
+                # No saved contracts, but Yahoo says he was kept into this
+                # season: at least once, which is all that can be said.
+                kept = max(kept, 1)
+            rows.append((p, v, kept, kept < self.league.keeper_years))
         ranked = sorted(
             (r for r in rows if r[3] and r[1] is not None), key=lambda r: (-r[1], r[0].name)
         )

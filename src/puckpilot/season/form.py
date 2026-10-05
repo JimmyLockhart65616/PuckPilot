@@ -80,7 +80,9 @@ USAGE_CLIP = (0.7, 1.5)
 PP_GAMMA = 0.5
 PP_CLIP = (0.5, 2.0)
 PP_SMOOTH = 30.0
-# Whether form rates use it. Off until the add gate has judged it (-u).
+# Whether form rates use it. The add gate cannot see a gain that small: -r-u
+# against -r, 12 teams x 22 weeks, -0.05 +/- 0.07 and +0.04 +/- 0.05
+# categories a week. Off; the cards show the ice time either way.
 FORM_USAGE = False
 
 

@@ -232,3 +232,11 @@ def test_the_keeper_gate_scores_a_perfect_ranking_as_no_regret():
     backwards = score_rule(-actual, actual, {1, 2, 3, 4, 5}, {1, 2, 3, 4, 5}, rosters, 2, 3)
     # keeps 5, 4 and 3: 0 (below replacement counts as replacement) + 1 + 6
     assert backwards.regret == (10 + 8 + 6) - (0 + 1 + 6)
+
+
+def test_without_saved_contracts_yahoo_s_keeper_flag_counts_a_keep():
+    board = _board({1: 9.0, 2: 5.0}, years=1)
+    yahoo_kept = SimpleNamespace(player_key="a", nhl_player_id=1, name="Kept", kept=True)
+    ranks = {k.player_key: k for k in board.rank([yahoo_kept, _p("b", 2)])}
+    assert ranks["a"].times_kept == 1 and not ranks["a"].eligible  # one keep, one allowed
+    assert ranks["b"].eligible
