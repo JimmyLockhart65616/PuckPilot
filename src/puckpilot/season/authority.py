@@ -197,7 +197,15 @@ class TransactionAuthority:
     # season, less what keeping costs (`season.keeper_value`). Decided once a
     # week, so the line does not move under a waiting proposal. A league
     # without keepers protects nobody.
-    protect_keepers: bool = False
+    #
+    # Measured twice. Which keepers it picks (`ppilot season keeper-check`,
+    # 48 drafted rosters, 2023-24 and 2024-25): from January on, those it would
+    # keep did better the next season than the preseason projection's picks
+    # and far better than the per-game value drops were judged by. What it
+    # costs now (add gate `odds-daily-h-f25-x1-k1`, 12 teams x 22 weeks):
+    # +0.04 +/- 0.05 and +0.14 +/- 0.05 categories a week - nothing; the
+    # players it shields are the rising ones the per-game value cut too soon.
+    protect_keepers: bool = True
     keeper_margin: int = 1
 
     def __post_init__(self) -> None:

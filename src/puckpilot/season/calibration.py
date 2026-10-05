@@ -150,11 +150,16 @@ def build_cases(
     seed: int = 20261,
     progress: Callable[[str], None] | None = None,
     goalies: str = "",
+    rates_mode: str = "pre",
 ) -> list[Case]:
     """Every matchup-morning of one replayed season, with how its week ended.
 
     `goalies` is the starting-goalie model, as `goalies.parse_spec` reads it.
+    `rates_mode` "form" forecasts each morning with per-category rates that have
+    seen the season so far (`season.form`); "pre" with the preseason rates.
     """
+    if rates_mode not in ("pre", "form"):
+        raise ValueError(f"rates_mode must be 'pre' or 'form', not {rates_mode!r}")
     from puckpilot.draft.h2h import round_robin_schedule
     from puckpilot.draft.replay import G_WIDTH, build_replay_data
     from puckpilot.draft.sim import _default_opponents, build_universe, keepers_for, run_draft
@@ -181,6 +186,11 @@ def build_cases(
     pg_value = projected_pg_values(u.frame, vm, skater_keys)
     positions = dict(zip(u.ids.tolist(), u.pos.tolist(), strict=True))
     rates = per_game_rates(u.frame, cats)
+    form = None
+    if rates_mode == "form":
+        from puckpilot.season.form import FormRates
+
+        form = FormRates(data, rates)
 
     from puckpilot.draft.engine import RosterValuePolicy
 
@@ -260,13 +270,14 @@ def build_cases(
                 goalie_games.setdefault(pid, []).append(ps)
         return skater_games, goalie_games
 
-    def side_of(t, banked, skater_games, goalie_games) -> Side:
+    def side_of(t, banked, skater_games, goalie_games, at: str) -> Side:
+        now = form.rates(at) if form is not None else rates
         skaters: dict[str, float] = {}
         for pid, n in skater_games.items():
-            for k, r in (rates.get(pid) or {}).items():
+            for k, r in (now.get(pid) or {}).items():
                 skaters[k] = skaters.get(k, 0.0) + r * n
         goalies = [
-            goalie_game(rates.get(pid) or {}, p) for pid, ps in goalie_games.items() for p in ps
+            goalie_game(now.get(pid) or {}, p) for pid, ps in goalie_games.items() for p in ps
         ]
         return Side(banked=banked, skaters=skaters, goalies=goalies)
 
@@ -299,8 +310,8 @@ def build_cases(
                         week=wi + 1,
                         day=k,
                         days_left=len(rest),
-                        ours=side_of(a, bank_a, sa, ga),
-                        theirs=side_of(b, bank_b, sb, gb),
+                        ours=side_of(a, bank_a, sa, ga, cutoff),
+                        theirs=side_of(b, bank_b, sb, gb, cutoff),
                         outcome=outcome,
                     )
                 )
@@ -467,6 +478,7 @@ def calibration_report(
     seed: int = 20261,
     progress: Callable[[str], None] | None = None,
     goalies: str = "",
+    rates_mode: str = "pre",
 ) -> CalibrationReport:
     say = progress or (lambda _m: None)
     cats = league.all_cats
@@ -475,8 +487,12 @@ def calibration_report(
         y = int(season[:4])
         return tuple(f"{y - i}{y - i + 1}" for i in range(1, 4))
 
-    fit_cases = build_cases(conn, fit_season, train(fit_season), league, seed, say, goalies)
-    test_cases = build_cases(conn, test_season, train(test_season), league, seed, say, goalies)
+    fit_cases = build_cases(
+        conn, fit_season, train(fit_season), league, seed, say, goalies, rates_mode
+    )
+    test_cases = build_cases(
+        conn, test_season, train(test_season), league, seed, say, goalies, rates_mode
+    )
     say("fitting")
     model = fit(fit_cases, cats, say)
     s_fit = score(fit_cases, model, cats)

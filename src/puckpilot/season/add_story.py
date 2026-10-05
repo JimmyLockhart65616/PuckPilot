@@ -403,6 +403,67 @@ def form_line(player, conn, season: str) -> str:
     )
 
 
+def _clock(seconds: float) -> str:
+    m, sec = divmod(int(round(seconds)), 60)
+    return f"{m}:{sec:02d}"
+
+
+def usage_line(conn, player, season: str, day: str, n: int = 5) -> str:
+    """Ice time over his last `n` games against last season's, and the power
+    play's share - the first place a change of role shows (`form.Usage`)."""
+    import json
+
+    pid = player.nhl_player_id
+    if pid is None or player.position == "G":
+        return ""
+    last = f"{int(season[:4]) - 1}{season[:4]}"
+
+    def minutes(rows) -> list[float]:
+        out = []
+        for (stats,) in rows:
+            mins, _, secs = str(json.loads(stats).get("toi") or "").partition(":")
+            with contextlib.suppress(ValueError):
+                out.append(int(mins) + int(secs or 0) / 60.0)
+        return out
+
+    recent = minutes(
+        conn.execute(
+            "SELECT stats_json FROM nhl_game_logs WHERE player_id = ? AND season = ? "
+            "AND game_type = 2 AND game_date < ? ORDER BY game_date DESC LIMIT ?",
+            (pid, season, day, n),
+        )
+    )
+    if not recent:
+        return ""
+    before = minutes(
+        conn.execute(
+            "SELECT stats_json FROM nhl_game_logs WHERE player_id = ? AND season = ? "
+            "AND game_type = 2",
+            (pid, last),
+        )
+    )
+    line = f"ice time {sum(recent) / len(recent):.1f} min a game over his last {len(recent)}"
+    if before:
+        line += f" ({sum(before) / len(before):.1f} last season)"
+    pp_now = [
+        r[0]
+        for r in conn.execute(
+            "SELECT pp_toi_s FROM nhl_skater_toi WHERE player_id = ? AND season = ? "
+            "AND game_date < ? AND pp_toi_s IS NOT NULL ORDER BY game_date DESC LIMIT ?",
+            (pid, season, day, n),
+        )
+    ]
+    if pp_now:
+        line += f"; power play {_clock(sum(pp_now) / len(pp_now))}"
+        base = conn.execute(
+            "SELECT AVG(pp_toi_s) FROM nhl_skater_toi WHERE player_id = ? AND season = ?",
+            (pid, last),
+        ).fetchone()[0]
+        if base is not None:
+            line += f" ({_clock(base)})"
+    return line
+
+
 def _age(conn, pid, day: str) -> str:
     if pid is None:
         return ""
@@ -462,6 +523,9 @@ def profile_lines(conn, runtime, cand, drop, day: str) -> list[str]:
         out.append(head + (": " + "; ".join(extra) if extra else ""))
         out.append(f"  {form_line(p, conn, last)}")
         out.append(f"  {form_line(p, conn, season)}")
+        usage = usage_line(conn, p, season, day)
+        if usage:
+            out.append(f"  {usage}")
     return out
 
 

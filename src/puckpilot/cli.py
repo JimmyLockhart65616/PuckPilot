@@ -1660,6 +1660,7 @@ def _cmd_season_calibrate(args: argparse.Namespace) -> int:
         seed=args.seed,
         progress=print if args.verbose else None,
         goalies=args.goalies,
+        rates_mode=args.rates,
     )
     print()
     print(report.text)
@@ -1727,6 +1728,24 @@ def _cmd_season_keeper_check(args: argparse.Namespace) -> int:
     print()
     print(report.text)
     return 0 if report.text.rstrip().endswith("PASS") else 1
+
+
+def _cmd_season_form_check(args: argparse.Namespace) -> int:
+    """Do rates pulled toward recent form forecast next week better than August's?"""
+    from puckpilot.data import store
+    from puckpilot.season.form_gate import form_gate_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = form_gate_report(
+        conn,
+        _league(args),
+        seasons=tuple(args.season),
+        progress=print if args.verbose else None,
+    )
+    print()
+    print(report.text)
+    return 0
 
 
 def _cmd_season_preflight(args: argparse.Namespace) -> int:
@@ -2109,6 +2128,20 @@ def _cmd_shadow_season(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_data_toi(args: argparse.Namespace) -> int:
+    """Backfill ice time by situation (power play, short-handed, even strength)."""
+    from puckpilot.data import store
+    from puckpilot.data.nhlstats import NhlStatsClient
+    from puckpilot.data.sync import sync_skater_toi
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    store.init_db(conn)
+    print(f"Ice time by situation for {', '.join(args.seasons)} (one request per game date)...")
+    sync_skater_toi(conn, NhlStatsClient(), args.seasons, progress=print)
+    return 0
+
+
 def _cmd_data_daily(args: argparse.Namespace) -> int:
     from puckpilot.data import store
     from puckpilot.data.nhl import NhlClient
@@ -2279,6 +2312,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-players", type=int, default=None, help="Cap player log fetches for a quick run"
     )
     daily.set_defaults(func=_cmd_data_daily)
+
+    toi = data_sub.add_parser(
+        "toi", help="Backfill ice time by situation per game (power play, short-handed)"
+    )
+    toi.add_argument("--seasons", nargs="+", default=["20262027"])
+    toi.set_defaults(func=_cmd_data_toi)
 
     rosters = data_sub.add_parser(
         "rosters",
@@ -2624,6 +2663,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Starting-goalie model, e.g. old or club-dw2-chain (default: current)",
     )
+    s_cal.add_argument(
+        "--rates",
+        choices=("pre", "form"),
+        default="pre",
+        help="Forecast with preseason rates, or rates that have seen the season so far",
+    )
     s_cal.add_argument("--verbose", action="store_true")
     s_cal.set_defaults(func=_cmd_season_calibrate)
 
@@ -2666,6 +2711,14 @@ def build_parser() -> argparse.ArgumentParser:
     s_kc.add_argument("--season", nargs="+", default=["20232024", "20242025"])
     s_kc.add_argument("--verbose", action="store_true")
     s_kc.set_defaults(func=_cmd_season_keeper_check)
+
+    s_fc = season_sub.add_parser(
+        "form-check",
+        help="Do rates pulled toward recent form forecast next week better than August's?",
+    )
+    s_fc.add_argument("--season", nargs="+", default=["20232024", "20242025", "20252026"])
+    s_fc.add_argument("--verbose", action="store_true")
+    s_fc.set_defaults(func=_cmd_season_form_check)
 
     s_run = season_sub.add_parser(
         "run",

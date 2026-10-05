@@ -427,6 +427,80 @@ def players_behind_their_boxscores(
     return [int(r[0]) for r in rows]
 
 
+def _seconds(v) -> int | None:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def sync_skater_toi(
+    conn: sqlite3.Connection,
+    stats,
+    seasons: list[str],
+    *,
+    delay: float = POLITE_DELAY_S,
+    today: date | None = None,
+    progress: Progress = _noop,
+) -> dict[str, dict[str, int]]:
+    """Ice time by situation for every regular-season game date already played.
+
+    One request per date (`NhlStatsClient.skater_toi`), incremental via sync_meta
+    key 'toi:{date}'. A date that comes back empty is left unmarked, so a run
+    before the stats are published picks it up on the next one.
+    """
+    cutoff = (today or date.today()).isoformat()
+    report: dict[str, dict[str, int]] = {}
+    for season in seasons:
+        dates = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT game_date FROM nhl_schedule"
+                " WHERE season = ? AND game_type = ? AND game_date < ? ORDER BY game_date",
+                (season, REGULAR_SEASON, cutoff),
+            )
+        ]
+        synced = skipped = empty = rows_written = 0
+        for d in dates:
+            key = f"toi:{d}"
+            if store.get_meta(conn, key) == "done":
+                skipped += 1
+                continue
+            got = stats.skater_toi(d)
+            rows = [
+                (
+                    int(r["gameId"]),
+                    int(r["playerId"]),
+                    season,
+                    d,
+                    _seconds(r.get("timeOnIce")),
+                    _seconds(r.get("ppTimeOnIce")),
+                    _seconds(r.get("shTimeOnIce")),
+                    _seconds(r.get("evTimeOnIce")),
+                )
+                for r in got
+                if r.get("gameId") is not None and r.get("playerId") is not None
+            ]
+            if not rows:
+                empty += 1
+                continue
+            store.upsert_skater_toi(conn, rows)
+            store.set_meta(conn, key, "done")
+            synced += 1
+            rows_written += len(rows)
+            if synced % 25 == 0:
+                conn.commit()
+                progress(f"    {season}: {synced} dates")
+            time.sleep(delay)
+        conn.commit()
+        progress(
+            f"  {season}: ice time for {synced} date(s), {skipped} already done, "
+            f"{empty} empty, {rows_written} rows"
+        )
+        report[season] = {"dates": synced, "skipped": skipped, "empty": empty, "rows": rows_written}
+    return report
+
+
 def sync_day(
     conn: sqlite3.Connection,
     nhl: NhlClient,
@@ -483,4 +557,14 @@ def sync_day(
 
     still = len(players_behind_their_boxscores(conn, season))
     progress(f"  {season}: {synced} player log(s) updated, {still} still behind")
-    return {"boxscores": fetched, "players_synced": synced, "still_behind": still}
+    # Ice time by situation, from a second, unofficial API: its failure costs a
+    # day of power-play time, never the morning's lineup.
+    toi = 0
+    try:
+        from puckpilot.data.nhlstats import NhlStatsClient
+
+        got = sync_skater_toi(conn, NhlStatsClient(), [season], delay=delay, today=today)
+        toi = got.get(season, {}).get("dates", 0)
+    except Exception as e:  # noqa: BLE001
+        progress(f"  {season}: ice time not synced - {type(e).__name__}: {e}")
+    return {"boxscores": fetched, "players_synced": synced, "still_behind": still, "toi": toi}

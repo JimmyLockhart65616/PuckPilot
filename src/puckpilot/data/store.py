@@ -91,6 +91,22 @@ CREATE TABLE IF NOT EXISTS nhl_boxscore_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_nhl_boxscore_player ON nhl_boxscore_stats (player_id, season);
 
+-- Ice time by situation per skater-game, from the NHL stats API
+-- (data/nhlstats.py), in seconds. The game log carries only the total; the
+-- power-play share is the earliest sign of a power-play role.
+CREATE TABLE IF NOT EXISTS nhl_skater_toi (
+    game_id     INTEGER NOT NULL,
+    player_id   INTEGER NOT NULL,
+    season      TEXT NOT NULL,
+    game_date   TEXT NOT NULL,
+    toi_s       INTEGER,
+    pp_toi_s    INTEGER,
+    sh_toi_s    INTEGER,
+    ev_toi_s    INTEGER,
+    PRIMARY KEY (game_id, player_id)
+);
+CREATE INDEX IF NOT EXISTS idx_nhl_skater_toi_player ON nhl_skater_toi (player_id, season);
+
 -- Biographical data (birth date drives age curves). Kept in its own table so
 -- adding it needs no migration of nhl_players.
 CREATE TABLE IF NOT EXISTS nhl_player_bio (
@@ -532,6 +548,19 @@ def upsert_player_bio(
         " (player_id, birth_date, height_in, weight_lb, shoots)"
         " VALUES (?, ?, ?, ?, ?)",
         (player_id, birth_date, height_in, weight_lb, shoots),
+    )
+
+
+def upsert_skater_toi(
+    conn: sqlite3.Connection,
+    rows: list[tuple[int, int, str, str, int | None, int | None, int | None, int | None]],
+) -> None:
+    """Bulk upsert of (game_id, player_id, season, game_date, toi, pp, sh, ev) seconds."""
+    conn.executemany(
+        "INSERT OR REPLACE INTO nhl_skater_toi"
+        " (game_id, player_id, season, game_date, toi_s, pp_toi_s, sh_toi_s, ev_toi_s)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
     )
 
 

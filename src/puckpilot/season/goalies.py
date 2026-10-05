@@ -37,6 +37,10 @@ from collections.abc import Iterable
 # Team games of history to weigh. Swept over 2025-26 and confirmed on 2024-25
 # and 2023-24; 10 was best or tied-best in all three, and the plateau across
 # 10-20 games is broad enough that the exact value is not load-bearing.
+# Re-swept on the current model (2026-10-05, `goalie-check`): 6 and 8 worse in
+# every season and measure; 12 and 15 a little better on Brier (+0.001 to
+# +0.006) and a little worse at naming tonight's starter (-0.2 to -1.0 pt),
+# all inside noise. Demotion 0.4 costs 2-3 points tonight, 0.6-0.7 Brier.
 TRAILING_TEAM_GAMES = 10
 
 # Multiplicative demotion for whoever started the team's previous game. 0.5 was
@@ -69,8 +73,9 @@ AHEAD_RULES = ("damped", "share", "chain")
 # +2.2 to +2.4 points tonight (about 4 SE, clustered by club) and 0.21-0.22
 # fewer starts misplaced per 7 games, in all three seasons. Downstream:
 # the live lineup path is flat (+1.4 +/- 1.3 and -0.0 +/- 0.4 a roster), and
-# the add gate with this model for the tested team only was +0.03 +/- 0.05 and
-# +0.08 +/- 0.06 categories a week - never worse. Two clubs a goalie dressed
+# the add gate with this model for the tested team only, 4 drafts x 2 seasons,
+# pooled +0.05 +/- 0.02 categories a week (one league clear of 2 SE, none
+# worse by it). Two clubs a goalie dressed
 # for one after another count him only for the latter; one who has not
 # dressed in two games is out; games after the next walk the demotion forward.
 CURRENT_CLUB = True

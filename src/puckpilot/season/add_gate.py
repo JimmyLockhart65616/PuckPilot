@@ -52,7 +52,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -82,6 +82,15 @@ class ArmSpec:
     # -l: a goalie's rest-of-season games are his club's times his share of
     # its starts (`goalies.GoalieWorkload`), not all of his club's.
     workload: bool = False
+    # -r: plans price with per-category rates that have seen this season
+    # (`season.form`), not the preseason projection's.
+    form_rates: bool = False
+    # -v: plans value players per game from those rates (`form.FORM_VALUE`),
+    # not the 14-day blend.
+    form_value: bool = False
+    # -u: those rates scaled by recent ice time and power-play time
+    # (`form.Usage`).
+    usage: bool = False
     # -kN: next season's best n_keepers + N are never dropped, ranked each
     # Monday by `keeper_value` as of the latest month's start (no contracts:
     # every player eligible). None: no protection.
@@ -118,6 +127,12 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.goalies = True
         elif tok == "l":
             spec.workload = True
+        elif tok == "r":
+            spec.form_rates = True
+        elif tok == "v":
+            spec.form_value = True
+        elif tok == "u":
+            spec.usage = True
         elif len(tok) > 1 and tok[0] in "spqfxk" and tok[1:].isdigit():
             n = int(tok[1:])
             if tok[0] == "k":
@@ -164,6 +179,9 @@ class AsOfValues:
 
     def per_game_tilted(self, pid: int, date: str, weights) -> float:
         return self.values.per_game_tilted(pid, min(date, self.cutoff), weights)
+
+    def rates(self, cats, date: str):
+        return self.values.rates(cats, min(date, self.cutoff))
 
     def knows(self, pid: int) -> bool:
         return self.values.knows(pid)
@@ -230,6 +248,7 @@ def add_gate_report(
         projected_pg_values,
         skater_availability,
     )
+    from puckpilot.season.form import FormRates, Usage
     from puckpilot.season.goalies import (
         AsOfGoalieSource,
         GoalieWorkload,
@@ -258,9 +277,37 @@ def add_gate_report(
     vm = GameValueModel(data, set(u.ids.tolist()), league.goalie_cats)
     pg_value = projected_pg_values(u.frame, vm, skater_keys)
     positions = dict(zip(u.ids.tolist(), u.pos.tolist(), strict=True))
+    skaters = {int(p) for p, pos in u.frame["position"].items() if pos != "G"}
+    form = FormRates(data, per_game_rates(u.frame, cats), skaters=skaters)
     values = ValueModel(
-        vm=vm, data=data, proj_pg=pg_value, season=season, scale_season=season, frame=u.frame
+        vm=vm,
+        data=data,
+        proj_pg=pg_value,
+        season=season,
+        scale_season=season,
+        frame=u.frame,
+        form=form,
+        form_value=False,
     )
+    form_u = (
+        FormRates(
+            data,
+            per_game_rates(u.frame, cats),
+            skaters=skaters,
+            usage=Usage(conn, season, data.dates),
+        )
+        if any(parse_arm(a, stream_spots).usage for a in arms)
+        else None
+    )
+    by_kind: dict[tuple[bool, bool], ValueModel] = {(False, False): values}
+
+    def values_for(spec: ArmSpec) -> ValueModel:
+        key = (spec.form_value, spec.usage)
+        if key not in by_kind:
+            by_kind[key] = replace(
+                values, form=form_u if spec.usage else form, form_value=spec.form_value, _tilts={}
+            )
+        return by_kind[key]
 
     opponents = _default_opponents(rng, league)
     order = rng.permutation(len(opponents))
@@ -474,6 +521,7 @@ def add_gate_report(
             kind, spots = spec.kind, spec.spots
             pol = policy_alt if spec.goalies else policy
             wl = workload if spec.workload else None
+            vals = values_for(spec)
             last_n = max(spec.preload, spec.queue)
             roster = list(rosters[t])
             adds_season = 0
@@ -549,7 +597,7 @@ def add_gate_report(
                                 pool,
                                 u.frame,
                                 AsOfGoalieSource(pol, date),
-                                AsOfValues(values, date),
+                                AsOfValues(vals, date),
                                 # Queued moves are paid for next week, not now.
                                 adds_used_week=0 if spec.queue else adds_week,
                                 adds_used_season=adds_season,
@@ -563,6 +611,7 @@ def add_gate_report(
                                 stream_spots=spots,
                                 measure_room=False,
                                 workload=wl,
+                                form_rates=spec.form_rates,
                             )
                             for target in plan.targets:
                                 drop = target.drop
@@ -628,7 +677,7 @@ def add_gate_report(
                             pool,
                             u.frame,
                             AsOfGoalieSource(pol, date),
-                            AsOfValues(values, date),
+                            AsOfValues(vals, date),
                             adds_used_week=adds_week,
                             adds_used_season=adds_season,
                             min_gain=min_gain,
@@ -644,6 +693,7 @@ def add_gate_report(
                             stream_spots=spots,
                             measure_room=False,
                             workload=wl,
+                            form_rates=spec.form_rates,
                         )
                         targets = list(plan.targets)
                         nopp = (
@@ -673,7 +723,7 @@ def add_gate_report(
                                 [],
                                 u.frame,
                                 AsOfGoalieSource(pol, date),
-                                AsOfValues(values, date),
+                                AsOfValues(vals, date),
                                 find_targets=False,
                                 reprice=[(x.player, x.drop) for x in targets],
                                 odds_model=OddsModel() if odds_arm else None,
@@ -684,6 +734,7 @@ def add_gate_report(
                                 stream_spots=spots,
                                 measure_room=False,
                                 workload=wl,
+                                form_rates=spec.form_rates,
                             )
                             later = {_pair(x): _worth(x) for x in (*nplan.targets, *nplan.lapsed)}
                             targets = [

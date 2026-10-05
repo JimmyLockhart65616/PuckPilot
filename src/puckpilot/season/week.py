@@ -693,6 +693,7 @@ def build_week_plan(
     reprice=None,
     horizon: str = "this week",
     workload=None,
+    form_rates: bool | None = None,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -712,12 +713,21 @@ def build_week_plan(
     `workload` (`goalies.GoalieWorkload`) counts a goalie's games over the rest
     of the season as his club's times his share of its starts, rather than all
     of his club's; without it every number is as it was.
+
+    `form_rates` (default `form.FORM_RATES`) prices with per-category rates
+    that have seen this season (`values.rates`) instead of August's.
     """
+    from puckpilot.season.form import FORM_RATES
+
     cats = league.all_cats
-    rates = per_game_rates(frame, cats)
     if workload is None:
         workload = getattr(values, "workload", None)
     days = [d for d in week.dates() if from_day is None or d >= from_day]
+    use_form = FORM_RATES if form_rates is None else form_rates
+    if use_form and days and hasattr(values, "rates"):
+        rates = values.rates(cats, days[0])
+    else:
+        rates = per_game_rates(frame, cats)
     exclude = {days[0]: set(started)} if days and started else None
     base_ours = banked_components(banked_ours or {})
     base_theirs = banked_components(banked_theirs or {})

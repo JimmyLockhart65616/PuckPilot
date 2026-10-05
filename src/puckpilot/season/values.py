@@ -30,8 +30,14 @@ from puckpilot.engine.waivers import blended_pg_value
 from puckpilot.league import DEFAULT_LEAGUE, LeagueConfig
 
 # Count a goalie's rest-of-season games as his share of his club's
-# (`goalies.GoalieWorkload`) rather than all of them. Off until the add gate
-# has judged it; see `season.goalie_gate` for how the share itself was tuned.
+# (`goalies.GoalieWorkload`) rather than all of them. The share itself is far
+# better (remaining-share error 0.60 -> 0.11-0.14, `season goalie-check`), but
+# the add search does worse with it: add gate `-g-l` against `-g`'s baseline,
+# 4 drafts x 2 seasons, pooled -0.11 +/- 0.03 categories a week, three leagues
+# worse by more than 2 SE, none better. Valued at his share, a backup goalie
+# becomes one of the cheapest players on the roster and is cut for a skater
+# streamer, and the goalie categories go with him. Off: the inflated number
+# was doing a job the search relies on.
 GOALIE_WORKLOAD = False
 
 
@@ -50,6 +56,11 @@ class ValueModel:
     workload: object | None = None
     # keeper_value.KeeperBoard, when the run ranked next season's keepers
     keepers: object | None = None
+    # form.FormRates: per-category rates that have seen this season
+    form: object | None = None
+    # per_game from `form` for skaters rather than the 14-day blend; None
+    # follows `form.FORM_VALUE`
+    form_value: bool | None = None
 
     def day_index(self, date: str) -> int:
         """Dates strictly before `date`. No lookahead by construction."""
@@ -62,7 +73,23 @@ class ValueModel:
         is `waivers.blended_pg_value` - the same function the waiver backtest
         was validated with, and it filters strictly to days before `date`.
         """
+        if self.form is not None:
+            from puckpilot.season.form import FORM_VALUE
+
+            if FORM_VALUE if self.form_value is None else self.form_value:
+                v = self.form.value(pid, date, self.vm)
+                if v is not None:
+                    return v
         return blended_pg_value(pid, self.day_index(date), self.data, self.vm, self.proj_pg)
+
+    def rates(self, cats, date: str) -> dict[int, dict[str, float]]:
+        """Per-game category rates as of `date`: this season's form when it is
+        attached (`season.form`), else the preseason projection's."""
+        if self.form is not None:
+            return self.form.rates(date)
+        from puckpilot.season.week import per_game_rates
+
+        return per_game_rates(self.frame, cats)
 
     def projected(self, pid: int) -> float:
         """The preseason number alone, for showing what form has moved."""
@@ -166,6 +193,16 @@ def build_value_model(
 
     live = build_replay_data(conn, season, skater_keys)
     proj_pg = projected_pg_values(universe.frame, vm, skater_keys)
+    from puckpilot.season.form import FORM_USAGE, FormRates, Usage
+    from puckpilot.season.week import per_game_rates
+
+    skaters = {int(p) for p, pos in universe.frame["position"].items() if pos != "G"}
+    form = FormRates(
+        live,
+        per_game_rates(universe.frame, league.all_cats),
+        skaters=skaters,
+        usage=Usage(conn, season, live.dates) if FORM_USAGE else None,
+    )
 
     workload = None
     if GOALIE_WORKLOAD if goalie_workload is None else goalie_workload:
@@ -183,4 +220,5 @@ def build_value_model(
         scale_season=scale,
         frame=universe.frame,
         workload=workload,
+        form=form,
     )
