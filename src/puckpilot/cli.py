@@ -166,6 +166,16 @@ def _cmd_yahoo_playermap(args: argparse.Namespace) -> int:
     settings = Settings()
     conn = store.connect(settings.resolved_db_path)
 
+    if args.recheck:
+        from puckpilot.yahoo.playermap import recheck_map
+
+        changes = recheck_map(conn, progress=print)
+        print()
+        print(f"{len(changes)} stored match(es) changed:" if changes else "No match changed.")
+        for line in changes:
+            print(f"  {line}")
+        return 0
+
     if args.reresolve_only:
         from puckpilot.yahoo.playermap import reresolve_unmatched
 
@@ -2387,6 +2397,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reresolve-only",
         action="store_true",
         help="Skip Yahoo; re-match already-fetched unmatched rows against nhl_players now",
+    )
+    ym.add_argument(
+        "--recheck",
+        action="store_true",
+        help="Skip Yahoo; re-match EVERY stored row (corrects matches an older resolver got wrong)",
     )
     ym.set_defaults(func=_cmd_yahoo_playermap)
 

@@ -216,6 +216,14 @@ def _surname(name: str) -> str:
     return parts[-1] if parts else ""
 
 
+def _given_tokens(name: str) -> list[str]:
+    """'Anthony (AJ) Spellacy' -> ['anthony', 'aj']."""
+    import re
+
+    parts = name.split()[:-1]
+    return [_norm(t) for t in re.split(r"[\s\-()]+", " ".join(parts)) if _norm(t)]
+
+
 def same_player(a: str, b: str) -> bool:
     """Two spellings of one player, not two players.
 
@@ -232,6 +240,15 @@ def same_player(a: str, b: str) -> bool:
         fa, fb = x.removesuffix(sa), y.removesuffix(sb)
         common = len(os.path.commonprefix([fa, fb]))
         if common >= 3 or difflib.SequenceMatcher(None, x, y).ratio() >= SAME_PLAYER_RATIO:
+            return True
+        # "Bo" for Benoit-Olivier (his initials), "AJ" for "Anthony (AJ)" (a
+        # name he also goes by). Same initial alone is not enough: Jamie and
+        # Jordie Benn are brothers.
+        ga, gb = _given_tokens(a), _given_tokens(b)
+        if set(ga) & set(gb):
+            return True
+        initials = ("".join(t[0] for t in ga), "".join(t[0] for t in gb))
+        if (len(ga) > 1 and initials[0] in gb) or (len(gb) > 1 and initials[1] in ga):
             return True
     ratio = difflib.SequenceMatcher(None, x, y).ratio()
     surname = difflib.SequenceMatcher(None, sa, sb).ratio()

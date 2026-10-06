@@ -233,3 +233,67 @@ def test_position_corrections_only_touch_skaters_yahoo_will_not_play_there(db):
         2: frozenset({"C", "L"}),
         3: frozenset({"G"}),
     }
+
+
+# -- the 2026-10-05 recheck: name alone was too little ----------------------------
+
+
+@pytest.fixture
+def idx2(db):
+    for pid, name, pos, team in [
+        (21, "Elias Pettersson", "C", "VAN"),  # two players, one name, one club
+        (22, "Elias Pettersson", "D", "VAN"),
+        (23, "Konnor Smith", "D", "ANA"),
+        (24, "John Moore", "D", "BOS"),
+        (25, "Benoit-Olivier Groulx", "C", "TOR"),
+        (26, "Anthony (AJ) Spellacy", "R", "CHI"),
+    ]:
+        store.upsert_player(db, pid, name, pos, team)
+    return _nhl_index(db)
+
+
+def test_one_name_on_one_club_is_told_apart_by_position(idx2):
+    assert _resolve(idx2, "Elias Pettersson", "VAN", "C,Util") == (21, "exact+position")
+    assert _resolve(idx2, "Elias Pettersson", "VAN", "D,Util") == (22, "exact+position")
+    assert _resolve(idx2, "Elias Pettersson", "VAN")[0] is None  # no position: refuse
+
+
+def test_a_surname_and_a_club_are_not_enough(idx2):
+    """Tarin Smith was matched to Konnor Smith, and a centre named William Moore
+    to a defenceman named John - each the only one of his surname on the club."""
+    assert _resolve(idx2, "Tarin Smith", "ANA", "D,Util")[0] is None
+    assert _resolve(idx2, "William Moore", "BOS", "C,Util")[0] is None
+
+
+def test_nicknames_still_find_their_player(idx2):
+    assert _resolve(idx2, "Bo Groulx", "TOR", "C,Util")[0] == 25
+    assert _resolve(idx2, "AJ Spellacy", "CHI", "RW,Util")[0] == 26
+
+
+def test_given_names_and_positions_compare_as_people_would():
+    from puckpilot.yahoo.playermap import position_class, same_given
+
+    assert same_given("Bob Smith", "Robert Smith")  # a nickname
+    assert same_given("Egor Chinakhov", "Yegor Chinakhov")  # a transliteration
+    assert not same_given("Tarin Smith", "Konnor Smith")
+    assert position_class("C,LW,Util") == "F" and position_class("D,Util") == "D"
+    assert position_class("G") == "G" and position_class("") == ""
+
+
+def test_a_recheck_corrects_a_stored_match_without_asking_yahoo(db, idx2):
+    from puckpilot.yahoo.playermap import recheck_map
+
+    db.executemany(
+        "INSERT INTO yahoo_player_map (player_key, league_key, full_name, team_abbrev,"
+        " positions, nhl_player_id, adp_rank) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("k1", "L", "Elias Pettersson", "VAN", "C,Util", 21, 1),
+            ("k2", "L", "Elias Pettersson", "VAN", "D,Util", None, 109),
+            ("k3", "L", "Tarin Smith", "ANA", "D,Util", 23, 300),  # the old wrong match
+        ],
+    )
+    db.commit()
+    changes = recheck_map(db)
+    got = dict(db.execute("SELECT player_key, nhl_player_id FROM yahoo_player_map"))
+    assert got == {"k1": 21, "k2": 22, "k3": None}
+    assert len(changes) == 2 and any("Konnor Smith -> nobody" in c for c in changes)

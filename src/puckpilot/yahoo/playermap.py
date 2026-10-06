@@ -19,6 +19,7 @@ and shape of the gap is inspectable instead of silent.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -121,26 +122,88 @@ class NhlIndex:
     by_last: dict[str, list[int]] = field(default_factory=dict)
     names: dict[int, str] = field(default_factory=dict)
     teams: dict[int, str] = field(default_factory=dict)
+    positions: dict[int, str] = field(default_factory=dict)
 
 
 def _last(name: str) -> str:
     return _norm(name.split()[-1]) if name.split() else ""
 
 
+# Short forms that share no letters a spelling comparison could find.
+NICKNAMES = {
+    "bob": "robert",
+    "rob": "robert",
+    "bobby": "robert",
+    "bill": "william",
+    "billy": "william",
+    "will": "william",
+    "dick": "richard",
+    "ted": "edward",
+    "ned": "edward",
+    "chuck": "charles",
+    "jack": "john",
+}
+
+
+def _given(name: str) -> list[str]:
+    """'Anthony (AJ) Spellacy' -> ['anthony', 'aj']: the given names, surname dropped."""
+    parts = name.split()[:-1]
+    return [_norm(t) for t in re.split(r"[\s\-()]+", " ".join(parts)) if _norm(t)]
+
+
+def same_given(a: str, b: str) -> bool:
+    """Whether two given names could be one person's: the same initial, a close
+    spelling (Egor / Yegor), a shared token (AJ / Anthony (AJ)) or a common
+    nickname (Bob / Robert). Tarin / Konnor and William / John are not."""
+    ga, gb = _given(a), _given(b)
+    if not ga or not gb:
+        return True
+    if ga[0][0] == gb[0][0] or set(ga) & set(gb):
+        return True
+    x, y = "".join(ga), "".join(gb)
+    if NICKNAMES.get(x) == y or NICKNAMES.get(y) == x:
+        return True
+    from difflib import SequenceMatcher
+
+    return SequenceMatcher(None, x, y).ratio() >= 0.6
+
+
+def position_class(positions: str | None) -> str:
+    """F, D or G from a position or a Yahoo eligibility list; '' when unknown."""
+    got = {x.strip().upper() for x in re.split(r"[,/ ]+", positions or "") if x.strip()}
+    if "G" in got:
+        return "G"
+    if got & {"C", "LW", "RW", "L", "R", "F", "W"}:
+        return "F"
+    if "D" in got:
+        return "D"
+    return ""
+
+
+def _fits(idx: NhlIndex, pid: int, name: str, ycls: str) -> bool:
+    """A fuzzy candidate may be this Yahoo player: a given name that could be
+    his, and no forward / defence / goalie disagreement."""
+    if not same_given(name, idx.names[pid]):
+        return False
+    ncls = position_class(idx.positions.get(pid))
+    return not (ycls and ncls and ycls != ncls)
+
+
 def _nhl_index(conn: sqlite3.Connection) -> NhlIndex:
     idx = NhlIndex()
-    for row in conn.execute("SELECT player_id, full_name, team_abbrev FROM nhl_players"):
-        pid, name, team = int(row[0]), row[1], row[2]
+    for row in conn.execute("SELECT player_id, full_name, team_abbrev, position FROM nhl_players"):
+        pid, name, team, pos = int(row[0]), row[1], row[2], row[3]
         key = _norm(name)
         idx.by_name.setdefault(key, []).append(pid)
         idx.by_name_team.setdefault((key, _team(team)), pid)
         idx.by_last.setdefault(_last(name), []).append(pid)
         idx.names[pid] = name
         idx.teams[pid] = _team(team)
+        idx.positions[pid] = pos or ""
     return idx
 
 
-def _resolve(idx: NhlIndex, name: str, team: str) -> tuple[int | None, str]:
+def _resolve(idx: NhlIndex, name: str, team: str, positions: str = "") -> tuple[int | None, str]:
     """Best NHL id for a Yahoo name, plus how it was found.
 
     Three layers, each narrower than the last. The fallbacks exist because two
@@ -153,22 +216,34 @@ def _resolve(idx: NhlIndex, name: str, team: str) -> tuple[int | None, str]:
       correctly, so exact and even last-name matching both fail.
 
     Every fallback requires the team to agree, which is what keeps a fuzzy match
-    from ever silently taking the wrong player off the board.
+    from ever silently taking the wrong player off the board - and, given
+    Yahoo's `positions`, a given name that could be his and no forward /
+    defence / goalie disagreement. Without those, a surname and a club were
+    enough: Tarin Smith came back as Konnor Smith, and a centre named William
+    Moore as a defenceman named John. Two players with one name on one club
+    (Vancouver has two Elias Petterssons) are told apart by position.
     """
     norm = _norm(name)
+    ycls = position_class(positions)
 
     exact = idx.by_name.get(norm, [])
     if len(exact) == 1:
         return exact[0], "exact"
     if len(exact) > 1:
-        hit = idx.by_name_team.get((norm, team))
-        return (hit, "exact+team") if hit else (None, "ambiguous")
+        on_team = [p for p in exact if idx.teams.get(p) == team]
+        if len(on_team) == 1:
+            return on_team[0], "exact+team"
+        if ycls:
+            fit = [p for p in (on_team or exact) if position_class(idx.positions.get(p)) == ycls]
+            if len(fit) == 1:
+                return fit[0], "exact+position"
+        return None, "ambiguous"
 
     from difflib import SequenceMatcher
 
     # Layer 2: surname plus team. Catches nicknames and transliterations.
     all_last = idx.by_last.get(_last(name), [])
-    same_last = [p for p in all_last if idx.teams.get(p) == team]
+    same_last = [p for p in all_last if idx.teams.get(p) == team and _fits(idx, p, name, ycls)]
     if len(same_last) == 1:
         return same_last[0], "surname+team"
 
@@ -178,7 +253,7 @@ def _resolve(idx: NhlIndex, name: str, team: str) -> tuple[int | None, str]:
     # every player traded in the offseason fails any team-constrained check -
     # Marner reads as TOR here and VGK on Yahoo. Requiring a unique surname plus
     # name similarity keeps it safe without trusting the stale team.
-    if len(all_last) == 1:
+    if len(all_last) == 1 and _fits(idx, all_last[0], name, ycls):
         score = SequenceMatcher(None, norm, _norm(idx.names[all_last[0]])).ratio()
         if score >= 0.70:
             return all_last[0], f"surname-unique{score:.2f}"
@@ -187,7 +262,7 @@ def _resolve(idx: NhlIndex, name: str, team: str) -> tuple[int | None, str]:
 
     best, best_score = None, 0.0
     for pid, other in idx.names.items():
-        if idx.teams.get(pid) != team:
+        if idx.teams.get(pid) != team or not _fits(idx, pid, name, ycls):
             continue
         score = SequenceMatcher(None, norm, _norm(other)).ratio()
         if score > best_score:
@@ -217,7 +292,8 @@ def build_map(
         if not key or not name:
             continue
         team = _team(p.get("editorial_team_abbr"))
-        nhl_id, how = _resolve(idx, name, team)
+        positions = ",".join(p.get("eligible_positions") or [])
+        nhl_id, how = _resolve(idx, name, team, positions)
         if how == "ambiguous":
             report.ambiguous.append(name)
         elif how not in ("exact", "unmatched") and nhl_id is not None:
@@ -279,14 +355,14 @@ def reresolve_unmatched(conn: sqlite3.Connection, progress: Progress = _noop) ->
         )
     }
     rows = conn.execute(
-        "SELECT player_key, full_name, team_abbrev FROM yahoo_player_map"
+        "SELECT player_key, full_name, team_abbrev, positions FROM yahoo_player_map"
         " WHERE nhl_player_id IS NULL"
     ).fetchall()
 
     report = MapReport(total=len(rows))
     updates = []
-    for key, name, team in rows:
-        nhl_id, how = _resolve(idx, name, team or "")
+    for key, name, team, positions in rows:
+        nhl_id, how = _resolve(idx, name, team or "", positions or "")
         if how == "ambiguous":
             report.ambiguous.append(name)
         if nhl_id is not None and nhl_id in claimed:
@@ -304,6 +380,42 @@ def reresolve_unmatched(conn: sqlite3.Connection, progress: Progress = _noop) ->
     conn.commit()
     progress(f"  re-resolved {report.matched}/{report.total} previously-unmatched players")
     return report
+
+
+def recheck_map(conn: sqlite3.Connection, progress: Progress = _noop) -> list[str]:
+    """Resolve every stored row again, as `build_map` would today - no Yahoo read.
+
+    The rows keep what was fetched (name, team, eligibility, ADP); only the NHL
+    id is decided again, best ADP first within each league, so a match an older
+    resolver got wrong is corrected now rather than at the next full rebuild.
+    Returns one line per changed row.
+    """
+    idx = _nhl_index(conn)
+    rows = conn.execute(
+        "SELECT player_key, league_key, full_name, team_abbrev, positions, nhl_player_id"
+        " FROM yahoo_player_map ORDER BY league_key, adp_rank"
+    ).fetchall()
+    claimed: dict[str, set[int]] = {}
+    changes, updates = [], []
+    for key, league, name, team, positions, old in rows:
+        taken = claimed.setdefault(league, set())
+        new, _how = _resolve(idx, name, team or "", positions or "")
+        if new is not None and new in taken:
+            new = None
+        if new is not None:
+            taken.add(new)
+        if new != old:
+            updates.append((new, key, league))
+            was = idx.names.get(old, old) if old is not None else "nobody"
+            now = idx.names.get(new, new) if new is not None else "nobody"
+            changes.append(f"{name} ({team} {positions}): {was} -> {now}")
+    conn.executemany(
+        "UPDATE yahoo_player_map SET nhl_player_id = ? WHERE player_key = ? AND league_key = ?",
+        updates,
+    )
+    conn.commit()
+    progress(f"  rechecked {len(rows)} rows, {len(changes)} changed")
+    return changes
 
 
 def load_map(conn: sqlite3.Connection, league_key: str) -> dict[str, int]:
