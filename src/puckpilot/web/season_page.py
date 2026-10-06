@@ -335,11 +335,25 @@ function render(s) {
 }
 
 var failures = 0;
+// A tab left open across a redeploy keeps polling with the script it loaded,
+// so whatever the new one draws never appears - the week's plan card did not,
+// the morning after it shipped. The relay sends its build with every /state;
+// the first one a load sees is its own, and a different one later means the
+// page under it changed: reload. A fresh load takes the new build as its own,
+// so this cannot loop.
+var loadedBuild = null;
+function redeployed(s) {
+  if (!s.build) return false;
+  if (loadedBuild === null) { loadedBuild = s.build; return false; }
+  return s.build !== loadedBuild;
+}
+
 function tick() {
   fetch(q('/state')).then(function (r) {
     if (!r.ok) throw new Error(r.status === 403 ? 'wrong or missing key' : 'server ' + r.status);
     return r.json();
   }).then(function (s) {
+    if (redeployed(s)) { location.reload(); return; }
     failures = 0;
     window.__s = s;
     try { render(s); } catch (e) {

@@ -72,6 +72,18 @@ def build_id(here: Path | None = None) -> str:
     return h.hexdigest()[:12]
 
 
+_SERVED: str | None = None
+
+
+def served_build() -> str:
+    """This process's `build_id`, worked out once - it is sent with every
+    /state, so an open page can tell when the relay under it was redeployed."""
+    global _SERVED
+    if _SERVED is None:
+        _SERVED = build_id()
+    return _SERVED
+
+
 def parse_keys(spec: str) -> dict[str, str]:
     """`jimmy:abc,sam:def` -> {key: manager}.
 
@@ -146,6 +158,7 @@ class SeasonState:
                 "next_local": "",
                 "acted": None,
                 "withdrawn": [],
+                "build": served_build(),
             }
         age = time.time() - at
         out = dict(snap)
@@ -153,6 +166,7 @@ class SeasonState:
         out["empty"] = False
         out["age_seconds"] = round(age, 1)
         out["stale"] = _stale(snap, age, self.stale_after)
+        out["build"] = served_build()
         return out
 
     # -- the return path ---------------------------------------------------
