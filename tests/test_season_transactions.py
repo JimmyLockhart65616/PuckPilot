@@ -197,6 +197,71 @@ def test_an_add_made_another_way_cancels_the_move(db, sent):
     assert proposals_mod.get(db, pid).status == proposals_mod.REJECTED
 
 
+def _now(ownership="freeagents", status=""):
+    from puckpilot.season.pool import PoolPlayer
+
+    return PoolPlayer(
+        player_key="a1", name="Pickup", team="MTL", primary_position="C",
+        yahoo_eligible=frozenset({"C"}), status=status, ownership_type=ownership,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("now", "why"),
+    [
+        (_now(ownership="team"), "no longer available"),
+        (_now(ownership="waivers"), "on waivers now"),
+        (_now(status="O"), "now listed O"),
+    ],
+)
+def test_an_acquisition_is_not_spent_on_a_different_situation(db, sent, now, why):
+    """Approved for a healthy free agent; since then he was taken, put on
+    waivers, or listed out. That yes was not given to this."""
+    pid = _approved(db)
+    make = _Make()
+    _, report = _run(db, [BEFORE], make, read_adds=lambda keys: {"a1": now})
+    assert make.calls == [] and why in report.steps[0].detail
+    assert proposals_mod.get(db, pid).status == proposals_mod.REJECTED
+
+
+def test_an_add_that_cannot_be_read_is_tried_again_not_cancelled(db, sent):
+    pid = _approved(db)
+    make = _Make()
+    _, report = _run(db, [BEFORE], make, read_adds=lambda keys: {})
+    assert make.calls == [] and "could not be read" in report.steps[0].detail
+    assert proposals_mod.get(db, pid).status == proposals_mod.APPROVED
+
+
+def test_a_healthy_free_agent_is_added(db, sent):
+    pid = _approved(db)
+    make = _Make(_result())
+    made, _ = _run(db, [BEFORE, AFTER], make, read_adds=lambda keys: {"a1": _now(status="DTD")})
+    assert made == 1 and make.calls == [pid]  # day-to-day is not out
+
+
+def test_a_drop_who_became_a_protected_keeper_is_kept(db, sent):
+    """Dropping him gives up his keeper rights, and that cannot be undone."""
+    pid = _approved(db)
+    make = _Make()
+    _, report = _run(db, [BEFORE], make, protected={"d1"})
+    assert make.calls == [] and "keepers protected" in report.steps[0].detail
+    assert proposals_mod.get(db, pid).status == proposals_mod.REJECTED
+
+
+def test_protection_comes_from_the_latest_weekly_ranking(db):
+    from puckpilot.season import keeper_value
+    from puckpilot.season.run import _protected_keepers
+
+    def rank(key, protected):
+        return keeper_value.KeeperRank(key, None, key, 1.0, 1.0, 0, True, 1, protected)
+
+    assert _protected_keepers(db, "m") == set()
+    keeper_value.save(db, "m", "2026-09-28", "x", [rank("d1", True), rank("d2", True)])
+    keeper_value.save(db, "m", "2026-10-05", "x", [rank("d1", True), rank("d2", False)])
+    assert _protected_keepers(db, "m") == {"d1"}
+    assert _protected_keepers(db, "other") == set()
+
+
 def test_without_an_executor_the_moves_are_left_to_the_person(db, sent, monkeypatch):
     _approved(db)
     monkeypatch.setattr("puckpilot.season.transactions.executor", lambda: None)

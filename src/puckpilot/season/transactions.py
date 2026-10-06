@@ -21,10 +21,12 @@ Three refusals sit in front of every attempt:
   again by itself: a second attempt at a transaction that did go through would
   be a second transaction. It is reported, loudly, for a person to look at.
 
-A move that can no longer be made as approved - the drop has left the roster,
-the add has been taken - is cancelled with the reason (`proposals.cancel`)
-rather than retried on every run. One that failed for a passing reason is
-tried again on the next run, and its failure told once.
+A move that can no longer be made as approved - the drop has left the roster
+or become a keeper to protect, the add has been taken, gone on waivers or been
+listed out since the approval - is cancelled with the reason
+(`proposals.cancel`) rather than retried on every run. An acquisition is not
+spent on a yes given to a different situation. One that failed for a passing
+reason is tried again on the next run, and its failure told once.
 
 Making the move in Yahoo is an optional local executor, like the lineup
 actuator; without one, every approved move is reported as waiting to be made
@@ -69,13 +71,17 @@ def carry_out(
     today: str = "",
     make=None,
     page_url: str = "",
+    read_adds=None,
+    protected=frozenset(),
 ) -> int:
     """Make every approved move not yet made. Returns how many were made.
 
     `read_roster()` reads our roster from Yahoo now; `playing_today` and
     `started_today` are the clubs with a game today and those whose game has
     begun; `today` is the date (ISO). `make(manager, team_key, proposal)` is
-    the executor (the local module by default). A move made, or one that
+    the executor (the local module by default). `read_adds(keys)` reads the
+    adds as they stand now ({player_key: pool.PoolPlayer}); `protected` is the
+    player keys kept for next season, never dropped. A move made, or one that
     failed for a new reason, is pushed to the phone (season/notify.py).
     """
     from puckpilot.season import notify
@@ -109,6 +115,7 @@ def carry_out(
             )
             return 0
     roster = read_roster()
+    adds = read_adds([p.add_player_key for p in mine]) if read_adds is not None else None
     made = 0
     for p in mine:
         p = proposals_mod.take_for_execution(conn, p.id)
@@ -144,6 +151,19 @@ def carry_out(
                     f"{p.add_name} is already on your roster and {p.drop_name} still is too",
                     page_url, final=True)  # fmt: skip
             continue
+        if drop is not None and drop.player_key in protected:
+            _failed(conn, manager, league_key, team_key, report, p, what,
+                    f"{p.drop_name} is now one of the keepers protected for next season",
+                    page_url, final=True)  # fmt: skip
+            continue
+        if adds is not None:
+            now = adds.get(p.add_player_key)
+            why = _add_refusal(p, now)
+            if why:
+                # Unreadable is passing; taken, on waivers or out is not.
+                _failed(conn, manager, league_key, team_key, report, p, what, why, page_url,
+                        final=now is not None)  # fmt: skip
+                continue
         if drop is not None and drop.team in started_today:
             report.add(
                 "transactions",
@@ -205,6 +225,19 @@ def _failed(
         proposals_mod.cancel(conn, p.id, f"not made - {why}")
     else:
         proposals_mod.annotate(conn, p.id, failed_notice=why)
+
+
+def _add_refusal(p, now) -> str:
+    """Why the add cannot be made as approved now, or "" when it can."""
+    if now is None:
+        return f"{p.add_name}'s status could not be read in Yahoo"
+    if not now.is_available:
+        return f"{p.add_name} is no longer available"
+    if now.on_waivers:
+        return f"{p.add_name} is on waivers now - a claim, which PuckPilot does not make"
+    if now.is_out:
+        return f"{p.add_name} is now listed {now.status}"
+    return ""
 
 
 def _drop(p) -> str:

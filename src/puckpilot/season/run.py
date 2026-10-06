@@ -517,6 +517,7 @@ def _carry_out(conn, manager, league_key, runtime, day, report, pmap) -> int:
     before and after each one in its own session - the executor needs the
     profile to itself in between."""
     from puckpilot.season import calendar, cli_support
+    from puckpilot.season import pool as pool_mod
     from puckpilot.season.fetch import discover_team_key, fetch_roster
     from puckpilot.season.transactions import carry_out
 
@@ -529,6 +530,19 @@ def _carry_out(conn, manager, league_key, runtime, day, report, pmap) -> int:
             manager, lambda s: fetch_roster(s, team_key, day, player_map=pmap)
         )
 
+    def read_adds(keys):
+        # The adds as they stand now: an approval is not carried out for a
+        # player taken, put on waivers or listed out since it was given.
+        found = cli_support.run_session(
+            manager, lambda s: pool_mod.fetch_players(s, league_key, keys, player_map=pmap)
+        )
+        return {a.player_key: a for a in found}
+
+    protected = (
+        _protected_keepers(conn, manager.name)
+        if manager.authority.transactions.protect_keepers
+        else set()
+    )
     playing = calendar.teams_playing(conn, day, runtime.nhl_season)
     url = manager.page.url if manager.page.publishes else ""
     return carry_out(
@@ -542,7 +556,22 @@ def _carry_out(conn, manager, league_key, runtime, day, report, pmap) -> int:
         started_today=started_clubs(conn, runtime.nhl_season, day),
         today=day,
         page_url=url,
+        read_adds=read_adds,
+        protected=protected,
     )
+
+
+def _protected_keepers(conn, manager_name: str) -> set[str]:
+    """Player keys protected for next season by the latest weekly ranking
+    (season/keeper_value.py) - the moves run before this week's is decided."""
+    from puckpilot.season import keeper_value
+
+    row = conn.execute(
+        "SELECT MAX(week_start) FROM keeper_ranks WHERE manager = ?", (manager_name,)
+    ).fetchone()
+    if not row or not row[0]:
+        return set()
+    return {k.player_key for k in keeper_value.load(conn, manager_name, row[0]) if k.protected}
 
 
 def _notify(conn, manager, league_key: str, report: RunReport, since: str) -> None:
