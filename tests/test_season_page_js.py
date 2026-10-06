@@ -388,6 +388,74 @@ def test_a_proposal_shows_its_reasons():
         assert expected in out["app"], expected
 
 
+def run_page_and_approve(payload: dict) -> dict:
+    """Draw the page, tap every Approve, and return what each tap sent."""
+    harness = (
+        HARNESS.replace(
+            "fetch: () => Promise.resolve(",
+            "fetch: (u, o) => (o && o.body && posts.push(JSON.parse(o.body)), Promise.resolve(",
+        )
+        .replace(
+            "json: () => Promise.resolve(input) }),",
+            "json: () => Promise.resolve(input) })),",
+        )
+        .replace(
+            "console.log(JSON.stringify({ fresh: fresh.textContent, app: app.textContent }));",
+            """const drawn = app.textContent;
+  (function walk(n) {
+    if (n.tagName === 'button' && n._text === 'Approve') n.onclick();
+    n.children.forEach(walk);
+  })(app);
+  const seen = { fresh: fresh.textContent, app: drawn, posts };
+  setTimeout(() => console.log(JSON.stringify(seen)), 20);""",
+        )
+    )
+    assert harness.count("posts") == 2, "the harness changed shape - update this test"
+    script = re.search(r"<script>(.*?)</script>", PAGE, re.S).group(1)
+    proc = subprocess.run(
+        [NODE, "-e", "const posts = [];\nconst SCRIPT = " + json.dumps(script) + ";\n" + harness],
+        input=wire.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_approve_sends_what_the_card_said():
+    """The run makes a move in Yahoo only for an approval given on words that
+    said it would. Each card's words and the flag its tap sends come from the
+    same server field, card by card - and a push from before the field existed
+    says "make it yourself" and sends no consent."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [
+                {"id": 6, "add": "Marco Rossi", "drop": "Nick Cousins", "why": "", "timing": "",
+                 "executes": True, "approve_means": "Approve and PuckPilot makes this add and "
+                 "drop in Yahoo on its next run."},
+                {"id": 7, "add": "Sean Durzi", "drop": "", "why": "", "timing": "",
+                 "executes": False, "approve_means": "A waiver claim: put it in Yahoo yourself."},
+                {"id": 8, "add": "Old Card", "drop": "", "why": "", "timing": ""},
+            ],
+        },
+    )  # fmt: skip
+    out = run_page_and_approve(state.get("jimmy"))
+    assert_clean(out)
+    assert [(p["id"], p["executes"]) for p in out["posts"]] == [(6, True), (7, False), (8, False)]
+    for words in (
+        "PuckPilot makes this add and drop in Yahoo on its next run.",
+        "A waiver claim: put it in Yahoo yourself.",
+        "Make it in Yahoo yourself",  # the old card
+    ):
+        assert words in out["app"], words
+
+
 def test_the_page_says_whether_the_changes_were_made():
     state = SeasonState()
     state.push(

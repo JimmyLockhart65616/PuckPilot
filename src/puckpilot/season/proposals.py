@@ -256,6 +256,9 @@ def _reason(t, week: int, horizon: str = "") -> dict:
     if horizon:
         # Priced against another week than the one under way ("next week").
         out["horizon"] = horizon
+    if getattr(t, "after_games_of", ""):
+        # Its value is next week's alone: made after that day's games, not before.
+        out["after_games_of"] = t.after_games_of
     return out
 
 
@@ -306,8 +309,20 @@ def pending(conn: sqlite3.Connection, manager: str = "", league_key: str = "") -
     return listing(conn, manager, league_key, status=PENDING)
 
 
-def decide(conn: sqlite3.Connection, proposal_id: int, approve: bool) -> Proposal:
-    """Record a person's decision. The only way a proposal becomes actionable."""
+def decide(
+    conn: sqlite3.Connection,
+    proposal_id: int,
+    approve: bool,
+    to_execute: bool = False,
+    tapped_at: float | None = None,
+) -> Proposal:
+    """Record a person's decision. The only way a proposal becomes actionable.
+
+    `to_execute` is what the page said Approve would do when it was tapped:
+    make the move in Yahoo (True), or record it for the person to make (False).
+    Only an approval given on the first kind is ever handed to the executor -
+    a "yes" to "make it yourself" is not a "yes" to "make it for me".
+    """
     p = get(conn, proposal_id)
     if p.status != PENDING:
         raise ProposalError(f"proposal #{proposal_id} is already {p.status}")
@@ -315,9 +330,29 @@ def decide(conn: sqlite3.Connection, proposal_id: int, approve: bool) -> Proposa
         raise ProposalError(
             f"proposal #{proposal_id} was withdrawn by a newer search - decide on the current ones"
         )
+    reason = dict(p.reason)
+    if approve:
+        reason["approved_to_execute"] = bool(to_execute)
+        if tapped_at is not None:
+            reason["tapped_at"] = datetime.fromtimestamp(float(tapped_at), UTC).isoformat(
+                timespec="seconds"
+            )
     conn.execute(
-        "UPDATE waiver_proposals SET status = ?, decided_at = ? WHERE id = ?",
-        (APPROVED if approve else REJECTED, _now(), proposal_id),
+        "UPDATE waiver_proposals SET status = ?, decided_at = ?, reason_json = ? WHERE id = ?",
+        (APPROVED if approve else REJECTED, _now(), json.dumps(reason), proposal_id),
+    )
+    conn.commit()
+    return get(conn, proposal_id)
+
+
+def annotate(conn: sqlite3.Connection, proposal_id: int, **fields) -> Proposal:
+    """Merge notes into a proposal's reason - when a move was submitted, which
+    failure was last reported - without touching its status."""
+    p = get(conn, proposal_id)
+    reason = {**p.reason, **fields}
+    conn.execute(
+        "UPDATE waiver_proposals SET reason_json = ? WHERE id = ?",
+        (json.dumps(reason), proposal_id),
     )
     conn.commit()
     return get(conn, proposal_id)

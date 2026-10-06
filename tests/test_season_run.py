@@ -572,7 +572,14 @@ def _both(db, now_gain, next_gain, playing_today=frozenset()):
     )
     terms = SimpleNamespace(add_scoring="odds", min_expected_gain=0.1, min_weekly_gain=0.25)
     lines = _recheck_both(
-        db, [(p, None, t.drop)], {}, now, nxt, terms, playing_today=frozenset(playing_today)
+        db,
+        [(p, None, t.drop)],
+        {},
+        now,
+        nxt,
+        terms,
+        playing_today=frozenset(playing_today),
+        day="2026-10-04",
     )
     return p, lines
 
@@ -593,6 +600,8 @@ def test_a_move_whose_drop_plays_today_is_queued_and_judged_on_next_week(db):
     p2, _ = _both(db, 0.0, 0.30, playing_today={"MTL"})
     [live] = proposals.pending(db, "jimmy")
     assert "queued - make it after tonight's games, once rosters unlock" in live.reason["timing"]
+    # And marked, so an approval is made after tonight's games and not before.
+    assert live.reason["after_games_of"] == "2026-10-04"
 
 
 def test_a_late_add_that_hurts_next_week_is_withdrawn_with_both_numbers(db):

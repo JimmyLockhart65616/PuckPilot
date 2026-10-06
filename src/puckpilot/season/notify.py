@@ -66,6 +66,13 @@ def new_pickups(proposals, page_url: str = "", post=None) -> bool:
     return send(title, "\n".join(lines), click=page_url, tags="ice_hockey", post=post)
 
 
+def made(what: str, page_url: str = "", post=None) -> bool:
+    """An approved move went through: the roster read afterwards shows it."""
+    return send(
+        f"Done: {what}", "Made in Yahoo.", click=page_url, tags="white_check_mark", post=post
+    )
+
+
 def failed(what: str, why: str, page_url: str = "", post=None) -> bool:
     """Something the manager is relying on did not happen."""
     title = f"NOT done: {what}"

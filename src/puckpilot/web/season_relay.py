@@ -157,7 +157,9 @@ class SeasonState:
 
     # -- the return path ---------------------------------------------------
 
-    def decide(self, manager: str, kind: str, ident: int, approve: bool) -> dict:
+    def decide(
+        self, manager: str, kind: str, ident: int, approve: bool, executes: bool = False
+    ) -> dict:
         if kind not in ("proposal", "protocol"):
             raise ValueError(f"unknown decision kind {kind!r}")
         with self._lock:
@@ -170,6 +172,9 @@ class SeasonState:
                 "kind": kind,
                 "id": int(ident),
                 "approve": bool(approve),
+                # What the page told the person Approve would do: make the move
+                # (True) or leave it to them. Carried, never inferred.
+                "executes": bool(executes),
                 "at": time.time(),
             }
             self._decisions.append(row)
@@ -306,6 +311,7 @@ def make_handler(state: SeasonState, keys: dict[str, str]):
                         str(body.get("kind")),
                         int(body.get("id")),
                         bool(body.get("approve")),
+                        executes=body.get("executes") is True,
                     )
                 except (TypeError, ValueError) as e:
                     self._refuse(400, str(e))

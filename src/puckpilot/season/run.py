@@ -247,10 +247,19 @@ def run_day(
 
         _guard(report, "decisions", _collect)
 
+    # 2b. Moves approved to be made, made - before the roster is read, so the
+    # lineup below already has the new player in it.
+    pmap = playermap.load_map(conn, league_key)
+    if manager.authority.transactions.execute_approved:
+        _guard(
+            report,
+            "transactions",
+            lambda: _carry_out(conn, manager, league_key, runtime, day, report, pmap),
+        )
+
     # 3. Tonight - and the week's live score and the opponent's roster, read in
     # the same browser session. Intra-week state cannot be fetched afterwards,
     # so every run logs it.
-    pmap = playermap.load_map(conn, league_key)
     week = week_for(runtime, day)
     ctx = WeekContext(week=week)
 
@@ -471,6 +480,7 @@ def run_day(
                 acted=acted,
                 show_protocol=manager.authority.lineup.follow_protocol,
                 lineup_by=lineup_by(manager),
+                executes_moves=_executes(manager),
             )
             publish.push(manager.page.url, page_key, snap)
             report.add("page", True, manager.page.url)
@@ -491,6 +501,48 @@ def run_day(
 
     say(report.text)
     return report
+
+
+def _executes(manager) -> bool:
+    """Whether Approve makes the move: the manager turned it on and an executor
+    is installed. The page words its cards by this - and an approval is only
+    ever carried out if the card it was given on said so."""
+    from puckpilot.season.transactions import executor
+
+    return bool(manager.authority.transactions.execute_approved) and executor() is not None
+
+
+def _carry_out(conn, manager, league_key, runtime, day, report, pmap) -> int:
+    """Make the approved moves (season/transactions.py), reading the roster
+    before and after each one in its own session - the executor needs the
+    profile to itself in between."""
+    from puckpilot.season import calendar, cli_support
+    from puckpilot.season.fetch import discover_team_key, fetch_roster
+    from puckpilot.season.transactions import carry_out
+
+    team_key = manager.team_key
+    if not team_key:
+        team_key = cli_support.run_session(manager, lambda s: discover_team_key(s, league_key))
+
+    def read_roster():
+        return cli_support.run_session(
+            manager, lambda s: fetch_roster(s, team_key, day, player_map=pmap)
+        )
+
+    playing = calendar.teams_playing(conn, day, runtime.nhl_season)
+    url = manager.page.url if manager.page.publishes else ""
+    return carry_out(
+        conn,
+        manager,
+        league_key,
+        team_key,
+        report,
+        read_roster,
+        playing_today=playing,
+        started_today=started_clubs(conn, runtime.nhl_season, day),
+        today=day,
+        page_url=url,
+    )
 
 
 def _notify(conn, manager, league_key: str, report: RunReport, since: str) -> None:
@@ -930,6 +982,7 @@ def _next_week(
             plan,
             terms,
             playing_today=calendar.teams_playing(conn, day, runtime.nhl_season),
+            day=day,
         )
     report.add("next week", True, head, lines)
     return plan
@@ -1013,7 +1066,7 @@ def _recheck(conn, workable, lapsed, plan, terms) -> list[str]:
 
 
 def _recheck_both(
-    conn, workable, lapsed, now_plan, next_plan, terms, playing_today=frozenset()
+    conn, workable, lapsed, now_plan, next_plan, terms, playing_today=frozenset(), day: str = ""
 ) -> list[str]:
     """A waiting add, late in a week: worth it over the rest of this week and
     the next one together, or withdrawn with both numbers.
@@ -1027,6 +1080,8 @@ def _recheck_both(
     played and is no longer editable for today", Error #174), and dropping him
     before his game gives the game away. So it changes nothing this week - it
     is worth next week alone, and counts against next week's acquisitions.
+    It is marked with `day` (`after_games_of`), so an approval is made after
+    that day's games and not before.
     """
     from dataclasses import replace
 
@@ -1066,6 +1121,7 @@ def _recheck_both(
                 timing=f"{t_next.timing}; queued - make it after tonight's games, once rosters "
                 f"unlock ({p.drop_name} plays today, and Yahoo locks a player for the day "
                 f"once he has played)",
+                after_games_of=day,
             )
             lines.append(f"#{p.id} {p.add_name} for {p.drop_name}: {both} - kept")
             continue

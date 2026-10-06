@@ -138,19 +138,23 @@ function renderMoves(root, s) {
   }
 }
 
-function decide(kind, id, approve, btn) {
+function decide(kind, id, approve, btn, executes) {
   var box = btn.parentNode;
   Array.prototype.forEach.call(box.querySelectorAll('button'), function (b) { b.disabled = true; });
   fetch(q('/decide'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kind: kind, id: id, approve: approve })
+    // `executes` is what this card told the person Approve would do; the run
+    // makes the move in Yahoo only for an approval given on those words.
+    body: JSON.stringify({ kind: kind, id: id, approve: approve, executes: executes === true })
   }).then(function (r) { return r.json(); }).then(function (out) {
-    // An approved pickup is a record, not an action: nothing makes the add
-    // for you. Saying "applied" here once let a decision read as done.
+    // Say exactly what happens next. "Applied" once let a decision read as
+    // done when nothing made it.
     var said = approve ? 'Approved' : 'Rejected';
     var then = kind === 'proposal' && approve
-      ? ' \\u2013 now make it in Yahoo. PuckPilot records it but makes no adds or drops.'
+      ? (executes === true
+        ? ' \\u2013 PuckPilot makes it in Yahoo on its next run, then checks your roster.'
+        : ' \\u2013 now make it in Yahoo. PuckPilot records it but makes no adds or drops.')
       : ' \\u2013 recorded on the next run.';
     box.parentNode.replaceChild(
       el('div', 'sub', out.error ? 'Failed: ' + out.error : said + then),
@@ -160,12 +164,12 @@ function decide(kind, id, approve, btn) {
   });
 }
 
-function decisionButtons(c, kind, id) {
+function decisionButtons(c, kind, id, executes) {
   var box = el('div', 'btns');
   var yes = el('button', 'yes', 'Approve');
   var no = el('button', 'no', 'Reject');
-  yes.onclick = function () { decide(kind, id, true, yes); };
-  no.onclick = function () { decide(kind, id, false, no); };
+  yes.onclick = function () { decide(kind, id, true, yes, executes); };
+  no.onclick = function () { decide(kind, id, false, no, executes); };
   box.appendChild(yes); box.appendChild(no);
   c.appendChild(box);
 }
@@ -210,10 +214,13 @@ function renderProposals(root, list) {
     c.appendChild(el('div', null, 'Add ' + p.add + (p.drop ? '  \\u2013  drop ' + p.drop : '')));
     if (p.why) c.appendChild(el('div', 'sub', p.why));
     if (p.timing) c.appendChild(el('div', 'sub', p.timing));
-    c.appendChild(el('div', 'sub',
-                     'Make it in Yahoo yourself \\u2013 PuckPilot never adds or drops.'));
+    // The server words what Approve does, card by card, and the tap sends
+    // back whether this card said it makes the move. A push from before that
+    // carries neither, and every card then was "make it yourself".
+    c.appendChild(el('div', 'sub', p.approve_means ||
+      'Make it in Yahoo yourself \\u2013 PuckPilot never adds or drops.'));
     renderReasons(c, p);
-    decisionButtons(c, 'proposal', p.id);
+    decisionButtons(c, 'proposal', p.id, p.executes === true);
   });
 }
 

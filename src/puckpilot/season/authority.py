@@ -244,6 +244,13 @@ class TransactionAuthority:
     # list of 40 (`-n40`, the control) did the same: a longer list finds more
     # moves that clear the floor on paper and do not pay.
     screen: str = "value"
+    # Make an approved add and drop in Yahoo, rather than leave it to the
+    # manager. It changes who makes the move, not who decides: every move
+    # still needs its own approval (`proposals.take_for_execution`), and only
+    # an approval given while the page said Approve would make the move is
+    # carried out - one given on "make it in Yahoo yourself" never is. Needs
+    # the local executor (`local/transact.py`); without it, nothing changes.
+    execute_approved: bool = False
 
     def __post_init__(self) -> None:
         if self.screen not in SCREENS:
@@ -305,6 +312,12 @@ class TransactionAuthority:
                 f"proposed as a drop"
                 if self.protect_keepers
                 else "  next season's keepers are not protected from a drop"
+            ),
+            (
+                "  an approved move is made in Yahoo on the next run (where the executor is "
+                "installed) - approval still required for each"
+                if self.execute_approved
+                else "  an approved move is recorded; the manager makes it in Yahoo"
             ),
         ]
 

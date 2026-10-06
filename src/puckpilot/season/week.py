@@ -208,6 +208,9 @@ class AddTarget:
     gain: float | None = None
     # The reasons, section -> lines (season/add_story.py).
     detail: dict = field(default_factory=dict)
+    # Queued: to be made only after this date's games, because the drop plays
+    # that day (`run._recheck_both`). Empty: made as soon as it is approved.
+    after_games_of: str = ""
 
     def moved(self, limit: int = 4) -> str:
         """The biggest category changes, in the league's own units and labels."""

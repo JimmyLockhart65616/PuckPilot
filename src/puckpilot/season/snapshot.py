@@ -59,6 +59,7 @@ def build(
     acted: dict | None = None,
     show_protocol: bool = True,
     lineup_by: str = "season value",
+    executes_moves: bool = False,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -136,6 +137,7 @@ def build(
             "why": _why(p),
             "timing": str(p.reason.get("timing", "")),
             "detail": _reasons(p.reason.get("detail")),
+            **_approve_means(p, executes_moves),
         }
         for p in pending
     ]
@@ -312,6 +314,36 @@ def _week_note(wp) -> str:
     return ""
 
 
+def _approve_means(p, executes_moves: bool) -> dict:
+    """What Approve does for this card, in words, and whether it makes the move.
+
+    The page shows the words and sends `executes` back with the tap; the run
+    makes a move only for an approval given on a card that said it would
+    (`proposals.decide`). So the two are decided here, together, per card: a
+    waiver claim is never made by PuckPilot, and a move queued for after
+    tonight's games says so.
+    """
+    if not executes_moves:
+        return {"executes": False, "approve_means": MANUAL}
+    if str(p.reason.get("timing", "")).startswith("on waivers"):
+        return {
+            "executes": False,
+            "approve_means": "A waiver claim: put it in Yahoo yourself \u2013 PuckPilot makes "
+            "adds and drops, never claims.",
+        }
+    what = "add and drop" if p.drop_player_key else "add"
+    when = "after tonight's games" if p.reason.get("after_games_of") else "on its next run"
+    return {
+        "executes": True,
+        "approve_means": f"Approve and PuckPilot makes this {what} in Yahoo {when}, checking "
+        f"each step and then your roster. Reject and nothing happens.",
+    }
+
+
+# What a card says when Approve only records the decision.
+MANUAL = "Make it in Yahoo yourself \u2013 PuckPilot never adds or drops."
+
+
 def apply_decisions(conn: sqlite3.Connection, decisions: list[dict]) -> list[str]:
     """Record decisions collected from the page. Returns what happened, in words.
 
@@ -328,8 +360,17 @@ def apply_decisions(conn: sqlite3.Connection, decisions: list[dict]) -> list[str
                 p = protocol_mod.decide(conn, int(ident), approve)
                 out.append(f"protocol #{p.id} (week {p.week}) {verb}")
             elif kind == "proposal":
-                p = proposals_mod.decide(conn, int(ident), approve)
-                out.append(f"proposal #{p.id} {p.add_name} {verb}")
+                p = proposals_mod.decide(
+                    conn,
+                    int(ident),
+                    approve,
+                    # What the page said Approve would do, as it showed it.
+                    # A relay older than the flag sends none: "make it yourself".
+                    to_execute=bool(d.get("executes")),
+                    tapped_at=d.get("at"),
+                )
+                how = " - to be made in Yahoo" if approve and d.get("executes") else ""
+                out.append(f"proposal #{p.id} {p.add_name} {verb}{how}")
             else:
                 out.append(f"ignored decision of unknown kind {kind!r}")
         except (protocol_mod.ProtocolError, proposals_mod.ProposalError, ValueError) as e:
