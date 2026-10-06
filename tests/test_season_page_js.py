@@ -488,3 +488,77 @@ def test_a_withdrawn_proposal_is_shown_with_its_reason():
     assert_clean(out)
     assert "Withdrawn" in out["app"]
     assert "Marco Rossi" in out["app"] and "now worth +0.03" in out["app"]
+
+
+RELOAD_HARNESS = r"""
+const vm = require('vm');
+const fs = require('fs');
+const states = JSON.parse(fs.readFileSync(0, 'utf8'));
+let reloads = 0;
+let i = 0;
+function node(tag) {
+  return {
+    tagName: tag, className: '', _text: '', children: [], style: {},
+    set textContent(v) { this._text = String(v); this.children = []; },
+    get textContent() { return this._text + this.children.map(c => ' ' + c.textContent).join(''); },
+    appendChild(c) { this.children.push(c); return c; },
+    replaceChild() {}, querySelectorAll() { return []; }, addEventListener() {},
+  };
+}
+const fresh = node('div'), app = node('div');
+const sandbox = {
+  document: { createElement: node, getElementById: (id) => (id === 'fresh' ? fresh : app),
+              addEventListener: () => {}, hidden: false },
+  window: {},
+  location: { search: '?k=test', reload: () => { reloads += 1; } },
+  URLSearchParams: class { get() { return 'test'; } },
+  setInterval: () => {},
+  fetch: () => {
+    const s = states[Math.min(i, states.length - 1)];
+    i += 1;
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(s) });
+  },
+  console,
+};
+sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(SCRIPT, sandbox);
+// The script ticks once on load; two more polls, as the interval would.
+setTimeout(() => {
+  vm.runInContext('tick()', sandbox);
+  setTimeout(() => {
+    vm.runInContext('tick()', sandbox);
+    setTimeout(() => console.log(JSON.stringify({ reloads })), 20);
+  }, 20);
+}, 20);
+"""
+
+
+def _reloads(states: list[dict]) -> int:
+    script = re.search(r"<script>(.*?)</script>", PAGE, re.S).group(1)
+    harness = "const SCRIPT = " + json.dumps(script) + ";\n" + RELOAD_HARNESS
+    proc = subprocess.run(
+        [NODE, "-e", harness],
+        input=json.dumps(states),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])["reloads"]
+
+
+def test_a_tab_left_open_across_a_redeploy_reloads_itself():
+    """The morning after the plan card shipped, an open tab kept drawing with
+    the old script and never showed it. A new build under the page reloads it."""
+    state = SeasonState().get("jimmy")
+    same = [dict(state, build="aaa"), dict(state, build="aaa"), dict(state, build="aaa")]
+    moved = [dict(state, build="aaa"), dict(state, build="aaa"), dict(state, build="bbb")]
+    assert _reloads(same) == 0
+    assert _reloads(moved) == 1
+
+
+def test_a_relay_that_sends_no_build_never_reloads_the_page():
+    state = {k: v for k, v in SeasonState().get("jimmy").items() if k != "build"}
+    assert _reloads([state, state, state]) == 0

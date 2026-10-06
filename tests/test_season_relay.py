@@ -283,3 +283,14 @@ def test_within_the_grace_a_late_run_is_not_yet_stale():
     just = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     state.push("jimmy", {"team": "X", "next_run_utc": just})
     assert state.get("jimmy")["stale"] is False
+
+
+def test_every_state_carries_the_build_the_page_checks_against():
+    """Cold or warm, so a page opened before the first push still notices a
+    redeploy."""
+    from puckpilot.web.season_relay import SeasonState, build_id
+
+    state = SeasonState()
+    assert state.get("jimmy")["build"] == build_id()
+    state.push("jimmy", {"team": "Home Team", "moves": []})
+    assert state.get("jimmy")["build"] == build_id()
