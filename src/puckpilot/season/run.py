@@ -209,6 +209,8 @@ def run_day(
 
     report = RunReport(date=day, manager=manager.name)
     page_key = manager.page.owner_key or _env_key()
+    # In the proposals table's own format, to find what this run queued.
+    started = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
     # 0. Keep the league's own rules current. Cheap, and the alternative is a
     # week calendar that quietly stops advancing.
@@ -484,8 +486,36 @@ def run_day(
             lambda: _plan_rest_of_day(conn, manager, runtime, day, report, own),
         )
 
+    # 7. Tell the phone about anything that needs the manager.
+    _guard(report, "notify", lambda: _notify(conn, manager, league_key, report, started))
+
     say(report.text)
     return report
+
+
+def _notify(conn, manager, league_key: str, report: RunReport, since: str) -> None:
+    """New pickups this run queued, and tonight's lineup if it was not made.
+
+    Quiet unless `PUCKPILOT_NOTIFY_URL` is set (season/notify.py). A lineup
+    switched off on purpose (the kill switch) is not news.
+    """
+    from puckpilot.season import notify
+
+    url = manager.page.url if manager.page.publishes else ""
+    new = [
+        p
+        for p in proposals_mod.listing(conn, manager.name, league_key, status=proposals_mod.PENDING)
+        if p.created_at >= since and not p.superseded_at
+    ]
+    sent = []
+    if new and notify.new_pickups(new, url):
+        sent.append(f"{len(new)} new pickup(s)")
+    for s in report.steps:
+        lineup_missed = s.name == "act" and not s.ok and "switched off" not in s.detail
+        if lineup_missed and notify.failed("tonight's lineup", s.detail, url):
+            sent.append("lineup not made")
+    if sent:
+        report.add("notify", True, "sent to your phone: " + ", ".join(sent))
 
 
 def act(conn, manager, league_key, roster, plan, report, apply=None) -> dict | None:
