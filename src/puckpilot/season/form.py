@@ -50,8 +50,9 @@ DEFAULT_FORM_K = 40.0
 # log-loss 0.5557 -> 0.5487, Brier 0.1325 -> 0.1302, 10/10 deciles within 5
 # points and ahead of the plain normal model - re-run once the harness built
 # both seasons' leagues alike (38d1689); before that it read 0.5793 -> 0.5733
-# with six of eight skater categories better and no decile worse; gate G2 (`odds-daily-h-f25-x1-r`, 12 teams x 22 weeks) +0.29 +/- 0.08
-# and +0.14 +/- 0.06 categories a week, both clear of 2 SE. Refitting the odds
+# with six of eight skater categories better and no decile worse. Gate G2
+# (`odds-daily-h-f25-x1-r`, 12 teams x 22 weeks): +0.29 +/- 0.08 and +0.14 +/-
+# 0.06 categories a week, both clear of 2 SE. Refitting the odds
 # model's P_PLAY and PHI on these rates (0.80; A 1.20, SOG 1.00, BLK 1.35) gains
 # 0.0005 log-loss on the test season, so the constants stay as G2 ran them.
 FORM_RATES = True
