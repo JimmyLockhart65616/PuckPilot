@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.season import calendar
 from puckpilot.season.authority import LineupAuthority
+from puckpilot.season.odds import game_worth
 from puckpilot.season.roster import RosterPlayer, TeamRoster
 from puckpilot.season.settings import IR_SLOTS, YAHOO_TO_POS, LeagueRuntime
 from puckpilot.season.values import ValueModel
@@ -47,6 +48,12 @@ GOALIE_CONFIDENCE = 0.9
 
 # Large enough to beat any real value, small enough to stay finite.
 _FORCED_START = 1e6
+
+# Steered by this week's odds (`authority.lineup.steer`), a skater is worth the
+# expected categories his game adds, plus this much of his plain per-game value:
+# far too little to outweigh a real difference in the odds, enough to settle a
+# tie - so a week already decided either way lines up exactly as unsteered.
+STEER_TIE = 1e-4
 
 
 @dataclass(frozen=True)
@@ -246,8 +253,14 @@ def build_plan(
     goalie_starts_so_far: int | None = None,
     weights: dict[str, float] | None = None,
     goalie_confidence: float = GOALIE_CONFIDENCE,
+    steer=None,
 ) -> LineupPlan:
     """Decide tonight's lineup and diff it against what Yahoo currently has.
+
+    `steer` (`week.Steer`, built on this run from the live score) decides a
+    night with more players than slots by this week's odds: a skater is worth
+    the expected categories his game adds, and tonight's goalies are the set
+    `odds.choose_goalies` prefers. Never over the weekly goalie minimum.
 
     `weights` is an approved week protocol's category stance. Absent - which is
     the default, and the case whenever nobody has agreed one - every category
@@ -280,6 +293,7 @@ def build_plan(
             + ", ".join(f"{k} x{v:g}" for k, v in sorted(weights.items()))
         )
     candidates: list[Candidate] = []
+    plain: dict[str, float] = {}  # each player's unsteered value, for the note
     spare: list[tuple[float, float, RosterPlayer]] = []
     idle: list[RosterPlayer] = []
     out: list[RosterPlayer] = []
@@ -307,6 +321,10 @@ def build_plan(
         value = values.per_game(p.nhl_player_id, date)
         if weights:
             value *= values.tilt(p.nhl_player_id, weights)
+        plain[p.player_key] = value
+        if steer is not None and p.position != "G":
+            line = steer.rates.get(p.nhl_player_id) or {}
+            value = game_worth(steer.leverage, line) + STEER_TIE * value
         p_start: float | None = None
         note = ""
 
@@ -351,6 +369,15 @@ def build_plan(
     # A goalie below the floor fills a G slot only if nobody above it will:
     # one who does not start then scores what the empty slot would have.
     g_slots = sum(n for pos, n in shape.slots if pos == "G")
+    if steer is not None and not forced:
+        candidates, sat = _steer_goalies(candidates, steer, g_slots)
+        idle.extend(sat)
+        if sat:
+            notes.append(
+                "By this week's odds, "
+                + ", ".join(p.name for p in sat)
+                + " sits: another start costs more expected categories than it adds."
+            )
     room = g_slots - sum(1 for c in candidates if c.is_goalie)
     for i, (v, p_start, g) in enumerate(sorted(spare, key=lambda x: -x[0])):
         if i < room:
@@ -394,10 +421,16 @@ def build_plan(
 
     moves, gain = _diff(roster, candidates, assignment, shape, vacating)
     empty = _empty_slots(shape, assignment)
+    if steer is not None:
+        notes.extend(_steered_note(candidates, assignment, plain, shape, incumbent))
 
     # Leave a lineup alone when the change is not worth making. Churning for
     # 0.01 makes the audit log unreadable and trains you to ignore the message.
-    if moves and gain < auth.min_gain:
+    # Steered, values are expected categories plus STEER_TIE of the plain
+    # value, so the same floor is scaled by it: a decided week churns no more
+    # than an unsteered one, and any real difference in the odds is made.
+    floor = auth.min_gain * (STEER_TIE if steer is not None else 1.0)
+    if moves and gain < floor:
         notes.append(
             f"{len(moves)} change(s) available but worth only {gain:+.2f}, "
             f"below the agreed {auth.min_gain:.2f} - left alone."
@@ -430,6 +463,54 @@ def build_plan(
         ir_alerts=tuple(ir_alerts),
         ir_within_authority=auth.enabled and auth.manage_ir,
     )
+
+
+def _steer_goalies(candidates, steer, g_slots: int):
+    """Tonight's goalie candidates cut to the set the week's odds prefer.
+
+    `odds.choose_goalies` scores each subset by the goalie categories it
+    leaves expected: with wins and saves settled and save percentage close,
+    another start can only cost the one category still open. Only removes -
+    a goalie the floor already sat stays sat.
+    """
+    from puckpilot.season.odds import choose_goalies, goalie_game
+
+    goalies = [c for c in candidates if c.is_goalie and c.p_start]
+    if not goalies:
+        return candidates, []
+    tonight = {
+        c.player.nhl_player_id: goalie_game(
+            steer.rates.get(c.player.nhl_player_id) or {}, c.p_start
+        )
+        for c in goalies
+    }
+    keep = choose_goalies(steer.model, steer.cats, steer.ours, tonight, steer.theirs, g_slots).start
+    sat = [c.player for c in goalies if c.player.nhl_player_id not in keep]
+    gone = {p.player_key for p in sat}
+    return [c for c in candidates if c.player.player_key not in gone], sat
+
+
+def _steered_note(candidates, assignment, plain, shape, incumbent) -> list[str]:
+    """Who starts by the week's odds that would not by season value, and who
+    sits for them - so a steered night can be checked, not taken on trust."""
+    skaters = [c for c in candidates if not c.is_goalie]
+    by_value = optimize_lineup(
+        [
+            (c.player.player_key, c.player.eligible, plain.get(c.player.player_key, 0.0))
+            for c in skaters
+        ],
+        shape,
+        incumbent=incumbent,
+    )
+    names = {c.player.player_key: c.player.name for c in skaters}
+    started = [names[k] for k in assignment if k in names and k not in by_value]
+    benched = [names[k] for k in by_value if k not in assignment]
+    if not started and not benched:
+        return []
+    line = "By this week's odds: " + (", ".join(started) or "nobody") + " start"
+    if benched:
+        line += " over " + ", ".join(benched)
+    return [line + " - more expected categories than season value would get."]
 
 
 def ir_changes(runtime: LeagueRuntime, roster: TeamRoster) -> tuple[list[Move], list[str]]:

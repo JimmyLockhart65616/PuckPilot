@@ -244,7 +244,9 @@ def test_a_likely_starter_is_started_and_his_value_is_weighted(db_with_games):
     assert p.gain == pytest.approx(8.0)  # 10.0 x 0.8
 
 
-def _minimum_plan(db, p_start, so_far, *, later=None, value=1.0, waived=None, date=DATE):
+def _minimum_plan(
+    db, p_start, so_far, *, later=None, value=1.0, waived=None, date=DATE, steer=None
+):
     """A one-goalie roster against a weekly minimum of one game."""
     over = {"min_games_played": "1"}
     if waived:
@@ -274,6 +276,7 @@ def _minimum_plan(db, p_start, so_far, *, later=None, value=1.0, waived=None, da
         manager="test",
         authority=LineupAuthority(enabled=True, min_gain=0.0, min_goalie_p_start=0.5),
         goalie_starts_so_far=so_far,
+        steer=steer,
     )
 
 
@@ -737,3 +740,108 @@ def test_the_floor_still_decides_between_goalies_for_one_slot(db_with_games):
     )
     assert [m.describe() for m in p.moves] == ["START Likely in G"]
     assert [x.name for x in p.idle] == ["Long Shot Star"]
+
+
+# -- steered by this week's odds ------------------------------------------------
+
+
+def _steer(leverage=None, rates=None, ours=None, theirs=None, cats=None):
+    from puckpilot.engine.categories import resolve
+    from puckpilot.season.odds import OddsModel, Side
+    from puckpilot.season.week import Steer
+
+    return Steer(
+        leverage=leverage or {},
+        rates=rates or {},
+        model=OddsModel(),
+        cats=cats or (resolve("G"), resolve("HIT")),
+        ours=ours or Side(),
+        theirs=theirs or Side(),
+    )
+
+
+def _one_c_night(db, steer, auth=None):
+    """Two centres with a game, one C slot: a bench call."""
+    return build_plan(
+        db,
+        runtime(),
+        roster(
+            player("p.1", "Scorer", 1, "TOR", "C", "BN"),
+            player("p.2", "Hitter", 2, "MTL", "C", "BN"),
+        ),
+        Values({1: 3.0, 2: 1.0}),
+        StaticGoalieSource(),
+        DATE,
+        manager="test",
+        authority=auth or LineupAuthority(enabled=True, min_gain=0.0),
+        steer=steer,
+    )
+
+
+RATES = {1: {"goals": 0.6, "hits": 0.5}, 2: {"goals": 0.1, "hits": 3.0}}
+
+
+def test_steered_a_bench_call_goes_to_the_player_the_close_category_needs(db_with_games):
+    """Goals decided, hits level: the hitter's game is worth more this week
+    than the scorer's, whatever their season values say."""
+    plain = _one_c_night(db_with_games, None)
+    steered = _one_c_night(db_with_games, _steer({"goals": 0.0, "hits": 0.05}, RATES))
+    assert [m.describe() for m in plain.moves] == ["START Scorer in C"]
+    assert [m.describe() for m in steered.moves] == ["START Hitter in C"]
+    assert any(n.startswith("By this week's odds: Hitter start over Scorer") for n in steered.notes)
+
+
+def test_steered_a_decided_week_lines_up_as_unsteered(db_with_games):
+    p = _one_c_night(db_with_games, _steer({"goals": 0.0, "hits": 0.0}, RATES))
+    assert [m.describe() for m in p.moves] == ["START Scorer in C"]
+    assert not any(n.startswith("By this week's odds") for n in p.notes)
+
+
+def test_steered_moves_are_not_refused_by_a_floor_in_other_units(db_with_games):
+    """The agreed floor is in per-game value units; steered values are expected
+    categories, a hundredth the size. Unscaled, it would refuse every one."""
+    p = _one_c_night(
+        db_with_games,
+        _steer({"goals": 0.0, "hits": 0.05}, RATES),
+        auth=LineupAuthority(enabled=True, min_gain=0.15),
+    )
+    assert [m.describe() for m in p.moves] == ["START Hitter in C"]
+
+
+def _settled_goalie_week():
+    """Wins and saves locked up, save percentage a narrow lead."""
+    from puckpilot.engine.categories import resolve
+    from puckpilot.season.odds import Side
+
+    return _steer(
+        rates={1: {"wins": 0.5, "saves": 24.0, "shots_against": 26.5}},  # .906
+        ours=Side(banked={"wins": 5.0, "saves": 230.0, "shots_against": 250.0}),  # .920
+        theirs=Side(banked={"wins": 1.0, "saves": 91.0, "shots_against": 100.0}),  # .910
+        cats=(resolve("W"), resolve("SV"), resolve("SV%")),
+    )
+
+
+def test_steered_a_start_that_can_only_cost_the_open_category_sits(db_with_games):
+    g = StaticGoalieSource({DATE: {1: 0.95}})
+    p = plan(
+        db_with_games, roster(player("p.1", "Starter", 1, "TOR", "G", "BN")), {1: 10.0}, goalies=g
+    )
+    assert [m.describe() for m in p.moves] == ["START Starter in G"]
+    steered = build_plan(
+        db_with_games,
+        runtime(),
+        roster(player("p.1", "Starter", 1, "TOR", "G", "BN")),
+        Values({1: 10.0}),
+        g,
+        DATE,
+        manager="test",
+        authority=LineupAuthority(enabled=True, min_gain=0.0),
+        steer=_settled_goalie_week(),
+    )
+    assert steered.is_noop
+    assert any("Starter sits" in n for n in steered.notes)
+
+
+def test_steering_never_overrides_the_weekly_goalie_minimum(db_with_games):
+    p = _minimum_plan(db_with_games, p_start=0.95, so_far=0, steer=_settled_goalie_week())
+    assert [m.describe() for m in p.moves] == ["START Backup in G"]

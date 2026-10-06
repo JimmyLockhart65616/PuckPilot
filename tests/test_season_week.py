@@ -932,3 +932,219 @@ def test_a_card_priced_for_next_week_says_so(db):
     week = t.detail["week"]
     assert "slot-games empty over the 4 days of next week" in week[0]
     assert "4 games next week, 4 in your lineup" in week[1]
+
+
+# -- the plan as a whole ------------------------------------------------------
+
+
+def _plan_with_pool(db, pool, slots=(("C", 2, 1), ("BN", 1, 0)), **kw):
+    import pandas as pd
+
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season.odds import OddsModel
+    from puckpilot.season.roster import TeamRoster
+    from puckpilot.season.week import build_week_plan
+    from tests.test_season_settings import _slots
+
+    _week_games(db)
+    rt = _runtime_for_week(roster_positions=_slots(*slots))
+    ours = TeamRoster(
+        league_key="999.l.1",
+        team_key="t",
+        date="2026-10-05",
+        players=(_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+    )
+    theirs = TeamRoster(
+        league_key="999.l.1",
+        team_key="u",
+        date="2026-10-05",
+        players=(_rp("p.3", "Them", 3, "OTT", "C"), _rp("p.4", "Them Too", 4, "OTT", "C")),
+    )
+    ids = [1, 2, 3, 4, 9, 10]
+    goals = {1: 41.0, 2: 8.0, 3: 30.0, 4: 30.0, 9: 30.0, 10: 25.0}
+    frame = pd.DataFrame(
+        {"goals": [goals[i] for i in ids], "proj_gp": [82.0] * len(ids)}, index=ids
+    )
+    return build_week_plan(
+        db,
+        rt,
+        LeagueConfig(skater_cats=(resolve("G"),), goalie_cats=()),
+        rt.week(1),
+        "Them",
+        ours,
+        theirs,
+        pool,
+        frame,
+        None,
+        _PerGame({1: 1.5, 2: 0.3, 3: 1.0, 4: 1.0, 9: 1.0, 10: 0.9}),
+        odds_model=OddsModel(p_play=1.0),
+        add_scoring="odds",
+        min_expected_gain=0.0,
+        find_targets=True,
+        **kw,
+    )
+
+
+def test_the_plan_carries_the_week_with_every_move_made(db):
+    """Each move is priced on the roster the ones before it leave, so the odds
+    with all of them made are the odds now plus every move's gain."""
+    p = _plan_with_pool(db, [_fa("fa.1", "Streamer", 9)])
+    assert p.targets and p.planned is not None
+    gained = sum(t.gain for t in p.targets)
+    assert p.planned.expected == pytest.approx(p.expected + gained, abs=1e-9)
+    assert p.planned.expected > p.expected
+
+
+def test_with_no_moves_there_is_no_planned_week(db):
+    p = _plan_with_pool(db, [])
+    assert p.targets == () and p.planned is None
+
+
+def test_the_plan_knows_what_one_more_goal_is_worth(db):
+    p = _plan_with_pool(db, [])
+    assert p.leverage["goals"] > 0
+    assert p.extra_game["G"] > 0
+
+
+def test_a_ceiling_spends_every_acquisition_left_on_one_category(db):
+    p = _plan_with_pool(db, [_fa("fa.1", "Streamer", 9), _fa("fa.2", "Streamer Two", 10)])
+    assert p.ceiling["goals"] >= p.outlook[0].expected
+
+
+def test_a_night_with_more_players_than_slots_is_a_bench_call(db):
+    """One C slot, two centres who both play on Tuesday: someone sits."""
+    from puckpilot.data import store
+    from puckpilot.season.week import expected_starts
+    from tests.test_season_settings import _slots
+
+    store.upsert_schedule_game(
+        db,
+        game_id=1,
+        season="20262027",
+        game_type=2,
+        game_date="2026-10-06",
+        start_time_utc=None,
+        home_team="TOR",
+        away_team="MTL",
+    )
+    db.commit()
+    rt = _runtime_for_week(roster_positions=_slots(("C", 1, 1), ("BN", 2, 0)))
+    benched: dict[str, int] = {}
+    expected_starts(
+        db,
+        rt,
+        rt.week(1),
+        [_rp("p.1", "A", 1, "TOR", "C"), _rp("p.2", "B", 2, "MTL", "C")],
+        None,
+        _PerGame({1: 1.0, 2: 0.5}),
+        benched=benched,
+    )
+    assert benched == {"2026-10-06": 1}
+
+
+def test_a_specialist_outside_the_value_shortlist_is_priced_under_union(db):
+    """Six free agents worth more per game, none of whom scores, fill the value
+    shortlist; the one who moves the close category is never priced - unless
+    the shortlist also takes the players whose games move it most."""
+    shiny = [_fa(f"fa.{i}", f"Shiny {i}", 20 + i) for i in range(6)]
+    specialist = _fa("fa.9", "Specialist", 9)
+    rates = {1: {"goals": 0.5}, 2: {"goals": 0.1}, 9: {"goals": 0.6}}
+    rates.update({20 + i: {"goals": 0.0} for i in range(6)})
+    per_game = {1: 1.5, 2: 0.2, 9: 0.3}
+    per_game.update({20 + i: 2.0 for i in range(6)})
+
+    def best(screen_by):
+        got = _targets_for(
+            db,
+            (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+            (("C", 2, 1), ("BN", 1, 0)),
+            pool=[*shiny, specialist],
+            rates=rates,
+            per_game=per_game,
+            screen=5,
+            screen_by=screen_by,
+            leverage={"goals": 0.2},
+        )
+        return [t.player.name for t in got]
+
+    assert "Specialist" not in best("value")
+    assert best("union")[0] == "Specialist"
+
+
+def test_without_leverage_union_is_the_value_shortlist(db):
+    got = _targets_for(
+        db,
+        (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+        (("C", 2, 1), ("BN", 1, 0)),
+        screen_by="union",
+        leverage=None,
+    )
+    plain = _targets_for(
+        db,
+        (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+        (("C", 2, 1), ("BN", 1, 0)),
+    )
+    assert [t.player.name for t in got] == [t.player.name for t in plain]
+
+
+def test_a_misspelt_screen_is_refused():
+    from puckpilot.season.authority import AuthorityError, LineupAuthority, TransactionAuthority
+
+    with pytest.raises(AuthorityError):
+        TransactionAuthority(screen="vibes")
+    with pytest.raises(AuthorityError):
+        LineupAuthority(steer="vibes")
+
+
+class _RatedPerGame(_PerGame):
+    def __init__(self, pg, rates):
+        super().__init__(pg)
+        self._rates = rates
+
+    def rates(self, cats, day):
+        return self._rates
+
+
+def _tonight(db, banked_ours, banked_theirs, day="2026-10-07"):
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season.odds import OddsModel
+    from puckpilot.season.roster import TeamRoster
+    from puckpilot.season.week import tonight_odds
+    from tests.test_season_settings import _slots
+
+    _live_week(db)  # TOR v OTT on each of the week's four days
+    rt = _runtime_for_week(roster_positions=_slots(("C", 1, 1), ("BN", 1, 0)))
+    ours = TeamRoster(
+        league_key="l", team_key="t.5", date=day, players=(_rp("p.1", "Ours", 1, "TOR", "C"),)
+    )
+    theirs = TeamRoster(
+        league_key="l", team_key="t.11", date=day, players=(_rp("p.2", "Theirs", 2, "OTT", "C"),)
+    )
+    return tonight_odds(
+        db,
+        rt,
+        LeagueConfig(skater_cats=(resolve("G"),), goalie_cats=()),
+        rt.week(1),
+        ours,
+        theirs,
+        None,
+        _RatedPerGame({1: 1.0, 2: 1.0}, {1: {"goals": 0.5}, 2: {"goals": 0.5}}),
+        OddsModel(p_play=1.0),
+        day,
+        banked_ours=banked_ours,
+        banked_theirs=banked_theirs,
+        form_rates=True,
+    )
+
+
+def test_tonight_s_odds_are_the_score_as_it_stands_on_this_run(db):
+    """A level week makes one more goal count; the same week six goals up by
+    Wednesday evening makes it count for next to nothing."""
+    level = _tonight(db, {"G": 2.0}, {"G": 2.0})
+    ahead = _tonight(db, {"G": 8.0}, {"G": 2.0})
+    assert level.leverage["goals"] > 5 * ahead.leverage["goals"]
+    assert level.ours.banked == {"goals": 2.0}
+
+
+def test_no_steer_outside_the_week(db):
+    assert _tonight(db, {}, {}, day="2026-10-20") is None

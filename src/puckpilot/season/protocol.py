@@ -294,6 +294,22 @@ def active(
     return p if p and p.status == APPROVED else None
 
 
+def lineup_weights(conn: sqlite3.Connection, manager, league_key: str, runtime, day: str):
+    """The category weights an approved protocol puts on `day`'s lineup.
+
+    Empty unless the manager's lineup follows protocols (`follow_protocol`) -
+    and the one place both the scheduled run and `ppilot lineup today` read
+    them, so the setting means the same thing on either path.
+    """
+    if not manager.authority.lineup.follow_protocol:
+        return {}
+    try:
+        live = active(conn, manager.name, league_key, runtime.week_of(day))
+    except Exception:  # noqa: BLE001 - no calendar, no protocol; the plain plan stands
+        return {}
+    return live.weights() if live else {}
+
+
 def decide(conn: sqlite3.Connection, pid: int, approve: bool) -> WeekProtocol:
     p = load_by_id(conn, pid)
     if p.status != PROPOSED:

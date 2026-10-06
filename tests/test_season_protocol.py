@@ -216,3 +216,40 @@ def test_a_long_shot_an_add_could_rescue_is_not_conceded():
 def test_a_lower_is_better_lead_is_never_conceded():
     p = derive(_live("GAA", 2.0, 3.0, sd=0.3, lineup_room=0.0, add_room=0.0))
     assert p.stances[0].stance == HOLD
+
+
+# -- who reads an approved protocol ---------------------------------------------
+
+
+def _manager(follow: bool):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        name="jimmy", authority=SimpleNamespace(lineup=SimpleNamespace(follow_protocol=follow))
+    )
+
+
+class _Weeks:
+    def week_of(self, day):
+        return 2
+
+
+def test_the_lineup_reads_an_approved_protocol_only_when_it_follows_one(db):
+    """One lookup for the scheduled run and `ppilot lineup today` alike - the
+    scheduled run used to ignore the setting entirely."""
+    p = protocol.save(
+        db, derive(outlook("HIT", 41.0, 52.0, add_room=1.0), outlook("PPP", 8.5, 7.7, add_room=5.0))
+    )
+    protocol.decide(db, p.id, True)
+    on = protocol.lineup_weights(db, _manager(True), "999.l.1", _Weeks(), "2026-10-06")
+    off = protocol.lineup_weights(db, _manager(False), "999.l.1", _Weeks(), "2026-10-06")
+    assert on == {"hits": WEIGHTS[CONCEDE], "ppp": WEIGHTS[CHASE]}
+    assert off == {}
+
+
+def test_no_calendar_means_no_weights_rather_than_a_failed_lineup(db):
+    class _NoCalendar:
+        def week_of(self, day):
+            raise ValueError("no week")
+
+    assert protocol.lineup_weights(db, _manager(True), "999.l.1", _NoCalendar(), "d") == {}

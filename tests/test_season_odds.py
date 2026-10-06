@@ -214,3 +214,78 @@ def test_the_weekly_minimum_is_a_floor_on_the_choice():
         at_least=1,
     )
     assert got.start == frozenset({1})
+
+
+# -- what more of one category is worth -----------------------------------------
+
+
+def test_nothing_extra_is_the_same_side():
+    from puckpilot.season.odds import with_extra
+
+    s = Side(banked={"goals": 2.0}, skaters={"goals": 3.0})
+    assert with_extra(s, "goals", 0.0) is s
+
+
+def test_extra_of_a_count_raises_only_that_count():
+    from puckpilot.season.odds import with_extra
+
+    s = Side(skaters={"goals": 3.0, "sog": 20.0})
+    more = with_extra(s, "goals", 1.5)
+    assert more.skaters == {"goals": 4.5, "sog": 20.0}
+    assert s.skaters["goals"] == 3.0  # the original is untouched
+
+
+def test_extra_wins_and_saves_come_as_goalie_games():
+    from puckpilot.season.odds import with_extra
+
+    wins = with_extra(Side(), "wins", 1.2)
+    assert sum(g.p_win * g.p_start for g in wins.goalies) == pytest.approx(1.2)
+    assert all(g.p_win <= 0.5 for g in wins.goalies)
+    saves = with_extra(Side(), "saves", 60.0)
+    assert sum(g.shots * g.save_pct for g in saves.goalies) == pytest.approx(60.0)
+
+
+def test_a_rate_has_no_more_of():
+    from puckpilot.season.odds import with_extra
+
+    assert with_extra(Side(), "save_pct", 1.0) is None
+    assert with_extra(Side(), "gaa", 1.0) is None
+
+
+def test_one_more_goal_counts_most_when_level_and_least_when_decided():
+    """The whole point of leverage: the same goal is worth a lot in a close
+    category and next to nothing in one already won or lost."""
+    from puckpilot.season.odds import leverage
+
+    cats = (resolve("G"),)
+    model = OddsModel(p_play=1.0)
+    theirs = Side(skaters={"goals": 4.0})
+
+    def lev(banked):
+        return leverage(model, cats, Side(banked={"goals": banked}, skaters={"goals": 4.0}), theirs)
+
+    level, ahead, far_ahead = lev(0.0)["goals"], lev(4.0)["goals"], lev(15.0)["goals"]
+    far_behind = leverage(model, cats, Side(skaters={"goals": 4.0}), Side(banked={"goals": 15.0}))
+    assert level > ahead > far_ahead >= 0
+    assert far_behind["goals"] < 0.01
+    assert level > 0.05
+
+
+def test_leverage_leaves_rates_out():
+    from puckpilot.season.odds import leverage
+
+    got = leverage(OddsModel(), (resolve("SV%"), resolve("W")), Side(), Side())
+    assert "save_pct" not in got and "wins" in got
+
+
+def test_a_ceiling_is_the_chance_with_every_acquisition_on_one_category():
+    from puckpilot.season.odds import ceilings
+
+    cats = (resolve("HIT"), resolve("SV%"))
+    model = OddsModel(p_play=1.0)
+    ours = Side(skaters={"hits": 20.0})
+    theirs = Side(skaters={"hits": 35.0})
+    now = model.category(cats[0], ours, theirs).expected
+    got = ceilings(model, cats, ours, theirs, {"hits": 20.0, "save_pct": None})
+    assert got["hits"] > now
+    assert "save_pct" not in got

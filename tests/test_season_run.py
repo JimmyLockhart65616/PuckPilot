@@ -700,3 +700,21 @@ def test_only_untagged_goalies_count_as_known_healthy():
         players=[p(1, "G", ""), p(2, "G", "DTD"), p(3, "G", "IR"), p(4, "C", "")]
     )
     assert _healthy_goalies(ours, None) == {1}
+
+
+def test_steering_is_off_unless_asked_and_loud_when_it_cannot_read_the_week():
+    """Off: the plain lineup, silently. On without a matchup to read: an error
+    the run reports - the plain lineup still stands - never a quiet guess."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    from puckpilot.season.run import WeekContext, _steer
+
+    def manager(steer):
+        return SimpleNamespace(authority=SimpleNamespace(lineup=SimpleNamespace(steer=steer)))
+
+    ctx = WeekContext(week=None)
+    assert _steer(None, manager("off"), None, ctx, None, None, "2026-10-06") is None
+    with pytest.raises(RuntimeError, match="plain lineup"):
+        _steer(None, manager("odds"), None, ctx, object(), None, "2026-10-06")

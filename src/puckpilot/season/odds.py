@@ -414,6 +414,96 @@ def side(
     return Side(banked=dict(banked), skaters=skaters, goalies=goalies)
 
 
+# -- what more of one category is worth -----------------------------------------
+
+# Extra wins are added as yes/no chances no likelier than this, and extra saves
+# in starts of about this many, so the spread grows with the mean the way a
+# real goalie's would.
+_WIN_CHANCE = 0.5
+_SAVES_PER_START = 25.0
+
+
+def with_extra(s: Side, key: str, extra: float) -> Side | None:
+    """`s` with `extra` more of one counting category still to come.
+
+    Skater totals are raw expected totals - `p_play` applies inside
+    `OddsModel.category`, to these as to the rest - so the extra is raw too.
+    Wins come as yes/no chances, saves as starts that stop every shot. A rate
+    (save percentage, GAA) has no "more of": None.
+    """
+    if key in ("save_pct", "gaa"):
+        return None
+    if extra <= 0:
+        return s
+    if key in ("wins", "shutouts"):
+        n = max(1, math.ceil(extra / _WIN_CHANCE))
+        p = extra / n
+        chance = {"p_win": p} if key == "wins" else {"p_win": 0.0, "p_shutout": p}
+        extra_games = [
+            GoalieGame(p_start=1.0, shots=0.0, save_pct=1.0, hours=0.0, **chance) for _ in range(n)
+        ]
+        return Side(banked=s.banked, skaters=s.skaters, goalies=[*s.goalies, *extra_games])
+    if key in ("saves", "shots_against"):
+        n = max(1, math.ceil(extra / _SAVES_PER_START))
+        extra_games = [
+            GoalieGame(p_start=1.0, p_win=0.0, shots=extra / n, save_pct=1.0, hours=0.0)
+            for _ in range(n)
+        ]
+        return Side(banked=s.banked, skaters=s.skaters, goalies=[*s.goalies, *extra_games])
+    skaters = dict(s.skaters)
+    skaters[key] = skaters.get(key, 0.0) + extra
+    return Side(banked=s.banked, skaters=skaters, goalies=s.goalies)
+
+
+def leverage(
+    model: OddsModel, cats: tuple[Category, ...], ours: Side, theirs: Side, unit: float = 1.0
+) -> dict[str, float]:
+    """Expected categories gained per unit more of each counting category.
+
+    What one more goal, hit or save is worth this week, from the same
+    distributions as the odds: next to nothing in a category already decided
+    either way, most in one that is level. A rate gets no entry - it is not
+    moved by adding more of anything.
+    """
+    out: dict[str, float] = {}
+    for c in cats:
+        more = with_extra(ours, c.key, unit)
+        if more is None:
+            continue
+        base = model.category(c, ours, theirs).expected
+        out[c.key] = (model.category(c, more, theirs).expected - base) / unit
+    return out
+
+
+def game_worth(leverage: dict[str, float], line: dict[str, float]) -> float:
+    """Expected categories one game of this per-game line adds, to first order."""
+    return sum(lev * line.get(k, 0.0) for k, lev in leverage.items())
+
+
+def ceilings(
+    model: OddsModel,
+    cats: tuple[Category, ...],
+    ours: Side,
+    theirs: Side,
+    room: dict[str, float | None],
+) -> dict[str, float]:
+    """Each category's expected score with `room` more of it alone.
+
+    `room` is what every acquisition left could add to one category
+    (`week.add_headroom`) - an upper bound, so this is "at most".
+    """
+    out: dict[str, float] = {}
+    for c in cats:
+        extra = room.get(c.key)
+        if extra is None:
+            continue
+        more = with_extra(ours, c.key, extra)
+        if more is None:
+            continue
+        out[c.key] = model.category(c, more, theirs).expected
+    return out
+
+
 # -- the live record ------------------------------------------------------------
 
 

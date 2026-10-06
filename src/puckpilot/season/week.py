@@ -73,6 +73,10 @@ BERNOULLI = {"wins", "shutouts"}
 # is in net - so its binomial spread is widened by this much.
 SV_PCT_INFLATION = 1.3
 
+# A goalie left out of the G slots counts as a bench call only if he was more
+# likely than not to start: a backup who sits sits whoever else is rostered.
+BENCH_START = 0.5
+
 
 @dataclass(frozen=True)
 class CategoryOutlook:
@@ -233,6 +237,18 @@ class WeekPlan:
     odds: object | None = None  # season.odds.WeekOdds
     # Proposed swaps a re-check priced below the floor (build_week_plan `reprice`).
     lapsed: tuple[AddTarget, ...] = ()
+    # The odds with every move in `targets` made, in order; None with no moves.
+    planned: object | None = None  # season.odds.WeekOdds
+    # Expected categories per unit more of each counting category (odds.leverage).
+    leverage: dict[str, float] = field(default_factory=dict)
+    # Each category's expected score with every acquisition left spent on it
+    # alone - an upper bound (odds.ceilings).
+    ceiling: dict[str, float] = field(default_factory=dict)
+    # day -> how many of our players with a game would sit: the lineup's choices.
+    bench_calls: dict[str, int] = field(default_factory=dict)
+    # label -> expected categories one more typical skater game of ours adds,
+    # per skater category: where an add would count, when none is proposed.
+    extra_game: dict[str, float] = field(default_factory=dict)
 
     @property
     def expected(self) -> float | None:
@@ -276,7 +292,9 @@ class WeekPlan:
             "  In play: " + (", ".join(o.category.label for o in close) if close else "none")
         )
         counted = [o for o in self.outlook if o.measured]
-        if counted and all(o.lineup_room == 0.0 for o in counted):
+        # A night with more likely starters than slots is a choice, even when
+        # favouring one category would not change who makes it.
+        if not self.bench_calls and counted and all(o.lineup_room == 0.0 for o in counted):
             lines.append(
                 "  The lineup has no discretion this week - on every day, everyone "
                 "with a game fits in a slot. Only an add moves anything."
@@ -481,8 +499,12 @@ def expected_starts(
     days: list[str] | None = None,
     exclude: dict[str, set[str]] | None = None,
     goalie_games: dict[int, list[float]] | None = None,
+    benched: dict[str, int] | None = None,
 ) -> dict[int, float]:
     """Expected *starts* for each player over the week, not team games.
+
+    `benched`, when given, collects day -> how many players with a game would
+    sit: the nights the lineup has a choice to make at all.
 
     `days` narrows it to part of the week - the days still to play, once some
     have been banked. Default: all of it. `exclude` removes clubs from a day:
@@ -529,9 +551,113 @@ def expected_starts(
             out[pid] = out.get(pid, 0.0) + p_start
             if goalie_games is not None and p_start > 0:
                 goalie_games.setdefault(pid, []).append(p_start)
-        for pid in optimize_lineup(cands, shape):
+        slotted = optimize_lineup(cands, shape)
+        for pid in slotted:
             out[pid] = out.get(pid, 0.0) + 1.0
+        if benched is not None:
+            sat = sum(1 for pid, _, _ in cands if pid not in slotted) + sum(
+                1 for _, p_start, _ in goalies[g_slots:] if p_start >= BENCH_START
+            )
+            if sat:
+                benched[day] = sat
     return {k: round(v, 2) for k, v in out.items()}
+
+
+@dataclass(frozen=True)
+class Steer:
+    """This week's odds as of this run, for deciding tonight by them.
+
+    `ours` is banked plus the days left, without tonight's goalie games - those
+    are the choice being made (`odds.choose_goalies`); `leverage` is what one
+    more unit of each counting category is worth (`odds.leverage`).
+    """
+
+    leverage: dict[str, float]
+    rates: dict[int, dict[str, float]]
+    model: object  # season.odds.OddsModel
+    cats: tuple[Category, ...]
+    ours: object  # season.odds.Side
+    theirs: object  # season.odds.Side
+
+
+def _skaters_only(players, games: dict[int, float]) -> dict[int, float]:
+    skate = {p.nhl_player_id for p in players if p.position != "G"}
+    return {pid: n for pid, n in games.items() if pid in skate}
+
+
+def tonight_odds(
+    conn: sqlite3.Connection,
+    runtime: LeagueRuntime,
+    league: LeagueConfig,
+    week: Week,
+    ours: TeamRoster,
+    theirs: TeamRoster,
+    goalie_source,
+    values,
+    model,
+    day: str,
+    banked_ours: dict[str, float] | None = None,
+    banked_theirs: dict[str, float] | None = None,
+    started: set[str] | None = None,
+    form_rates: bool | None = None,
+) -> Steer | None:
+    """The week's odds as they stand on this run, for tonight's lineup.
+
+    Built the way `build_week_plan` builds them - Yahoo's banked totals by
+    label, plus both sides' expected starts over the days left from `day`, with
+    games already under way left to the banked side - so a lineup decided at
+    5pm sees the score as it stands at 5pm, not Monday's. None when `day` is
+    not in the week.
+    """
+    from puckpilot.season import odds as odds_mod
+    from puckpilot.season.form import FORM_RATES
+
+    if not week.contains(day):
+        return None
+    cats = league.all_cats
+    days = [d for d in week.dates() if d >= day]
+    use_form = FORM_RATES if form_rates is None else form_rates
+    if use_form and hasattr(values, "rates"):
+        rates = values.rates(cats, day)
+    else:
+        rates = per_game_rates(values.frame, cats)
+    exclude = {day: set(started)} if started else None
+    our_games = expected_starts(
+        conn, runtime, week, ours.players, goalie_source, values, days=days, exclude=exclude
+    )
+    later: dict[int, list[float]] = {}
+    expected_starts(
+        conn, runtime, week, ours.players, goalie_source, values, days=days[1:], goalie_games=later
+    )
+    their_goalies: dict[int, list[float]] = {}
+    their_games = expected_starts(
+        conn,
+        runtime,
+        week,
+        theirs.players,
+        goalie_source,
+        values,
+        days=days,
+        exclude=exclude,
+        goalie_games=their_goalies,
+    )
+    our_side = odds_mod.side(
+        banked_components(banked_ours or {}), _skaters_only(ours.players, our_games), later, rates
+    )
+    their_side = odds_mod.side(
+        banked_components(banked_theirs or {}),
+        _skaters_only(theirs.players, their_games),
+        their_goalies,
+        rates,
+    )
+    return Steer(
+        leverage=odds_mod.leverage(model, cats, our_side, their_side),
+        rates=rates,
+        model=model,
+        cats=cats,
+        ours=our_side,
+        theirs=their_side,
+    )
 
 
 def team_games_in(
@@ -694,6 +820,8 @@ def build_week_plan(
     horizon: str = "this week",
     workload=None,
     form_rates: bool | None = None,
+    screen_by: str = "value",
+    screen: int = 20,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -716,6 +844,9 @@ def build_week_plan(
 
     `form_rates` (default `form.FORM_RATES`) prices with per-category rates
     that have seen this season (`values.rates`) instead of August's.
+
+    `screen_by` / `screen`: how the add search shortlists (`_targets`); "union"
+    needs the odds, and falls back to "value" without them.
     """
     from puckpilot.season.form import FORM_RATES
 
@@ -735,6 +866,7 @@ def build_week_plan(
 
     our_goalie_games: dict[int, list[float]] = {}
     their_goalie_games: dict[int, list[float]] = {}
+    bench_calls: dict[str, int] = {}
     our_games = expected_starts(
         conn,
         runtime,
@@ -745,6 +877,7 @@ def build_week_plan(
         days=days,
         exclude=exclude,
         goalie_games=our_goalie_games,
+        benched=bench_calls,
     )
     their_games = expected_starts(
         conn,
@@ -807,23 +940,23 @@ def build_week_plan(
         return math.sqrt(max(our_var.get(key, 0.0) + their_var.get(key, 0.0), 0.0))
 
     odds = their_side = None
+    leverage: dict[str, float] = {}
+    ceiling: dict[str, float] = {}
+    extra_game: dict[str, float] = {}
     if odds_model is not None:
         from puckpilot.season import odds as odds_mod
 
-        def skaters_only(players, games):
-            skate = {p.nhl_player_id for p in players if p.position != "G"}
-            return {pid: n for pid, n in games.items() if pid in skate}
-
         their_side = odds_mod.side(
-            base_theirs, skaters_only(theirs.players, their_games), their_goalie_games, rates
+            base_theirs, _skaters_only(theirs.players, their_games), their_goalie_games, rates
         )
-        odds = odds_model.week(
-            cats,
-            odds_mod.side(
-                base_ours, skaters_only(ours.players, our_games), our_goalie_games, rates
-            ),
-            their_side,
+        our_side = odds_mod.side(
+            base_ours, _skaters_only(ours.players, our_games), our_goalie_games, rates
         )
+        odds = odds_model.week(cats, our_side, their_side)
+        leverage = odds_mod.leverage(odds_model, cats, our_side, their_side)
+        if adds:
+            ceiling = odds_mod.ceilings(odds_model, cats, our_side, their_side, adds)
+        extra_game = _extra_game(leverage, ours.players, rates, league.skater_cats)
 
     def chance(key: str) -> tuple[float | None, float | None]:
         o = odds.of(key) if odds is not None else None
@@ -919,7 +1052,28 @@ def build_week_plan(
             exclude=exclude,
             horizon=horizon,
             workload=workload,
+            screen=screen,
+            screen_by=screen_by,
+            leverage=leverage,
         )
+
+    # The week with every move made, in order, priced by the odds whichever
+    # way the moves were chosen - what the plan as a whole is for.
+    planned = None
+    if targets and odds is not None and their_side is not None:
+        evaluate = _evaluator(
+            conn,
+            runtime,
+            week,
+            rates,
+            cats,
+            goalie_source,
+            values,
+            days,
+            OddsContext(model=odds_model, banked=base_ours, theirs=their_side, cats=cats),
+            exclude,
+        )
+        planned = evaluate(with_moves(ours.players, targets))[2]
 
     return WeekPlan(
         week=week.number,
@@ -939,7 +1093,38 @@ def build_week_plan(
         adds_left_season=adds_left_season,
         notes=tuple(notes),
         lapsed=lapsed,
+        planned=planned,
+        leverage=leverage,
+        ceiling=ceiling,
+        bench_calls=bench_calls,
+        extra_game=extra_game,
     )
+
+
+def _extra_game(leverage, players, rates, skater_cats) -> dict[str, float]:
+    """label -> expected categories from one more game of a typical skater of
+    ours: the median of our skaters' per-game rates, times what a unit is worth."""
+    from statistics import median
+
+    lines = [
+        rates[p.nhl_player_id] for p in players if p.position != "G" and p.nhl_player_id in rates
+    ]
+    out: dict[str, float] = {}
+    for c in skater_cats:
+        if c.key not in leverage or not lines:
+            continue
+        out[c.label] = leverage[c.key] * median(r.get(c.key, 0.0) for r in lines)
+    return out
+
+
+def with_moves(players, targets) -> list:
+    """The roster after each target's add and drop, in order."""
+    out = list(players)
+    for t in targets:
+        if t.drop is not None:
+            out = [p for p in out if p.player_key != t.drop.player_key]
+        out.append(t.player)
+    return out
 
 
 @dataclass
@@ -974,6 +1159,8 @@ def _targets(
     exclude: dict[str, set[str]] | None = None,
     horizon: str = "this week",
     workload=None,
+    screen_by: str = "value",
+    leverage: dict[str, float] | None = None,
 ) -> tuple[AddTarget, ...]:
     """Adds that move a category in play, priced by re-slotting the actual week.
 
@@ -1000,7 +1187,10 @@ def _targets(
     and on a real roster that is soon a regular.
 
     Each step costs an optimizer pass per candidate, so the pool is screened
-    cheaply first and only the shortlist is priced properly.
+    cheaply first and only the shortlist is priced properly. `screen_by`
+    "union" adds to the value shortlist the `screen` players whose games move
+    this week's categories most by `leverage` - a specialist in a close
+    category can rank outside the value 20 and is then never priced at all.
     """
     from puckpilot.season.today import ir_changes, open_roster_spots
 
@@ -1056,18 +1246,29 @@ def _targets(
     # Cheap screen: his rate times the games he would actually fill - days his
     # team plays AND a slot he can take is empty. Ranking by team games alone
     # favoured a four-game week that lands on nights the lineup is already full.
+    eligible = [
+        c for c in pool if c.nhl_player_id is not None and not c.is_out and c.nhl_player_id in rates
+    ]
+    size = max(screen, max_targets)
     screened = sorted(
-        (
-            c
-            for c in pool
-            if c.nhl_player_id is not None and not c.is_out and c.nhl_player_id in rates
-        ),
+        eligible,
         key=lambda c: (
             -values.per_game(c.nhl_player_id, days[0])
             * _screen_games(c, holes, playing)
             * share_of(season_left, c)
         ),
-    )[: max(screen, max_targets)]
+    )[:size]
+    if screen_by == "union" and leverage:
+        from puckpilot.season.odds import game_worth
+
+        def fit(c) -> float:
+            per_game = game_worth(leverage, rates[c.nhl_player_id])
+            return per_game * _screen_games(c, holes, playing) * share_of(season_left, c)
+
+        seen = {c.player_key for c in screened}
+        screened += [
+            c for c in sorted(eligible, key=fit, reverse=True)[:size] if c.player_key not in seen
+        ]
 
     steps = max_targets if adds_left is None else min(max_targets, adds_left)
     chosen: list[AddTarget] = []

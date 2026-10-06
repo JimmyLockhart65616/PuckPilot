@@ -57,8 +57,15 @@ def build(
     week_no: int | None = None,
     next_run=None,
     acted: dict | None = None,
+    show_protocol: bool = True,
+    lineup_by: str = "season value",
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
+
+    The week carries its plan (`game_plan`), rebuilt on every push from that
+    run's odds. A week protocol - the old approve-a-stance card - is shown only
+    to a manager whose lineup follows one (`show_protocol`); `lineup_by` says
+    how the week's bench calls are being decided.
 
     A missing section renders as absent rather than as an error; a page that
     half-draws is worse than one that says a thing is not there yet, which is
@@ -138,7 +145,7 @@ def build(
     # a push replaces the whole page, and an Approve button that vanishes on
     # the next run is one that cannot be pressed.
     week_no = week_plan.week if week_plan is not None else week_no
-    if week_no is not None:
+    if week_no is not None and show_protocol:
         snap["protocol"] = _protocol(protocol_mod.load(conn, manager, league_key, week_no))
     if week_plan is not None:
         banked = getattr(week_plan, "banked", False)
@@ -165,6 +172,7 @@ def build(
                 for o in week_plan.outlook
             ],
             "note": _week_note(week_plan),
+            "plan": _plan(week_plan, lineup_by),
         }
 
     if roster is not None:
@@ -256,6 +264,13 @@ def _protocol(live) -> dict | None:
     }
 
 
+def _plan(week_plan, lineup_by: str) -> dict | None:
+    from puckpilot.season.game_plan import GamePlan
+
+    gp = GamePlan.from_week(week_plan, lineup_by=lineup_by)
+    return gp.payload() if gp is not None else None
+
+
 def _state(o) -> str:
     """likely / in play / long shot by the odds bands; gone when even every
     lever left could not make it more than a long shot."""
@@ -290,6 +305,8 @@ def _maybe(v, key: str, banked: bool):
 
 def _week_note(wp) -> str:
     counted = [o for o in wp.outlook if o.measured]
+    if getattr(wp, "bench_calls", None):
+        return ""  # someone with a game sits somewhere this week; the plan says when
     if counted and all(o.lineup_room == 0.0 for o in counted):
         return "Everyone with a game fits in a slot this week - only an add moves anything."
     return ""

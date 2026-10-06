@@ -170,9 +170,26 @@ function decisionButtons(c, kind, id) {
   c.appendChild(box);
 }
 
+// The week's plan: every line is written by the server; this only lays it out.
+// Read-only - it is rebuilt on every run from that run's odds.
+function renderPlan(root, w) {
+  var p = w && w.plan;
+  if (!p || !p.head) return;
+  h2(root, 'This week\\u2019s plan');
+  var c = card(root);
+  if (p.title) c.appendChild(el('div', null, p.title));
+  c.appendChild(el('div', null, p.head));
+  (p.groups || []).forEach(function (g) {
+    c.appendChild(el('div', 'why-title', g.title));
+    (g.lines || []).forEach(function (line) { c.appendChild(el('div', 'why-line', line)); });
+  });
+  (p.notes || []).forEach(function (n) { c.appendChild(el('div', 'sub', n)); });
+}
+
+// A week protocol, for a manager whose lineup follows one (`follow_protocol`).
 function renderProtocol(root, p) {
   if (!p) return;
-  h2(root, 'This week\\u2019s plan');
+  h2(root, 'Week protocol');
   var c = card(root);
   c.appendChild(el('div', null, 'Week ' + p.week + (p.opponent ? ' vs ' + p.opponent : '')));
   (p.give_up || []).forEach(function (t) {
@@ -311,6 +328,7 @@ function render(s) {
   renderMoves(app, s);
   renderProposals(app, s.proposals);
   renderWithdrawn(app, s.withdrawn);
+  renderPlan(app, s.week);
   renderProtocol(app, s.protocol);
   renderWeek(app, s.week);
   renderRoster(app, s.roster);

@@ -298,3 +298,61 @@ def test_a_pickup_priced_for_next_week_says_next_week(db):
     [p] = snapshot.build(db, "jimmy", "999.l.1", "T")["proposals"]
     assert "+0.31 categories expected next week" in p["why"]
     assert "+2 starts next week" in p["why"]
+
+
+def _odds_week():
+    from puckpilot.engine.categories import resolve
+    from puckpilot.season.odds import CategoryOdds, WeekOdds
+    from puckpilot.season.week import CategoryOutlook, WeekPlan
+
+    g, hit = resolve("G"), resolve("HIT")
+    return WeekPlan(
+        week=2,
+        start="a",
+        end="b",
+        opponent="X",
+        outlook=(
+            CategoryOutlook(g, 9.0, 8.0, sd=2.0, p_win=0.50, p_tie=0.0),
+            CategoryOutlook(hit, 30.0, 46.0, sd=6.0, p_win=0.06, p_tie=0.0),
+        ),
+        odds=WeekOdds(
+            (CategoryOdds(g, 0.50, 0.0, 9.0, 8.0), CategoryOdds(hit, 0.06, 0.0, 30.0, 46.0))
+        ),
+        adds_left_week=3,
+    )
+
+
+def test_the_week_carries_its_plan_rebuilt_on_every_push(db):
+    w = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_plan=_odds_week())["week"]
+    plan = w["plan"]
+    assert plan["title"] == "Week 2 vs X"
+    assert plan["head"].startswith("Expect 0.6 of 2")
+    assert {"title": "Giving up", "lines": ["HIT 6%"]} in plan["groups"]
+
+
+def test_a_protocol_is_shown_only_to_a_lineup_that_follows_one(db):
+    protocol_mod.save(db, derive(outlook("PPP", 8.5, 7.7, add_room=5.0), week=2))
+    hidden = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_no=2, show_protocol=False)
+    shown = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_no=2)
+    assert hidden["protocol"] is None and shown["protocol"] is not None
+
+
+def test_no_discretion_is_not_claimed_on_a_week_with_a_bench_call(db):
+    """Week 2's Saturday: three likely starters for two G slots. Favouring a
+    category changes nothing, but someone with a game still sits."""
+    from dataclasses import replace
+
+    from puckpilot.engine.categories import resolve
+    from puckpilot.season.week import CategoryOutlook
+
+    wp = replace(
+        _odds_week(),
+        outlook=(CategoryOutlook(resolve("G"), 9.0, 8.0, lineup_room=0.0, add_room=1.0),),
+    )
+    quiet = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_plan=wp)["week"]
+    busy = snapshot.build(
+        db, "jimmy", "999.l.1", "Home Team", week_plan=replace(wp, bench_calls={"2026-10-10": 1})
+    )["week"]
+    assert quiet["note"].startswith("Everyone with a game fits")
+    assert busy["note"] == ""
+    assert "has no discretion" not in replace(wp, bench_calls={"2026-10-10": 1}).text()

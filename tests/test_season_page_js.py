@@ -152,6 +152,17 @@ def test_a_full_payload_renders_every_section():
                     {"label": "SV%", "ours": 0.898, "theirs": 0.902, "state": "close"},
                 ],
                 "note": "Everyone with a game fits in a slot this week.",
+                "plan": {
+                    "title": "Week 2 vs Rival FC",
+                    "head": "Expect 5.7 of 11 -> 6.2 if the 2 proposed moves are made",
+                    "groups": [
+                        {"title": "Go after", "lines": ["SOG 54% -> 68%"]},
+                        {"title": "Paying for it", "lines": ["SV 69% -> 61%"]},
+                        {"title": "Giving up", "lines": ["HIT 6%"]},
+                        {"title": "Toss-ups", "lines": ["A 60% · SV% 47%"]},
+                    ],
+                    "notes": ["Lineup: no bench calls - everyone with a game starts"],
+                },
             },
             "roster": [
                 {"slot": "C", "name": "Evgeni Malkin", "team": "PIT", "opp": "", "status": ""},
@@ -162,6 +173,13 @@ def test_a_full_payload_renders_every_section():
     out = run_page(state.get("jimmy"))
     assert_clean(out)
     for expected in (
+        "This week’s plan",
+        "Expect 5.7 of 11 -> 6.2",
+        "Paying for it",
+        "SV 69% -> 61%",
+        "Giving up",
+        "SV% 47%",
+        "Lineup: no bench calls",
         "Home Team",
         "Alex Tuch",
         "Will Cuylle",

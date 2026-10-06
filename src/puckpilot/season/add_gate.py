@@ -13,6 +13,18 @@ per week against the real schedule of opponents.
     goalie-odds    no adds; tonight's goalies chosen by expected categories
                    (`odds.choose_goalies`) instead of starting whoever plays
 
+Asked for when the weekly plan was rebuilt around what it targets and gives up
+(2026-10-05), and tested the same way:
+
+    -e       the search's shortlist also takes the players whose games move
+             this week's close categories most (`screen_by="union"`), not
+             only the 20 worth most per game
+    -n<N>    a value-only shortlist of N - the control for -e, so a gain from
+             a longer list is not read as one from leverage
+    -t       the daily lineup steered by this week's odds, rebuilt each
+             morning from the banked score: skaters by what their game adds to
+             expected categories won, goalies by `odds.choose_goalies`
+
 Any search arm takes a `-s<n>` suffix - `odds-weekly-s3` - to let the bottom
 `n` players by rest-of-season value rotate for a streamer instead of the run's
 `stream_spots`. Asked after week 1 of 2026-27, when 30-46 empty slot-games went
@@ -98,6 +110,12 @@ class ArmSpec:
     # Monday by `keeper_value` as of the latest month's start (no contracts:
     # every player eligible). None: no protection.
     keepers: int | None = None
+    # -e: the shortlist adds the players whose games move this week's close
+    # categories most; -nN: a value-only shortlist of N (the control).
+    screen_by: str = "value"
+    screen: int = 20
+    # -t: the lineup steered by this week's odds each morning.
+    steer: bool = False
 
 
 def _swap(roster: list[int], target) -> None:
@@ -138,9 +156,15 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.usage = True
         elif tok == "m":
             spec.momentum = True
-        elif len(tok) > 1 and tok[0] in "spqfxk" and tok[1:].isdigit():
+        elif tok == "e":
+            spec.screen_by = "union"
+        elif tok == "t":
+            spec.steer = True
+        elif len(tok) > 1 and tok[0] in "spqfxkn" and tok[1:].isdigit():
             n = int(tok[1:])
-            if tok[0] == "k":
+            if tok[0] == "n":
+                spec.screen = n
+            elif tok[0] == "k":
                 spec.keepers = n
             elif tok[0] == "s":
                 spec.spots = n
@@ -260,10 +284,18 @@ def add_gate_report(
         projected_shares,
         trailing_model,
     )
-    from puckpilot.season.odds import OddsModel, Side, choose_goalies, goalie_game
+    from puckpilot.season.odds import (
+        OddsModel,
+        Side,
+        choose_goalies,
+        game_worth,
+        goalie_game,
+        leverage,
+    )
     from puckpilot.season.pool import PoolPlayer
     from puckpilot.season.replay import POS_TO_YAHOO, runtime_for_replay, team_by_day
     from puckpilot.season.roster import RosterPlayer, TeamRoster
+    from puckpilot.season.today import STEER_TIE
     from puckpilot.season.values import ValueModel
     from puckpilot.season.week import build_week_plan, per_game_rates
 
@@ -369,14 +401,17 @@ def add_gate_report(
     g_slots = sum(n for pos, n in shape.slots if pos == "G")
     model = OddsModel()
 
-    def projected_side(roster, banked_sk, banked_g, rest, cutoff, tonight_too=True):
+    def projected_side(
+        roster, banked_sk, banked_g, rest, cutoff, tonight_too=True, line_rates=None, pol=None
+    ):
         """Banked totals plus the as-of projection of `rest` (date indices)."""
-        frozen = AsOfGoalieSource(policy, cutoff)
+        line_rates = line_rates if line_rates is not None else rates
+        frozen = AsOfGoalieSource(pol or policy, cutoff)
         skaters: dict[str, float] = {}
         goalies = []
         for j in rest:
             for pid in lineup_skaters(roster, j):
-                for key, r in (rates.get(pid) or {}).items():
+                for key, r in (line_rates.get(pid) or {}).items():
                     skaters[key] = skaters.get(key, 0.0) + r
             if not tonight_too and j == rest[0]:
                 continue
@@ -389,7 +424,7 @@ def add_gate_report(
                 ),
                 reverse=True,
             )[:g_slots]
-            goalies += [goalie_game(rates.get(pid) or {}, ps) for _, ps, pid in gs]
+            goalies += [goalie_game(line_rates.get(pid) or {}, ps) for _, ps, pid in gs]
         return Side(
             banked=_components(banked_sk, banked_g, skater_keys), skaters=skaters, goalies=goalies
         )
@@ -430,6 +465,48 @@ def add_gate_report(
         assigned = dict(lineup_skaters(roster, i))
         for pid in choice.start:
             assigned[pid] = "G"
+        return assigned
+
+    steered: dict[str, int] = {}  # -t arms: nights the lineup left the plain one
+
+    def lineup_steered(arm, roster, i, rest, sk, g, opp, opp_done, pol, line_rates):
+        """Tonight by this week's odds, as of this morning: banked plus the
+        days left, both sides. Skaters by what their game adds to expected
+        categories won (ties to the plain value); goalies by choose_goalies."""
+        date = data.dates[i]
+        ours = projected_side(
+            roster, sk, g, rest, date, tonight_too=False, line_rates=line_rates, pol=pol
+        )
+        theirs = projected_side(
+            rosters[opp],
+            sk_day[opp, opp_done].sum(0) if opp_done else np.zeros(len(skater_keys)),
+            g_day[opp, opp_done].sum(0) if opp_done else np.zeros(G_WIDTH),
+            rest,
+            date,
+            line_rates=line_rates,
+            pol=pol,
+        )
+        lev = leverage(model, cats, ours, theirs)
+        cands = [
+            (
+                pid,
+                positions.get(pid, "C"),
+                game_worth(lev, line_rates.get(pid) or {}) + STEER_TIE * pg_value.get(pid, 0.0),
+            )
+            for pid in roster
+            if positions.get(pid) != "G" and i in avail.get(pid, ())
+        ]
+        assigned = dict(optimize_lineup(cands, shape))
+        p = (pol or policy).starts(date)
+        tonight = {
+            pid: goalie_game(line_rates.get(pid) or {}, p[pid])
+            for pid in roster
+            if positions.get(pid) == "G" and p.get(pid, 0.0) > 0
+        }
+        for pid in choose_goalies(model, cats, ours, tonight, theirs, slots=g_slots).start:
+            assigned[pid] = "G"
+        if set(assigned) != set(lineup(roster, i, pol)):
+            steered[arm] = steered.get(arm, 0) + 1
         return assigned
 
     def realise(assigned, i, sk, g):
@@ -625,6 +702,8 @@ def add_gate_report(
                                 measure_room=False,
                                 workload=wl,
                                 form_rates=spec.form_rates,
+                                screen_by=spec.screen_by,
+                                screen=spec.screen,
                             )
                             for target in plan.targets:
                                 drop = target.drop
@@ -707,6 +786,8 @@ def add_gate_report(
                             measure_room=False,
                             workload=wl,
                             form_rates=spec.form_rates,
+                            screen_by=spec.screen_by,
+                            screen=spec.screen,
                         )
                         targets = list(plan.targets)
                         nopp = (
@@ -764,6 +845,11 @@ def add_gate_report(
                             made[arm] += 1
                     if arm == "goalie-odds":
                         assigned = lineup_goalie_odds(roster, i, days[k:], sk, g, opp, days[:k])
+                    elif spec.steer:
+                        line_rates = vals.rates(cats, date) if spec.form_rates else rates
+                        assigned = lineup_steered(
+                            arm, roster, i, days[k:], sk, g, opp, days[:k], pol, line_rates
+                        )
                     else:
                         assigned = lineup(roster, i, pol)
                     realise(assigned, i, sk, g)
@@ -786,7 +872,10 @@ def add_gate_report(
         f"{'arm':14}{'cats/week':>11}{'adds':>7}   (goalie-odds: nights changed)",
     ]
     for arm in arms:
-        lines.append(f"{arm:14}{report.mean(arm):>11.3f}{made[arm]:>7}")
+        line = f"{arm:14}{report.mean(arm):>11.3f}{made[arm]:>7}"
+        if arm in steered:
+            line += f"   steered lineups: {steered[arm]} nights changed"
+        lines.append(line)
     lines.append("")
     pairs = [(a, "none") for a in arms if a != "none" and "none" in arms]
     if "odds-daily" in arms and "share-daily" in arms:

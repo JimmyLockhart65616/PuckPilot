@@ -26,6 +26,10 @@ from dataclasses import dataclass, field
 QUESTIONABLE_MODES = ("never", "only_if_needed", "always")
 # How an add is priced (see TransactionAuthority.add_scoring).
 ADD_SCORING = ("share", "odds")
+# How the add search shortlists candidates (TransactionAuthority.screen).
+SCREENS = ("value", "union")
+# How a night with more players than slots is decided (LineupAuthority.steer).
+STEER_MODES = ("off", "odds")
 
 
 class AuthorityError(ValueError):
@@ -86,8 +90,27 @@ class LineupAuthority:
     # also found no gain in choosing goalies by those odds, so nothing in the
     # daily lineup acts on it. This flag only governs the lineup.
     follow_protocol: bool = False
+    # How a night with more players than slots is decided. "off": by each
+    # player's per-game value, as always. "odds": by what his game adds to
+    # this week's expected categories won - from the odds rebuilt on that run,
+    # Yahoo's banked score plus the days left - and tonight's goalies by
+    # `odds.choose_goalies`.
+    #
+    # OFF, on measurement (add gate `odds-daily-h-f25-x1-k1-r-t` against the
+    # same arm unsteered, 12 teams x 22 weeks, 4 drafts x 2 seasons): ahead in
+    # 6 of 8 leagues, pooled +0.015 +/- 0.009 categories a week - inside noise,
+    # and short of the rule set before running it (clear of 2 SE in both
+    # seasons of the first draft: +0.081 +/- 0.026, +0.006 +/- 0.024). It
+    # changes 14-20 nights a team-season; there are not enough bench calls for
+    # the odds to matter. The fixed-weight protocol measured the same way.
+    steer: str = "off"
 
     def __post_init__(self) -> None:
+        if self.steer not in STEER_MODES:
+            raise AuthorityError(
+                f"authority.lineup.steer must be one of {', '.join(STEER_MODES)}; "
+                f"got {self.steer!r}"
+            )
         if self.start_questionable not in QUESTIONABLE_MODES:
             raise AuthorityError(
                 f"authority.lineup.start_questionable must be one of "
@@ -114,6 +137,8 @@ class LineupAuthority:
             "  changes are unlimited until each player's game starts",
             "  week protocol steers the lineup: "
             + ("yes" if self.follow_protocol else "no (measured inert)"),
+            "  bench calls decided by: "
+            + ("this week's odds" if self.steer == "odds" else "season value"),
             *([f"  never benched: {', '.join(self.never_bench)}"] if self.never_bench else []),
         ]
 
@@ -207,8 +232,25 @@ class TransactionAuthority:
     # players it shields are the rising ones the per-game value cut too soon.
     protect_keepers: bool = True
     keeper_margin: int = 1
+    # How the search shortlists free agents before pricing them properly.
+    # "value": the 20 worth most per game times the empty slots they would
+    # fill. "union": those, plus the 20 whose games move this week's close
+    # categories most (`odds.leverage`) - a hitter when HIT is level, which a
+    # general value can rank out of the 20.
+    #
+    # "value", on measurement (add gate `-e` against the live arm, 4 drafts x
+    # 2 seasons): behind in 7 of 8 leagues, pooled -0.044 +/- 0.023
+    # categories a week, with 25-70 more adds a league-season. A value-only
+    # list of 40 (`-n40`, the control) did the same: a longer list finds more
+    # moves that clear the floor on paper and do not pay.
+    screen: str = "value"
 
     def __post_init__(self) -> None:
+        if self.screen not in SCREENS:
+            raise AuthorityError(
+                f"authority.transactions.screen must be one of {', '.join(SCREENS)}; "
+                f"got {self.screen!r}"
+            )
         if self.add_scoring not in ADD_SCORING:
             raise AuthorityError(
                 f"authority.transactions.add_scoring must be one of {', '.join(ADD_SCORING)}; "

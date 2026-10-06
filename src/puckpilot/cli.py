@@ -1312,10 +1312,13 @@ def _cmd_season_roster(args: argparse.Namespace) -> int:
 
 
 def _cmd_lineup_today(args: argparse.Namespace) -> int:
+    from dataclasses import replace
+
     from puckpilot.season import cli_support
-    from puckpilot.season.fetch import discover_team_key, fetch_roster, save_roster
+    from puckpilot.season.fetch import discover_team_key, fetch_live, fetch_roster, save_roster
     from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
     from puckpilot.season.manager import ManagerError
+    from puckpilot.season.run import WeekContext, week_for
     from puckpilot.season.today import build_plan, yahoo_goalie_games
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
@@ -1323,12 +1326,24 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
     date = args.date or cli_support.today_str()
     try:
         manager, conn, league_key, _ = _season_setup(args)
+        if args.steer:
+            # This run only: a preview of the steered lineup, config untouched.
+            lineup = replace(manager.authority.lineup, steer=args.steer)
+            manager = replace(manager, authority=replace(manager.authority, lineup=lineup))
         runtime = cli_support.load_rules(conn, league_key)
         pmap = playermap.load_map(conn, league_key)
+        ctx = WeekContext(week=week_for(runtime, date))
 
         def _read(session):
             key = manager.team_key or discover_team_key(session, league_key)
-            return fetch_roster(session, key, date, player_map=pmap)
+            got = fetch_roster(session, key, date, player_map=pmap)
+            # Steered, tonight is decided on the week's score as it stands now.
+            if manager.authority.lineup.steer == "odds" and ctx.week is not None:
+                ctx.live = fetch_live(session, key, ctx.week.number)[0]
+                opp = ctx.live.theirs.team_key if ctx.live is not None else ""
+                if opp:
+                    ctx.theirs = fetch_roster(session, opp, date, player_map=pmap)
+            return got
 
         roster = cli_support.run_session(manager, _read)
     except (ManagerError, cli_support.SeasonCliError) as e:
@@ -1342,13 +1357,19 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
 
     from puckpilot.season import protocol as protocol_mod
 
-    weights: dict[str, float] = {}
-    if manager.authority.lineup.follow_protocol:
+    weights = protocol_mod.lineup_weights(conn, manager, league_key, runtime, date)
+    steer = None
+    if manager.authority.lineup.steer == "odds" and date != cli_support.today_str():
+        # The live score is today's: a later night's odds would miss the days
+        # between, as if nothing were played until then.
+        print("  Not steered: the week's odds can only be read for tonight.")
+    elif manager.authority.lineup.steer == "odds":
+        from puckpilot.season.run import _steer
+
         try:
-            live = protocol_mod.active(conn, manager.name, league_key, runtime.week_of(date))
-            weights = live.weights() if live else {}
-        except Exception:  # noqa: BLE001 - no calendar, no protocol; the plain plan stands
-            weights = {}
+            steer = _steer(conn, manager, runtime, ctx, roster, (values, goalies), date)
+        except Exception as e:  # noqa: BLE001 - the plain lineup still stands
+            print(f"  Not steered ({e}); the lineup below is by season value.")
 
     plan = build_plan(
         conn,
@@ -1361,6 +1382,7 @@ def _cmd_lineup_today(args: argparse.Namespace) -> int:
         authority=manager.authority.lineup,
         goalie_starts_so_far=yahoo_goalie_games(roster, runtime, date),
         weights=weights,
+        steer=steer,
     )
     from puckpilot.season import explain
 
@@ -1408,6 +1430,7 @@ def _season_publish(
 ):
     """Collect decisions, then push the view. Never fatal."""
     from puckpilot.season import publish, snapshot
+    from puckpilot.season.run import lineup_by
 
     if not manager.page.publishes:
         return
@@ -1431,6 +1454,8 @@ def _season_publish(
             roster=roster,
             reasons=reasons,
             next_run=_next_scheduled_run(manager, conn, league_key, roster),
+            show_protocol=manager.authority.lineup.follow_protocol,
+            lineup_by=lineup_by(manager),
         )
         publish.push(manager.page.url, key, snap)
         if not quiet:
@@ -2068,6 +2093,7 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         min_expected_gain=manager.authority.transactions.min_expected_gain,
         playoff_reserve=manager.authority.transactions.playoff_reserve,
         stream_spots=manager.authority.transactions.stream_spots,
+        screen_by=manager.authority.transactions.screen,
         **live_inputs(conn, runtime, m.as_week(), live, today),
     )
     log_week(conn, manager.name, league_key, ours.team_key, plan, today)
@@ -2109,24 +2135,33 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         print("  Nothing here is executed. Approve a move to act on it.")
 
     from puckpilot.season import protocol as protocol_mod
+    from puckpilot.season.game_plan import GamePlan
+    from puckpilot.season.run import lineup_by
 
-    stance = protocol_mod.derive(
-        plan.outlook, manager.name, league_key, ours.team_key, plan.week, m.opponent_name
-    )
-    existing = protocol_mod.load(conn, manager.name, league_key, plan.week)
-    live = existing if existing and existing.status == protocol_mod.APPROVED else None
-    if live is None:
-        stance = protocol_mod.save(conn, stance)
-    shown = live or stance
-    print()
-    for line in explain.protocol_story(shown, plan.adds_left_week):
-        print(f"  {line}" if line else "")
-    print()
-    if live is not None:
-        print(f"  Already approved (protocol #{live.id}).")
-    else:
-        print(f"  Approve with: ppilot season protocol --approve {shown.id}")
-        print("  Or just ignore it - nothing happens until you decide.")
+    game = GamePlan.from_week(plan, lineup_by=lineup_by(manager))
+    if game is not None:
+        print()
+        print(game.text())
+
+    # A stance to approve only matters to a lineup that follows one.
+    if manager.authority.lineup.follow_protocol:
+        stance = protocol_mod.derive(
+            plan.outlook, manager.name, league_key, ours.team_key, plan.week, m.opponent_name
+        )
+        existing = protocol_mod.load(conn, manager.name, league_key, plan.week)
+        live = existing if existing and existing.status == protocol_mod.APPROVED else None
+        if live is None:
+            stance = protocol_mod.save(conn, stance)
+        shown = live or stance
+        print()
+        for line in explain.protocol_story(shown, plan.adds_left_week):
+            print(f"  {line}" if line else "")
+        print()
+        if live is not None:
+            print(f"  Already approved (protocol #{live.id}).")
+        else:
+            print(f"  Approve with: ppilot season protocol --approve {shown.id}")
+            print("  Or just ignore it - nothing happens until you decide.")
 
     _season_publish(manager, conn, league_key, week_plan=plan, roster=ours)
 
@@ -2924,6 +2959,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     today.add_argument(
         "--explain", action="store_true", help="Show each playing player's value tonight"
+    )
+    today.add_argument(
+        "--steer",
+        choices=("off", "odds"),
+        default=None,
+        help="Decide bench calls by this week's odds (or not) for this run only - "
+        "a preview; the manager file's authority.lineup.steer is the standing setting",
     )
     today.set_defaults(func=_cmd_lineup_today)
     verify = lineup_sub.add_parser(

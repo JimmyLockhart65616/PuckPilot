@@ -79,3 +79,15 @@ def test_an_arm_names_its_options():
         parse_arm("odds-weekly-zz", 2)
     with pytest.raises(ValueError, match="unknown arm"):
         parse_arm("weekly-odds", 2)
+
+
+def test_the_shortlist_and_steering_options_parse_and_combine():
+    from puckpilot.season.add_gate import parse_arm
+
+    plain = parse_arm("odds-daily-h-f25-x1-k1-r", 2)
+    assert (plain.screen_by, plain.screen, plain.steer) == ("value", 20, False)
+    e = parse_arm("odds-daily-h-f25-x1-k1-r-e", 2)
+    assert e.screen_by == "union" and e.form_rates and e.keepers == 1 and e.mid_floor == 0.25
+    assert parse_arm("odds-daily-h-f25-x1-k1-r-n40", 2).screen == 40
+    t = parse_arm("odds-weekly-t-e", 2)
+    assert t.steer and t.screen_by == "union"

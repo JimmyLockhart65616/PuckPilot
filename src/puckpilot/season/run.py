@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import sqlite3
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from puckpilot.season import proposals as proposals_mod
+from puckpilot.season import protocol as protocol_mod
 from puckpilot.season.preflight import age_days as _age_days
 
 # The league's own settings carry the week calendar and which week it is now.
@@ -303,6 +304,9 @@ def run_day(
 
         def _plan():
             values, goalies = models
+            steer = _guard(
+                report, "steer", lambda: _steer(conn, manager, runtime, ctx, roster, models, day)
+            )
             got = build_plan(
                 conn,
                 runtime,
@@ -313,6 +317,8 @@ def run_day(
                 manager=manager.name,
                 authority=manager.authority.lineup,
                 goalie_starts_so_far=yahoo_goalie_games(roster, runtime, day),
+                weights=protocol_mod.lineup_weights(conn, manager, league_key, runtime, day),
+                steer=steer,
             )
             reasons = explain.move_reasons(conn, runtime, got)
             report.add(
@@ -461,6 +467,8 @@ def run_day(
                 week_no=week.number if week is not None else None,
                 next_run=_next_run(conn, manager, runtime, day, roster),
                 acted=acted,
+                show_protocol=manager.authority.lineup.follow_protocol,
+                lineup_by=lineup_by(manager),
             )
             publish.push(manager.page.url, page_key, snap)
             report.add("page", True, manager.page.url)
@@ -813,6 +821,7 @@ def _next_week(
         add_scoring=terms.add_scoring,
         playoff_reserve=terms.playoff_reserve,
         stream_spots=terms.stream_spots,
+        screen_by=terms.screen,
     )
     pairs = [(add, drop) for _, add, drop in workable]
     # Re-checks price every pair whatever it is worth (no floor); the
@@ -1096,7 +1105,6 @@ def _weekly(
     """
     from puckpilot.draft.sim import build_universe
     from puckpilot.season import cli_support, explain, pool
-    from puckpilot.season import protocol as protocol_mod
     from puckpilot.season import week as weekmod
     from puckpilot.season.fetch import fetch_matchups, fetch_roster
     from puckpilot.season.matchups import current_or_next
@@ -1172,6 +1180,7 @@ def _weekly(
         min_expected_gain=bar,
         playoff_reserve=terms.playoff_reserve,
         stream_spots=terms.stream_spots,
+        screen_by=terms.screen,
         **live_inputs(conn, runtime, week, live, day),
     )
     log_week(conn, manager.name, league_key, ours.team_key, plan, day)
@@ -1180,8 +1189,13 @@ def _weekly(
     if horizon and ahead is not None and targets:
         targets, notes = _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models)
         lines += notes
+        if len(targets) < len(plan.targets):
+            # The odds with every move made were priced on the chain as
+            # searched; with a link gone that chain no longer exists. The next
+            # run re-prices exactly the queue and restores them.
+            plan = replace(plan, planned=None)
 
-    if start_of_week:
+    if start_of_week and manager.authority.lineup.follow_protocol:
         stance = protocol_mod.derive(
             plan.outlook, manager.name, league_key, ours.team_key, plan.week, opp_name
         )
@@ -1211,6 +1225,51 @@ def _weekly(
     head = _week_line(plan) if not start_of_week else f"week {plan.week} vs {opp_name}"
     report.add("week", True, head, lines)
     return plan
+
+
+def _steer(conn, manager, runtime, ctx, roster, models, day):
+    """This week's odds as they stand on this run, for tonight's bench calls.
+
+    Rebuilt every run from Yahoo's live score - the 07:00 run and each lock run
+    see the week as it stands then - so a decision at 5pm is made on the score
+    at 5pm. None (the plain lineup) when the setting is off; an error, which
+    the report shows and the lineup survives, when the odds cannot be read.
+    """
+    if getattr(manager.authority.lineup, "steer", "off") != "odds":
+        return None
+    week = ctx.week
+    if week is None or ctx.theirs is None or roster is None or not week.contains(day):
+        raise RuntimeError("no matchup or opponent roster to read the odds from - plain lineup")
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.odds import OddsModel
+
+    values, goalies = models
+    live = live_inputs(conn, runtime, week, ctx.live, day)
+    return weekmod.tonight_odds(
+        conn,
+        runtime,
+        manager.league,
+        week,
+        roster,
+        ctx.theirs,
+        goalies,
+        values,
+        OddsModel(),
+        day,
+        banked_ours=live.get("banked_ours"),
+        banked_theirs=live.get("banked_theirs"),
+        started=live.get("started"),
+    )
+
+
+def lineup_by(manager) -> str:
+    """How the week's bench calls are being decided, in the plan card's words."""
+    lineup = manager.authority.lineup
+    if getattr(lineup, "steer", "off") == "odds":
+        return "this week's odds"
+    if lineup.follow_protocol:
+        return "season value, tilted by an approved protocol"
+    return "season value"
 
 
 def _following(runtime, week):
