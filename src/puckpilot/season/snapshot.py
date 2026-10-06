@@ -174,7 +174,9 @@ def build(
                 for o in week_plan.outlook
             ],
             "note": _week_note(week_plan),
-            "plan": _plan(week_plan, lineup_by),
+            "plan": _plan(
+                week_plan, lineup_by, _approved_unmade(conn, manager, league_key, week_plan, roster)
+            ),
         }
 
     if roster is not None:
@@ -266,10 +268,27 @@ def _protocol(live) -> dict | None:
     }
 
 
-def _plan(week_plan, lineup_by: str) -> dict | None:
+def _approved_unmade(conn, manager: str, league_key: str, week_plan, roster) -> tuple:
+    """This week's approved adds not on the roster yet, and who makes each."""
+    mine = {p.player_key for p in roster.players} if roster is not None else set()
+    out = []
+    for p in proposals_mod.approved_unmade(conn, manager, league_key, week_plan.week):
+        if p.add_player_key in mine:
+            continue
+        move = p.add_name + (f" for {p.drop_name}" if p.drop_player_key else "")
+        who = (
+            "PuckPilot makes it in Yahoo"
+            if p.reason.get("approved_to_execute")
+            else "make it in Yahoo yourself"
+        )
+        out.append(f"{move} - {who}")
+    return tuple(out)
+
+
+def _plan(week_plan, lineup_by: str, approved: tuple = ()) -> dict | None:
     from puckpilot.season.game_plan import GamePlan
 
-    gp = GamePlan.from_week(week_plan, lineup_by=lineup_by)
+    gp = GamePlan.from_week(week_plan, lineup_by=lineup_by, approved=approved)
     return gp.payload() if gp is not None else None
 
 

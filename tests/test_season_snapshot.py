@@ -356,3 +356,36 @@ def test_no_discretion_is_not_claimed_on_a_week_with_a_bench_call(db):
     assert quiet["note"].startswith("Everyone with a game fits")
     assert busy["note"] == ""
     assert "has no discretion" not in replace(wp, bench_calls={"2026-10-10": 1}).text()
+
+
+def test_the_plan_lists_this_week_s_approved_adds_not_yet_made(db):
+    """Approved is decided, not done - until the player is on the roster."""
+    from dataclasses import replace
+
+    [a] = make(db, target())
+    proposals_mod.decide(db, a.id, True)
+    wp = replace(_odds_week(), week=a.reason["week"])
+    plan = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_plan=wp)["week"]["plan"]
+    assert plan["groups"][0]["title"] == "Approved, not made yet"
+    assert plan["groups"][0]["lines"][0].endswith("make it in Yahoo yourself")
+
+    made = TeamRoster(
+        league_key="999.l.1",
+        team_key="t",
+        date="d",
+        players=(
+            RosterPlayer(
+                player_key=a.add_player_key,
+                yahoo_id="1",
+                name=a.add_name,
+                team="TOR",
+                primary_position="C",
+                yahoo_eligible=frozenset({"C"}),
+                selected_slot="BN",
+                nhl_player_id=a.add_pid,
+            ),
+        ),
+    )
+    plan = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_plan=wp, roster=made)
+    titles = [g["title"] for g in plan["week"]["plan"]["groups"]]
+    assert "Approved, not made yet" not in titles

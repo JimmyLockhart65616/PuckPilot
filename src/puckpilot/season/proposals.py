@@ -305,6 +305,24 @@ def listing(
     return [_row_to_proposal(r) for r in conn.execute(sql, args)]
 
 
+def approved_unmade(
+    conn: sqlite3.Connection, manager: str, league_key: str, week: int
+) -> list[Proposal]:
+    """This week's approved moves not yet made, oldest first.
+
+    Approved is decided, not done: a move approved on "make it yourself" stays
+    approved until it is made in Yahoo, and one approved for the executor
+    until its next run. Whether the add is on the roster yet is the caller's to
+    check - this only knows what was decided.
+    """
+    got = [
+        p
+        for p in listing(conn, manager, league_key, status=APPROVED, limit=200)
+        if p.reason.get("week") == week
+    ]
+    return sorted(got, key=lambda p: p.id)
+
+
 def pending(conn: sqlite3.Connection, manager: str = "", league_key: str = "") -> list[Proposal]:
     return listing(conn, manager, league_key, status=PENDING)
 

@@ -727,3 +727,76 @@ def test_steering_is_off_unless_asked_and_loud_when_it_cannot_read_the_week():
     assert _steer(None, manager("off"), None, ctx, None, None, "2026-10-06") is None
     with pytest.raises(RuntimeError, match="plain lineup"):
         _steer(None, manager("odds"), None, ctx, object(), None, "2026-10-06")
+
+
+def test_the_plan_counts_an_approved_move_not_yet_made_and_never_withdraws_it(db, monkeypatch):
+    """2026-10-06: #12 approved on "make it yourself", not made, and the plan
+    priced pending cards only - so it said no pickup cleared the bar. Approved
+    moves go first in the chain; only pending cards are re-checked."""
+    from types import SimpleNamespace
+
+    import puckpilot.draft.sim as sim
+    import puckpilot.season.run as run
+    import puckpilot.season.week as weekmod
+    from puckpilot.season import proposals
+    from tests.test_season_proposals import make, target
+
+    [approved] = make(db, target(name="Approved", key="p.a", pid=9101))
+    [waiting] = make(db, target(name="Waiting", key="p.w", pid=9102))
+    proposals.decide(db, approved.id, True)
+    seen = {}
+
+    def plan(*a, reprice=None, **k):
+        seen["reprice"] = [add.player_key for add, _ in reprice]
+        return SimpleNamespace(targets=(), lapsed=(), adds_left_week=2, week=2)
+
+    monkeypatch.setattr(sim, "build_universe", lambda *a, **k: SimpleNamespace(frame=None))
+    monkeypatch.setattr(weekmod, "build_week_plan", plan)
+    monkeypatch.setattr(
+        run,
+        "_workable",
+        lambda conn, m, lk, ctx, ps: (
+            [(p, SimpleNamespace(player_key=p.add_player_key), None) for p in ps],
+            {},
+        ),
+    )
+    import puckpilot.season.odds as odds_mod
+
+    monkeypatch.setattr(odds_mod, "log_week", lambda *a, **k: True)
+    monkeypatch.setattr(run, "_week_line", lambda p: "week")
+    monkeypatch.setattr(run, "live_inputs", lambda *a, **k: {})
+    monkeypatch.setattr(run, "adds_used", lambda *a: (0, 0))
+    monkeypatch.setattr("puckpilot.season.pool.load_pool", lambda *a, **k: [])
+    manager = SimpleNamespace(
+        name="jimmy",
+        league=None,
+        authority=SimpleNamespace(
+            transactions=SimpleNamespace(
+                add_scoring="odds",
+                min_expected_gain=0.1,
+                min_weekly_gain=0.25,
+                playoff_reserve=6,
+                stream_spots=2,
+            )
+        ),
+    )
+    ctx = SimpleNamespace(
+        roster=SimpleNamespace(players=[], team_key="t"),
+        theirs=None,
+        live=None,
+        week=SimpleNamespace(number=approved.reason["week"]),
+    )
+    report = RunReport(date="2026-10-06", manager="jimmy")
+    run._outlook(
+        db,
+        manager,
+        "999.l.1",
+        SimpleNamespace(nhl_season="20262027"),
+        "2026-10-06",
+        report,
+        ctx,
+        (None, None),
+    )
+    assert seen["reprice"] == ["p.a", "p.w"]  # the approved move first
+    assert proposals.get(db, approved.id).status == "approved"  # never withdrawn
+    assert "withdrawn" in proposals.get(db, waiting.id).reason  # pending, below the floor

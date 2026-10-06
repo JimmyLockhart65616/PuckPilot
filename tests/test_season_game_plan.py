@@ -57,7 +57,7 @@ def test_each_category_gets_one_role():
 def test_the_head_says_what_the_moves_are_worth():
     gp = GamePlan.from_week(_week(NOW, dict(NOW, SOG=0.68), moves=2))
     now, then = sum(NOW.values()), sum(NOW.values()) + 0.14
-    assert gp.head() == f"Expect {now:.1f} of 6 -> {then:.1f} if the 2 proposed moves are made"
+    assert gp.head() == f"Expect {now:.1f} of 6 -> {then:.1f} if the 2 moves are made"
 
 
 def test_with_no_moves_the_head_says_so_and_points_at_where_a_game_counts():
@@ -119,3 +119,28 @@ def test_the_payload_is_all_strings_the_page_only_lays_out():
     assert p["title"] == "Week 2 vs Rival FC"
     assert all(isinstance(x, str) for g in p["groups"] for x in [g["title"], *g["lines"]])
     assert all(isinstance(x, str) for x in p["notes"])
+
+
+def _target(name, drop=None):
+    return SimpleNamespace(
+        player=SimpleNamespace(name=name), drop=SimpleNamespace(name=drop) if drop else None
+    )
+
+
+def test_the_head_names_the_moves_it_counts():
+    targets = (_target("Anton Frondell"), _target("Marco Rossi", drop="Evgeni Malkin"))
+    gp = GamePlan.from_week(_week(NOW, dict(NOW, SOG=0.68), moves=2, targets=targets))
+    assert gp.head().endswith("with Anton Frondell added and Marco Rossi for Evgeni Malkin")
+
+
+def test_an_approved_move_not_made_yet_comes_first():
+    """2026-10-06: approved on "make it yourself", never made, and the card
+    said no pickup cleared the bar. A decision still to carry out leads."""
+    gp = GamePlan.from_week(
+        _week(NOW, dict(NOW, SOG=0.68), moves=1, targets=(_target("Anton Frondell"),)),
+        approved=("Anton Frondell - make it in Yahoo yourself",),
+    )
+    assert gp.groups()[0] == (
+        "Approved, not made yet",
+        ["Anton Frondell - make it in Yahoo yourself"],
+    )

@@ -339,3 +339,20 @@ def test_a_made_move_cannot_be_cancelled(db):
     proposals.mark_executed(db, p.id, "made")
     with pytest.raises(ProposalError, match="nothing to cancel"):
         proposals.cancel(db, p.id, "too late")
+
+
+def test_approved_unmade_is_this_week_s_approvals_oldest_first(db):
+    from puckpilot.season import proposals
+
+    [a] = make(db, target(name="First", key="p.1", pid=1))
+    [b] = make(db, target(name="Second", key="p.2", pid=2))
+    [c] = make(db, target(name="Refused", key="p.3", pid=3))
+    proposals.decide(db, b.id, True)
+    proposals.decide(db, a.id, True)
+    proposals.decide(db, c.id, False)
+    week = a.reason["week"]
+    assert [p.add_name for p in proposals.approved_unmade(db, "jimmy", "999.l.1", week)] == [
+        "First",
+        "Second",
+    ]
+    assert proposals.approved_unmade(db, "jimmy", "999.l.1", week + 1) == []

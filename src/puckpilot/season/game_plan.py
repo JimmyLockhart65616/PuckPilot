@@ -81,9 +81,15 @@ class GamePlan:
     bench_calls: dict[str, int]
     lineup_by: str
     extra_game: tuple[str, ...] = ()
+    # The moves the planned odds assume, in words ("Anton Frondell added").
+    move_names: tuple[str, ...] = ()
+    # This week's approved moves not made yet, each with who makes it.
+    approved: tuple[str, ...] = ()
 
     @classmethod
-    def from_week(cls, plan, lineup_by: str = "season value") -> GamePlan | None:
+    def from_week(
+        cls, plan, lineup_by: str = "season value", approved: tuple[str, ...] = ()
+    ) -> GamePlan | None:
         """The plan for a `week.WeekPlan`, or None when it carries no odds."""
         from puckpilot.season.week import LIKELY
 
@@ -131,6 +137,8 @@ class GamePlan:
             bench_calls=dict(getattr(plan, "bench_calls", {}) or {}),
             lineup_by=lineup_by,
             extra_game=_extra_game(getattr(plan, "extra_game", {}) or {}),
+            move_names=tuple(_move_name(t) for t in getattr(plan, "targets", ())),
+            approved=tuple(approved),
         )
 
     def of(self, role: str) -> tuple[Row, ...]:
@@ -147,11 +155,10 @@ class GamePlan:
         if self.days_left == 0:
             return line + " - the week is over"
         if self.planned is not None and self.moves:
-            the = (
-                "the proposed move is"
-                if self.moves == 1
-                else f"the {self.moves} proposed moves are"
-            )
+            names = [n for n in self.move_names if n]
+            if names and len(names) == self.moves:
+                return line + f" -> {self.planned:.1f} with " + _and(names)
+            the = "the move is" if self.moves == 1 else f"the {self.moves} moves are"
             return line + f" -> {self.planned:.1f} if {the} made"
         if self.adds_left == 0:
             return line + " - no acquisitions left this week"
@@ -177,6 +184,9 @@ class GamePlan:
             out.append((TITLES[role], lines))
         if not self.moves and self.extra_game and self.days_left:
             out.insert(0, ("An extra skater game counts most in", [", ".join(self.extra_game)]))
+        if self.approved:
+            # First: a decision already made that still needs doing.
+            out.insert(0, ("Approved, not made yet", list(self.approved)))
         return out
 
     def _give_up_line(self, r: Row) -> str:
@@ -226,6 +236,20 @@ class GamePlan:
             lines.extend(f"    {x}" for x in got)
         lines.extend(f"  {x}" for x in self.notes(sep=", "))
         return "\n".join(lines)
+
+
+def _move_name(t) -> str:
+    """One move in words: "Anton Frondell added" or "Marco Rossi for Evgeni Malkin"."""
+    player = getattr(t, "player", None)
+    name = getattr(player, "name", "")
+    if not name:
+        return ""
+    drop = getattr(t, "drop", None)
+    return f"{name} for {drop.name}" if drop is not None else f"{name} added"
+
+
+def _and(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
 def _pct(p: float | None) -> str:

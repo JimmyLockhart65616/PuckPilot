@@ -795,6 +795,12 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propo
     swap as the search would today, in the order proposed, and withdraws, with
     the reason, any whose player is gone, whose drop is no longer droppable, or
     that no longer clears the floor. Nothing new is searched for.
+
+    The week is priced with this week's approved moves not yet made as well,
+    ahead of the pending ones: approved is decided, not done, and on
+    2026-10-06 a plan that counted only pending cards told the manager no
+    pickup cleared the bar while the best one sat approved and unmade. An
+    approval is never withdrawn here - only pending cards are re-checked.
     """
     from puckpilot.draft.sim import build_universe
     from puckpilot.season import pool as pool_mod
@@ -810,7 +816,22 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propo
         if propose
         else []
     )
-    workable, lapsed = _workable(conn, manager, league_key, ctx, waiting) if waiting else ([], {})
+    mine = {p.player_key for p in ctx.roster.players}
+    approved = [
+        p
+        for p in proposals_mod.approved_unmade(conn, manager.name, league_key, ctx.week.number)
+        if p.add_player_key not in mine
+    ]
+    workable, lapsed = (
+        _workable(conn, manager, league_key, ctx, approved + waiting)
+        if approved or waiting
+        else ([], {})
+    )
+    decided = {p.id for p in approved}
+    reprice = [(add, drop) for p, add, drop in workable if p.id in decided]
+    workable = [w for w in workable if w[0].id not in decided]
+    lapsed = {pid: why for pid, why in lapsed.items() if pid not in decided}
+    reprice += [(add, drop) for _, add, drop in workable]
     terms = manager.authority.transactions
     plan = weekmod.build_week_plan(
         conn,
@@ -833,7 +854,7 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propo
         min_expected_gain=terms.min_expected_gain,
         playoff_reserve=terms.playoff_reserve,
         stream_spots=terms.stream_spots,
-        reprice=[(add, drop) for _, add, drop in workable] if waiting else None,
+        reprice=reprice if approved or waiting else None,
         **live_inputs(conn, runtime, ctx.week, ctx.live, day),
     )
     log_week(conn, manager.name, league_key, ctx.roster.team_key, plan, day)
