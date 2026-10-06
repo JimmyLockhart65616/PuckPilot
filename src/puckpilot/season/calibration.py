@@ -162,7 +162,7 @@ def build_cases(
         raise ValueError(f"rates_mode must be 'pre' or 'form', not {rates_mode!r}")
     from puckpilot.draft.h2h import round_robin_schedule
     from puckpilot.draft.replay import G_WIDTH, build_replay_data
-    from puckpilot.draft.sim import _default_opponents, build_universe, keepers_for, run_draft
+    from puckpilot.draft.sim import _default_opponents, build_universe, run_draft, simulate_keepers
     from puckpilot.engine.lineup_replay import (
         GameValueModel,
         iter_daily_assignments,
@@ -200,7 +200,12 @@ def build_cases(
     for seat in range(shape.n_teams):
         bots.append(RosterValuePolicy() if seat == 0 else opponents[order[oi]])
         oi += 0 if seat == 0 else 1
-    keepers = keepers_for(conn, u, season, league, rng)
+    # Keepers are simulated for every season, never read from the league's
+    # recorded list. The constants are fitted on one season and judged on
+    # another, so both leagues must be built the same way: once a real list
+    # was recorded for 2025-26 only, the test league stopped matching the fit
+    # one and G1 failed with the model unchanged (2026-10-05).
+    keepers = simulate_keepers(u, shape.n_teams, league.n_keepers, rng)
     rosters = [[int(u.ids[i]) for i in r] for r in run_draft(u, bots, rules, rng, keepers)]
     say(f"{season}: drafted {len(rosters)} teams")
 
