@@ -8,9 +8,12 @@ way they were approved, and proves each one from the roster afterwards.
 Three refusals sit in front of every attempt:
 
 - **Consent.** Only an approval given while the page said Approve would make
-  the move (`approved_to_execute`, carried from the card that was tapped). An
-  approval given on "make it in Yahoo yourself" is reported once and left to
-  the person - a yes to one is not a yes to the other.
+  the move (`approved_to_execute`, carried from the card that was tapped). A
+  yes to "make it in Yahoo yourself" is not a yes to PuckPilot making it - so
+  with an executor installed it is not left to the person either (a manager
+  who turned this on does not make pickups by hand): the card is reopened, and
+  the next push asks again on the words that are true now. Without an
+  executor, the move is the person's to make, as the card said.
 - **When it was priced for.** A move is priced from the first game not yet
   played, so it is made on the next run - the drop's game today is part of its
   price. Two exceptions wait: a drop whose game today has begun (Yahoo will
@@ -90,10 +93,28 @@ def carry_out(
         proposals_mod.listing(conn, manager.name, league_key, status=proposals_mod.APPROVED),
         key=lambda p: p.id,
     )
+    if make is None:
+        make = executor()
     mine = []
     for p in approved:
         if p.reason.get("approved_to_execute"):
             mine.append(p)
+        elif make is not None and not p.reason.get("submitted_at"):
+            # Approved on "make it yourself", and this manager does not make
+            # pickups by hand: ask again, on the card's words now.
+            what = f"#{p.id} add {p.add_name}{_drop(p)}"
+            why = "approved when the card said to make it yourself - asked again"
+            proposals_mod.reopen(conn, p.id, why)
+            # The reason itself is rebuilt by the next re-check; the record is here.
+            _audit(conn, manager, league_key, team_key, p, "skipped", why)
+            notify.ask_again(what, page_url)
+            report.add(
+                "transactions",
+                True,
+                f"{what}: approved when the page said to make it yourself - back on the page "
+                f"to approve again; PuckPilot makes it then. Until then it is a card like any "
+                f"other, and a later search can withdraw it",
+            )
         elif not p.reason.get("manual_noted"):
             report.add(
                 "transactions",
@@ -105,15 +126,13 @@ def carry_out(
     if not mine:
         return 0
     if make is None:
-        make = executor()
-        if make is None:
-            report.add(
-                "transactions",
-                True,
-                f"{len(mine)} approved - make them in Yahoo (no executor installed)",
-                [f"#{p.id} add {p.add_name}{_drop(p)}" for p in mine],
-            )
-            return 0
+        report.add(
+            "transactions",
+            True,
+            f"{len(mine)} approved - make them in Yahoo (no executor installed)",
+            [f"#{p.id} add {p.add_name}{_drop(p)}" for p in mine],
+        )
+        return 0
     roster = read_roster()
     adds = read_adds([p.add_player_key for p in mine]) if read_adds is not None else None
     made = 0

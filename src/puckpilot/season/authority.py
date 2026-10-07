@@ -248,8 +248,11 @@ class TransactionAuthority:
     # manager. It changes who makes the move, not who decides: every move
     # still needs its own approval (`proposals.take_for_execution`), and only
     # an approval given while the page said Approve would make the move is
-    # carried out - one given on "make it in Yahoo yourself" never is. Needs
-    # the local executor (`local/transact.py`); without it, nothing changes.
+    # carried out. One given on "make it in Yahoo yourself" is put back on the
+    # page to be asked again - a manager who turned this on does not make
+    # pickups by hand - and no waiver claim is offered, the one move it does
+    # not make. Needs the local executor (`local/transact.py`); without it,
+    # nothing changes.
     execute_approved: bool = False
 
     def __post_init__(self) -> None:

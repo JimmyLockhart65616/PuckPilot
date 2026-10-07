@@ -376,6 +376,30 @@ def annotate(conn: sqlite3.Connection, proposal_id: int, **fields) -> Proposal:
     return get(conn, proposal_id)
 
 
+def reopen(conn: sqlite3.Connection, proposal_id: int, why: str) -> Proposal:
+    """Ask again: an approval given on words that no longer say what Approve does.
+
+    Back to pending with its decision cleared, so the next push shows the card
+    as it reads now and a tap on it is consent to that. Only an approved move
+    never submitted can be reopened - one submitted may have gone through.
+    """
+    p = get(conn, proposal_id)
+    if p.status != APPROVED:
+        raise ProposalError(f"proposal #{proposal_id} is {p.status}, not approved")
+    if p.reason.get("submitted_at"):
+        raise ProposalError(f"proposal #{proposal_id} was already submitted to Yahoo")
+    gone = ("approved_to_execute", "tapped_at", "manual_noted")
+    reason = {k: v for k, v in p.reason.items() if k not in gone}
+    reason["reopened"] = why
+    conn.execute(
+        "UPDATE waiver_proposals SET status = ?, decided_at = NULL, superseded_at = NULL, "
+        "reason_json = ? WHERE id = ?",
+        (PENDING, json.dumps(reason), proposal_id),
+    )
+    conn.commit()
+    return get(conn, proposal_id)
+
+
 def cancel(conn: sqlite3.Connection, proposal_id: int, why: str) -> Proposal:
     """Call off a move that is waiting or approved but not yet made.
 

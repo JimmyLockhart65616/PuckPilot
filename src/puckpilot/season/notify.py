@@ -73,6 +73,20 @@ def made(what: str, page_url: str = "", post=None) -> bool:
     )
 
 
+def ask_again(what: str, page_url: str = "", post=None) -> bool:
+    """An approval given on "make it yourself", back on the page for one more
+    tap now that PuckPilot makes the move - a card that reappears silently is
+    one nobody looks for."""
+    return send(
+        f"One more tap: {what}",
+        "Approved when the card said to make it yourself. PuckPilot makes it now - "
+        "approve it again on the page.",
+        click=page_url,
+        tags="point_right",
+        post=post,
+    )
+
+
 def failed(what: str, why: str, page_url: str = "", post=None) -> bool:
     """Something the manager is relying on did not happen."""
     title = f"NOT done: {what}"

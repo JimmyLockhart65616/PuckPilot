@@ -1999,9 +1999,18 @@ def _cmd_season_proposals(args: argparse.Namespace) -> int:
     except (ManagerError, cli_support.SeasonCliError) as e:
         return cli_support.report(e)
 
+    from puckpilot.season.run import _executes
+    from puckpilot.season.snapshot import _approve_means
+
+    executes = _executes(manager)
     try:
         for pid in args.approve or []:
-            print(proposals.decide(conn, pid, True).describe())
+            # Approving here is approving the card as it reads: the same rule
+            # decides whether PuckPilot makes the move.
+            means = _approve_means(proposals.get(conn, pid), executes)
+            got = proposals.decide(conn, pid, True, to_execute=means["executes"])
+            print(got.describe())
+            print(f"      {means['approve_means']}")
         for pid in args.reject or []:
             print(proposals.decide(conn, pid, False).describe())
         for pid in args.cancel or []:
@@ -2034,7 +2043,7 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
     from puckpilot.season.manager import ManagerError
     from puckpilot.season.matchups import current_or_next, for_week
     from puckpilot.season.odds import OddsModel, log_week
-    from puckpilot.season.run import adds_used, live_inputs
+    from puckpilot.season.run import _executes, adds_used, live_inputs
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
 
@@ -2067,7 +2076,13 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
             fa = pool.fetch_pool(
                 session, league_key, "FA", limit=args.pool, player_map=pmap, progress=print
             )
-            wv = pool.fetch_pool(session, league_key, "W", limit=50, player_map=pmap)
+            # A claim is the one move the executor does not make; a manager
+            # whose approvals PuckPilot makes is not offered one to make by hand.
+            wv = (
+                []
+                if _executes(manager)
+                else pool.fetch_pool(session, league_key, "W", limit=50, player_map=pmap)
+            )
             return m, ours, theirs, fa + wv, live
 
         m, ours, theirs, available, live = cli_support.run_session(manager, _read)

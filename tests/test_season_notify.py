@@ -106,3 +106,17 @@ def test_a_run_notifies_its_new_pickups_and_a_missed_lineup(db, monkeypatch):
     _notify(db, manager, "L", quiet, since="2026-10-06 12:00:00")
     assert sent == []  # the kill switch is not news
     assert proposals_mod.PENDING == "pending"
+
+
+def test_an_approval_asked_again_says_why(monkeypatch):
+    from puckpilot.season import notify
+
+    got = []
+    monkeypatch.setenv(notify.NOTIFY_ENV, "https://ntfy.example/topic")
+    notify.ask_again("#12 add Pickup", "https://page", post=lambda url, **k: got.append(k) or _Ok())
+    assert got[0]["headers"]["Title"] == "One more tap: #12 add Pickup"
+    assert "make it yourself" in got[0]["content"].decode()
+
+
+class _Ok:
+    status_code = 200

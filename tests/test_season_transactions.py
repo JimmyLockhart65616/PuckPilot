@@ -82,17 +82,49 @@ def test_a_move_approved_to_be_made_is_made_and_proven(db, sent):
     assert row[0] == "executed"
 
 
-def test_an_approval_given_on_make_it_yourself_is_never_made(db, sent):
+def test_an_approval_given_on_make_it_yourself_is_asked_again_not_made(db, sent, monkeypatch):
     """The card said PuckPilot never adds or drops. A yes to that is not a yes
-    to PuckPilot doing it."""
-    pid = _approved(db, to_execute=False)
+    to PuckPilot doing it - and a manager with an executor does not make
+    pickups by hand either (2026-10-06), so it goes back on the page."""
+    asked = []
+    monkeypatch.setattr(notify, "ask_again", lambda what, url="": asked.append(what) or True)
+    pid = _approved(db, to_execute=False, tapped_at="2026-10-06T12:00:00+00:00")
     make = _Make()
     made, report = _run(db, [], make)
     assert made == 0 and make.calls == []
-    assert "leaves it to you" in report.steps[0].detail
+    p = proposals_mod.get(db, pid)
+    assert p.status == proposals_mod.PENDING and p.decided_at == "" and not p.superseded_at
+    assert "approved_to_execute" not in p.reason and "tapped_at" not in p.reason
+    assert "approve again" in report.steps[0].detail
+    assert asked == [f"#{pid} add Pickup, drop Depth"]
+    row = db.execute(
+        "SELECT outcome, message FROM season_actions WHERE kind = 'transaction'"
+    ).fetchone()
+    assert row[0] == "skipped" and "asked again" in row[1]
     _, again = _run(db, [], make)
-    assert again.steps == []  # said once, not every run
+    assert again.steps == []  # pending now: nothing for the executor until a fresh tap
+
+
+def test_without_an_executor_a_make_it_yourself_approval_is_the_person_s(db, sent, monkeypatch):
+    """No executor, no one else to make it: as the card said, said once."""
+    monkeypatch.setattr("puckpilot.season.transactions.executor", lambda: None)
+    pid = _approved(db, to_execute=False)
+    report = RunReport(date=TODAY, manager="m")
+    assert carry_out(db, MANAGER, "L", "T", report, lambda: BEFORE) == 0
+    assert "leaves it to you" in report.steps[0].detail
+    again = RunReport(date=TODAY, manager="m")
+    carry_out(db, MANAGER, "L", "T", again, lambda: BEFORE)
+    assert again.steps == []
     assert proposals_mod.get(db, pid).status == proposals_mod.APPROVED
+
+
+def test_reopen_refuses_what_was_not_approved_or_was_submitted(db):
+    pending = _pending(db, "a9")
+    with pytest.raises(proposals_mod.ProposalError, match="not approved"):
+        proposals_mod.reopen(db, pending, "why")
+    sent_off = _approved(db, pid_add="a2", submitted_at="2026-10-06T12:00:00+00:00")
+    with pytest.raises(proposals_mod.ProposalError, match="already submitted"):
+        proposals_mod.reopen(db, sent_off, "why")
 
 
 def test_a_move_already_made_by_hand_is_recorded_not_made_again(db, sent):
