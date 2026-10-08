@@ -42,6 +42,9 @@ from datetime import UTC, datetime
 
 from puckpilot.season import proposals as proposals_mod
 
+# What a move made and then seen on the roster is recorded as.
+SHOWN = "made in Yahoo - the roster shows it"
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -133,8 +136,17 @@ def carry_out(
             [f"#{p.id} add {p.add_name}{_drop(p)}" for p in mine],
         )
         return 0
-    roster = read_roster()
-    adds = read_adds([p.add_player_key for p in mine]) if read_adds is not None else None
+    try:
+        roster = read_roster()
+        adds = read_adds([p.add_player_key for p in mine]) if read_adds is not None else None
+    except Exception as e:  # noqa: BLE001 - nothing was made; the next run reads again
+        # On 2026-10-07 a dropped read crashed the step at 19:10 and nobody was
+        # told: the approved add simply was not there. Say so, once per reason.
+        for p in mine:
+            _failed(conn, manager, league_key, team_key, report, p,
+                    f"#{p.id} add {p.add_name}{_drop(p)}",
+                    f"Yahoo could not be read ({type(e).__name__})", page_url)  # fmt: skip
+        return 0
     made = 0
     for p in mine:
         p = proposals_mod.take_for_execution(conn, p.id)
@@ -203,10 +215,17 @@ def carry_out(
                     lines=result.lines)  # fmt: skip
             continue
         p = proposals_mod.annotate(conn, p.id, submitted_at=_now())
-        roster = read_roster()
+        try:
+            roster = read_roster()
+        except Exception as e:  # noqa: BLE001 - submitted: the next run checks the roster
+            _failed(conn, manager, league_key, team_key, report, p, what,
+                    f"submitted, but the roster could not be read to check it "
+                    f"({type(e).__name__})", page_url, submitted=True,
+                    lines=result.lines)  # fmt: skip
+            break  # the rest wait for a run that can see the roster
         if result.ok and swapped(roster, p):
-            proposals_mod.mark_executed(conn, p.id, result.message)
-            _audit(conn, manager, league_key, team_key, p, "executed", result.message, result.lines)
+            proposals_mod.mark_executed(conn, p.id, SHOWN)
+            _audit(conn, manager, league_key, team_key, p, "executed", SHOWN, result.lines)
             report.add("transactions", True, f"{what}: made in Yahoo", list(result.lines))
             notify.made(what, page_url)
             made += 1

@@ -294,6 +294,51 @@ def test_protection_comes_from_the_latest_weekly_ranking(db):
     assert _protected_keepers(db, "other") == set()
 
 
+def test_a_read_that_fails_is_told_once_and_tried_again(db, sent):
+    """2026-10-07 19:10: a dropped read crashed the step, and the approved add
+    was simply not there - nobody was told."""
+    pid = _approved(db)
+    make = _Make(_result())
+
+    def broken():
+        raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")
+
+    for _ in range(2):
+        report = RunReport(date=TODAY, manager="m")
+        assert carry_out(db, MANAGER, "L", "T", report, broken, make=make, today=TODAY) == 0
+        assert not report.steps[0].ok and "could not be read" in report.steps[0].detail
+    assert make.calls == [] and [k for k, _ in sent] == ["failed"]  # told once
+    assert proposals_mod.get(db, pid).status == proposals_mod.APPROVED
+    made, _ = _run(db, [BEFORE, AFTER], make)
+    assert made == 1 and proposals_mod.get(db, pid).reason["result"].endswith("shows it")
+
+
+def test_a_roster_lost_after_submitting_is_checked_next_run(db, sent):
+    pid = _approved(db)
+    make = _Make(_result())
+    reads = iter([BEFORE])
+
+    def then_broken():
+        try:
+            return next(reads)
+        except StopIteration:
+            raise RuntimeError("Failed to fetch") from None
+
+    report = RunReport(date=TODAY, manager="m")
+    carry_out(db, MANAGER, "L", "T", report, then_broken, make=make, today=TODAY)
+    assert "could not be read to check it" in report.steps[0].detail
+    assert proposals_mod.get(db, pid).reason.get("submitted_at")  # never submitted again
+    made, late = _run(db, [AFTER], make)
+    assert made == 1 and make.calls == [pid] and sent[-1][0] == "made"
+
+
+def test_a_move_without_a_drop_reads_as_an_add():
+    from puckpilot.season.run import _swap
+
+    assert _swap(SimpleNamespace(add_name="A", drop_name="B", drop_player_key="d")) == "A for B"
+    assert _swap(SimpleNamespace(add_name="A", drop_name="", drop_player_key="")) == "A added"
+
+
 def test_without_an_executor_the_moves_are_left_to_the_person(db, sent, monkeypatch):
     _approved(db)
     monkeypatch.setattr("puckpilot.season.transactions.executor", lambda: None)

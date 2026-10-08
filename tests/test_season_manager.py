@@ -169,3 +169,27 @@ def test_any_other_failure_is_not_retried(monkeypatch):
     monkeypatch.setattr(cli_support, "open_session", broken)
     with pytest.raises(ValueError):
         cli_support.run_session(None, lambda s: s, sleep=lambda _s: pytest.fail("retried"))
+
+
+def test_a_request_the_page_dropped_is_retried_once(monkeypatch):
+    """2026-10-07 19:10: "Failed to fetch" on one read, and the same read a
+    minute later worked. A read is safe to run again."""
+    import contextlib
+
+    from puckpilot.season import cli_support
+
+    @contextlib.contextmanager
+    def fake_open(manager, settings=None):
+        yield "session"
+
+    monkeypatch.setattr(cli_support, "open_session", fake_open)
+    tries, waited = [], []
+
+    def work(s):
+        tries.append(s)
+        if len(tries) == 1:
+            raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")
+        return "read"
+
+    assert cli_support.run_session(None, work, sleep=waited.append) == "read"
+    assert len(tries) == 2 and waited == [cli_support.FETCH_RETRY_WAIT_S]

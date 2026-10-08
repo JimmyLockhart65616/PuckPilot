@@ -1104,7 +1104,7 @@ def _recheck(conn, workable, lapsed, plan, terms) -> list[str]:
             kept[p.id] = t
             now = t.gain if odds and t.gain is not None else t.score
             before = f" (was {float(was):+.2f})" if was is not None else ""
-            lines.append(f"#{p.id} {p.add_name} for {p.drop_name}: still {now:+.2f}{before}")
+            lines.append(f"#{p.id} {_swap(p)}: still {now:+.2f}{before}")
             continue
         t = low.get(pair)
         now = (t.gain if odds and t.gain is not None else t.score) if t is not None else 0.0
@@ -1113,6 +1113,12 @@ def _recheck(conn, workable, lapsed, plan, terms) -> list[str]:
     proposals_mod.refresh(conn, kept, lapsed)
     lines += [f"#{pid} withdrawn: {why}" for pid, why in lapsed.items()]
     return lines
+
+
+def _swap(p) -> str:
+    """A proposal's move in words: "Marco Rossi for Evgeni Malkin", or "Anton
+    Frondell added" when it drops nobody."""
+    return f"{p.add_name} for {p.drop_name}" if p.drop_player_key else f"{p.add_name} added"
 
 
 def _recheck_both(
@@ -1173,7 +1179,7 @@ def _recheck_both(
                 f"once he has played)",
                 after_games_of=day,
             )
-            lines.append(f"#{p.id} {p.add_name} for {p.drop_name}: {both} - kept")
+            lines.append(f"#{p.id} {_swap(p)}: {both} - kept")
             continue
         if a + b >= floor and not queued and (t_now or t_next) is not None:
             t = t_now or t_next
@@ -1186,7 +1192,7 @@ def _recheck_both(
             detail = dict(t.detail)
             detail["week"] = [ahead, *detail.get("week", [])]
             kept[p.id] = replace(t, detail=detail)
-            lines.append(f"#{p.id} {p.add_name} for {p.drop_name}: {both} - kept")
+            lines.append(f"#{p.id} {_swap(p)}: {both} - kept")
             continue
         lapsed[p.id] = f"{both} - {a + b:+.2f} together, below the {floor:.2f} floor"
     proposals_mod.refresh(conn, kept, lapsed)

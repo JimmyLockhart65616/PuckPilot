@@ -119,6 +119,18 @@ def _refuse_if_busy(profile: Path) -> None:
 
 # How long to wait before the one retry when the browser dies under a read.
 BROWSER_RETRY_WAIT_S = 45.0
+# And when the page's own request is dropped ("Failed to fetch"): at 19:10 on
+# 2026-10-07 one read failed so, and the same read a minute later did not.
+FETCH_RETRY_WAIT_S = 10.0
+
+
+def _retry_wait(e: Exception) -> float | None:
+    """How long to wait before the one retry, or None for a failure not retried."""
+    if type(e).__name__ == "TargetClosedError":
+        return BROWSER_RETRY_WAIT_S
+    if "Failed to fetch" in str(e):
+        return FETCH_RETRY_WAIT_S
+    return None
 
 
 def run_session(manager: Manager, work, settings: Settings | None = None, sleep=None):
@@ -128,10 +140,11 @@ def run_session(manager: Manager, work, settings: Settings | None = None, sleep=
     the documented API should win the moment it is available - but to a
     scheduled job it looks like an unexplained failure on an ordinary morning.
 
-    A browser that dies under it is retried once, after a wait. On 2026-10-02
-    Chrome updated itself at 8:42 PM: a read died mid-page and the next launch
-    exited at once, while a lock run was due within the hour. Every `work`
-    passed here only reads, so running it again is safe.
+    A browser that dies under it, or a request the page drops, is retried
+    once, after a wait. On 2026-10-02 Chrome updated itself at 8:42 PM: a read
+    died mid-page and the next launch exited at once, while a lock run was due
+    within the hour. Every `work` passed here only reads, so running it again
+    is safe.
     """
     import time
 
@@ -142,9 +155,10 @@ def run_session(manager: Manager, work, settings: Settings | None = None, sleep=
             with open_session(manager, settings) as session:
                 return work(session)
         except Exception as e:  # noqa: BLE001 - narrowed just below
-            if type(e).__name__ != "TargetClosedError":
+            wait = _retry_wait(e)
+            if wait is None:
                 raise
-            (sleep or time.sleep)(BROWSER_RETRY_WAIT_S)
+            (sleep or time.sleep)(wait)
             with open_session(manager, settings) as session:
                 return work(session)
     except FallbackNoLongerNeeded as e:
