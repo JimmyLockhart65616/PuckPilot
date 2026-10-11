@@ -1801,6 +1801,7 @@ def _cmd_season_add_gate(args: argparse.Namespace) -> int:
             versus=args.versus,
             goalies=args.goalies,
             goalies_alt=args.goalies_alt,
+            goalie_minimum=not args.no_goalie_minimum,
         )
         print()
         print(report.text)
@@ -1821,6 +1822,7 @@ def _cmd_season_goalie_check(args: argparse.Namespace) -> int:
         versus=args.versus,
         shares=not args.no_shares,
         progress=print if args.verbose else None,
+        window=args.window,
     )
     print()
     print(report.text)
@@ -2043,7 +2045,13 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
     from puckpilot.season.manager import ManagerError
     from puckpilot.season.matchups import current_or_next, for_week
     from puckpilot.season.odds import OddsModel, log_week
-    from puckpilot.season.run import _executes, adds_used, live_inputs
+    from puckpilot.season.run import (
+        _executes,
+        adds_used,
+        goalie_terms,
+        live_inputs,
+        near_miss_lines,
+    )
     from puckpilot.season.values import build_value_model
     from puckpilot.yahoo import playermap
 
@@ -2120,12 +2128,13 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         stream_spots=manager.authority.transactions.stream_spots,
         screen_by=manager.authority.transactions.screen,
         **live_inputs(conn, runtime, m.as_week(), live, today),
+        **goalie_terms(manager.authority.transactions, runtime, m.as_week(), today, ours, theirs),
     )
     log_week(conn, manager.name, league_key, ours.team_key, plan, today)
     from puckpilot.season import explain
 
     print()
-    for line in explain.week_story(plan, runtime):
+    for line in [*explain.week_story(plan, runtime), *near_miss_lines(plan)]:
         print(f"  {line}" if line else "")
     print()
     print(plan.text())
@@ -2850,6 +2859,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="club-dw2-chain",
         help="The goalie model -g arms give the tested team",
     )
+    s_ag.add_argument(
+        "--no-goalie-minimum",
+        action="store_true",
+        help="Score weeks without the league's goalie minimum (the gate before 2026-10-11)",
+    )
     s_ag.add_argument("--verbose", action="store_true")
     s_ag.set_defaults(func=_cmd_season_add_gate)
 
@@ -2861,6 +2875,12 @@ def build_parser() -> argparse.ArgumentParser:
     s_gc.add_argument("--variants", default="", help="comma list, e.g. old,club-dw2-share")
     s_gc.add_argument("--versus", default="old", help="compare every variant with this one")
     s_gc.add_argument("--no-shares", action="store_true", help="Skip the remaining-share table")
+    s_gc.add_argument(
+        "--window",
+        choices=["late", "early", "all"],
+        default="late",
+        help="Team-dates scored: after the first 21 game dates (late), those dates, or all",
+    )
     s_gc.add_argument("--verbose", action="store_true")
     s_gc.set_defaults(func=_cmd_season_goalie_check)
 

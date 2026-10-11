@@ -177,6 +177,39 @@ def live_inputs(conn, runtime, week, live, day: str, now=None) -> dict:
     return out
 
 
+def goalie_terms(terms, runtime, week, day: str | None = None, ours=None, theirs=None) -> dict:
+    """The goalie-move arguments for `build_week_plan`, from a manager's terms.
+
+    The weekly minimum is priced only from a count we can trust: nothing
+    banked before the week starts, Yahoo's own count once it has (an unknown
+    count leaves the minimum unpriced rather than guessing it at zero). The
+    opponent's count is used when Yahoo shows it; unknown, they are taken to
+    reach it.
+    """
+    from puckpilot.season.today import yahoo_goalie_games
+
+    out: dict = {
+        "drop_choice": getattr(terms, "drop_choice", "cheapest"),
+        "goalie_lane": getattr(terms, "goalie_lane", 0),
+    }
+    if not getattr(terms, "price_goalie_minimum", False) or week is None:
+        return out
+    need = runtime.min_goalie_games(week.number)
+    if day is None or day <= week.start:
+        out.update(goalie_minimum=need, goalie_appearances=0.0, their_goalie_appearances=None)
+        return out
+    mine = yahoo_goalie_games(ours, runtime, day) if ours is not None else None
+    if mine is None:
+        return out
+    got = yahoo_goalie_games(theirs, runtime, day) if theirs is not None else None
+    out.update(
+        goalie_minimum=need,
+        goalie_appearances=float(mine),
+        their_goalie_appearances=None if got is None else float(got),
+    )
+    return out
+
+
 def adds_used(roster, week) -> tuple[int, int]:
     """(this week, this season) - Yahoo's own counters, zero only when unknown."""
     wk = roster.adds_this_week if roster is not None else None
@@ -856,6 +889,7 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propo
         stream_spots=terms.stream_spots,
         reprice=reprice if approved or waiting else None,
         **live_inputs(conn, runtime, ctx.week, ctx.live, day),
+        **goalie_terms(terms, runtime, ctx.week, day, ctx.roster, ctx.theirs),
     )
     log_week(conn, manager.name, league_key, ctx.roster.team_key, plan, day)
     lines = _recheck(conn, workable, lapsed, plan, terms) if waiting else []
@@ -954,6 +988,7 @@ def _next_week(
         playoff_reserve=terms.playoff_reserve,
         stream_spots=terms.stream_spots,
         screen_by=terms.screen,
+        **goalie_terms(terms, runtime, nxt),
     )
     pairs = [(add, drop) for _, add, drop in workable]
     # Re-checks price every pair whatever it is worth (no floor); the
@@ -1324,9 +1359,11 @@ def _weekly(
         stream_spots=terms.stream_spots,
         screen_by=terms.screen,
         **live_inputs(conn, runtime, week, live, day),
+        **goalie_terms(terms, runtime, week, day, ours, theirs),
     )
     log_week(conn, manager.name, league_key, ours.team_key, plan, day)
     lines = [ln for ln in explain.week_story(plan, runtime) if ln]
+    lines += near_miss_lines(plan)
     targets = list(plan.targets)
     if horizon and ahead is not None and targets:
         targets, notes = _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models)
@@ -1424,6 +1461,20 @@ def _following(runtime, week):
         return None
 
 
+def near_miss_lines(plan, limit: int = 3) -> list[str]:
+    """The best few swaps the search priced and turned down, for the log.
+
+    So a week with nothing proposed shows what was weighed: "considered" tells
+    "no goalie was ever looked at" from "looked at, and short of the bar".
+    """
+    out = []
+    for t in plan.near_misses[:limit]:
+        what = t.player.name + (f" for {t.drop.name}" if t.drop else "")
+        worth = t.gain if t.gain is not None else t.score
+        out.append(f"considered, below the bar: {what} ({worth:+.2f})")
+    return out
+
+
 def _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models):
     """Keep the swaps that pay over the rest of this week and next week together.
 
@@ -1466,6 +1517,7 @@ def _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models):
         stream_spots=terms.stream_spots,
         measure_room=False,
         horizon="next week",
+        **goalie_terms(terms, runtime, nxt),
     )
 
     def key(t):

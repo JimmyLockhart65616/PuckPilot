@@ -14,7 +14,10 @@ Three questions, because the lineup asks the model three different things:
   season needs. Error weighted by the games remaining.
 
 The protocol is every team-date of a completed season after its first
-`SKIP_DATES` game dates, with the model frozen as of that date. The model as
+`SKIP_DATES` game dates, with the model frozen as of that date. `window="early"`
+scores those first dates instead (and "all" both): the opening weeks, when a
+club's window holds only a few games, are a regime of their own and were never
+measured until 2026-10-11. The model as
 first measured (`old`) used 60 sampled dates instead; run with that sample it
 still reproduces 61.5% / Brier 0.2174 on 2025-26 exactly, and every team-date
 is simply the larger sample of the same thing.
@@ -42,9 +45,12 @@ from puckpilot.season.goalies import (
 
 SEASONS = ("20232024", "20242025", "20252026")
 
-# The season's first game dates are skipped: with a handful of games behind
-# them every model is mostly guessing, and the fallback season answers instead.
+# The season's first game dates are scored apart ("early"): with a handful of
+# games behind a club the window is short, and the fallback season answers
+# only for a club with no game at all yet - after one game, this season's
+# starts are the whole window.
 SKIP_DATES = 21
+WINDOWS = ("late", "early", "all")
 
 # Tonight and the team's next six games: the length of a fantasy week.
 AHEAD = 7
@@ -115,17 +121,27 @@ def _favourite(p: dict[int, float]) -> int | None:
     return min(p.items(), key=lambda kv: (-kv[1], kv[0]))[0]
 
 
-def _eval_dates(src: TrailingStartShareSource) -> list[str]:
+def _eval_dates(src: TrailingStartShareSource, window: str = "late") -> list[str]:
+    if window not in WINDOWS:
+        raise ValueError(f"window must be one of {WINDOWS}, not {window!r}")
     played = sorted({d for d, _ in src._starts})
-    return played[SKIP_DATES:]
+    if window == "early":
+        return played[:SKIP_DATES]
+    return played[SKIP_DATES:] if window == "late" else played
 
 
-def score_variant(conn: sqlite3.Connection, season: str, spec: str, fallback: str | None) -> Scores:
-    """Every team-date after the skip, frozen as of that date."""
+def score_variant(
+    conn: sqlite3.Connection,
+    season: str,
+    spec: str,
+    fallback: str | None,
+    window: str = "late",
+) -> Scores:
+    """Every team-date in the window, frozen as of that date."""
     src = trailing_model(conn, season, fallback, spec)
     truth = src._starts
     out = Scores(variant=spec, season=season)
-    for cutoff in _eval_dates(src):
+    for cutoff in _eval_dates(src, window):
         for team in sorted(src._schedule.get(cutoff, ())):
             actual = truth.get((cutoff, team))
             if actual is None:
@@ -285,6 +301,7 @@ def goalie_gate_report(
     versus: str = "old",
     shares: bool = True,
     progress: Callable[[str], None] | None = None,
+    window: str = "late",
 ) -> GoalieGateReport:
     """Every variant on every season, then each against `versus`."""
     from puckpilot.engine import projections
@@ -295,13 +312,13 @@ def goalie_gate_report(
         variants = (versus, *variants)
     scores: dict[tuple[str, str], Scores] = {}
     share_scores: dict[str, ShareScores] = {}
-    lines = ["Starting-goalie model, scored on who actually started", ""]
+    lines = [f"Starting-goalie model, scored on who actually started ({window} dates)", ""]
     for season in seasons:
         y = int(season[:4])
         train = [f"{y - i}{y - i + 1}" for i in range(1, 4)]
         for spec in variants:
             say(f"  {season} {spec}")
-            scores[(season, spec)] = score_variant(conn, season, spec, train[0])
+            scores[(season, spec)] = score_variant(conn, season, spec, train[0], window)
         if shares:
             say(f"  {season} remaining shares")
             _, proj_g = projections.project(conn, season, train)

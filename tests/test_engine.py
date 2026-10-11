@@ -365,3 +365,50 @@ def test_rank_players_combines_and_sorts():
     assert set(out["kind"]) == {"skater", "goalie"}
     assert list(out["vorp"]) == sorted(out["vorp"], reverse=True)
     assert out.loc[3, "vorp"] > out.loc[4, "vorp"]  # workhorse beats backup
+
+
+def _veteran():
+    return _frame(
+        {
+            7: {
+                "gp": 60,
+                "wins": 30,
+                "shutouts": 3,
+                "shots_against": 1800,
+                "goals_against": 160,
+                "toi_hours": 60.0,
+            }
+        }
+    )
+
+
+def test_aged_on_games_a_veteran_plays_less_but_faces_as_many_shots_a_start():
+    """The curve on volume had a 34-year-old facing fewer shots a start; on
+    games he plays fewer starts at his own rates. Season totals are the same
+    either way (2026-10-11 audit: per start, 31+ saves bias -3.99 v +0.08)."""
+    ages = pd.Series({7: 34.0})
+    f = float(age_factor(ages).iloc[0])
+    vol = project_goalies([(_veteran(), 82)], 82, (1.0,), ages=ages, team_win_blend=0.0)
+    gam = project_goalies(
+        [(_veteran(), 82)], 82, (1.0,), ages=ages, team_win_blend=0.0, age_on="games"
+    )
+    per_start = 1800 / 60
+    assert vol.loc[7, "shots_against"] / vol.loc[7, "proj_gp"] == pytest.approx(per_start * f)
+    assert gam.loc[7, "shots_against"] / gam.loc[7, "proj_gp"] == pytest.approx(per_start)
+    assert gam.loc[7, "proj_gp"] == pytest.approx(vol.loc[7, "proj_gp"] * f)
+    for col in ("shots_against", "goals_against", "saves", "wins"):
+        assert gam.loc[7, col] == pytest.approx(vol.loc[7, col])
+    assert gam.loc[7, "save_pct"] == pytest.approx(vol.loc[7, "save_pct"])
+
+
+def test_games_already_played_are_never_aged():
+    """train_gp is history. Aged, a 34-year-old's 60 games read as 50.4 and a
+    20-year-old's 18 as 22, moving players across the board's thin line."""
+    ages = pd.Series({7: 34.0})
+    out = project_goalies([(_veteran(), 82)], 82, (1.0,), ages=ages)
+    assert out.loc[7, "train_gp"] == pytest.approx(60.0)
+
+
+def test_an_unknown_age_mode_is_refused():
+    with pytest.raises(ValueError):
+        project_goalies([(_veteran(), 82)], 82, (1.0,), age_on="vibes")

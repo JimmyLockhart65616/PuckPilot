@@ -40,6 +40,16 @@ from puckpilot.league import DEFAULT_LEAGUE, LeagueConfig
 # was doing a job the search relies on.
 GOALIE_WORKLOAD = False
 
+# Where the age curve lands for goalies in the in-season model - their rates a
+# start and value a game (`projections.GOALIE_AGE_MODES`). The draft keeps
+# `projections.GOALIE_AGE_ON`: aged on games there, the draft sim drafted worse
+# goalies (top-3 0.706 -> 0.684, W 0.377 -> 0.304, seed 20261, 2026-10-11),
+# while in season "volume" under-counts an older goalie's shots and wins a
+# start (a 33-year-old: 20.5 saves against 23.1). Judged in season by add gate `-a`
+# against the live arm, 4 drafts x 2 seasons: -0.004 +/- 0.023 categories a
+# week, 4 of 8 leagues positive - nothing. None: the draft's setting.
+IN_SEASON_GOALIE_AGE_ON: str | None = None
+
 
 @dataclass
 class ValueModel:
@@ -177,19 +187,22 @@ def build_value_model(
     league: LeagueConfig = DEFAULT_LEAGUE,
     scale_season: str | None = None,
     goalie_workload: bool | None = None,
+    goalie_age_on: str | None = None,
 ) -> ValueModel:
     """Assemble the live value model.
 
     `scale_season` is the season whose game lines set the category scales;
     it defaults to the most recent training season, which is the most recent
-    completed one. `goalie_workload` defaults to `GOALIE_WORKLOAD`.
+    completed one. `goalie_workload` defaults to `GOALIE_WORKLOAD`, and
+    `goalie_age_on` to `IN_SEASON_GOALIE_AGE_ON`.
     """
     from puckpilot.draft.sim import build_universe
 
     scale = scale_season or train_seasons[0]
     skater_keys = [c.key for c in league.skater_cats]
 
-    universe = build_universe(conn, season, train_seasons, league)
+    age_on = goalie_age_on or IN_SEASON_GOALIE_AGE_ON
+    universe = build_universe(conn, season, train_seasons, league, goalie_age_on=age_on)
     scale_data = build_replay_data(conn, scale, skater_keys)
     vm = GameValueModel(scale_data, set(universe.ids), league.goalie_cats)
 

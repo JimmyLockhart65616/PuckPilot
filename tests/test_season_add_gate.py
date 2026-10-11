@@ -91,3 +91,28 @@ def test_the_shortlist_and_steering_options_parse_and_combine():
     assert parse_arm("odds-daily-h-f25-x1-k1-r-n40", 2).screen == 40
     t = parse_arm("odds-weekly-t-e", 2)
     assert t.steer and t.screen_by == "union"
+
+
+def test_a_week_short_of_the_goalie_minimum_wins_no_goalie_category():
+    """Yahoo: "you won't win any stat categories or get any points for their
+    performance" (help.yahoo.com/kb/SLN6878) - every goalie category."""
+    from puckpilot.engine.categories import CATALOG
+    from puckpilot.season.add_gate import week_result
+
+    cats = tuple(CATALOG[k] for k in ("G", "W", "SV", "SV%"))
+    ours = {"goals": 5.0, "wins": 3.0, "saves": 100.0, "shots_against": 108.0}
+    theirs = {"goals": 4.0, "wins": 1.0, "saves": 50.0, "shots_against": 56.0}
+    assert week_result(cats, ours, theirs) == 4.0  # 100/108 = .926 beats 50/56 = .893
+    assert week_result(cats, ours, theirs, our_short=True) == 1.0  # the skater cat only
+    assert week_result(cats, theirs, ours, their_short=True) == 3.0  # their goalies forfeit
+    assert week_result(cats, ours, theirs, our_short=True, their_short=True) == 2.5
+
+
+def test_the_goalie_move_options_parse():
+    from puckpilot.season.add_gate import parse_arm
+
+    spec = parse_arm("odds-daily-h-f25-x1-k1-r-dg-j3-w")
+    assert (spec.drops, spec.lane, spec.minimum) == ("goalies", 3, True)
+    assert parse_arm("odds-weekly-da").drops == "all"
+    plain = parse_arm("odds-weekly")
+    assert (plain.drops, plain.lane, plain.minimum) == ("cheapest", 0, False)

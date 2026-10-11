@@ -29,6 +29,26 @@ AGE_YOUNG_SLOPE = 0.04
 AGE_OLD_SLOPE = 0.02
 AGE_CLIP = (0.5, 1.5)
 
+# Where the age curve lands for a goalie. "volume" (as first built) scales
+# each game's shots, goals against, time in net and wins, so an older goalie
+# is projected to face fewer shots a start - one 33-year-old starter at 20.5
+# saves a start against 23.1 the season before, and 47 minutes a game. "games"
+# scales the games he plays instead and leaves his per-start rates alone:
+# season totals are the same, and per start is what the in-season engine
+# multiplies by expected starts. Walk-forward per start (2023-24..2025-26,
+# goalies 31+): saves bias -3.99 under "volume" against +0.08 unaged; 31+
+# goalies are over-projected by +11.8 games, which is where age shows (audit,
+# 2026-10-11).
+#
+# Stays "volume" on measurement (2026-10-11). "games" is the better
+# projection - `rank --validate` goalie VORP Spearman 0.374 -> 0.386, GP and W
+# MAE down, SV unchanged - but the draft sim drafted worse with it (seed 20261,
+# 2000 drafts: top-3 0.706 -> 0.684, mean finish 2.88 -> 3.02, W won 0.377 ->
+# 0.304, SV 0.400 -> 0.347), and in season (`values.IN_SEASON_GOALIE_AGE_ON`,
+# add gate -a) it moved nothing: -0.004 +/- 0.023 a week over 8 leagues.
+GOALIE_AGE_ON = "volume"
+GOALIE_AGE_MODES = ("volume", "games")
+
 GOALIE_COUNT_COLS = ["wins", "shutouts"]
 GOALIE_VOLUME_COLS = ["shots_against", "goals_against", "toi_hours"]
 
@@ -131,11 +151,19 @@ def age_factor(
     return f.clip(*AGE_CLIP).fillna(1.0)
 
 
-def _apply_age(df: pd.DataFrame, ages: pd.Series) -> pd.DataFrame:
+def _apply_age(df: pd.DataFrame, ages: pd.Series, on_games: bool = False) -> pd.DataFrame:
+    """Scale projected totals by the age factor.
+
+    `train_gp` is history - games already played - and is never aged (it was,
+    which moved players across the board's thin-history line by age alone).
+    `on_games` ages `proj_gp` along with the totals, so per-game rates stay
+    unaged and the curve says how much he plays rather than how he plays.
+    """
     if df.empty or ages.empty:
         return df
     f = age_factor(ages.reindex(df.index)).fillna(1.0)
-    cols = [c for c in df.columns if c != "proj_gp"]
+    keep = {"train_gp"} if on_games else {"proj_gp", "train_gp"}
+    cols = [c for c in df.columns if c not in keep]
     df[cols] = df[cols].mul(f, axis=0)
     return df
 
@@ -170,6 +198,7 @@ def project_goalies(
     weights: tuple[float, ...] = DEFAULT_WEIGHTS,
     ages: pd.Series | None = None,
     team_win_blend: float = GOALIE_TEAM_WIN_BLEND,
+    age_on: str | None = None,
 ) -> pd.DataFrame:
     """Counting cats blend like skaters; SV%, GAA and SV derive from projected
     volume AFTER any age adjustment, so the rates and the totals can never
@@ -177,7 +206,12 @@ def project_goalies(
 
     Wins are additionally blended toward team strength (see GOALIE_TEAM_WIN_BLEND),
     using the most recent training season's team win rates.
+
+    `age_on` is where the age curve lands (`GOALIE_AGE_ON`, read at call time).
     """
+    age_on = age_on or GOALIE_AGE_ON
+    if age_on not in GOALIE_AGE_MODES:
+        raise ValueError(f"age_on must be one of {GOALIE_AGE_MODES}, not {age_on!r}")
     out = blend_counting(
         frames,
         weights,
@@ -187,7 +221,7 @@ def project_goalies(
         GOALIE_GP_REGRESS_SEASONS,
     )
     if ages is not None:
-        out = _apply_age(out, ages)
+        out = _apply_age(out, ages, on_games=age_on == "games")
 
     if team_win_blend and frames and not out.empty:
         proj_gp = out["proj_gp"].where(out["proj_gp"] > 0)
@@ -211,6 +245,7 @@ def project(
     weights: tuple[float, ...] = DEFAULT_WEIGHTS,
     as_of: str | None = None,
     target_games: int | None = None,
+    goalie_age_on: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(skaters, goalies) projected category totals for target_season.
 
@@ -242,7 +277,7 @@ def project(
     )
     ages = player_ages(conn, target_season)
     skaters = _apply_age(project_skaters(sk_frames, target_games, weights), ages)
-    goalies = project_goalies(g_frames, target_games, weights, ages=ages)
+    goalies = project_goalies(g_frames, target_games, weights, ages=ages, age_on=goalie_age_on)
     # Age is consumed by `_apply_age` and then thrown away, so nothing
     # downstream can tell a fading veteran from an unproven youngster. Carry it.
     meta = meta.join(ages.rename("age"), how="left")

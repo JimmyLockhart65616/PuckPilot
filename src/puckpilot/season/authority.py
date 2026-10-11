@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 QUESTIONABLE_MODES = ("never", "only_if_needed", "always")
 # How an add is priced (see TransactionAuthority.add_scoring).
 ADD_SCORING = ("share", "odds")
+# Mirrors `week.DROP_CHOICES`, kept here so reading a config imports no engine.
+DROP_CHOICES = ("cheapest", "goalies", "all")
 # How the add search shortlists candidates (TransactionAuthority.screen).
 SCREENS = ("value", "union")
 # How a night with more players than slots is decided (LineupAuthority.steer).
@@ -244,6 +246,35 @@ class TransactionAuthority:
     # list of 40 (`-n40`, the control) did the same: a longer list finds more
     # moves that clear the floor on paper and do not pay.
     screen: str = "value"
+    # Which drops each free agent is priced against. "cheapest": the player
+    # with the least rest-of-season value - with a goalie minimum, only ever
+    # one goalie, however few of his starts this roster can use. "goalies":
+    # also every other goalie he may replace; "all": every legal drop. An
+    # upgrade is then judged on one scale (a skater does not out-value a
+    # goalie by being a skater). Audit 2026-10-11: a third goalie whose club
+    # plays on nights the other two fill both G slots was never priced as a
+    # drop. "cheapest" on measurement (add gate `-dg` v the live arm, 12 teams
+    # x 22 weeks): 4 drafts x 2 seasons +0.030 +/- 0.019 categories a week (6
+    # of 8 leagues ahead), then on 8 fresh leagues +0.013 +/- 0.019 (6 of 8) -
+    # small, never clear of noise. A manager's choice; "goalies" costs ~3x the
+    # pricing time on rosters with goalies to spare.
+    drop_choice: str = "cheapest"
+    # Free-agent goalies always priced, the most expected starts' worth first.
+    # The screen counts a goalie's games only into an empty G slot and ignores
+    # whether he starts, so on a roster with goalies to spare it almost never
+    # shortlisted one. 0 = off, on measurement: three in the lane (add gate
+    # `-j3` v the live arm, 4 drafts x 2 seasons) lost -0.069 +/- 0.025
+    # categories a week (2 of 8 leagues positive) with ~6% more adds - the
+    # longer-list lesson of `screen` again: more moves that pay on paper only.
+    goalie_lane: int = 0
+    # Price the league's weekly goalie minimum into the odds: a side short of
+    # it wins no goalie category (Yahoo, help.yahoo.com/kb/SLN6878), so a drop
+    # that leaves too few goalie games pays for the risk. Off on measurement
+    # (add gate `-w`, 12 teams x 22 weeks): +0.044 +/- 0.023 categories a week
+    # over 4 drafts x 2 seasons, then +0.011 +/- 0.025 (3 of 8 ahead) on 8
+    # fresh leagues; with `drop_choice = "goalies"`, +0.024 +/- 0.026. The
+    # gate itself now scores the minimum, so this is what pricing it buys.
+    price_goalie_minimum: bool = False
     # Make an approved add and drop in Yahoo, rather than leave it to the
     # manager. It changes who makes the move, not who decides: every move
     # still needs its own approval (`proposals.take_for_execution`), and only
@@ -275,6 +306,13 @@ class TransactionAuthority:
             raise AuthorityError("authority.transactions.mid_week_floor cannot be negative")
         if self.keeper_margin < 0:
             raise AuthorityError("authority.transactions.keeper_margin cannot be negative")
+        if self.drop_choice not in DROP_CHOICES:
+            raise AuthorityError(
+                f"authority.transactions.drop_choice must be one of {', '.join(DROP_CHOICES)}; "
+                f"got {self.drop_choice!r}"
+            )
+        if self.goalie_lane < 0:
+            raise AuthorityError("authority.transactions.goalie_lane cannot be negative")
 
     @property
     def requires_approval(self) -> bool:
@@ -315,6 +353,22 @@ class TransactionAuthority:
                 f"proposed as a drop"
                 if self.protect_keepers
                 else "  next season's keepers are not protected from a drop"
+            ),
+            (
+                "  each free agent is priced against the cheapest legal drop"
+                if self.drop_choice == "cheapest"
+                else "  each free agent is priced against the cheapest legal drop and every "
+                + ("goalie he may replace" if self.drop_choice == "goalies" else "legal drop")
+            ),
+            *(
+                [f"  the {self.goalie_lane} free-agent goalie(s) with most expected starts priced"]
+                if self.goalie_lane
+                else []
+            ),
+            *(
+                ["  the weekly goalie minimum is priced: a short week forfeits goalie categories"]
+                if self.price_goalie_minimum
+                else []
             ),
             (
                 "  an approved move is made in Yahoo on the next run (where the executor is "

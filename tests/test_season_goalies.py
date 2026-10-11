@@ -234,11 +234,13 @@ def test_a_starter_who_stops_dressing_hands_his_share_to_whoever_is_left(db):
     sched(db, 120, "2026-10-15", "TOR", "OTT")
     db.commit()
 
-    before = TrailingStartShareSource(db, SEASON, dressed_window=None).starts("2026-10-15")
-    assert before[2] < 0.5  # the old model: the healthy goalie under the floor
-    after = TrailingStartShareSource(db, SEASON, dressed_window=2).starts("2026-10-15")
+    # The window alone (no prior, no back-to-back rule): what the dressed rule changes.
+    plain = {"prior_games": 0.0, "b2b_same": None}
+    before = TrailingStartShareSource(db, SEASON, dressed_window=None, **plain)
+    assert before.starts("2026-10-15")[2] < 0.5  # the old model: the healthy goalie under the floor
+    after = TrailingStartShareSource(db, SEASON, dressed_window=2, **plain).starts("2026-10-15")
     assert after == {2: 1.0}
-    assert TrailingStartShareSource(db, SEASON).starts("2026-10-15") == after  # the default
+    assert TrailingStartShareSource(db, SEASON, **plain).starts("2026-10-15") == after  # default
 
 
 def _tandem(db):
@@ -295,7 +297,14 @@ def test_model_specs_read_from_the_command_line():
     from puckpilot.season.goalies import parse_spec
 
     assert parse_spec("") == {}
-    assert parse_spec("old") == {"current_club": False, "dressed_window": None, "ahead": "damped"}
+    assert parse_spec("old") == {
+        "current_club": False,
+        "dressed_window": None,
+        "ahead": "damped",
+        "prior_games": 0.0,
+        "b2b_same": None,
+    }
+    assert parse_spec("club-dw2-chain-p0-boff")["b2b_same"] is None
     assert parse_spec("club-dw2-chain") == {
         "current_club": True,
         "dressed_window": 2,
@@ -391,7 +400,9 @@ def test_the_gate_scores_a_certain_starter_as_perfect(db, monkeypatch):
     for i in range(8):
         game(db, 100 + i, f"2026-10-{i + 1:02d}", "TOR", 1, 2)
     db.commit()
-    s = goalie_gate.score_variant(db, SEASON, "club-dw2-chain", None)
+    # Eight straight days are all back-to-backs; the scoring is the subject here,
+    # so the model is the one without the back-to-back rule or a prior.
+    s = goalie_gate.score_variant(db, SEASON, "club-dw2-chain-p0-boff", None)
     assert s.n == 5
     assert s.mean("hit") == 1.0
     assert s.mean("brier") == 0.0
@@ -426,3 +437,152 @@ def test_a_goalie_tagged_healthy_is_not_written_off_for_missing_two_games(db):
     back = TrailingStartShareSource(db, SEASON, dressed_window=2, healthy={1}).starts("2026-10-15")
     assert 1 not in gone
     assert back[1] > back[2]
+
+
+# -- the opening weeks and back-to-backs (2026-10-11) -------------------------
+
+PRIOR = "20252026"
+
+
+def _sole_starter(db, days, next_days):
+    """TOR: goalie 1 started every game so far, 2 dressed as his backup."""
+    add_player(db, 1, "Starter", "G")
+    add_player(db, 2, "Backup", "G")
+    for i, d in enumerate(days):
+        game(db, 100 + i, d, "TOR", 1, 2)
+    for i, d in enumerate(next_days):
+        sched(db, 200 + i, d, "TOR", "OTT")
+    db.commit()
+
+
+def test_a_sole_starter_is_certain_on_a_back_to_back_without_the_rule(db):
+    """What the live model said of a sole starter for the second night of a
+    back-to-back he did not start (2026-10-10)."""
+    _sole_starter(db, ["2026-10-01", "2026-10-03", "2026-10-05"], ["2026-10-06"])
+    old = TrailingStartShareSource(db, SEASON, prior_games=0, b2b_same=None)
+    assert old.starts("2026-10-06") == {1: 1.0}
+
+
+def test_the_second_night_of_a_back_to_back_goes_mostly_to_the_backup(db):
+    """Measured 4.5-8.1%: the previous night's starter rarely starts again.
+    His backup has no start of his own, so the demotion alone could not move
+    anything to him."""
+    _sole_starter(db, ["2026-10-01", "2026-10-03", "2026-10-05"], ["2026-10-06"])
+    src = TrailingStartShareSource(db, SEASON, prior_games=0, b2b_same=0.07)
+    assert src.starts("2026-10-06") == {1: 0.07, 2: 0.93}
+
+
+def test_a_back_to_back_later_in_the_week_is_walked_through_the_chain(db):
+    _sole_starter(db, ["2026-10-01", "2026-10-03", "2026-10-05"], ["2026-10-08", "2026-10-09"])
+    src = TrailingStartShareSource(db, SEASON, prior_games=0, b2b_same=0.07)
+    assert src.starts("2026-10-08") == {1: 1.0}  # rested: no back-to-back
+    assert src.starts("2026-10-09") == {1: 0.07, 2: 0.93}
+    plain = TrailingStartShareSource(db, SEASON, prior_games=0, b2b_same=None)
+    assert plain.starts("2026-10-09") == {1: 1.0}
+
+
+def _with_last_season(db):
+    """Last season TOR's 1 started three of four, 2 one; 3 started for TOR then
+    but has not dressed for it this season."""
+    for pid in (1, 2, 3):
+        add_player(db, pid, f"G{pid}", "G")
+    for i, (d, who) in enumerate(
+        [("2026-03-01", 1), ("2026-03-03", 1), ("2026-03-05", 2), ("2026-03-07", 3)]
+    ):
+        sched(db, 900 + i, d, "TOR", "MTL", season=PRIOR)
+        started(db, who, 900 + i, d, "TOR", season=PRIOR)
+
+
+def test_the_prior_pads_a_short_window_with_last_seasons_shares(db):
+    """Two games in, the window is two starts by one goalie. Padded to ten with
+    last season's shares - 1: 2/4, 2: 1/4 of a season, normalised over the
+    goalies who have dressed for TOR (3 has not, so he keeps nothing)."""
+    _with_last_season(db)
+    game(db, 100, "2026-10-01", "TOR", 1, 2)
+    game(db, 101, "2026-10-03", "TOR", 1, 2)
+    sched(db, 200, "2026-10-05", "TOR", "OTT")
+    db.commit()
+    plain = TrailingStartShareSource(db, SEASON, fallback_season=PRIOR, prior_games=0)
+    assert plain.starts("2026-10-05") == {1: 1.0}
+    src = TrailingStartShareSource(db, SEASON, fallback_season=PRIOR, prior_games=10)
+    # 1: 2 + 8 x 2/3, demoted by half as last night's starter; 2: 8 x 1/3.
+    w1, w2 = (2 + 8 * 2 / 3) * 0.5, 8 / 3
+    p = src.starts("2026-10-05")
+    assert p == {1: round(w1 / (w1 + w2), 4), 2: round(w2 / (w1 + w2), 4)}
+    assert 3 not in p
+
+
+def test_the_prior_fades_out_once_the_season_fills_the_window(db):
+    _with_last_season(db)
+    for i in range(10):
+        game(db, 100 + i, f"2026-10-{i + 1:02d}", "TOR", 1, 2)
+    sched(db, 200, "2026-10-12", "TOR", "OTT")
+    db.commit()
+    plain = TrailingStartShareSource(db, SEASON, fallback_season=PRIOR, prior_games=0)
+    padded = TrailingStartShareSource(db, SEASON, fallback_season=PRIOR, prior_games=10)
+    assert padded.starts("2026-10-12") == plain.starts("2026-10-12") == {1: 1.0}
+
+
+def test_a_goalie_with_no_starts_last_season_gets_the_unknown_share(db):
+    from puckpilot.season.goalies import UNKNOWN_PRIOR_SHARE
+
+    _with_last_season(db)
+    add_player(db, 4, "Rookie", "G")
+    game(db, 100, "2026-10-01", "TOR", 4, 1)
+    sched(db, 200, "2026-10-03", "TOR", "OTT")
+    db.commit()
+    src = TrailingStartShareSource(db, SEASON, fallback_season=PRIOR, prior_games=10)
+    shares = {1: 0.5, 4: UNKNOWN_PRIOR_SHARE}
+    total = sum(shares.values())
+    w1 = 9 * shares[1] / total
+    w4 = (1 + 9 * shares[4] / total) * 0.5  # he started last night
+    assert src.starts("2026-10-03") == {1: round(w1 / (w1 + w4), 4), 4: round(w4 / (w1 + w4), 4)}
+
+
+def test_the_new_knobs_read_from_a_spec_and_are_checked():
+    import pytest
+
+    from puckpilot.season.goalies import parse_spec
+
+    assert parse_spec("club-dw2-chain-p10-b0.07") == {
+        "current_club": True,
+        "dressed_window": 2,
+        "ahead": "chain",
+        "prior_games": 10.0,
+        "b2b_same": 0.07,
+    }
+    with pytest.raises(ValueError):
+        parse_spec("bsoon")
+
+
+def test_impossible_knob_values_are_refused(db):
+    import pytest
+
+    with pytest.raises(ValueError):
+        TrailingStartShareSource(db, SEASON, b2b_same=1.5)
+    with pytest.raises(ValueError):
+        TrailingStartShareSource(db, SEASON, prior_games=-1)
+
+
+def test_the_gate_scores_the_opening_dates_apart():
+    import pytest
+
+    from puckpilot.season.goalie_gate import SKIP_DATES, _eval_dates
+
+    class _Src:
+        _starts = {(f"2026-10-{d:02d}", "TOR"): 1 for d in range(1, 31)}
+
+    dates = sorted({d for d, _ in _Src._starts})
+    assert _eval_dates(_Src) == dates[SKIP_DATES:]
+    assert _eval_dates(_Src, "early") == dates[:SKIP_DATES]
+    assert _eval_dates(_Src, "all") == dates
+    with pytest.raises(ValueError):
+        _eval_dates(_Src, "midseason")
+
+
+def test_the_default_model_is_the_measured_one():
+    """2026-10-11: the prior and the back-to-back rule passed every
+    pre-registered check (goalie-check early and late, add gate -g)."""
+    from puckpilot.season import goalies
+
+    assert goalies.PRIOR_GAMES == 10.0 and goalies.B2B_SAME == 0.07

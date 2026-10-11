@@ -227,6 +227,7 @@ def build_universe(
     market_ids: set[int] | None = None,
     position_overrides: dict[int, str] | None = None,
     eligibility: dict[int, frozenset[str]] | None = None,
+    goalie_age_on: str | None = None,
 ) -> Universe:
     """Projection-ranked pool with pseudo-ADP.
 
@@ -240,6 +241,9 @@ def build_universe(
     `eligibility` (player id -> Yahoo positions) values multi-position skaters
     at their best allowed position - see `valuation.replacement_adjust`. It
     changes VORP only; attach it to the universe separately for accounting.
+
+    `goalie_age_on`: where the age curve lands for goalies
+    (`projections.GOALIE_AGE_ON` when None).
     """
     kw = {
         "shape": league.shape,
@@ -247,7 +251,9 @@ def build_universe(
         "goalie_cats": league.goalie_cats,
         "eligibility": eligibility,
     }
-    proj_sk, proj_g = projections.project(conn, target_season, list(train_seasons))
+    proj_sk, proj_g = projections.project(
+        conn, target_season, list(train_seasons), goalie_age_on=goalie_age_on
+    )
     act_sk, act_g = season_aggregates(conn, train_seasons[0])
     if position_overrides:
         for frame in (proj_sk, act_sk):

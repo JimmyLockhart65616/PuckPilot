@@ -289,3 +289,60 @@ def test_a_ceiling_is_the_chance_with_every_acquisition_on_one_category():
     got = ceilings(model, cats, ours, theirs, {"hits": 20.0, "save_pct": None})
     assert got["hits"] > now
     assert "save_pct" not in got
+
+
+# -- the weekly goalie minimum (2026-10-11) -----------------------------------
+
+
+def _gm(p=0.5):
+    from puckpilot.season.odds import GoalieGame
+
+    return GoalieGame(p_start=p, p_win=0.5, shots=30.0, save_pct=0.9)
+
+
+def test_the_chance_of_reaching_the_goalie_minimum():
+    from puckpilot.season.odds import Side
+
+    assert Side(goalies=[_gm(), _gm()]).p_reach_minimum() == 1.0  # not priced
+    two = Side(goalies=[_gm(), _gm()], min_appearances=3)
+    assert two.p_reach_minimum() == 0.0  # two chances cannot make three
+    banked = Side(goalies=[_gm(), _gm()], min_appearances=3, appearances=2)
+    assert banked.p_reach_minimum() == pytest.approx(0.75)  # one of two
+    done = Side(goalies=[], min_appearances=3, appearances=3)
+    assert done.p_reach_minimum() == 1.0
+
+
+def test_a_side_that_cannot_reach_the_minimum_wins_no_goalie_category():
+    """Yahoo: short of the minimum, "you won't win any stat categories or get
+    any points for their performance" (help.yahoo.com/kb/SLN6878)."""
+    from puckpilot.season.odds import OddsModel, Side
+
+    cats = (resolve("G"), resolve("W"), resolve("SV"), resolve("SV%"))
+    theirs = Side(skaters={"goals": 3.0}, goalies=[_gm(0.9)] * 4)
+    plain = OddsModel().week(cats, Side(skaters={"goals": 3.0}, goalies=[_gm(), _gm()]), theirs)
+    short = OddsModel().week(
+        cats, Side(skaters={"goals": 3.0}, goalies=[_gm(), _gm()], min_appearances=3), theirs
+    )
+    for key in ("wins", "saves", "save_pct"):
+        assert plain.of(key).p_win > 0
+        assert short.of(key).p_win == 0.0 and short.of(key).p_tie == 0.0
+    assert short.of("goals").p_win == plain.of("goals").p_win  # skaters untouched
+
+
+def test_both_sides_short_of_the_minimum_tie_the_goalie_categories():
+    from puckpilot.season.odds import OddsModel, Side
+
+    cats = (resolve("W"),)
+    a = Side(goalies=[_gm()], min_appearances=3)
+    b = Side(goalies=[_gm()], min_appearances=3)
+    w = OddsModel().week(cats, a, b).of("wins")
+    assert w.p_win == 0.0 and w.p_tie == 1.0
+
+
+def test_extra_units_for_leverage_are_not_appearances():
+    from puckpilot.season.odds import Side, with_extra
+
+    s = Side(goalies=[_gm(), _gm()], min_appearances=3)
+    more = with_extra(s, "wins", 1.0)
+    assert more.min_appearances == 3
+    assert more.p_reach_minimum() == s.p_reach_minimum() == 0.0

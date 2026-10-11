@@ -1148,3 +1148,152 @@ def test_tonight_s_odds_are_the_score_as_it_stands_on_this_run(db):
 
 def test_no_steer_outside_the_week(db):
     assert _tonight(db, {}, {}, day="2026-10-20") is None
+
+
+# -- goalie moves (2026-10-11 audit) -----------------------------------------
+
+
+class _Who:
+    def __init__(self, key, pos):
+        self.player_key, self.position, self.name = key, pos, key
+        self.player = self
+        self.drop = None
+
+
+def test_only_the_cheapest_goalie_is_ever_a_drop_unless_asked():
+    """With a two-goalie minimum, the cheapest-drop rule can only ever offer
+    one goalie - the audit's third goalie (fewest starts this roster can use)
+    was never priced because another goalie's value a game was lower."""
+    from puckpilot.draft.engine import DraftRules
+    from puckpilot.season.week import _legal_drops
+
+    g1, g2, g3, c1 = (_Who(k, p) for k, p in (("g1", "G"), ("g2", "G"), ("g3", "G"), ("c1", "C")))
+    keep = {"g1": 1.0, "g2": 2.0, "g3": 3.0, "c1": 4.0}
+    counts = {"G": 3, "C": 3}
+    skater = _Who("fa", "C")
+
+    def names(choice):
+        got = _legal_drops(skater, [c1, g3, g2, g1], keep, counts, DraftRules(), choice)
+        return [p.player_key for p in got]
+
+    assert names("cheapest") == ["g1"]
+    assert names("goalies") == ["g1", "g2", "g3"]
+    assert names("all") == ["g1", "g2", "g3", "c1"]
+
+
+def test_no_goalie_is_a_legal_drop_at_the_goalie_minimum():
+    from puckpilot.draft.engine import DraftRules
+    from puckpilot.season.week import _legal_drops
+
+    g1, g2, c1 = _Who("g1", "G"), _Who("g2", "G"), _Who("c1", "C")
+    keep = {"g1": 1.0, "g2": 2.0, "c1": 4.0}
+    got = _legal_drops(_Who("fa", "C"), [g1, g2, c1], keep, {"G": 2, "C": 3}, DraftRules(), "all")
+    assert [p.player_key for p in got] == ["c1"]
+
+
+def test_a_goalie_over_the_cap_may_only_replace_a_goalie():
+    from puckpilot.draft.engine import DraftRules
+    from puckpilot.season.week import _legal_drops
+
+    g1, g2, g3, c1 = (_Who(k, p) for k, p in (("g1", "G"), ("g2", "G"), ("g3", "G"), ("c1", "C")))
+    keep = {"c1": 0.5, "g1": 1.0, "g2": 2.0, "g3": 3.0}
+    got = _legal_drops(
+        _Who("fa", "G"), [c1, g1, g2, g3], keep, {"G": 3, "C": 3}, DraftRules(), "all"
+    )
+    assert [p.player_key for p in got] == ["g1", "g2", "g3"]
+
+
+def test_an_unknown_drop_choice_is_refused(db):
+    with pytest.raises(ValueError):
+        _targets_for(
+            db,
+            (_rp("p.1", "Star", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")),
+            (("C", 2, 1),),
+            drop_choice="everyone",
+        )
+
+
+def _goalie_fa(key, name, pid, team="TOR"):
+    from puckpilot.season.pool import PoolPlayer
+
+    return PoolPlayer(
+        player_key=key,
+        name=name,
+        team=team,
+        primary_position="G",
+        yahoo_eligible=frozenset({"G"}),
+        nhl_player_id=pid,
+    )
+
+
+def test_the_goalie_lane_prices_a_goalie_the_screen_leaves_out(db, monkeypatch):
+    """The screen counts a goalie's games only into an empty G slot, so with
+    the slots covered he ranks on a quarter of his games and never reaches a
+    short list. The lane prices the goalies with the most expected starts."""
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season import week as W
+    from puckpilot.season.goalies import StaticGoalieSource
+    from puckpilot.season.roster import TeamRoster
+    from tests.test_season_settings import _slots
+
+    priced: list[str] = []
+    real = W._price
+
+    def spy(*a):
+        priced.append(a[8].name)
+        return real(*a)
+
+    monkeypatch.setattr(W, "_price", spy)
+    _week_games(db)
+    rt = _runtime_for_week(roster_positions=_slots(("C", 2, 1)))
+    players = (
+        _rp("p.1", "Star", 1, "MTL", "C"),
+        _rp("p.2", "Depth", 2, "TOR", "C"),
+        _rp("p.3", "Extra", 3, "TOR", "BN"),
+    )
+    ours = TeamRoster(league_key="999.l.1", team_key="t", date="2026-10-05", players=players)
+    tor_days = ("2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08")
+    source = StaticGoalieSource({d: {11: 0.7} for d in tor_days})
+    rates = {1: {"goals": 0.5}, 2: {"goals": 0.2}, 3: {"goals": 0.1}, 9: {"goals": 0.3}}
+    rates[11] = {"goals": 0.0}
+
+    def run(lane):
+        priced.clear()
+        W._targets(
+            db,
+            rt,
+            LeagueConfig(skater_cats=(resolve("G"),), goalie_cats=()),
+            rt.week(1),
+            ours,
+            [_fa("fa.1", "Streamer", 9), _goalie_fa("fa.2", "Stopper", 11)],
+            rates,
+            {},
+            source,
+            _PerGame({1: 1.5, 2: 0.5, 3: 0.4, 9: 1.0, 11: 0.5}),
+            1e9,  # nothing pays: every candidate is priced, none chosen
+            1,  # max_targets: the short list is max(screen, max_targets) long
+            screen=1,
+            goalie_lane=lane,
+        )
+        return set(priced)
+
+    assert "Stopper" not in run(0)
+    assert "Stopper" in run(1)
+
+
+def test_near_misses_are_the_best_unmade_swaps_one_per_pair():
+    from types import SimpleNamespace
+
+    from puckpilot.season.week import _near_misses
+
+    def t(add, drop, score):
+        return SimpleNamespace(
+            player=SimpleNamespace(player_key=add),
+            drop=SimpleNamespace(player_key=drop) if drop else None,
+            score=score,
+        )
+
+    misses = [t("a", "x", 0.10), t("a", "x", 0.12), t("b", "y", 0.20), t("c", None, 0.05)]
+    chosen = [t("b", "y", 0.30)]
+    got = _near_misses(misses, chosen)
+    assert [(m.player.player_key, m.score) for m in got] == [("a", 0.12), ("c", 0.05)]

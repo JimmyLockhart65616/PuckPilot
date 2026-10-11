@@ -110,3 +110,14 @@ min_weekly_gain = 0.25
 
 # More than this awaiting your decision means the tool is guessing, not advising.
 max_pending = 5
+
+# Goalie moves (measured 2026-10-11; see season/authority.py for the numbers).
+# Which drops a free agent is priced against: "cheapest" (the player with the
+# least rest-of-season value), "goalies" (also every goalie he may replace -
+# with a goalie minimum the cheapest rule can only ever offer one), or "all".
+# drop_choice = "cheapest"
+# Price the weekly goalie minimum into the odds: a week short of it wins no
+# goalie category, so a drop that leaves too few goalie games pays for that.
+# price_goalie_minimum = false
+# Free-agent goalies always priced by expected starts. Measured worse: 0.
+# goalie_lane = 0

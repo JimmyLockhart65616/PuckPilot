@@ -47,7 +47,28 @@ Asked for after week 1, and tested the same way:
     -x<n>    no search on the week's last n days (daily arms) - the live run,
              where Sunday follows the queue rule instead
 
+Asked for after the goalie audit (2026-10-11), and tested the same way:
+
+    -dg      each candidate is also priced against every goalie he may
+             replace, not only the cheapest legal drop (`drop_choice`)
+    -da      ... against every legal drop
+    -j<n>    the n free agent goalies with the most expected starts' worth
+             are always priced (`goalie_lane`)
+    -w       the odds price the weekly goalie minimum: a side short of it
+             wins no goalie category (`goalie_minimum`)
+    -a       the tested team's in-season pricing uses goalie projections
+             aged on games played, not per-start volume
+             (`projections.GOALIE_AGE_ON`); the draft is the same in every arm
+
 `versus` compares every arm with one named arm - the live baseline.
+
+A week is scored as Yahoo scores it, including the weekly goalie minimum: a
+team whose goalies made fewer than `min_goalie_appearances` appearances
+(any game a goalie played, relief included) wins none of the goalie
+categories - "you won't win any stat categories or get any points for their
+performance" (help.yahoo.com/kb/SLN6878). Both short is scored a tie. Before
+2026-10-11 the gate had no minimum at all, which rewards cutting goalies;
+`goalie_minimum=False` reproduces those numbers.
 
 Every input is as-of the morning it is used: the value model and the goalie
 start model are clamped to that date (`AsOfValues`, `AsOfGoalieSource`), a
@@ -116,6 +137,14 @@ class ArmSpec:
     screen: int = 20
     # -t: the lineup steered by this week's odds each morning.
     steer: bool = False
+    # -dg / -da: which drops a candidate is priced against (`week.DROP_CHOICES`).
+    drops: str = "cheapest"
+    # -jN: free-agent goalies always priced, most expected starts first.
+    lane: int = 0
+    # -w: the weekly goalie minimum priced into the odds.
+    minimum: bool = False
+    # -a: in-season rates and values from the goalie projection aged on games.
+    age_games: bool = False
 
 
 def _swap(roster: list[int], target) -> None:
@@ -130,6 +159,21 @@ def _pair(target) -> tuple[str, str]:
 
 def _worth(target) -> float:
     return target.gain if target.gain is not None else target.score
+
+
+def week_result(cats, ours, theirs, our_short: bool = False, their_short: bool = False) -> float:
+    """Categories won in a week, the goalie minimum applied as Yahoo applies it.
+
+    A side short of the minimum wins none of the goalie categories; both short
+    is scored a tie in each.
+    """
+    total = 0.0
+    for c in cats:
+        if c.kind == "goalie" and (our_short or their_short):
+            total += 0.5 if (our_short and their_short) else (0.0 if our_short else 1.0)
+        else:
+            total += _result(c, ours, theirs)
+    return total
 
 
 def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
@@ -160,9 +204,17 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.screen_by = "union"
         elif tok == "t":
             spec.steer = True
-        elif len(tok) > 1 and tok[0] in "spqfxkn" and tok[1:].isdigit():
+        elif tok in ("dg", "da"):
+            spec.drops = "goalies" if tok == "dg" else "all"
+        elif tok == "w":
+            spec.minimum = True
+        elif tok == "a":
+            spec.age_games = True
+        elif len(tok) > 1 and tok[0] in "spqfxknj" and tok[1:].isdigit():
             n = int(tok[1:])
-            if tok[0] == "n":
+            if tok[0] == "j":
+                spec.lane = n
+            elif tok[0] == "n":
                 spec.screen = n
             elif tok[0] == "k":
                 spec.keepers = n
@@ -265,6 +317,7 @@ def add_gate_report(
     versus: str = "",
     goalies: str = "",
     goalies_alt: str = GOALIES_ALT,
+    goalie_minimum: bool = True,
 ) -> AddGateReport:
     from puckpilot.draft.engine import RosterValuePolicy
     from puckpilot.draft.h2h import round_robin_schedule
@@ -340,7 +393,29 @@ def add_gate_report(
         finder = StreakFinder(data, per_game_rates(u.frame, cats), usage=usage, momentum=table)
     by_kind: dict[tuple[bool, bool, bool], ValueModel] = {(False, False, False): values}
 
+    aged = None  # -a arms: (frame, ValueModel) from the games-aged goalie projection
+    if any(x.age_games for x in wanted):
+        if any(x.age_games and (x.form_value or x.usage or x.momentum) for x in wanted):
+            raise ValueError("-a does not combine with -v, -u or -m")
+        ua = build_universe(conn, season, train_seasons, league, goalie_age_on="games")
+        rates_a = per_game_rates(ua.frame, cats)
+        aged = (
+            ua.frame,
+            ValueModel(
+                vm=vm,
+                data=data,
+                proj_pg=projected_pg_values(ua.frame, vm, skater_keys),
+                season=season,
+                scale_season=season,
+                frame=ua.frame,
+                form=FormRates(data, rates_a, skaters=skaters),
+                form_value=False,
+            ),
+        )
+
     def values_for(spec: ArmSpec) -> ValueModel:
+        if spec.age_games and aged is not None:
+            return aged[1]
         key = (spec.form_value, spec.usage, spec.momentum)
         if key not in by_kind:
             rates_now = FormRates(
@@ -509,7 +584,9 @@ def add_gate_report(
             steered[arm] = steered.get(arm, 0) + 1
         return assigned
 
-    def realise(assigned, i, sk, g):
+    def realise(assigned, i, sk, g) -> int:
+        """Add the day's lines; return the goalie appearances (Yahoo's count)."""
+        apps = 0
         for pid in assigned:
             line = data.skater.get(pid, {}).get(i)
             if line is not None:
@@ -518,14 +595,17 @@ def add_gate_report(
             line = data.goalie.get(pid, {}).get(i)
             if line is not None:
                 g += line
+                apps += 1
+        return apps
 
     # The frozen league: every team's realised production, day by day.
     n_days = len(data.dates)
     sk_day = np.zeros((len(rosters), n_days, len(skater_keys)))
     g_day = np.zeros((len(rosters), n_days, G_WIDTH))
+    apps_day = np.zeros((len(rosters), n_days))
     for t, roster in enumerate(rosters):
         for i in range(n_days):
-            realise(lineup(roster, i), i, sk_day[t, i], g_day[t, i])
+            apps_day[t, i] = realise(lineup(roster, i), i, sk_day[t, i], g_day[t, i])
     say(f"{season}: frozen league played")
 
     weeks = [w for w in runtime.weeks if any(d in index for d in w.dates())][: league.regular_weeks]
@@ -612,6 +692,7 @@ def add_gate_report(
             pol = policy_alt if spec.goalies else policy
             wl = workload if spec.workload else None
             vals = values_for(spec)
+            frame_now = aged[0] if spec.age_games and aged is not None else u.frame
             last_n = max(spec.preload, spec.queue)
             roster = list(rosters[t])
             adds_season = 0
@@ -627,6 +708,7 @@ def add_gate_report(
                 adds_week, carry = carry, 0
                 sk = np.zeros(len(skater_keys))
                 g = np.zeros(G_WIDTH)
+                apps = 0
                 if spec.keepers is not None and league.n_keepers > 0:
                     board = keeper_board(data.dates[days[0]])
                     ranks = board.rank([rp(pid, days[0]) for pid in roster], margin=spec.keepers)
@@ -685,7 +767,7 @@ def add_gate_report(
                                 ours,
                                 theirs,
                                 pool,
-                                u.frame,
+                                frame_now,
                                 AsOfGoalieSource(pol, date),
                                 AsOfValues(vals, date),
                                 # Queued moves are paid for next week, not now.
@@ -704,6 +786,11 @@ def add_gate_report(
                                 form_rates=spec.form_rates,
                                 screen_by=spec.screen_by,
                                 screen=spec.screen,
+                                drop_choice=spec.drops,
+                                goalie_lane=spec.lane,
+                                goalie_minimum=(
+                                    runtime.min_goalie_games(nw.number) if spec.minimum else 0
+                                ),
                             )
                             for target in plan.targets:
                                 drop = target.drop
@@ -767,7 +854,7 @@ def add_gate_report(
                             ours,
                             theirs,
                             pool,
-                            u.frame,
+                            frame_now,
                             AsOfGoalieSource(pol, date),
                             AsOfValues(vals, date),
                             adds_used_week=adds_week,
@@ -788,6 +875,12 @@ def add_gate_report(
                             form_rates=spec.form_rates,
                             screen_by=spec.screen_by,
                             screen=spec.screen,
+                            drop_choice=spec.drops,
+                            goalie_lane=spec.lane,
+                            goalie_minimum=(
+                                runtime.min_goalie_games(w.number) if spec.minimum else 0
+                            ),
+                            goalie_appearances=apps,
                         )
                         targets = list(plan.targets)
                         nopp = (
@@ -815,7 +908,7 @@ def add_gate_report(
                                     players=tuple(rp(pid, i) for pid in rosters[nopp]),
                                 ),
                                 [],
-                                u.frame,
+                                frame_now,
                                 AsOfGoalieSource(pol, date),
                                 AsOfValues(vals, date),
                                 find_targets=False,
@@ -829,6 +922,11 @@ def add_gate_report(
                                 measure_room=False,
                                 workload=wl,
                                 form_rates=spec.form_rates,
+                                goalie_minimum=(
+                                    runtime.min_goalie_games(weeks[nxt_wi].number)
+                                    if spec.minimum
+                                    else 0
+                                ),
                             )
                             later = {_pair(x): _worth(x) for x in (*nplan.targets, *nplan.lapsed)}
                             targets = [
@@ -852,7 +950,7 @@ def add_gate_report(
                         )
                     else:
                         assigned = lineup(roster, i, pol)
-                    realise(assigned, i, sk, g)
+                    apps += realise(assigned, i, sk, g)
                     # After the day's games the rosters unlock: queued moves are made.
                     for target in queued:
                         _swap(roster, target)
@@ -860,7 +958,16 @@ def add_gate_report(
                 theirs_final = _components(
                     sk_day[opp, days].sum(0), g_day[opp, days].sum(0), skater_keys
                 )
-                results[arm].append(sum(_result(c, ours_final, theirs_final) for c in cats))
+                need = runtime.min_goalie_games(w.number) if goalie_minimum else 0
+                results[arm].append(
+                    week_result(
+                        cats,
+                        ours_final,
+                        theirs_final,
+                        our_short=apps < need,
+                        their_short=float(apps_day[opp, days].sum()) < need,
+                    )
+                )
             if arm == "goalie-odds":
                 made[arm] = changed[0]
             say(f"{season}: team {t + 1}/{len(tested)} {arm}: {made[arm]} adds so far")

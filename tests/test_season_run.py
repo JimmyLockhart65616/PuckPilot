@@ -800,3 +800,35 @@ def test_the_plan_counts_an_approved_move_not_yet_made_and_never_withdraws_it(db
     assert seen["reprice"] == ["p.a", "p.w"]  # the approved move first
     assert proposals.get(db, approved.id).status == "approved"  # never withdrawn
     assert "withdrawn" in proposals.get(db, waiting.id).reason  # pending, below the floor
+
+
+def test_goalie_terms_price_the_minimum_only_from_a_count_it_can_trust():
+    from types import SimpleNamespace
+
+    from puckpilot.season.authority import TransactionAuthority
+    from puckpilot.season.run import goalie_terms
+
+    runtime = SimpleNamespace(min_goalie_games=lambda n: 3, week_of=lambda d: 2)
+    week = SimpleNamespace(number=2, start="2026-10-05")
+    off = goalie_terms(TransactionAuthority(), runtime, week, "2026-10-07")
+    assert off == {"drop_choice": "cheapest", "goalie_lane": 0}
+    on = TransactionAuthority(price_goalie_minimum=True, drop_choice="goalies", goalie_lane=2)
+    before = goalie_terms(on, runtime, week, "2026-10-05")
+    assert before["goalie_minimum"] == 3 and before["goalie_appearances"] == 0.0
+    unknown = SimpleNamespace(goalie_games=None, goalie_games_week=None)
+    assert "goalie_minimum" not in goalie_terms(on, runtime, week, "2026-10-07", unknown)
+    counted = SimpleNamespace(goalie_games=2, goalie_games_week=2)
+    mid = goalie_terms(on, runtime, week, "2026-10-07", counted, unknown)
+    assert mid["goalie_appearances"] == 2.0 and mid["their_goalie_appearances"] is None
+    assert (mid["drop_choice"], mid["goalie_lane"]) == ("goalies", 2)
+
+
+def test_a_bad_goalie_setting_is_refused():
+    import pytest
+
+    from puckpilot.season.authority import AuthorityError, TransactionAuthority
+
+    with pytest.raises(AuthorityError):
+        TransactionAuthority(drop_choice="everyone")
+    with pytest.raises(AuthorityError):
+        TransactionAuthority(goalie_lane=-1)

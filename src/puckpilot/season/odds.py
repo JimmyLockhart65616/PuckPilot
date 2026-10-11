@@ -35,7 +35,7 @@ that lasted 69% of the time; a confident wrong number is worse than none.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from statistics import NormalDist
 
 import numpy as np
@@ -96,6 +96,9 @@ class GoalieGame:
     save_pct: float
     p_shutout: float = 0.0
     hours: float = 1.0  # time in net per start, for GAA
+    # A real game toward the weekly minimum; the hypothetical extra units
+    # `with_extra` prices (leverage) are not appearances.
+    appearance: bool = True
 
 
 @dataclass
@@ -109,6 +112,24 @@ class Side:
     banked: dict[str, float] = field(default_factory=dict)
     skaters: dict[str, float] = field(default_factory=dict)  # expected remaining totals
     goalies: list[GoalieGame] = field(default_factory=list)
+    # The league's weekly goalie minimum, and the appearances already banked
+    # toward it. 0 = not priced: the goalie categories are taken as counted.
+    min_appearances: int = 0
+    appearances: float = 0.0
+
+    def p_reach_minimum(self) -> float:
+        """P(this side's goalies make the week's minimum appearances).
+
+        Each goalie game still to come is a chance at an appearance; a side
+        short of the minimum wins none of the goalie categories (Yahoo:
+        help.yahoo.com/kb/SLN6878). Relief appearances count for Yahoo and are
+        not modelled, so this errs low by a little.
+        """
+        need = self.min_appearances - int(round(self.appearances))
+        if self.min_appearances <= 0 or need <= 0:
+            return 1.0
+        pmf = trials_pmf([g.p_start for g in self.goalies if g.appearance])
+        return float(pmf[need:].sum()) if need < len(pmf) else 0.0
 
 
 @dataclass(frozen=True)
@@ -367,7 +388,11 @@ class OddsModel:
         return self._oriented(c, p_win, p_tie, fo, ft)
 
     def week(self, cats: tuple[Category, ...], ours: Side, theirs: Side) -> WeekOdds:
-        return WeekOdds(tuple(self.category(c, ours, theirs) for c in cats))
+        out = tuple(self.category(c, ours, theirs) for c in cats)
+        r_o, r_t = ours.p_reach_minimum(), theirs.p_reach_minimum()
+        if r_o < 1.0 or r_t < 1.0:
+            out = tuple(_minimum(o, r_o, r_t) if o.category.kind == "goalie" else o for o in out)
+        return WeekOdds(out)
 
     @staticmethod
     def _oriented(c: Category, p_win: float, p_tie: float, ours: float, theirs: float):
@@ -375,6 +400,22 @@ class OddsModel:
         if c.higher_is_better:
             return CategoryOdds(c, p_win, p_tie, ours, theirs)
         return CategoryOdds(c, max(1.0 - p_win - p_tie, 0.0), p_tie, ours, theirs)
+
+
+def _minimum(o: CategoryOdds, r_o: float, r_t: float) -> CategoryOdds:
+    """A goalie category with each side's chance of missing the minimum.
+
+    Short alone loses it, the other side short alone wins it, both short is
+    a tie; otherwise the category is decided as usual.
+    """
+    both = r_o * r_t
+    return CategoryOdds(
+        o.category,
+        p_win=both * o.p_win + r_o * (1.0 - r_t),
+        p_tie=both * o.p_tie + (1.0 - r_o) * (1.0 - r_t),
+        ours=o.ours,
+        theirs=o.theirs,
+    )
 
 
 # -- building a side from a roster --------------------------------------------
@@ -399,8 +440,13 @@ def side(
     skater_games: dict[int, float],
     goalie_games: dict[int, list[float]],
     rates: dict[int, dict[str, float]],
+    min_appearances: int = 0,
+    appearances: float = 0.0,
 ) -> Side:
-    """A side from expected skater starts and each goalie game's P(start)."""
+    """A side from expected skater starts and each goalie game's P(start).
+
+    `min_appearances` > 0 prices the weekly goalie minimum against the
+    `appearances` already banked (`Side.p_reach_minimum`)."""
     skaters: dict[str, float] = {}
     for pid, n in skater_games.items():
         for k, r in (rates.get(pid) or {}).items():
@@ -411,7 +457,13 @@ def side(
         for p in ps
         if p > 0
     ]
-    return Side(banked=dict(banked), skaters=skaters, goalies=goalies)
+    return Side(
+        banked=dict(banked),
+        skaters=skaters,
+        goalies=goalies,
+        min_appearances=min_appearances,
+        appearances=appearances,
+    )
 
 
 # -- what more of one category is worth -----------------------------------------
@@ -440,19 +492,22 @@ def with_extra(s: Side, key: str, extra: float) -> Side | None:
         p = extra / n
         chance = {"p_win": p} if key == "wins" else {"p_win": 0.0, "p_shutout": p}
         extra_games = [
-            GoalieGame(p_start=1.0, shots=0.0, save_pct=1.0, hours=0.0, **chance) for _ in range(n)
+            GoalieGame(p_start=1.0, shots=0.0, save_pct=1.0, hours=0.0, appearance=False, **chance)
+            for _ in range(n)
         ]
-        return Side(banked=s.banked, skaters=s.skaters, goalies=[*s.goalies, *extra_games])
+        return replace(s, goalies=[*s.goalies, *extra_games])
     if key in ("saves", "shots_against"):
         n = max(1, math.ceil(extra / _SAVES_PER_START))
         extra_games = [
-            GoalieGame(p_start=1.0, p_win=0.0, shots=extra / n, save_pct=1.0, hours=0.0)
+            GoalieGame(
+                p_start=1.0, p_win=0.0, shots=extra / n, save_pct=1.0, hours=0.0, appearance=False
+            )
             for _ in range(n)
         ]
-        return Side(banked=s.banked, skaters=s.skaters, goalies=[*s.goalies, *extra_games])
+        return replace(s, goalies=[*s.goalies, *extra_games])
     skaters = dict(s.skaters)
     skaters[key] = skaters.get(key, 0.0) + extra
-    return Side(banked=s.banked, skaters=skaters, goalies=s.goalies)
+    return replace(s, skaters=skaters)
 
 
 def leverage(

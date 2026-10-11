@@ -33,6 +33,7 @@ import bisect
 import json
 import sqlite3
 from collections.abc import Iterable
+from datetime import date as _date
 
 # Team games of history to weigh. Swept over 2025-26 and confirmed on 2024-25
 # and 2023-24; 10 was best or tied-best in all three, and the plateau across
@@ -82,6 +83,38 @@ CURRENT_CLUB = True
 DRESSED_WINDOW = 2
 AHEAD = "chain"
 
+# Early in a season the trailing window is short, and a goalie who has started
+# every game so far gets the whole share - P(start) 1.0 for every game ahead,
+# back-to-backs included - although such goalies make only 52-67% of their
+# club's next seven starts (first 21 game dates of 2023-24..2025-26). Padding
+# the window with this many pseudo-games of last season's start shares, less
+# the club games already played, lets the prior fade out as the season fills
+# the window. 0 = off: the window holds only this season once it has a game.
+#
+# Measured with the back-to-back rule below (`goalie-check --window early`,
+# p10-b0.07 v club-dw2-chain, 2026-10-11): Brier tonight +0.131 / +0.198 /
+# +0.168 and starts misplaced per 7 games -0.45 / -0.46 / -0.25, every one
+# over 4 SE; after the 21st date the prior has faded out (+0.0004 Brier).
+PRIOR_GAMES = 10.0
+
+# The share of a goalie with no starts last season (a rookie, a call-up) in
+# that prior, before the club's goalies are normalised against each other.
+UNKNOWN_PRIOR_SHARE = 0.15
+
+# P(the goalie who started the club's previous game also starts the second
+# night of a back-to-back). Measured 4.5-8.1% across 2023-24..2025-26; the
+# general demotion (`PREVIOUS_STARTER_DAMPING`) cannot express it when he is
+# the only goalie with a start in the window. None = off: a back-to-back is
+# treated like any other next game.
+#
+# The largest gain the model has had (`goalie-check --window late`, every
+# team-date after the 21st, 2026-10-11): tonight's favourite started 64.0 /
+# 66.0 / 63.2% -> 68.9 / 71.6 / 68.3%, Brier +0.05 (about 10 SE) in all three
+# seasons; 0.10 measures the same. Downstream (add gate -g, 4 drafts x 2
+# seasons): pooled -0.012 +/- 0.019 categories a week - flat. 0.07 is a round
+# value of rates measured on the same seasons: one scalar, noted.
+B2B_SAME: float | None = 0.07
+
 
 class TrailingStartShareSource:
     """P(start) from who has been starting, demoting the previous starter.
@@ -110,6 +143,13 @@ class TrailingStartShareSource:
       clubs the rule zeroes the night's actual starter 22-29 times a season,
       10-12 of them the favourite back from an absence (it turns 61-71 misses
       into hits). A clean tag on a roster we read says which it is.
+    - `prior_games`: pseudo-games of last season's start shares (`fallback_season`)
+      added to the window, less the club games this season has played, so the
+      prior fades out once the season could fill the window (`PRIOR_GAMES`).
+      Spread over the goalies who have dressed for the club this season.
+    - `b2b_same`: P(the previous game's starter starts the second night of a
+      back-to-back), the rest going to the club's other goalies by weight
+      (`B2B_SAME`); None treats a back-to-back like any next game.
 
     Sharing out what the `MIN_MEANINGFUL_P` cut removes was measured too, and
     changed nothing: with ten games and a 0.5 demotion the smallest share the
@@ -129,9 +169,15 @@ class TrailingStartShareSource:
         ahead: str = AHEAD,
         unavailable: Iterable[int] = (),
         healthy: Iterable[int] = (),
+        prior_games: float = PRIOR_GAMES,
+        b2b_same: float | None = B2B_SAME,
     ):
         if ahead not in AHEAD_RULES:
             raise ValueError(f"ahead must be one of {AHEAD_RULES}, not {ahead!r}")
+        if prior_games < 0:
+            raise ValueError(f"prior_games cannot be negative, got {prior_games}")
+        if b2b_same is not None and not 0.0 <= b2b_same <= 1.0:
+            raise ValueError(f"b2b_same must be a probability, got {b2b_same}")
         self.season = season
         self.trailing_games = trailing_games
         self.previous_damping = previous_damping
@@ -140,16 +186,27 @@ class TrailingStartShareSource:
         self.ahead = ahead
         self.unavailable = frozenset(unavailable)
         self.healthy = frozenset(healthy)
+        self.prior_games = prior_games
+        self.b2b_same = b2b_same
         self._starts = _season_starts(conn, season)
         self._team_dates = _team_dates(self._starts)
         self._fallback = _season_starts(conn, fallback_season) if fallback_season else {}
         self._fallback_dates = _team_dates(self._fallback)
+        self._prior_share = _start_shares(self._fallback, self._fallback_dates)
         self._schedule = _scheduled_teams(conn, season)
         self._games = _team_schedule(self._schedule)
-        self._dressed = _dressed(conn, season) if (current_club or dressed_window) else {}
+        # The prior is spread over the goalies who have dressed for the club,
+        # and a back-to-back's demoted share goes to them, so both need the
+        # boxscores even when the club and dressed rules are off.
+        needs_dressed = current_club or dressed_window or prior_games > 0 or b2b_same is not None
+        self._dressed = _dressed(conn, season) if needs_dressed else {}
         self._dressed_dates = _team_dates(self._dressed)
         self._clubs = _clubs(self._dressed)
         self._cache: dict[str, dict[int, float]] = {}
+        # (team, cutoff) -> (goalies dressed for it before cutoff and available,
+        # those dressed for its last game): asked once per candidate per day
+        # by a replay's as-of source, which does not cache.
+        self._pools: dict[tuple[str, str], tuple[list[int], list[int]]] = {}
 
     def starts(self, date: str) -> dict[int, float]:
         if date in self._cache:
@@ -170,6 +227,7 @@ class TrailingStartShareSource:
         cutoff = date if cutoff is None else cutoff
         history = [d for d in self._team_dates.get(team, ()) if d < cutoff]
         starts = self._starts
+        current = bool(history)
         if not history and self._fallback_dates.get(team):
             history = list(self._fallback_dates[team])
             starts = self._fallback
@@ -177,23 +235,29 @@ class TrailingStartShareSource:
             return {}
         previous = starts.get((history[-1], team))
 
-        counts: dict[int, int] = {}
+        counts: dict[int, float] = {}
         for day in history[-self.trailing_games :]:
             pid = starts.get((day, team))
             if pid and self._available(pid, team, cutoff):
-                counts[pid] = counts.get(pid, 0) + 1
-        if not counts:
+                counts[pid] = counts.get(pid, 0.0) + 1.0
+        if current:
+            self._pad(counts, team, cutoff, len(history))
+        if not any(w > 0 for w in counts.values()):
             return {}
 
-        p = self._next(counts, previous)
-        games = self._games_between(team, history[-1], date)
-        if games > 1 and self.ahead == "share":
+        # One flag per game from the next one to `date`: is it the second
+        # night of a back-to-back?
+        flags = self._b2b_flags(team, history[-1], date) or [False]
+        if len(flags) == 1 or self.ahead == "damped":
+            p = self._next(counts, previous, flags[0] if len(flags) == 1 else False)
+        elif self.ahead == "share":
             p = self._next(counts, None)
-        elif games > 1 and self.ahead == "chain":
-            for _ in range(games - 1):
+        else:  # chain
+            p = self._next(counts, previous, flags[0])
+            for b2b in flags[1:]:
                 after: dict[int, float] = {}
                 for prev, q in p.items():
-                    for pid, r in self._next(counts, prev).items():
+                    for pid, r in self._next(counts, prev, b2b).items():
                         after[pid] = after.get(pid, 0.0) + q * r
                 p = after
 
@@ -203,8 +267,73 @@ class TrailingStartShareSource:
         """The next game as seen from `date`; the name older callers use."""
         return self.team_starts(team, date)
 
-    def _next(self, counts: dict[int, int], previous: int | None) -> dict[int, float]:
-        """The game after one started by `previous`: the share, him demoted."""
+    def _pad(self, counts: dict[int, float], team: str, cutoff: str, played: int) -> None:
+        """Add the prior's pseudo-games, and the club's backup for a back-to-back.
+
+        Both look only at goalies who have dressed for the club this season and
+        are still available, so a goalie who left keeps none of his old share.
+        """
+        pad = max(0.0, self.prior_games - played)
+        if pad <= 0 and self.b2b_same is None:
+            return
+        pool, last = self._pool(team, cutoff)
+        if pad > 0 and pool:
+            shares = {g: self._prior_share.get(g, UNKNOWN_PRIOR_SHARE) for g in pool}
+            total = sum(shares.values())
+            for g, s in shares.items():
+                counts[g] = counts.get(g, 0.0) + pad * s / total
+        if self.b2b_same is not None:
+            # Whoever dressed last game and did not start is the backup a
+            # back-to-back hands the game to, even with no start of his own.
+            for g in last:
+                counts.setdefault(g, 0.0)
+
+    def _pool(self, team: str, cutoff: str) -> tuple[list[int], list[int]]:
+        """Goalies dressed for `team` this season before `cutoff` and still
+        available, and those of them who dressed for its last game."""
+        key = (team, cutoff)
+        if key not in self._pools:
+            dates = self._dressed_dates.get(team, [])
+            i = bisect.bisect_left(dates, cutoff)
+            dressed: set[int] = set()
+            for d in dates[:i]:
+                dressed |= self._dressed[(d, team)]
+            pool = sorted(g for g in dressed if self._available(g, team, cutoff))
+            last = sorted(g for g in self._dressed[(dates[i - 1], team)] if g in pool) if i else []
+            self._pools[key] = (pool, last)
+        return self._pools[key]
+
+    def _b2b_flags(self, team: str, last: str, date: str) -> list[bool]:
+        """For each club game after `last` up to `date`: the day after the one before?"""
+        games = self._games.get(team, [])
+        seq = games[bisect.bisect_right(games, last) : bisect.bisect_right(games, date)]
+        out, prev = [], last
+        for d in seq:
+            out.append(_days_apart(prev, d) == 1)
+            prev = d
+        return out
+
+    def _next(
+        self, counts: dict[int, float], previous: int | None, b2b: bool = False
+    ) -> dict[int, float]:
+        """The game after one started by `previous`: the share, him demoted.
+
+        On the second night of a back-to-back (`b2b_same` set), he starts with
+        that probability and his club's other goalies share the rest by weight -
+        equally when none of them has any, which is a sole starter's backup.
+        """
+        if b2b and self.b2b_same is not None and previous in counts:
+            others = {g: w for g, w in counts.items() if g != previous}
+            if others:
+                rest = 1.0 - self.b2b_same
+                total = sum(others.values())
+                out = (
+                    {g: rest * w / total for g, w in others.items()}
+                    if total > 0
+                    else {g: rest / len(others) for g in others}
+                )
+                out[previous] = self.b2b_same
+                return out
         weights = {
             pid: n * (self.previous_damping if pid == previous else 1.0)
             for pid, n in counts.items()
@@ -241,13 +370,23 @@ def parse_spec(spec: str) -> dict:
     So a gate can be told which model to run from the command line. Tokens:
     club (current club only), dw<n> (out after n games not dressed),
     damped/share/chain (games after the next), t<n> (trailing team games),
-    x<f> (previous-starter damping). 'old' is the model as first measured;
-    '' leaves every knob at its default.
+    x<f> (previous-starter damping), p<f> (prior pseudo-games from last
+    season), b<f> (P(same starter) on a back-to-back's second night), boff (no
+    back-to-back rule). 'old' is the model as first measured; '' leaves every
+    knob at its default. The model before 2026-10-11 is club-dw2-chain-p0-boff.
     """
     kw: dict = {}
     for tok in spec.split("-") if spec else ():
         if tok == "old":
-            kw.update(current_club=False, dressed_window=None, ahead="damped")
+            kw.update(
+                current_club=False,
+                dressed_window=None,
+                ahead="damped",
+                prior_games=0.0,
+                b2b_same=None,
+            )
+        elif tok == "boff":
+            kw["b2b_same"] = None
         elif tok == "club":
             kw["current_club"] = True
         elif tok.startswith("dw") and tok[2:].isdigit():
@@ -256,9 +395,10 @@ def parse_spec(spec: str) -> dict:
             kw["ahead"] = tok
         elif tok.startswith("t") and tok[1:].isdigit():
             kw["trailing_games"] = int(tok[1:])
-        elif tok.startswith("x"):
+        elif tok[:1] in ("x", "p", "b") and len(tok) > 1:
+            name = {"x": "previous_damping", "p": "prior_games", "b": "b2b_same"}[tok[0]]
             try:
-                kw["previous_damping"] = float(tok[1:])
+                kw[name] = float(tok[1:])
             except ValueError:
                 raise ValueError(f"unknown goalie model token {tok!r} in {spec!r}") from None
         else:
@@ -445,6 +585,24 @@ def _team_dates(starts: dict[tuple[str, str], int]) -> dict[str, list[str]]:
     for date, team in starts:
         out.setdefault(team, set()).add(date)
     return {t: sorted(d) for t, d in out.items()}
+
+
+def _start_shares(
+    starts: dict[tuple[str, str], int], team_dates: dict[str, list[str]]
+) -> dict[int, float]:
+    """goalie -> his starts over a full season's games, wherever he made them."""
+    games = max((len(d) for d in team_dates.values()), default=0)
+    if not games:
+        return {}
+    made: dict[int, int] = {}
+    for pid in starts.values():
+        made[pid] = made.get(pid, 0) + 1
+    return {pid: n / games for pid, n in made.items()}
+
+
+def _days_apart(a: str, b: str) -> int:
+    """Calendar days from ISO date `a` to ISO date `b`."""
+    return (_date.fromisoformat(b) - _date.fromisoformat(a)).days
 
 
 def _dressed(conn: sqlite3.Connection, season: str) -> dict[tuple[str, str], frozenset[int]]:

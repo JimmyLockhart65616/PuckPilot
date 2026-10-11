@@ -252,6 +252,9 @@ class WeekPlan:
     # label -> expected categories one more typical skater game of ours adds,
     # per skater category: where an add would count, when none is proposed.
     extra_game: dict[str, float] = field(default_factory=dict)
+    # Swaps the search priced and turned down - under the floor - best first,
+    # so "nothing proposed" can be told from "nothing considered".
+    near_misses: tuple[AddTarget, ...] = ()
 
     @property
     def expected(self) -> float | None:
@@ -825,6 +828,11 @@ def build_week_plan(
     form_rates: bool | None = None,
     screen_by: str = "value",
     screen: int = 20,
+    drop_choice: str = "cheapest",
+    goalie_lane: int = 0,
+    goalie_minimum: int = 0,
+    goalie_appearances: float = 0.0,
+    their_goalie_appearances: float | None = None,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -850,6 +858,16 @@ def build_week_plan(
 
     `screen_by` / `screen`: how the add search shortlists (`_targets`); "union"
     needs the odds, and falls back to "value" without them.
+
+    `drop_choice` / `goalie_lane`: which drops each candidate is priced
+    against, and how many free-agent goalies are always priced (`_targets`).
+
+    `goalie_minimum` > 0 prices the league's weekly goalie minimum into the
+    odds: a side short of it wins no goalie category, so each side's chance of
+    reaching it - from the appearances already banked and the goalie games
+    left - weighs the goalie categories (`odds.Side.p_reach_minimum`). Ours
+    start from `goalie_appearances`; `their_goalie_appearances` None means
+    theirs are unknown, and they are taken to reach it.
     """
     from puckpilot.season.form import FORM_RATES
 
@@ -950,10 +968,20 @@ def build_week_plan(
         from puckpilot.season import odds as odds_mod
 
         their_side = odds_mod.side(
-            base_theirs, _skaters_only(theirs.players, their_games), their_goalie_games, rates
+            base_theirs,
+            _skaters_only(theirs.players, their_games),
+            their_goalie_games,
+            rates,
+            min_appearances=goalie_minimum if their_goalie_appearances is not None else 0,
+            appearances=their_goalie_appearances or 0.0,
         )
         our_side = odds_mod.side(
-            base_ours, _skaters_only(ours.players, our_games), our_goalie_games, rates
+            base_ours,
+            _skaters_only(ours.players, our_games),
+            our_goalie_games,
+            rates,
+            min_appearances=goalie_minimum,
+            appearances=goalie_appearances,
         )
         odds = odds_model.week(cats, our_side, their_side)
         leverage = odds_mod.leverage(odds_model, cats, our_side, their_side)
@@ -1007,9 +1035,17 @@ def build_week_plan(
     ctx = None
     floor = min_gain
     if add_scoring == "odds" and odds is not None and their_side is not None:
-        ctx = OddsContext(model=odds_model, banked=base_ours, theirs=their_side, cats=cats)
+        ctx = OddsContext(
+            model=odds_model,
+            banked=base_ours,
+            theirs=their_side,
+            cats=cats,
+            minimum=goalie_minimum,
+            appearances=goalie_appearances,
+        )
         floor = min_expected_gain
     lapsed: tuple[AddTarget, ...] = ()
+    near_misses: tuple[AddTarget, ...] = ()
     if reprice is not None and days:
         targets, lapsed = _reprice(
             conn,
@@ -1031,6 +1067,7 @@ def build_week_plan(
             workload=workload,
         )
     elif find_targets and days and not holding:
+        misses: list = []
         targets = _targets(
             conn,
             runtime,
@@ -1058,7 +1095,11 @@ def build_week_plan(
             screen=screen,
             screen_by=screen_by,
             leverage=leverage,
+            drop_choice=drop_choice,
+            goalie_lane=goalie_lane,
+            misses=misses,
         )
+        near_misses = _near_misses(misses, targets)
 
     # The week with every move made, in order, priced by the odds whichever
     # way the moves were chosen - what the plan as a whole is for.
@@ -1073,7 +1114,14 @@ def build_week_plan(
             goalie_source,
             values,
             days,
-            OddsContext(model=odds_model, banked=base_ours, theirs=their_side, cats=cats),
+            OddsContext(
+                model=odds_model,
+                banked=base_ours,
+                theirs=their_side,
+                cats=cats,
+                minimum=goalie_minimum,
+                appearances=goalie_appearances,
+            ),
             exclude,
         )
         planned = evaluate(with_moves(ours.players, targets))[2]
@@ -1101,6 +1149,7 @@ def build_week_plan(
         ceiling=ceiling,
         bench_calls=bench_calls,
         extra_game=extra_game,
+        near_misses=near_misses,
     )
 
 
@@ -1138,6 +1187,10 @@ class OddsContext:
     banked: dict[str, float]  # our banked components
     theirs: object  # season.odds.Side, fixed for the week
     cats: tuple[Category, ...]
+    # The week's goalie minimum when it is priced (0: not), and our goalie
+    # appearances already banked toward it.
+    minimum: int = 0
+    appearances: float = 0.0
 
 
 def _targets(
@@ -1164,6 +1217,9 @@ def _targets(
     workload=None,
     screen_by: str = "value",
     leverage: dict[str, float] | None = None,
+    drop_choice: str = "cheapest",
+    goalie_lane: int = 0,
+    misses: list | None = None,
 ) -> tuple[AddTarget, ...]:
     """Adds that move a category in play, priced by re-slotting the actual week.
 
@@ -1194,7 +1250,25 @@ def _targets(
     "union" adds to the value shortlist the `screen` players whose games move
     this week's categories most by `leverage` - a specialist in a close
     category can rank outside the value 20 and is then never priced at all.
+
+    `drop_choice` is which drops a candidate is priced against. "cheapest" is
+    the one with the least rest-of-season value - and with a goalie minimum,
+    only one goalie can ever be that one, however little his starts are worth
+    to this roster (a third goalie whose club plays on nights the other two
+    fill both slots). "goalies" also prices every other goalie he may replace,
+    "all" every legal drop. Either of them judges an upgrade on one scale: a
+    goalie's value a game sits below every skater's, so a skater would
+    otherwise count as an upgrade on any goalie, the best one included.
+
+    `goalie_lane` free-agent goalies are always priced, the most expected
+    starts' worth first: the screen counts a goalie's games only where a G
+    slot is empty, which on a roster with goalies to spare is almost never,
+    and ignores whether he starts at all.
+
+    `misses`, when given, collects every swap priced and turned down.
     """
+    if drop_choice not in DROP_CHOICES:
+        raise ValueError(f"drop_choice must be one of {DROP_CHOICES}, not {drop_choice!r}")
     from puckpilot.season.today import ir_changes, open_roster_spots
 
     cats = league.all_cats
@@ -1244,6 +1318,8 @@ def _targets(
         worth = keep.get(p.player_key, 0.0)
         if stream_floor is not None and worth <= stream_floor:
             return True
+        if drop_choice != "cheapest" and (p.position == "G") != (cand.position == "G"):
+            return False  # an upgrade is judged on one scale
         return worth <= values.per_game(cand.nhl_player_id, days[0]) * games_left(season_left, cand)
 
     # Cheap screen: his rate times the games he would actually fill - days his
@@ -1272,6 +1348,25 @@ def _targets(
         screened += [
             c for c in sorted(eligible, key=fit, reverse=True)[:size] if c.player_key not in seen
         ]
+    if goalie_lane > 0:
+        p_by_day = {d: (goalie_source.starts(d) if goalie_source else {}) for d in days}
+
+        def starts_worth(c) -> float:
+            starts = sum(
+                float(p_by_day[d].get(c.nhl_player_id, 0.0))
+                for d in days
+                if c.team in playing.get(d, ())
+            )
+            per_game = values.per_game(c.nhl_player_id, days[0])
+            return per_game * starts * share_of(season_left, c)
+
+        seen = {c.player_key for c in screened}
+        lane = sorted(
+            (c for c in eligible if c.position == "G" and c.player_key not in seen),
+            key=starts_worth,
+            reverse=True,
+        )
+        screened += [c for c in lane[:goalie_lane] if starts_worth(c) > 0]
 
     steps = max_targets if adds_left is None else min(max_targets, adds_left)
     chosen: list[AddTarget] = []
@@ -1284,34 +1379,40 @@ def _targets(
                 continue
             over_cap = counts.get(cand.position, 0) + 1 > rules.caps.get(cand.position, 99)
             if spots > 0 and not over_cap:
-                drop = None
+                options: list = [None]
             else:
-                drop = _cheapest_legal_drop(
+                options = _legal_drops(
                     cand,
                     [p for p in droppable if p.player_key not in used_drops and may_drop(p, cand)],
                     keep,
                     counts,
                     rules,
+                    drop_choice,
                 )
-                if drop is None:
+                if not options:
                     continue
-            t, after_week = _price(
-                runtime,
-                cats,
-                evaluate,
-                base_players,
-                base_starts,
-                base_totals,
-                base_odds,
-                close_by_key,
-                cand,
-                drop,
-            )
-            if not _pays(t, min_gain, close_by_key):
-                continue
-            if best is None or t.score > best.score:
-                best = t
-                best_after = after_week
+            for drop in options:
+                t, after_week = _price(
+                    runtime,
+                    cats,
+                    evaluate,
+                    base_players,
+                    base_starts,
+                    base_totals,
+                    base_odds,
+                    close_by_key,
+                    cand,
+                    drop,
+                )
+                if not _pays(t, min_gain, close_by_key):
+                    # Against the roster as it is: later steps price swaps
+                    # against one with earlier moves made.
+                    if misses is not None and not chosen:
+                        misses.append(t)
+                    continue
+                if best is None or t.score > best.score:
+                    best = t
+                    best_after = after_week
         if best is None:
             break
         best = replace(
@@ -1466,6 +1567,8 @@ def _evaluator(
                 {pid: n for pid, n in starts.items() if pid in skate},
                 ggames,
                 rates,
+                min_appearances=odds_ctx.minimum,
+                appearances=odds_ctx.appearances,
             )
             odds = odds_ctx.model.week(odds_ctx.cats, side, odds_ctx.theirs)
         return starts, totals, odds
@@ -1515,6 +1618,21 @@ def _price(
         gain=gain,
     )
     return t, (after, after_starts, after_odds)
+
+
+def _near_misses(misses, chosen, limit: int = 5) -> tuple[AddTarget, ...]:
+    """The best few swaps priced and turned down, one per pair, best first."""
+
+    def key(t):
+        return (t.player.player_key, t.drop.player_key if t.drop else "")
+
+    made = {key(t) for t in chosen}
+    best: dict = {}
+    for t in misses:
+        k = key(t)
+        if k not in made and (k not in best or t.score > best[k].score):
+            best[k] = t
+    return tuple(sorted(best.values(), key=lambda t: -t.score)[:limit])
 
 
 def _pays(t: AddTarget, min_gain: float, close_by_key) -> bool:
@@ -1728,8 +1846,8 @@ def _categories_helped(
     return tuple(label for _, label in out[:3])
 
 
-def _cheapest_legal_drop(cand, droppable, drop_values, counts, rules):
-    """The least valuable player we may legally drop to make room.
+def _legal(cand, p, counts, rules) -> bool:
+    """May `p` be dropped to make room for `cand`?
 
     Position arithmetic only, the same check `waivers.best_move` makes: over a
     positional cap the drop must come from that position, and no drop may take
@@ -1738,14 +1856,32 @@ def _cheapest_legal_drop(cand, droppable, drop_values, counts, rules):
     """
     pos_add = cand.position
     over_cap = counts.get(pos_add, 0) + 1 > rules.caps.get(pos_add, 99)
-    best = None
-    for p in sorted(droppable, key=lambda x: drop_values.get(x.player_key, 0.0)):
-        pos_drop = p.position
-        if over_cap and pos_drop != pos_add:
-            continue
-        after = counts.get(pos_drop, 0) - 1 + (1 if pos_drop == pos_add else 0)
-        if after < rules.mins.get(pos_drop, 0):
-            continue
-        best = p
-        break
-    return best
+    if over_cap and p.position != pos_add:
+        return False
+    after = counts.get(p.position, 0) - 1 + (1 if p.position == pos_add else 0)
+    return after >= rules.mins.get(p.position, 0)
+
+
+def _cheapest_legal_drop(cand, droppable, drop_values, counts, rules):
+    """The least valuable player we may legally drop to make room."""
+    legal = _legal_drops(cand, droppable, drop_values, counts, rules)
+    return legal[0] if legal else None
+
+
+# Which drops a candidate is priced against (`_targets`' `drop_choice`).
+DROP_CHOICES = ("cheapest", "goalies", "all")
+
+
+def _legal_drops(cand, droppable, drop_values, counts, rules, choice: str = "cheapest") -> list:
+    """The drops to price for `cand`, cheapest first: the cheapest legal one,
+    plus every legal goalie ("goalies") or every legal drop ("all")."""
+    legal = [
+        p
+        for p in sorted(droppable, key=lambda x: drop_values.get(x.player_key, 0.0))
+        if _legal(cand, p, counts, rules)
+    ]
+    if choice == "all" or not legal:
+        return legal
+    if choice == "goalies":
+        return [legal[0], *(p for p in legal[1:] if p.position == "G")]
+    return legal[:1]
