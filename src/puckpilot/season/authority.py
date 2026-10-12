@@ -28,6 +28,8 @@ QUESTIONABLE_MODES = ("never", "only_if_needed", "always")
 ADD_SCORING = ("share", "odds")
 # Mirrors `week.DROP_CHOICES`, kept here so reading a config imports no engine.
 DROP_CHOICES = ("cheapest", "goalies", "all")
+# Mirrors `week.TIME_MODES`.
+TIME_MODES = ("off", "shift", "search")
 # How the add search shortlists candidates (TransactionAuthority.screen).
 SCREENS = ("value", "union")
 # How a night with more players than slots is decided (LineupAuthority.steer).
@@ -275,6 +277,20 @@ class TransactionAuthority:
     # fresh leagues; with `drop_choice = "goalies"`, +0.024 +/- 0.026. The
     # gate itself now scores the minimum, so this is what pricing it buys.
     price_goalie_minimum: bool = False
+    # Make a swap on its best day of the week, not the day it is found: after
+    # the games the player going out still has, on days the one coming in
+    # does not play ("make it Wednesday morning"). The card says when and the
+    # move waits for that morning's run. Each day waited is discounted by
+    # `wait_hazard`, the chance the free agent is taken first; a waiver claim
+    # is never timed. "shift": the moves the search would make anyway, on their
+    # best day; "search": also moves that pay only when timed. Both measured
+    # (add gate v the live arm, 4 drafts x 2 seasons, 2026-10-12): "search"
+    # -0.075 +/- 0.028 categories a week at 10% a day (~8% more adds),
+    # "shift" +0.003 +/- 0.014 at 10% and -0.035 +/- 0.014 at 5%. The games a
+    # drop still has are worth about what a pickup lost while waiting costs:
+    # "off" - make a move as soon as it is decided.
+    time_moves: str = "off"
+    wait_hazard: float = 0.10
     # Make an approved add and drop in Yahoo, rather than leave it to the
     # manager. It changes who makes the move, not who decides: every move
     # still needs its own approval (`proposals.take_for_execution`), and only
@@ -313,6 +329,15 @@ class TransactionAuthority:
             )
         if self.goalie_lane < 0:
             raise AuthorityError("authority.transactions.goalie_lane cannot be negative")
+        if self.time_moves not in TIME_MODES:
+            raise AuthorityError(
+                f"authority.transactions.time_moves must be one of {', '.join(TIME_MODES)}; "
+                f"got {self.time_moves!r}"
+            )
+        if not 0.0 <= self.wait_hazard < 1.0:
+            raise AuthorityError(
+                "authority.transactions.wait_hazard is a daily chance, from 0 up to (not) 1"
+            )
 
     @property
     def requires_approval(self) -> bool:
@@ -369,6 +394,12 @@ class TransactionAuthority:
                 ["  the weekly goalie minimum is priced: a short week forfeits goalie categories"]
                 if self.price_goalie_minimum
                 else []
+            ),
+            (
+                f"  a swap is proposed for its best day of the week (waiting discounted "
+                f"{self.wait_hazard:.0%} a day; {self.time_moves})"
+                if self.time_moves != "off"
+                else "  a swap is proposed to be made as soon as it is approved"
             ),
             (
                 "  an approved move is made in Yahoo on the next run (where the executor is "

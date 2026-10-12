@@ -60,6 +60,7 @@ def build(
     show_protocol: bool = True,
     lineup_by: str = "season value",
     executes_moves: bool = False,
+    today: str = "",
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -71,6 +72,8 @@ def build(
     A missing section renders as absent rather than as an error; a page that
     half-draws is worse than one that says a thing is not there yet, which is
     the lesson the draft relay's cold payload taught.
+
+    `today` dates the cards' "made when" words when there is no `plan` to.
     """
     snap: dict[str, Any] = {
         "team": team_name,
@@ -137,7 +140,7 @@ def build(
             "why": _why(p),
             "timing": str(p.reason.get("timing", "")),
             "detail": _reasons(p.reason.get("detail")),
-            **_approve_means(p, executes_moves),
+            **_approve_means(p, executes_moves, snap["date"] or today),
         }
         for p in pending
     ]
@@ -333,7 +336,7 @@ def _week_note(wp) -> str:
     return ""
 
 
-def _approve_means(p, executes_moves: bool) -> dict:
+def _approve_means(p, executes_moves: bool, today: str = "") -> dict:
     """What Approve does for this card, in words, and whether it makes the move.
 
     The page shows the words and sends `executes` back with the tap; the run
@@ -351,12 +354,30 @@ def _approve_means(p, executes_moves: bool) -> dict:
             "adds and drops, never claims.",
         }
     what = "add and drop" if p.drop_player_key else "add"
-    when = "after tonight's games" if p.reason.get("after_games_of") else "on its next run"
+    when = _when(str(p.reason.get("after_games_of") or ""), today)
     return {
         "executes": True,
         "approve_means": f"Approve and PuckPilot makes this {what} in Yahoo {when}, checking "
         f"each step and then your roster. Reject and nothing happens.",
     }
+
+
+def _when(after_games_of: str, today: str = "") -> str:
+    """When an approved move is made: the next run, or the morning after a
+    day's games - the next week's queue after Sunday's, or a swap timed to
+    keep the games the player going out still has."""
+    if not after_games_of:
+        return "on its next run"
+    if after_games_of == today:
+        return "after tonight's games"
+    from datetime import date, timedelta
+
+    try:
+        day = date.fromisoformat(after_games_of)
+    except ValueError:
+        return "after tonight's games"
+    morning = (day + timedelta(days=1)).strftime("%A")
+    return f"on {morning} morning, after {day.strftime('%A')}'s games"
 
 
 # What a card says when Approve only records the decision.

@@ -59,6 +59,13 @@ Asked for after the goalie audit (2026-10-11), and tested the same way:
     -a       the tested team's in-season pricing uses goalie projections
              aged on games played, not per-start volume
              (`projections.GOALIE_AGE_ON`); the draft is the same in every arm
+    -y<n>    swaps are timed to their best day (`time_moves="search"`), waiting
+             priced at n% a day; a timed swap is held, its acquisition
+             reserved, and made that morning unless the free agent was taken
+             first - which the replay draws at n% a day waited, since its
+             rivals are frozen and would otherwise never take anyone
+    -z<n>    the same, `time_moves="shift"`: only the swaps chosen on today's
+             price are moved to their best day - never an extra move
 
 `versus` compares every arm with one named arm - the live baseline.
 
@@ -145,6 +152,10 @@ class ArmSpec:
     minimum: bool = False
     # -a: in-season rates and values from the goalie projection aged on games.
     age_games: bool = False
+    # -yN / -zN: swaps timed to their best day ("search" / "shift"), waiting
+    # priced (and lost) at N% a day.
+    timing: float | None = None
+    timing_mode: str = "off"
 
 
 def _swap(roster: list[int], target) -> None:
@@ -210,9 +221,12 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.minimum = True
         elif tok == "a":
             spec.age_games = True
-        elif len(tok) > 1 and tok[0] in "spqfxknj" and tok[1:].isdigit():
+        elif len(tok) > 1 and tok[0] in "spqfxknjyz" and tok[1:].isdigit():
             n = int(tok[1:])
-            if tok[0] == "j":
+            if tok[0] in "yz":
+                spec.timing = n / 100
+                spec.timing_mode = "search" if tok[0] == "y" else "shift"
+            elif tok[0] == "j":
                 spec.lane = n
             elif tok[0] == "n":
                 spec.screen = n
@@ -684,6 +698,8 @@ def add_gate_report(
 
     results: dict[str, list[float]] = {a: [] for a in arms}
     made: dict[str, int] = dict.fromkeys(arms, 0)
+    timed_made: dict[str, int] = {}  # -y arms: swaps put off to a later morning
+    timed_lost: dict[str, int] = {}  # ... and of those, the free agent taken first
     tested = list(range(min(n_tested, len(rosters))))
     for t in tested:
         for arm in arms:
@@ -697,6 +713,9 @@ def add_gate_report(
             roster = list(rosters[t])
             adds_season = 0
             shield.clear()
+            # -y arms: (date index to make it on, index it was found on, target)
+            waiting: list = []
+            lost = np.random.default_rng([seed, t, arms.index(arm)])
             # Moves queued at the end of a week for the rosters' unlock are made
             # the next morning, so they count against the week that starts then.
             carry = 0
@@ -716,6 +735,16 @@ def add_gate_report(
                     shield.update(k.nhl_player_id for k in ranks if k.protected)
                 for k, i in enumerate(days):
                     date = data.dates[i]
+                    for when, found, target in [x for x in waiting if x[0] <= i]:
+                        waiting.remove((when, found, target))
+                        kept = (1.0 - (spec.timing or 0.0)) ** (when - found)
+                        if lost.random() < kept:
+                            _swap(roster, target)
+                            made[arm] += 1
+                        else:  # taken by someone else: the acquisition was never spent
+                            adds_week -= 1
+                            adds_season -= 1
+                            timed_lost[arm] = timed_lost.get(arm, 0) + 1
                     search = (
                         kind not in ("none", "goalie-odds")
                         and (kind.endswith("daily") or k == 0)
@@ -825,7 +854,8 @@ def add_gate_report(
                             date=date,
                             players=tuple(rp(pid, i) for pid in rosters[opp]),
                         )
-                        taken = frozen_pids | set(roster)
+                        pending = {int(x[2].player.player_key) for x in waiting}
+                        taken = frozen_pids | set(roster) | pending
                         pool = [
                             fa(pid, i)
                             for pid in by_value
@@ -881,6 +911,9 @@ def add_gate_report(
                                 runtime.min_goalie_games(w.number) if spec.minimum else 0
                             ),
                             goalie_appearances=apps,
+                            time_moves=spec.timing_mode,
+                            wait_hazard=spec.timing or 0.0,
+                            hold={x[2].drop.player_key for x in waiting if x[2].drop is not None},
                         )
                         targets = list(plan.targets)
                         nopp = (
@@ -937,9 +970,18 @@ def add_gate_report(
                         for target in targets:
                             if adds_week >= cap_w:
                                 break
-                            _swap(roster, target)
+                            on_days = [
+                                j
+                                for j in days[k + 1 :]
+                                if target.after_games_of and data.dates[j] > target.after_games_of
+                            ]
                             adds_week += 1
                             adds_season += 1
+                            if spec.timing is not None and on_days:
+                                waiting.append((on_days[0], i, target))
+                                timed_made[arm] = timed_made.get(arm, 0) + 1
+                                continue
+                            _swap(roster, target)
                             made[arm] += 1
                     if arm == "goalie-odds":
                         assigned = lineup_goalie_odds(roster, i, days[k:], sk, g, opp, days[:k])
@@ -982,6 +1024,8 @@ def add_gate_report(
         line = f"{arm:14}{report.mean(arm):>11.3f}{made[arm]:>7}"
         if arm in steered:
             line += f"   steered lineups: {steered[arm]} nights changed"
+        if arm in timed_made:
+            line += f"   timed: {timed_made[arm]} put off, {timed_lost.get(arm, 0)} lost waiting"
         lines.append(line)
     lines.append("")
     pairs = [(a, "none") for a in arms if a != "none" and "none" in arms]

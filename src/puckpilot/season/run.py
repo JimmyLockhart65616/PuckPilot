@@ -210,6 +210,31 @@ def goalie_terms(terms, runtime, week, day: str | None = None, ours=None, theirs
     return out
 
 
+def timing_terms(terms) -> dict:
+    """The swap-timing arguments for `build_week_plan`, from a manager's terms."""
+    return {
+        "time_moves": str(getattr(terms, "time_moves", "off")),
+        "wait_hazard": float(getattr(terms, "wait_hazard", 0.10)),
+    }
+
+
+def committed_moves(conn, manager_name: str, league_key: str, roster, week) -> list:
+    """This week's moves approved and not yet made - one timed for a later
+    morning, or one the executor could not make yet.
+
+    Each already holds an acquisition, its add and its drop, so a search plans
+    around them rather than over them.
+    """
+    if week is None or roster is None:
+        return []
+    mine = {p.player_key for p in roster.players}
+    return [
+        p
+        for p in proposals_mod.approved_unmade(conn, manager_name, league_key, week.number)
+        if p.add_player_key not in mine
+    ]
+
+
 def adds_used(roster, week) -> tuple[int, int]:
     """(this week, this season) - Yahoo's own counters, zero only when unknown."""
     wk = roster.adds_this_week if roster is not None else None
@@ -514,6 +539,7 @@ def run_day(
                 show_protocol=manager.authority.lineup.follow_protocol,
                 lineup_by=lineup_by(manager),
                 executes_moves=_executes(manager),
+                today=day,
             )
             publish.push(manager.page.url, page_key, snap)
             report.add("page", True, manager.page.url)
@@ -860,6 +886,11 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propo
         if approved or waiting
         else ([], {})
     )
+    switch_after = {
+        (p.add_player_key, p.drop_player_key or ""): str(p.reason["after_games_of"])
+        for p, _, _ in workable
+        if p.reason.get("after_games_of")
+    }
     decided = {p.id for p in approved}
     reprice = [(add, drop) for p, add, drop in workable if p.id in decided]
     workable = [w for w in workable if w[0].id not in decided]
@@ -888,6 +919,7 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propo
         playoff_reserve=terms.playoff_reserve,
         stream_spots=terms.stream_spots,
         reprice=reprice if approved or waiting else None,
+        switch_after=switch_after,
         **live_inputs(conn, runtime, ctx.week, ctx.live, day),
         **goalie_terms(terms, runtime, ctx.week, day, ctx.roster, ctx.theirs),
     )
@@ -1336,6 +1368,13 @@ def _weekly(
     values, goalies = models
     universe = build_universe(conn, season, _train_seasons(season), manager.league)
     used_week, used_season = adds_used(ours, week)
+    committed = committed_moves(conn, manager.name, league_key, ours, week)
+    if committed:
+        used_week += len(committed)
+        used_season += len(committed)
+        taken = {p.add_player_key for p in committed}
+        fa = [c for c in fa if c.player_key not in taken]
+    hold = {p.drop_player_key for p in committed if p.drop_player_key}
     live = ctx.live if ctx.week is not None and ctx.week.number == week.number else None
     plan = weekmod.build_week_plan(
         conn,
@@ -1358,11 +1397,19 @@ def _weekly(
         playoff_reserve=terms.playoff_reserve,
         stream_spots=terms.stream_spots,
         screen_by=terms.screen,
+        hold=hold,
         **live_inputs(conn, runtime, week, live, day),
         **goalie_terms(terms, runtime, week, day, ours, theirs),
+        **timing_terms(terms),
     )
     log_week(conn, manager.name, league_key, ours.team_key, plan, day)
     lines = [ln for ln in explain.week_story(plan, runtime) if ln]
+    if committed:
+        lines.append(
+            "planned around "
+            + ", ".join(f"#{p.id} {p.add_name}" for p in committed)
+            + " - approved, not made yet"
+        )
     lines += near_miss_lines(plan)
     targets = list(plan.targets)
     if horizon and ahead is not None and targets:

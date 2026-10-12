@@ -116,3 +116,14 @@ def test_the_goalie_move_options_parse():
     assert parse_arm("odds-weekly-da").drops == "all"
     plain = parse_arm("odds-weekly")
     assert (plain.drops, plain.lane, plain.minimum) == ("cheapest", 0, False)
+
+
+def test_the_timing_option_parses():
+    from puckpilot.season.add_gate import parse_arm
+
+    y = parse_arm("odds-daily-h-f25-x1-k1-r-y10")
+    assert (y.timing, y.timing_mode) == (0.1, "search")
+    z = parse_arm("odds-daily-h-f25-x1-k1-r-z10")
+    assert (z.timing, z.timing_mode) == (0.1, "shift")
+    assert parse_arm("odds-weekly-y0").timing == 0.0
+    assert parse_arm("odds-weekly").timing is None

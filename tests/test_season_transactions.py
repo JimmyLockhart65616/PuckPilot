@@ -370,7 +370,7 @@ def test_each_card_says_what_approve_does(db):
     _pending(db, "a4", "d4", after_games_of=TODAY)
     off = build(db, "m", "L", "Team")["proposals"]
     assert {(c["executes"], c["approve_means"]) for c in off} == {(False, MANUAL)}
-    on = build(db, "m", "L", "Team", executes_moves=True)["proposals"]
+    on = build(db, "m", "L", "Team", executes_moves=True, today=TODAY)["proposals"]
     assert [c["executes"] for c in on] == [True, True, False, True]
     swap, add, claim, queued = (c["approve_means"] for c in on)
     assert "makes this add and drop in Yahoo on its next run" in swap
@@ -413,3 +413,30 @@ def test_the_authority_says_who_makes_the_move():
     assert any("made in Yahoo on the next run" in x for x in on.transactions.describe())
     off = Authority.from_config({})
     assert any("the manager makes it" in x for x in off.transactions.describe())
+
+
+def test_a_timed_card_says_which_morning():
+    """A swap timed to keep the drop's games says when it is made; the queue
+    for after tonight's games keeps its words."""
+    from puckpilot.season.snapshot import _when
+
+    assert _when("") == "on its next run"
+    assert _when("2026-10-13", today="2026-10-13") == "after tonight's games"
+    assert _when("2026-10-13", today="2026-10-12") == "on Wednesday morning, after Tuesday's games"
+    assert _when("2026-10-13") == "on Wednesday morning, after Tuesday's games"
+
+
+def test_moves_approved_and_waiting_hold_their_add_and_drop(db):
+    from types import SimpleNamespace
+
+    from puckpilot.season.run import committed_moves
+
+    waiting = _pending(db, "a1", "d1", week=3, after_games_of="2026-10-13")
+    made = _pending(db, "a2", "d2", week=3)
+    other_week = _pending(db, "a3", "d3", week=2)
+    for pid in (waiting, made, other_week):
+        db.execute("UPDATE waiver_proposals SET status = 'approved' WHERE id = ?", (pid,))
+    db.commit()
+    roster = SimpleNamespace(players=[SimpleNamespace(player_key="a2")])  # a2 already added
+    got = committed_moves(db, "m", "L", roster, SimpleNamespace(number=3))
+    assert [p.id for p in got] == [waiting]

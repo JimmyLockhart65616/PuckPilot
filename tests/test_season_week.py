@@ -1297,3 +1297,169 @@ def test_near_misses_are_the_best_unmade_swaps_one_per_pair():
     chosen = [t("b", "y", 0.30)]
     got = _near_misses(misses, chosen)
     assert [(m.player.player_key, m.score) for m in got] == [("a", 0.12), ("c", 0.05)]
+
+
+# -- the best day to make a swap (2026-10-12) ---------------------------------
+
+
+def _split_week(db):
+    """TOR plays Monday and Tuesday; MTL plays Wednesday and Thursday."""
+    from puckpilot.data import store
+
+    gid = 500
+    for d, home in (
+        ("2026-10-05", "TOR"),
+        ("2026-10-06", "TOR"),
+        ("2026-10-07", "MTL"),
+        ("2026-10-08", "MTL"),
+    ):
+        store.upsert_schedule_game(
+            db,
+            game_id=gid,
+            season="20262027",
+            game_type=2,
+            game_date=d,
+            start_time_utc=None,
+            home_team=home,
+            away_team="OTT" if home == "TOR" else "BUF",
+        )
+        gid += 1
+    db.commit()
+
+
+def _timed(db, **kw):
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season.roster import TeamRoster
+    from puckpilot.season.week import _targets
+    from tests.test_season_settings import _slots
+
+    _split_week(db)
+    rt = _runtime_for_week(roster_positions=_slots(("C", 2, 1)))
+    players = (_rp("p.1", "Keep", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C"))
+    ours = TeamRoster(league_key="999.l.1", team_key="t", date="2026-10-05", players=players)
+    return _targets(
+        db,
+        rt,
+        LeagueConfig(skater_cats=(resolve("G"),), goalie_cats=()),
+        rt.week(1),
+        ours,
+        [_fa("fa.1", "Late", 9, team="MTL")],
+        {1: {"goals": 0.5}, 2: {"goals": 0.1}, 9: {"goals": 0.3}},
+        {},
+        None,
+        _PerGame({1: 1.5, 2: 0.4, 9: 1.0}),
+        0.0,
+        5,
+        **kw,
+    )
+
+
+def test_a_swap_is_made_today_unless_asked_to_time_it(db):
+    got = _timed(db)
+    assert [t.drop.name for t in got] == ["Depth"]
+    assert got[0].after_games_of == ""
+    assert got[0].score == pytest.approx(2 * 0.3 - 2 * 0.1)  # his two games for Depth's two
+
+
+def test_a_swap_waits_for_the_games_the_drop_still_has(db):
+    """Depth plays Monday and Tuesday, Late Wednesday and Thursday: made
+    Wednesday morning the week keeps all four games."""
+    got = _timed(db, time_moves="search", wait_hazard=0.0)
+    t = got[0]
+    assert t.after_games_of == "2026-10-06"
+    assert t.score == pytest.approx(2 * 0.3)
+    assert t.drop_starts == pytest.approx(0.0)  # he plays both his games first
+    assert "Wed Oct 07 morning" in t.timing and "Depth's Tuesday game" in t.timing
+    assert t.detail["week"][0].startswith("Best made Wed Oct 07 morning")
+
+
+def test_waiting_is_not_worth_it_when_the_add_is_likely_gone(db):
+    """Two days at a 50% a day chance he is taken: 0.6 x 0.25 < 0.4 now."""
+    got = _timed(db, time_moves="search", wait_hazard=0.5)
+    assert got[0].after_games_of == ""
+    assert got[0].score == pytest.approx(0.4)
+
+
+def test_a_queued_swap_is_re_priced_as_made_on_its_day(db):
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season.roster import TeamRoster
+    from puckpilot.season.week import _reprice
+    from tests.test_season_settings import _slots
+
+    _split_week(db)
+    rt = _runtime_for_week(roster_positions=_slots(("C", 2, 1)))
+    keep, depth = _rp("p.1", "Keep", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C")
+    ours = TeamRoster(league_key="999.l.1", team_key="t", date="2026-10-05", players=(keep, depth))
+    late = _fa("fa.1", "Late", 9, team="MTL")
+
+    def price(switch_after):
+        kept, _ = _reprice(
+            db,
+            rt,
+            LeagueConfig(skater_cats=(resolve("G"),), goalie_cats=()),
+            rt.week(1),
+            ours,
+            [(late, depth)],
+            {1: {"goals": 0.5}, 2: {"goals": 0.1}, 9: {"goals": 0.3}},
+            {},
+            None,
+            _PerGame({1: 1.5, 2: 0.4, 9: 1.0}),
+            0.0,
+            switch_after=switch_after,
+        )
+        return kept[0]
+
+    now = price(None)
+    later = price({("fa.1", "p.2"): "2026-10-06"})
+    assert now.after_games_of == "" and now.score == pytest.approx(0.4)
+    assert later.after_games_of == "2026-10-06" and later.score == pytest.approx(0.6)
+    # A date at or past the week's end is the next week's queue: priced as before.
+    queued = price({("fa.1", "p.2"): "2026-10-08"})
+    assert queued.after_games_of == "" and queued.score == pytest.approx(0.4)
+
+
+def test_shift_moves_the_chosen_swap_to_its_day(db):
+    """ "shift" makes the swap the search chose on today's price, on its best
+    morning - the same move, a better day."""
+    got = _timed(db, time_moves="shift", wait_hazard=0.0)
+    assert [t.drop.name for t in got] == ["Depth"]
+    assert got[0].after_games_of == "2026-10-06"
+    assert got[0].score == pytest.approx(0.6)
+
+
+def test_shift_never_chooses_a_swap_that_does_not_pay_today(db):
+    """At a floor of 0.5 the swap fails today (0.4) and passes made Wednesday
+    (0.6): "search" chooses it, "shift" does not - it only moves moves."""
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season.roster import TeamRoster
+    from puckpilot.season.week import _targets
+    from tests.test_season_settings import _slots
+
+    _split_week(db)
+    rt = _runtime_for_week(roster_positions=_slots(("C", 2, 1)))
+    players = (_rp("p.1", "Keep", 1, "MTL", "C"), _rp("p.2", "Depth", 2, "TOR", "C"))
+    ours = TeamRoster(league_key="999.l.1", team_key="t", date="2026-10-05", players=players)
+
+    def run(mode):
+        return _targets(
+            db,
+            rt,
+            LeagueConfig(skater_cats=(resolve("G"),), goalie_cats=()),
+            rt.week(1),
+            ours,
+            [_fa("fa.1", "Late", 9, team="MTL")],
+            {1: {"goals": 0.5}, 2: {"goals": 0.1}, 9: {"goals": 0.3}},
+            {},
+            None,
+            _PerGame({1: 1.5, 2: 0.4, 9: 1.0}),
+            0.5,
+            5,
+            time_moves=mode,
+            wait_hazard=0.0,
+        )
+
+    assert run("off") == ()
+    assert run("shift") == ()
+    assert [t.after_games_of for t in run("search")] == ["2026-10-06"]
+    with pytest.raises(ValueError):
+        run("sometimes")

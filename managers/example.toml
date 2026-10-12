@@ -121,3 +121,10 @@ max_pending = 5
 # price_goalie_minimum = false
 # Free-agent goalies always priced by expected starts. Measured worse: 0.
 # goalie_lane = 0
+# Make a swap on its best day of the week ("Wednesday morning, after Tuesday's
+# games") instead of as soon as it is approved: "off", "shift" (the same moves,
+# a later day) or "search" (also moves that only pay when timed). Measured: no
+# gain - the drop's last games are worth about what a pickup lost while
+# waiting costs. wait_hazard is the chance a day that the free agent is taken.
+# time_moves = "off"
+# wait_hazard = 0.10

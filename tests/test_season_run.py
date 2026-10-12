@@ -832,3 +832,21 @@ def test_a_bad_goalie_setting_is_refused():
         TransactionAuthority(drop_choice="everyone")
     with pytest.raises(AuthorityError):
         TransactionAuthority(goalie_lane=-1)
+
+
+def test_swap_timing_is_a_setting_and_checked():
+    import pytest
+
+    from puckpilot.season.authority import AuthorityError, TransactionAuthority
+    from puckpilot.season.run import timing_terms
+    from puckpilot.season.week import WAIT_HAZARD
+
+    assert TransactionAuthority().wait_hazard == WAIT_HAZARD  # one default, two places
+    assert timing_terms(TransactionAuthority()) == {"time_moves": "off", "wait_hazard": 0.10}
+    on = TransactionAuthority(time_moves="shift", wait_hazard=0.2)
+    assert timing_terms(on) == {"time_moves": "shift", "wait_hazard": 0.2}
+    assert any("best day of the week" in line for line in on.describe())
+    with pytest.raises(AuthorityError):
+        TransactionAuthority(wait_hazard=1.0)
+    with pytest.raises(AuthorityError):
+        TransactionAuthority(time_moves="always")

@@ -77,6 +77,20 @@ SV_PCT_INFLATION = 1.3
 # likely than not to start: a backup who sits sits whoever else is rostered.
 BENCH_START = 0.5
 
+# A swap is worth most made on its best day: after the games the player going
+# out still has, when the one coming in does not play them ("make it Wednesday
+# morning"). `time_moves`: "off" makes every swap at once; "shift" moves a swap
+# the search chose on today's price to its best morning - the same moves, a
+# better day; "search" also lets a swap that pays only when timed be chosen.
+# Waiting is discounted by `WAIT_HAZARD` a day for the chance the free agent is
+# taken first (a claim on waivers is never timed). Measured (add gate, 8
+# leagues): "search" -0.075 +/- 0.028 at 10% a day - more moves that pay on
+# paper only; "shift" +0.003 +/- 0.014 at 10%, -0.035 +/- 0.014 at 5%. Off.
+TIME_MODES = ("off", "shift", "search")
+WAIT_HAZARD = 0.10
+# How many of a step's best swaps are priced on later days as well.
+TIMING_TOP = 5
+
 
 @dataclass(frozen=True)
 class CategoryOutlook:
@@ -833,6 +847,10 @@ def build_week_plan(
     goalie_minimum: int = 0,
     goalie_appearances: float = 0.0,
     their_goalie_appearances: float | None = None,
+    time_moves: str = "off",
+    wait_hazard: float = WAIT_HAZARD,
+    switch_after: dict[tuple[str, str], str] | None = None,
+    hold: set[str] | None = None,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -868,6 +886,13 @@ def build_week_plan(
     left - weighs the goalie categories (`odds.Side.p_reach_minimum`). Ours
     start from `goalie_appearances`; `their_goalie_appearances` None means
     theirs are unknown, and they are taken to reach it.
+
+    `time_moves` ("off" | "shift" | "search", `TIME_MODES`) prices a swap on
+    its best day of the week, not only today (`_targets`), waiting discounted
+    by `wait_hazard` a day. `switch_after`
+    {(add key, drop key): date} re-prices a queued swap as made after that
+    date's games, the day it was planned for. `hold` is player keys no search
+    may drop - the drops of moves approved and not yet made.
     """
     from puckpilot.season.form import FORM_RATES
 
@@ -1065,6 +1090,7 @@ def build_week_plan(
             exclude=exclude,
             horizon=horizon,
             workload=workload,
+            switch_after=switch_after,
         )
     elif find_targets and days and not holding:
         misses: list = []
@@ -1098,6 +1124,9 @@ def build_week_plan(
             drop_choice=drop_choice,
             goalie_lane=goalie_lane,
             misses=misses,
+            time_moves=time_moves if horizon == "this week" else "off",
+            wait_hazard=wait_hazard,
+            hold=hold,
         )
         near_misses = _near_misses(misses, targets)
 
@@ -1220,6 +1249,9 @@ def _targets(
     drop_choice: str = "cheapest",
     goalie_lane: int = 0,
     misses: list | None = None,
+    time_moves: str = "off",
+    wait_hazard: float = WAIT_HAZARD,
+    hold: set[str] | None = None,
 ) -> tuple[AddTarget, ...]:
     """Adds that move a category in play, priced by re-slotting the actual week.
 
@@ -1266,7 +1298,18 @@ def _targets(
     and ignores whether he starts at all.
 
     `misses`, when given, collects every swap priced and turned down.
+
+    `time_moves`: "shift" prices the swap each step chose on today's price
+    made on the morning after each of the drop's remaining games too
+    (`_best_day`), and moves it to a later day when that is worth more after
+    `wait_hazard` a day for the chance the free agent is gone by then - the
+    same moves, a better day. "search" prices each step's `TIMING_TOP` best that
+    way before choosing, so a swap that pays only when timed can be chosen.
+    The card says when; `after_games_of` holds the executor until then.
+    `hold`: never dropped.
     """
+    if time_moves not in TIME_MODES:
+        raise ValueError(f"time_moves must be one of {TIME_MODES}, not {time_moves!r}")
     if drop_choice not in DROP_CHOICES:
         raise ValueError(f"drop_choice must be one of {DROP_CHOICES}, not {drop_choice!r}")
     from puckpilot.season.today import ir_changes, open_roster_spots
@@ -1288,6 +1331,8 @@ def _targets(
         and p.player_key not in to_ir
         # Next season's best keepers are not this week's to give away.
         and not getattr(p, "keeper_protected", False)
+        # Already the drop of a move approved and waiting to be made.
+        and p.player_key not in (hold or ())
     ]
     counts: dict[str, int] = {}
     for p in ours.players:
@@ -1298,6 +1343,14 @@ def _targets(
     evaluate = _evaluator(
         conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx, exclude
     )
+    split = (
+        _split_evaluator(
+            conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx, exclude
+        )
+        if time_moves != "off" and len(days) > 1
+        else None
+    )
+    notes: dict[tuple[str, str], str] = {}
 
     base_players = list(ours.players)
     base_starts, first_totals, base_odds = evaluate(base_players)
@@ -1374,6 +1427,7 @@ def _targets(
     for _ in range(max(steps, 0)):
         best: AddTarget | None = None
         best_after = None
+        priced: list = []
         for cand in screened:
             if any(t.player.player_key == cand.player_key for t in chosen):
                 continue
@@ -1404,17 +1458,58 @@ def _targets(
                     cand,
                     drop,
                 )
-                if not _pays(t, min_gain, close_by_key):
-                    # Against the roster as it is: later steps price swaps
-                    # against one with earlier moves made.
-                    if misses is not None and not chosen:
-                        misses.append(t)
-                    continue
-                if best is None or t.score > best.score:
-                    best = t
-                    best_after = after_week
+                priced.append((t, after_week))
+        if split is not None and time_moves == "search":
+            # The step's best few, made on a later morning instead.
+            for t0, _ in sorted(priced, key=lambda x: -x[0].score)[:TIMING_TOP]:
+                timed = _best_day(
+                    runtime,
+                    cats,
+                    split,
+                    base_players,
+                    base_starts,
+                    base_totals,
+                    base_odds,
+                    close_by_key,
+                    t0,
+                    days,
+                    playing,
+                    wait_hazard,
+                )
+                if timed is not None:
+                    priced.append(timed[:2])
+                    notes[_pair_key(timed[0])] = timed[2]
+        for t, after_week in priced:
+            if not _pays(t, min_gain, close_by_key):
+                # Against the roster as it is: later steps price swaps
+                # against one with earlier moves made.
+                if misses is not None and not chosen and not t.after_games_of:
+                    misses.append(t)
+                continue
+            if best is None or t.score > best.score:
+                best = t
+                best_after = after_week
         if best is None:
             break
+        if split is not None and time_moves == "shift":
+            # The swap chosen on today's price, on its best morning.
+            timed = _best_day(
+                runtime,
+                cats,
+                split,
+                base_players,
+                base_starts,
+                base_totals,
+                base_odds,
+                close_by_key,
+                best,
+                days,
+                playing,
+                wait_hazard,
+            )
+            if timed is not None:
+                best, best_after = timed[0], timed[1]
+                notes[_pair_key(best)] = timed[2]
         best = replace(
             best,
             detail=_explain(
@@ -1435,6 +1530,10 @@ def _targets(
                 horizon,
             ),
         )
+        if best.after_games_of and _pair_key(best) in notes:
+            detail = dict(best.detail)
+            detail["week"] = [notes[_pair_key(best)], *detail.get("week", [])]
+            best = replace(best, detail=detail)
         chosen.append(best)
         # Make it, and price the next one against the roster it leaves.
         if best.drop is None:
@@ -1469,9 +1568,11 @@ def _reprice(
     exclude: dict[str, set[str]] | None = None,
     horizon: str = "this week",
     workload=None,
+    switch_after: dict[tuple[str, str], str] | None = None,
 ) -> tuple[tuple[AddTarget, ...], tuple[AddTarget, ...]]:
     """(still pays, no longer pays) for swaps already proposed, priced as the
-    search would price them today.
+    search would price them today - or, one queued to be made after a day's
+    games (`switch_after`, from its `after_games_of`), made then.
 
     In the order they were proposed, each against the roster the ones kept
     before it leave - the search's own greedy order, so a later card still
@@ -1493,7 +1594,16 @@ def _reprice(
     )
     kept: list[AddTarget] = []
     lapsed: list[AddTarget] = []
+    split = _split_evaluator(
+        conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx, exclude
+    )
     for cand, drop in pairs:
+        when = (switch_after or {}).get((cand.player_key, drop.player_key if drop else ""), "")
+        # Made the morning after `when`: days left before it are played as is.
+        # A date at or past the week's last day is a move queued for the next
+        # week, priced here as before.
+        k = sum(1 for d in days if d <= when) if when else 0
+        timed = 0 < k < len(days)
         t, after_week = _price(
             runtime,
             cats,
@@ -1505,7 +1615,11 @@ def _reprice(
             close_by_key,
             cand,
             drop,
+            split=split if timed else None,
+            k=k if timed else 0,
         )
+        if timed:
+            t = replace(t, after_games_of=when, timing=f"{t.timing}; {_planned(days[k], drop)}")
         if not _pays(t, min_gain, close_by_key):
             lapsed.append(t)
             continue
@@ -1529,10 +1643,149 @@ def _reprice(
                 horizon,
             ),
         )
+        if t.after_games_of:
+            detail = dict(t.detail)
+            detail["week"] = [_planned(days[k], drop).capitalize(), *detail.get("week", [])]
+            t = replace(t, detail=detail)
         kept.append(t)
         base_players = after_week[0]
         base_starts, base_totals, base_odds = evaluate(base_players)
     return tuple(kept), tuple(lapsed)
+
+
+def _split_evaluator(
+    conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx=None, exclude=None
+):
+    """(before, after, k) -> (expected starts, remaining totals, odds) over
+    `days`, `before` playing days[:k] and `after` from days[k] on.
+
+    A swap made on a later morning: the player going out still plays the days
+    before it, the one coming in only those after.
+    """
+    from puckpilot.season import odds as odds_mod
+
+    def evaluate(before, after, k):
+        starts: dict[int, float] = {}
+        ggames: dict[int, list[float]] = {}
+        skate: set[int] = set()
+        for players, ds in ((before, days[:k]), (after, days[k:])):
+            if not ds:
+                continue
+            got: dict[int, list[float]] = {}
+            s = expected_starts(
+                conn,
+                runtime,
+                week,
+                players,
+                goalie_source,
+                values,
+                days=ds,
+                exclude=exclude,
+                goalie_games=got,
+            )
+            for pid, n in s.items():
+                starts[pid] = starts.get(pid, 0.0) + n
+            for pid, ps in got.items():
+                ggames.setdefault(pid, []).extend(ps)
+            skate |= {p.nhl_player_id for p in players if p.position != "G"}
+        totals = project_totals(starts, rates, cats)
+        odds = None
+        if odds_ctx is not None:
+            side = odds_mod.side(
+                odds_ctx.banked,
+                {pid: n for pid, n in starts.items() if pid in skate},
+                ggames,
+                rates,
+                min_appearances=odds_ctx.minimum,
+                appearances=odds_ctx.appearances,
+            )
+            odds = odds_ctx.model.week(odds_ctx.cats, side, odds_ctx.theirs)
+        return starts, totals, odds
+
+    return evaluate
+
+
+def _planned(morning: str, drop) -> str:
+    """'planned for Wed Oct 14 morning, after Smith's games before it'."""
+    from datetime import date as _date
+
+    day = _date.fromisoformat(morning).strftime("%a %b %d")
+    who = f", after {drop.name}'s games before it" if drop is not None else ""
+    return f"planned for {day} morning{who}"
+
+
+def _pair_key(t) -> tuple[str, str]:
+    return (t.player.player_key, t.drop.player_key if t.drop else "")
+
+
+def _best_day(
+    runtime,
+    cats,
+    split,
+    base_players,
+    base_starts,
+    base_totals,
+    base_odds,
+    close_by_key,
+    now: AddTarget,
+    days: list[str],
+    playing: dict[str, set[str]],
+    wait_hazard: float,
+):
+    """(target, week, note) for `now`'s swap made on its best later morning,
+    or None when making it today is as good.
+
+    Only the mornings after the drop's own games can beat today: before one of
+    them, waiting gives up the add's games and keeps nothing. Each day waited
+    is discounted by `wait_hazard`, the chance the free agent is taken first;
+    a waiver claim is not timed at all.
+    """
+    from datetime import date as _date
+
+    drop, cand = now.drop, now.player
+    if drop is None or getattr(cand, "on_waivers", False):
+        return None
+    ks = sorted({i + 1 for i, d in enumerate(days[:-1]) if drop.team in playing.get(d, ())})
+    best = None
+    for k in ks:
+        t, after = _price(
+            runtime,
+            cats,
+            None,
+            base_players,
+            base_starts,
+            base_totals,
+            base_odds,
+            close_by_key,
+            cand,
+            drop,
+            split=split,
+            k=k,
+        )
+        survive = (1.0 - wait_hazard) ** k
+        raw = t.gain if t.gain is not None else t.score
+        score = raw * survive
+        if score <= now.score + 1e-9 or (best is not None and score <= best[0].score):
+            continue
+        day = _date.fromisoformat(days[k]).strftime("%a %b %d")
+        game = _date.fromisoformat(days[k - 1]).strftime("%A")
+        timed = replace(
+            t,
+            gain=t.gain * survive if t.gain is not None else None,
+            score=score,
+            after_games_of=days[k - 1],
+            timing=(
+                f"{t.timing}; best made {day} morning, after {drop.name}'s {game} game - "
+                f"{cand.name} could be taken by then"
+            ),
+        )
+        note = (
+            f"Best made {day} morning, after {drop.name}'s {game} game: {raw:+.2f} "
+            f"categories expected then, {score:+.2f} allowing a {wait_hazard:.0%} a day chance "
+            f"{cand.name} is taken first (made today: {now.score:+.2f})"
+        )
+        best = (timed, after, note)
+    return best
 
 
 def _evaluator(
@@ -1587,11 +1840,20 @@ def _price(
     close_by_key,
     cand,
     drop,
+    split=None,
+    k: int = 0,
 ):
-    """One swap against a roster: its AddTarget, and the week it leaves."""
+    """One swap against a roster: its AddTarget, and the week it leaves.
+
+    With `split` and `k` > 0 it is made on the morning of the k-th day left:
+    the roster as it is plays the days before (`_split_evaluator`).
+    """
     after = [p for p in base_players if drop is None or p.player_key != drop.player_key]
     after.append(cand)
-    after_starts, after_totals, after_odds = evaluate(after)
+    later = split is not None and k > 0
+    after_starts, after_totals, after_odds = (
+        split(base_players, after, k) if later else evaluate(after)
+    )
     deltas = {
         c.key: after_totals.get(c.key, 0.0) - base_totals.get(c.key, 0.0)
         for c in cats
@@ -1608,7 +1870,14 @@ def _price(
     t = AddTarget(
         player=cand,
         starts=after_starts.get(cand.nhl_player_id, 0.0),
-        drop_starts=base_starts.get(drop.nhl_player_id, 0.0) if drop is not None else 0.0,
+        # The starts he no longer makes: all of them made now, those after
+        # the switch day when it waits for his games first.
+        drop_starts=(
+            base_starts.get(drop.nhl_player_id, 0.0)
+            - (after_starts.get(drop.nhl_player_id, 0.0) if later else 0.0)
+            if drop is not None
+            else 0.0
+        ),
         deltas=deltas,
         helps=helps,
         drop=drop,
