@@ -40,6 +40,20 @@ LOCK_TAG = "lock"
 ANCHOR_TIMES = ("07:00",)
 DEFAULT_TIMES = ANCHOR_TIMES
 
+# Windows' defaults for a task schtasks makes: a start missed while the PC was
+# off, asleep or signed out is never made up, and nothing starts on battery.
+# On 2026-10-15 an update restarted the PC at 09:30 and nobody signed in until
+# 20:21 the next day - that evening's lock runs and the next morning's anchor
+# never ran, and the lineup sat as it was. So the daily anchor runs as soon as
+# it can after a missed start (it re-plans the rest of the day), and no task
+# waits for mains power. A missed one-shot lock run is not made up: several
+# firing together at sign-in would only contend for the browser profile.
+SETTLE = (
+    "foreach ($n in @({names})) {{ $s = (Get-ScheduledTask -TaskName $n).Settings; "
+    "$s.StartWhenAvailable = ${catch_up}; $s.DisallowStartIfOnBatteries = $false; "
+    "$s.StopIfGoingOnBatteries = $false; Set-ScheduledTask -TaskName $n -Settings $s | Out-Null }}"
+)
+
 
 @dataclass(frozen=True)
 class Task:
@@ -66,6 +80,22 @@ class Task:
 
     def delete_args(self) -> list[str]:
         return ["schtasks", "/Delete", "/TN", self.name, "/F"]
+
+
+def settle_args(names: list[str], catch_up: bool) -> list[str]:
+    """One PowerShell call setting what schtasks cannot (see SETTLE)."""
+    quoted = ", ".join("'" + n.replace("'", "''") + "'" for n in names)
+    script = SETTLE.format(names=quoted, catch_up="true" if catch_up else "false")
+    return ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+
+
+def _settle(names: list[str], catch_up: bool) -> str:
+    """ "" when the tasks were set up, else why not - reported, never raised:
+    a task that runs on Windows' defaults still runs."""
+    if not names:
+        return ""
+    r = subprocess.run(settle_args(names, catch_up), capture_output=True, text=True)
+    return "" if r.returncode == 0 else (r.stderr or r.stdout).strip()[:100] or "failed"
 
 
 def _python() -> str:
@@ -114,13 +144,19 @@ def plan_day(manager: str, repo: Path, times: list[str], log: str = LOG) -> list
     reason at an hour nobody is watching.
     """
     out = [f"cleared {n}" for n in _clear_locks(manager)]
+    made = []
     for t in lock_tasks(manager, repo, times, log):
         r = subprocess.run(t.create_args(once=True), capture_output=True, text=True)
         ok = r.returncode == 0
+        if ok:
+            made.append(t.name)
         out.append(
             f"{'scheduled' if ok else 'FAILED'} a run at {t.time}"
             + ("" if ok else f" - {(r.stderr or r.stdout).strip()[:100]}")
         )
+    why = _settle(made, catch_up=False)
+    if why:
+        out.append(f"could not let them run on battery - {why}")
     if not times:
         out.append("no further locks today - nothing more to run")
     return out
@@ -152,10 +188,12 @@ def describe(items: list[Task], key_set: bool) -> str:
         "",
         "The command syncs last night's games, collects anything you decided on the",
         "page, works out tonight's lineup, and on the first day of a fantasy week",
-        "works out the week and proposes adds. No add, drop or claim is ever made -",
-        "those wait for your approval. Lineup changes are made in Yahoo only under",
-        "standing authority ([authority.lineup] enabled) and only where an actuator",
-        "is installed; otherwise they are recommendations on the page.",
+        "works out the week and proposes adds. No add, drop or claim is ever made",
+        "without your approval, and an approved one is made in Yahoo only where",
+        "[authority.transactions] execute_approved is on and an executor is installed.",
+        "Lineup changes are made in Yahoo only under standing authority",
+        "([authority.lineup] enabled) and only where an actuator is installed;",
+        "otherwise they are recommendations on the page.",
         "",
         "Each run also schedules the rest of today from the real game times - a",
         "player locks when his own game starts, so a 1pm matinee needs a run before",
@@ -173,15 +211,25 @@ def describe(items: list[Task], key_set: bool) -> str:
 
 
 def install(items: list[Task]) -> list[str]:
-    out = []
+    out, made = [], []
     for t in items:
         r = subprocess.run(t.create_args(), capture_output=True, text=True)
         ok = r.returncode == 0
+        if ok:
+            made.append(t.name)
         out.append(
             f"{'created' if ok else 'FAILED'} {t.name} at {t.time}"
             + ("" if ok else f" - {(r.stderr or r.stdout).strip()[:120]}")
         )
-    return out
+    why = _settle(made, catch_up=True)
+    out.append(
+        f"could not set a missed run to be made up - {why}"
+        if why
+        else "a run missed while the PC was off or signed out is made as soon as it can be"
+        if made
+        else ""
+    )
+    return [line for line in out if line]
 
 
 def remove(manager: str) -> list[str]:

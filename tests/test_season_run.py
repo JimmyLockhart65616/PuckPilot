@@ -93,6 +93,30 @@ def test_lock_runs_are_one_shot_and_separately_named():
     assert "DAILY" in items[0].create_args()
 
 
+def test_a_missed_anchor_is_made_up_and_nothing_waits_for_mains_power(monkeypatch):
+    """2026-10-15: an update restarted the PC and nobody signed in until the
+    next evening - the morning anchor never ran, and schtasks' defaults never
+    make up a missed start. Lock runs are not made up: they would all fire at
+    once at sign-in, and the anchor re-plans the day anyway."""
+    calls = []
+
+    def run(args, **kw):
+        calls.append(args)
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(schedule.subprocess, "run", run)
+    monkeypatch.setattr(schedule, "installed", lambda: [])
+    out = schedule.install(schedule.tasks("jimmy", Path(".")))
+    settle = calls[-1][-1]
+    assert calls[-1][0] == "powershell" and "'PuckPilot-jimmy-0700'" in settle
+    assert "StartWhenAvailable = $true" in settle
+    assert "DisallowStartIfOnBatteries = $false" in settle
+    assert any("made as soon as it can be" in line for line in out)
+    calls.clear()
+    schedule.plan_day("jimmy", Path("."), ["19:40"])
+    assert "StartWhenAvailable = $false" in calls[-1][-1] and "lock-1940" in calls[-1][-1]
+
+
 def test_a_lock_run_does_the_same_work_as_the_anchor():
     anchor = schedule.tasks("jimmy", Path("C:/repo/puckpilot"))[0]
     lock = schedule.lock_tasks("jimmy", Path("C:/repo/puckpilot"), ["12:40"])[0]
@@ -121,7 +145,7 @@ def test_the_preview_warns_when_the_page_key_is_not_set():
 
 def test_the_preview_says_what_is_and_is_not_written_to_yahoo():
     text = schedule.describe(schedule.tasks("jimmy", Path(".")), key_set=True)
-    assert "No add, drop or claim is ever made" in text
+    assert "No add, drop or claim is ever made" in text and "without your approval" in text
     assert "only under" in text and "standing authority" in text
 
 
