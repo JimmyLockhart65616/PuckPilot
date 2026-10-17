@@ -425,6 +425,19 @@ def run_day(
                 report, "act", lambda: act(conn, manager, league_key, roster, plan, report)
             )
 
+        # 3b. The rest of the week, set in Yahoo, so a run that never happens
+        # leaves a planned day rather than a copy of the last one set.
+        if plan is not None and week is not None:
+            ir_done = bool(plan.ir_moves) and bool(acted and acted.get("ok"))
+            _guard(
+                report,
+                "ahead",
+                lambda: _set_ahead(
+                    conn, manager, league_key, runtime, day, week, roster, models, report,
+                    pmap, moved_today=ir_done,
+                ),
+            )  # fmt: skip
+
     # 4. The week: the full plan, with adds, on the day it turns over; where it
     # stands - banked plus what is left - on every other run.
     week_plan = None
@@ -698,6 +711,113 @@ def act(conn, manager, league_key, roster, plan, report, apply=None) -> dict | N
     )
     report.add("act", result.ok, result.message, list(result.lines))
     return {"ok": bool(result.ok), "message": result.message, "at": datetime.now(UTC)}
+
+
+def _set_ahead(
+    conn,
+    manager,
+    league_key: str,
+    runtime,
+    day: str,
+    week,
+    roster,
+    models,
+    report,
+    pmap=None,
+    moved_today: bool = False,
+    read_rosters=None,
+    plan_for=None,
+    apply=None,
+) -> None:
+    """Set each remaining day of the week's lineup in Yahoo, planned like tonight's.
+
+    Yahoo fills a day nobody set from the last day set before it - checked
+    live on 2026-10-16: a change made for the 16th showed on every day to the
+    22nd. So a run that does not happen leaves the last lineup in place,
+    players without a game in active slots and players with one on the bench.
+    From 09:30 on 2026-10-15 an update restart stopped every run for 35
+    hours; that evening the next six days of carried-over lineup would have
+    cost about 33 against the planner's own plan for each day (lineup value,
+    about four player-games). A day set on its own is kept when an earlier
+    day changes - checked the same evening: 10-19 set, then 10-17, and 10-19
+    stood - so each day can be set ahead and still be re-planned by its own
+    run, with what is known then.
+
+    Done on the week's first run, and again when the roster has changed since
+    (an add, a drop - a day set before it has a hole where the dropped player
+    stood) or an IR move was made today. Each day is planned with today's
+    values and statuses, under the same authority as tonight, without the
+    weekly goalie minimum (Yahoo's count for a later day is not known yet).
+    `read_rosters(days)`, `plan_for(roster, day)` and `apply` are for tests.
+    """
+    import json
+
+    from puckpilot.data.store import get_meta, set_meta
+
+    auth = manager.authority.lineup
+    if not (auth.enabled and auth.set_ahead):
+        return
+    days = [d for d in week.dates() if d > day]
+    if not days:
+        return
+    if apply is None:
+        try:  # Optional local actuator; without one there is nothing to set.
+            from puckpilot.local.act import apply_lineup as apply
+        except ImportError:
+            return
+    key = f"ahead:{manager.name}:{week.start}"
+    members = ",".join(sorted(p.player_key for p in roster.players))
+    done = json.loads(get_meta(conn, key) or "{}")
+    if done and done.get("roster") == members and not moved_today:
+        return
+    why = "the week's first run" if not done else "the roster changed"
+    if read_rosters is None:
+        from puckpilot.season import cli_support
+        from puckpilot.season.fetch import fetch_roster
+
+        def read_rosters(ds):
+            return cli_support.run_session(
+                manager,
+                lambda s: {d: fetch_roster(s, roster.team_key, d, player_map=pmap) for d in ds},
+            )
+
+    if plan_for is None:
+        from puckpilot.season.today import build_plan
+
+        values, goalies = models
+
+        def plan_for(r, d):
+            return build_plan(
+                conn, runtime, r, values, goalies, d, manager=manager.name, authority=auth
+            )
+
+    from datetime import date as _date
+
+    rosters = read_rosters(days)
+    lines, failed = [], 0
+    for d in days:
+        label = _date.fromisoformat(d).strftime("%a %d")
+        planned = plan_for(rosters[d], d)
+        if not (planned.moves or planned.ir_moves):
+            lines.append(f"{label}: already as planned")
+            continue
+        scratch = RunReport(date=d, manager=manager.name)
+        got = act(conn, manager, league_key, rosters[d], planned, scratch, apply)
+        if got is None:
+            lines.append(f"{label}: nothing within authority to change")
+            continue
+        failed += 0 if got["ok"] else 1
+        lines.append(f"{label}: {got['message']}")
+    if not failed:
+        set_meta(conn, key, json.dumps({"on": day, "roster": members}))
+    report.add(
+        "ahead",
+        not failed,
+        f"rest of the week set in Yahoo ({why})"
+        if not failed
+        else f"{failed} day(s) not set - tried again next run",
+        lines,
+    )
 
 
 def _next_run(conn, manager, runtime, day, roster):

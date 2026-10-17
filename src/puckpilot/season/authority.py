@@ -78,6 +78,11 @@ class LineupAuthority:
     # an add fills it - and the add is still a proposal. Off unless agreed:
     # it is a roster move a person may want to make themselves.
     manage_ir: bool = False
+    # Set the rest of the week's lineups in Yahoo too - on the week's first run,
+    # and again whenever the roster has changed since - so a run that never
+    # happens leaves that day planned, not a copy of the last day set
+    # (`run._set_ahead`). Each day's own run still plans it again.
+    set_ahead: bool = True
     # Whether an approved week protocol also re-weights the daily lineup.
     #
     # OFF, on measurement. Scored by categories won per week - the only metric
@@ -138,6 +143,8 @@ class LineupAuthority:
             f"  weekly goalie minimum enforced: {'yes' if self.enforce_min_games else 'no'}",
             "  out players moved to a free IR slot: "
             + ("yes" if self.manage_ir else "no (recommended, not made)"),
+            "  the rest of the week set ahead (week's first run, and after a roster change): "
+            + ("yes" if self.set_ahead else "no"),
             "  changes are unlimited until each player's game starts",
             "  week protocol steers the lineup: "
             + ("yes" if self.follow_protocol else "no (measured inert)"),
