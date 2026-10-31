@@ -275,3 +275,21 @@ def test_an_add_into_a_spot_ir_freed_says_the_spot_is_on_loan(db, monkeypatch):
     (line,) = fill.detail["room"]
     assert "Back is on IR" in line and "today that would be Streamer" in line
     assert swap.detail == {}
+
+
+def test_the_card_names_anyone_cheaper_the_roster_minimum_kept(db, monkeypatch):
+    """On 10-31 the two goalies were the cheapest players on the roster, and the
+    card listed them first without saying why neither was the drop."""
+    from puckpilot.season import run as runmod
+    from puckpilot.season import week as weekmod
+    from tests.test_season_legality import RULES, SMALL
+
+    keep = {"goalie": 5.0, "streamer": 40.0, "centre": 300.0, "defence": 250.0, "back": 280.0}
+    monkeypatch.setattr(weekmod, "keep_values", lambda *a, **k: keep)
+    goalie = rp("goalie", "G", eligible=("G",), pos="G")
+    ours = roster(rp("centre", "C", ("C", "Util"), "C"), DROP, rp("defence", "D"), goalie, BACK)
+    fix = Fix(BACK, DROP, "IR+", "the least valuable legal drop")
+    lines = runmod._room_lines(fix, ours, None, TODAY, db, SMALL, RULES)
+    assert any(line.startswith("Rest-of-season value of those who may go") and "Goalie" not in line
+               for line in lines)  # fmt: skip
+    assert any("Worth less but kept: Goalie" in line and "minimum at G" in line for line in lines)

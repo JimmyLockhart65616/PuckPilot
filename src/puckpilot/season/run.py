@@ -393,22 +393,22 @@ def run_day(
     )
     if models is not None and keepers is not None:
         models[0].keepers = keepers  # read by the add cards
-    # 3a. Roster legality, on every run that has the roster: a player cleared
-    # to play on a Wednesday must not wait for Monday's search, and nothing an
-    # add search proposes can be made while the roster is illegal.
-    if roster is not None and models is not None:
-        _guard(
-            report,
-            "legality",
-            lambda: _legality(conn, manager, league_key, runtime, day, roster, ctx, models,
-                              report, propose),
-        )  # fmt: skip
     plan = None
     acted = None
     if roster is not None:
         save_roster(conn, manager.name, roster)
         report.add("roster", True, f"{len(roster)} players", list(roster.unmapped))
         _guard(report, "statuses", lambda: _statuses(conn, roster, report, "yours"))
+        # 3a. Roster legality, on every run that has the roster: a player
+        # cleared to play on a Wednesday must not wait for Monday's search, and
+        # nothing an add search proposes can be made while the roster is illegal.
+        if models is not None:
+            _guard(
+                report,
+                "legality",
+                lambda: _legality(conn, manager, league_key, runtime, day, roster, ctx,
+                                  models, report, propose),
+            )  # fmt: skip
 
         def _plan():
             values, goalies = models
@@ -807,7 +807,8 @@ def _legality(conn, manager, league_key, runtime, day, roster, ctx, models, repo
             continue
         p, new = proposals_mod.propose_fix(
             conn, manager.name, league_key, roster.team_key, f, week_no,
-            {"detail": {"room": _room_lines(f, res, roster, values, day, conn, runtime)}},
+            {"detail": {"room": _room_lines(f, roster, values, day, conn, runtime,
+                                            manager.league.draft_rules())}},
         )  # fmt: skip
         state = "proposed" if new else p.status
         lines.append(f"{state}: #{p.id} {head} ({f.reason})")
@@ -817,13 +818,19 @@ def _legality(conn, manager, league_key, runtime, day, roster, ctx, models, repo
     return res
 
 
-def _room_lines(fix, res, roster, values, day, conn, runtime) -> list[str]:
-    """Why this drop, for the card: the rule, and the cheapest few it was chosen from."""
+def _room_lines(fix, roster, values, day, conn, runtime, rules=None) -> list[str]:
+    """Why this drop, for the card: the rule, the cheapest few it was chosen
+    from, and anyone cheaper whom the roster's minimums kept - so "why not
+    him?" is answered on the card."""
     from puckpilot.season import legality
     from puckpilot.season import week as weekmod
 
     keep = weekmod.keep_values(conn, runtime, roster.players, values, day)
-    pool = sorted(legality.droppable(roster), key=lambda q: keep.get(q.player_key, 0.0))
+    ranked = sorted(legality.droppable(roster), key=lambda q: keep.get(q.player_key, 0.0))
+    counts = legality.position_counts(roster)
+    pool = [q for q in ranked if legality.legal_drop(fix.player.position, q, counts, rules)]
+    floor = keep.get(fix.drop.player_key, 0.0) if fix.drop is not None else 0.0
+    kept = [q for q in ranked if q not in pool and keep.get(q.player_key, 0.0) < floor]
     out = [
         f"{fix.player.name} is cleared to play, but still in {fix.slot}: until he is back on the "
         f"active roster Yahoo refuses every add (Error #845), and all active spots are full.",
@@ -833,10 +840,20 @@ def _room_lines(fix, res, roster, values, day, conn, runtime) -> list[str]:
     ]
     if fix.releases:
         out.append(f"{fix.player.name} himself is worth least, so he is the one released.")
-    ranked = ", ".join(f"{q.name} {keep.get(q.player_key, 0.0):.0f}" for q in pool[:4])
-    if ranked:
-        out.append(f"Rest-of-season value, lowest first: {ranked}; "
-                   f"{fix.player.name} {keep.get(fix.player.player_key, 0.0):.0f}.")  # fmt: skip
+    line = ", ".join(f"{q.name} {keep.get(q.player_key, 0.0):.0f}" for q in pool[:4])
+    if line:
+        back = keep.get(fix.player.player_key, 0.0)
+        out.append(
+            f"Rest-of-season value of those who may go, lowest first: {line}; "
+            f"{fix.player.name} {back:.0f}."
+        )
+    if kept:
+        names = ", ".join(q.name for q in kept)
+        pos = "/".join(sorted({q.position for q in kept}))
+        out.append(
+            f"Worth less but kept: {names} - dropping {'him' if len(kept) == 1 else 'them'} "
+            f"would leave the roster under its minimum at {pos}."
+        )
     return out
 
 
