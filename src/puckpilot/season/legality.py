@@ -94,9 +94,16 @@ def ir_changes(runtime: LeagueRuntime, roster: TeamRoster) -> tuple[list[Move], 
 
     alerts: list[str] = []
     for p in _stuck(roster):
-        if active < limit:
+        if active < limit and p.is_editable:
             moves.append(Move(player=p, to_slot=BENCH, from_slot=p.selected_slot))
             active += 1
+        elif active < limit:
+            # His game today has begun: Yahoo will not move him until tomorrow,
+            # and a move it refuses fails the whole lineup.
+            alerts.append(
+                f"{p.name} can come off {p.selected_slot} into a free spot, but his game today "
+                f"has begun - he comes back tomorrow morning."
+            )
         else:
             alerts.append(_ir_text(p))
     return moves, alerts

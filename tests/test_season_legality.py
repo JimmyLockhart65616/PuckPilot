@@ -245,3 +245,15 @@ def test_made_means_the_drop_is_gone_and_the_player_stays():
     assert MoveKind.ACTIVATE.made_on(after, "back", "streamer")
     released = team(CENTRE, STREAMER, DEFENCE, GOALIE)
     assert MoveKind.ACTIVATE.made_on(released, "back", "back")
+
+
+def test_a_returning_player_whose_game_has_begun_comes_back_tomorrow():
+    """A move Yahoo refuses fails the whole lineup: one made after a drop the same
+    evening, for a player whose game had started, would have."""
+    from dataclasses import replace
+
+    locked = replace(BACK, is_editable=False)
+    moves, alerts = legality.ir_changes(SMALL, team(CENTRE, DEFENCE, GOALIE, locked))
+    assert moves == [] and "comes back tomorrow morning" in alerts[0]
+    moves, _ = legality.ir_changes(SMALL, team(CENTRE, DEFENCE, GOALIE, BACK))
+    assert [m.describe() for m in moves] == ["ACTIVATE Back IR+ -> BN"]
