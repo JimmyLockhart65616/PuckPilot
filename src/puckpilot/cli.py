@@ -2104,6 +2104,13 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
     values = build_value_model(conn, season, tuple(train), manager.league)
     goalies = ChainedGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0]))
     used_week, used_season = adds_used(ours, m.as_week())
+    # Priced on the roster as it will stand once any make-room move is made -
+    # the same rule the scheduled run follows (`run._resolution`).
+    from puckpilot.season import legality
+    from puckpilot.season.run import _resolution
+
+    resolution = _resolution(conn, manager, runtime, ours, values, today)
+    priced = ours if resolution.legal else legality.as_resolved(ours, resolution)
 
     plan = weekmod.build_week_plan(
         conn,
@@ -2111,7 +2118,7 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         manager.league,
         m.as_week(),
         m.opponent_name,
-        ours,
+        priced,
         theirs,
         available,
         universe.frame,
@@ -2139,12 +2146,27 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
     print()
     print(plan.text())
     print()
-    stuck = ours.illegal_ir()
-    if args.propose and plan.targets and stuck:
-        print(
-            "  Not queued: " + ", ".join(p.name for p in stuck) + " must come off IR first -"
-            " Yahoo refuses every add and drop until then."
-        )
+    from puckpilot.season.moves import MoveKind
+
+    for v in resolution.violations:
+        print(f"  !! {v.message}")
+    for f in resolution.transactions:
+        head = MoveKind.ACTIVATE.head(f.player.name if f.player else "", f.drop.name, f.slot)
+        if args.propose and f.player is not None:
+            from puckpilot.season import proposals
+
+            pr, new = proposals.propose_fix(
+                conn, manager.name, league_key, ours.team_key, f, plan.week
+            )
+            print(f"  {'Queued' if new else 'Waiting'} #{pr.id}: {head} ({f.reason})")
+        else:
+            print(f"  Needed first: {head} ({f.reason})")
+    for why in resolution.unresolved:
+        print(f"  !! {why}")
+    if resolution.transactions and plan.targets:
+        print("  The adds below assume that move is made first.")
+    if args.propose and plan.targets and resolution.unresolved:
+        print("  Not queued: the roster is illegal and nothing on it can be dropped to fix it.")
     elif args.propose and plan.targets:
         from puckpilot.season import proposals
 

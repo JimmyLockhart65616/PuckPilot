@@ -211,7 +211,10 @@ function renderProposals(root, list) {
   h2(root, 'Needs your decision');
   list.forEach(function (p) {
     var c = card(root);
-    c.appendChild(el('div', null, 'Add ' + p.add + (p.drop ? '  \\u2013  drop ' + p.drop : '')));
+    // The server words the first line per kind of move (`head`); a push from
+    // before it did carries none, and every card then was an add.
+    c.appendChild(el('div', null, p.head ||
+      ('Add ' + p.add + (p.drop ? '  \\u2013  drop ' + p.drop : ''))));
     if (p.why) c.appendChild(el('div', 'sub', p.why));
     if (p.timing) c.appendChild(el('div', 'sub', p.timing));
     // The server words what Approve does, card by card, and the tap sends

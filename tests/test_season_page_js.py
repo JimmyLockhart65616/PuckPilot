@@ -562,3 +562,38 @@ def test_a_tab_left_open_across_a_redeploy_reloads_itself():
 def test_a_relay_that_sends_no_build_never_reloads_the_page():
     state = {k: v for k, v in SeasonState().get("jimmy").items() if k != "build"}
     assert _reloads([state, state, state]) == 0
+
+
+def test_a_make_room_card_leads_with_its_own_words():
+    """A make-room move is not an add: the server words its first line (`head`),
+    and a push from before `head` existed still reads "Add X - drop Y"."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "alerts": ["Back is no longer eligible for IR+"],
+            "proposals": [
+                {
+                    "id": 21,
+                    "kind": "activate",
+                    "head": "Make room: drop Streamer so Back comes off IR+",
+                    "add": "Back",
+                    "drop": "Streamer",
+                    "why": "Yahoo refuses every add until this is made",
+                    "timing": "",
+                    "executes": True,
+                    "approve_means": "Approve and PuckPilot drops Streamer in Yahoo",
+                    "detail": [{"title": "Why this move", "lines": ["The drop is the player"]}],
+                },
+                {"id": 22, "add": "Old Card", "drop": "Someone", "why": "", "timing": ""},
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    assert "Make room: drop Streamer so Back comes off IR+" in out["app"]
+    assert "Add Back" not in out["app"]
+    assert "Why this move" in out["app"]
+    assert "Add Old Card" in out["app"] and "drop Someone" in out["app"]

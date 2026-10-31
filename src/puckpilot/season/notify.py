@@ -51,10 +51,22 @@ def send(
 
 
 def new_pickups(proposals, page_url: str = "", post=None) -> bool:
-    """One notification for the pickups a run just queued."""
+    """One notification for the pickups a run just queued.
+
+    A make-room move leads, at high priority: until it is made the roster is
+    illegal and no pickup in the same message can be made either.
+    """
     if not proposals:
         return False
-    lines = []
+    from puckpilot.season.moves import kind_of
+
+    rooms = [p for p in proposals if not kind_of(getattr(p, "kind", None)).spends_acquisition]
+    proposals = [p for p in proposals if p not in rooms]
+    lines = [
+        kind_of(p.kind).head(p.add_name, p.drop_name, str(p.reason.get("slot", "")))
+        + " - no add can be made until it is"
+        for p in rooms
+    ]
     for p in proposals:
         gain = p.reason.get("expected_gain")
         head = f"Add {p.add_name}" + (f" for {p.drop_name}" if p.drop_player_key else "")
@@ -63,6 +75,11 @@ def new_pickups(proposals, page_url: str = "", post=None) -> bool:
         lines.append(head + worth + (f" ({', '.join(helps[:2])})" if helps else ""))
     n = len(proposals)
     title = "New pickup to decide on" if n == 1 else f"{n} pickups to decide on"
+    if rooms:
+        title = "Roster blocked: approve the make-room move" + (f" (+{n} pickups)" if n else "")
+        return send(
+            title, "\n".join(lines), click=page_url, priority="high", tags="warning", post=post
+        )
     return send(title, "\n".join(lines), click=page_url, tags="ice_hockey", post=post)
 
 

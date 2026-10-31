@@ -31,13 +31,14 @@ from dataclasses import dataclass, field, replace
 from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.season import calendar
 from puckpilot.season.authority import LineupAuthority
+from puckpilot.season.legality import ir_changes
+from puckpilot.season.moves import BENCH, Move
 from puckpilot.season.odds import game_worth
 from puckpilot.season.roster import RosterPlayer, TeamRoster
-from puckpilot.season.settings import IR_SLOTS, YAHOO_TO_POS, LeagueRuntime
+from puckpilot.season.settings import YAHOO_TO_POS, LeagueRuntime
 from puckpilot.season.values import ValueModel
 
-# Yahoo's slot name for a benched player, and the engine's name for the flex.
-BENCH = "BN"
+# The engine's name for the flex (the bench slot is `moves.BENCH`).
 UTIL = "UTIL"
 YAHOO_UTIL = "Util"
 
@@ -70,53 +71,6 @@ class Candidate:
     @property
     def is_goalie(self) -> bool:
         return self.player.position == "G"
-
-
-@dataclass(frozen=True)
-class Move:
-    """One change to make in Yahoo."""
-
-    player: RosterPlayer
-    to_slot: str
-    from_slot: str
-
-    @property
-    def is_ir(self) -> bool:
-        """Onto an IR slot - off the active roster."""
-        return self.to_slot in IR_SLOTS
-
-    @property
-    def is_activation(self) -> bool:
-        """Off an IR slot and back onto the active roster."""
-        return self.from_slot in IR_SLOTS and self.to_slot not in IR_SLOTS
-
-    @property
-    def is_start(self) -> bool:
-        return self.to_slot != BENCH and not self.is_ir
-
-    @property
-    def is_bench(self) -> bool:
-        return self.to_slot == BENCH and not self.is_activation
-
-    @property
-    def kind_order(self) -> int:
-        """Roster moves first - they change who is available - then starts."""
-        if self.is_ir or self.is_activation:
-            return -1
-        if self.is_bench:
-            return 2
-        return 0 if self.from_slot in (BENCH, "?") else 1
-
-    def describe(self) -> str:
-        if self.is_ir:
-            return f"IR    {self.player.name} {self.from_slot} -> {self.to_slot}"
-        if self.is_activation:
-            return f"ACTIVATE {self.player.name} {self.from_slot} -> {self.to_slot}"
-        if self.is_bench:
-            return f"BENCH {self.player.name}  (was {self.from_slot})"
-        if self.from_slot in (BENCH, "?"):
-            return f"START {self.player.name} in {self.to_slot}"
-        return f"MOVE  {self.player.name} {self.from_slot} -> {self.to_slot}"
 
 
 @dataclass(frozen=True)
@@ -511,70 +465,6 @@ def _steered_note(candidates, assignment, plain, shape, incumbent) -> list[str]:
     if benched:
         line += " over " + ", ".join(benched)
     return [line + " - more expected categories than season value would get."]
-
-
-def ir_changes(runtime: LeagueRuntime, roster: TeamRoster) -> tuple[list[Move], list[str]]:
-    """Roster moves between IR and the active roster, and what blocks them.
-
-    Out players go onto a free IR slot they are eligible for - Yahoo's own
-    `eligible_positions` says which, so no status table is kept here. That
-    frees an active roster spot, which an add can then fill without a drop.
-
-    The reverse matters more. A player still in an IR slot once he is no longer
-    eligible for it makes the roster illegal, and Yahoo refuses every add and
-    drop until it is fixed: he is activated when an active spot is free, and
-    otherwise the alert says a drop has to come first.
-    """
-    cap = {s.position: s.count for s in runtime.slots if s.position in IR_SLOTS}
-    free = dict(cap)
-    for p in roster.players:
-        if p.selected_slot in free:
-            free[p.selected_slot] -= 1
-    active_cap = sum(s.count for s in runtime.slots if s.position not in IR_SLOTS)
-    active = sum(1 for p in roster.players if not p.on_ir)
-
-    moves: list[Move] = []
-    # Most restrictive slot first, so the flexible ones stay open for later.
-    order = [s for s in ("IR", "IR-LT", "NA", "IR+") if s in cap] + sorted(
-        s for s in cap if s not in ("IR", "IR-LT", "NA", "IR+")
-    )
-    for p in roster.players:
-        if not p.is_out or p.on_ir or not p.is_editable:
-            continue
-        slot = next((s for s in order if s in p.yahoo_eligible and free.get(s, 0) > 0), None)
-        if slot is None:
-            continue
-        moves.append(Move(player=p, to_slot=slot, from_slot=p.selected_slot))
-        free[slot] -= 1
-        active -= 1
-
-    alerts: list[str] = []
-    for p in roster.players:
-        if not p.on_ir or p.selected_slot in p.yahoo_eligible:
-            continue
-        if active < active_cap:
-            moves.append(Move(player=p, to_slot=BENCH, from_slot=p.selected_slot))
-            active += 1
-        else:
-            alerts.append(
-                f"{p.name} is no longer eligible for {p.selected_slot}, which makes the "
-                f"roster illegal - Yahoo blocks every add and drop until he is back on "
-                f"the active roster, and there is no free spot: a drop has to come first."
-            )
-    return moves, alerts
-
-
-def open_roster_spots(runtime: LeagueRuntime, roster: TeamRoster) -> int:
-    """Active roster spots free once today's IR moves are made.
-
-    Each one is an add that needs no drop - the spot an injured player was
-    holding, once he is on IR.
-    """
-    moves, _ = ir_changes(runtime, roster)
-    cap = sum(s.count for s in runtime.slots if s.position not in IR_SLOTS)
-    active = sum(1 for p in roster.players if not p.on_ir)
-    active += sum(1 for m in moves if m.is_activation) - sum(1 for m in moves if m.is_ir)
-    return max(cap - active, 0)
 
 
 def _demote_questionable(candidates: list[Candidate]) -> None:

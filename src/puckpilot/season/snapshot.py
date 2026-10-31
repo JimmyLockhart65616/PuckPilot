@@ -61,6 +61,7 @@ def build(
     lineup_by: str = "season value",
     executes_moves: bool = False,
     today: str = "",
+    executable_kinds: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -74,6 +75,9 @@ def build(
     the lesson the draft relay's cold payload taught.
 
     `today` dates the cards' "made when" words when there is no `plan` to.
+    `executable_kinds`: the move kinds the installed executor can make (None:
+    every kind, when `executes_moves`); a card of any other kind says to make
+    it yourself, because nothing here would.
     """
     snap: dict[str, Any] = {
         "team": team_name,
@@ -132,15 +136,27 @@ def build(
     # In the order they were proposed: the search's best first, and a later
     # card's "assumes ... is made too" refers to one above it.
     pending = sorted(proposals_mod.pending(conn, manager, league_key), key=lambda p: p.id)
+    # Make-room moves first: until one is made, no add below it can be.
+    pending.sort(key=lambda p: (p.move_kind.spends_acquisition, p.id))
     snap["proposals"] = [
         {
             "id": p.id,
+            "kind": p.move_kind.value,
+            # The card's first line, worded here so the page stays a renderer.
+            "head": p.move_kind.head(
+                p.add_name, p.drop_name if p.drop_player_key else "", str(p.reason.get("slot", ""))
+            ),
             "add": p.add_name,
             "drop": p.drop_name if p.drop_player_key else "",
             "why": _why(p),
             "timing": str(p.reason.get("timing", "")),
             "detail": _reasons(p.reason.get("detail")),
-            **_approve_means(p, executes_moves, snap["date"] or today),
+            **_approve_means(
+                p,
+                executes_moves
+                and (executable_kinds is None or p.move_kind.value in executable_kinds),
+                snap["date"] or today,
+            ),
         }
         for p in pending
     ]
@@ -225,6 +241,12 @@ def _withdrawn(conn, manager: str, league_key: str) -> list[dict]:
 
 def _why(p) -> str:
     """The net effect, in the league's own units - not an abstract score."""
+    if not p.move_kind.spends_acquisition:
+        gain = p.reason.get("expected_gain")
+        lead = "Yahoo refuses every add until this is made"
+        if gain is not None:
+            return f"{lead} · {float(gain):+.2f} categories expected this week with it made"
+        return lead
     bits = []
     # Which week it was priced for: on a week's last day, the next one.
     when = str(p.reason.get("horizon") or "this week")
@@ -276,9 +298,15 @@ def _approved_unmade(conn, manager: str, league_key: str, week_plan, roster) -> 
     mine = {p.player_key for p in roster.players} if roster is not None else set()
     out = []
     for p in proposals_mod.approved_unmade(conn, manager, league_key, week_plan.week):
-        if p.add_player_key in mine:
+        if p.move_kind.spends_acquisition and p.add_player_key in mine:
             continue
-        move = p.add_name + (f" for {p.drop_name}" if p.drop_player_key else "")
+        if not p.move_kind.spends_acquisition and p.drop_player_key not in mine:
+            continue  # a make-room move whose drop is gone: made
+        move = (
+            p.move_kind.head(p.add_name, p.drop_name, str(p.reason.get("slot", "")))
+            if not p.move_kind.spends_acquisition
+            else p.add_name + (f" for {p.drop_name}" if p.drop_player_key else "")
+        )
         who = (
             "PuckPilot makes it in Yahoo"
             if p.reason.get("approved_to_execute")
@@ -345,8 +373,22 @@ def _approve_means(p, executes_moves: bool, today: str = "") -> dict:
     waiver claim is never made by PuckPilot, and a move queued for after
     tonight's games says so.
     """
+    from puckpilot.season.moves import MoveKind
+
     if not executes_moves:
         return {"executes": False, "approve_means": MANUAL}
+    if p.move_kind is MoveKind.ACTIVATE:
+        back = p.add_name
+        if p.drop_player_key == p.add_player_key:
+            what = f"releases {back} in Yahoo"
+        else:
+            what = f"drops {p.drop_name} in Yahoo and then moves {back} back to the active roster"
+        return {
+            "executes": True,
+            "approve_means": f"Approve and PuckPilot {what} on its next run, checking each step "
+            f"and then your roster - and only while the roster still needs it. Reject and "
+            f"the roster stays illegal: no add can be made.",
+        }
     if str(p.reason.get("timing", "")).startswith("on waivers"):
         return {
             "executes": False,

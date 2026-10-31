@@ -89,8 +89,8 @@ def test_a_run_notifies_its_new_pickups_and_a_missed_lineup(db, monkeypatch):
     db.execute(
         "INSERT INTO waiver_proposals (created_at, add_pid, drop_pid, reason_json, status, manager,"
         " league_key, team_key, kind, add_player_key, drop_player_key) VALUES"
-        " ('2026-10-06 11:00:00', 1, NULL, '{}', 'pending', 'm', 'L', 'T', 'add', 'a1', NULL),"
-        " ('2026-10-06 09:00:00', 2, NULL, '{}', 'pending', 'm', 'L', 'T', 'add', 'a2', NULL)"
+        " ('2026-10-06 11:00:00', 1, NULL, '{}', 'pending', 'm', 'L', 'T', 'add_drop', 'a1', NULL),"
+        " ('2026-10-06 09:00:00', 2, NULL, '{}', 'pending', 'm', 'L', 'T', 'add_drop', 'a2', NULL)"
     )
     db.commit()
     manager = SimpleNamespace(name="m", page=SimpleNamespace(url="https://page", publishes=True))

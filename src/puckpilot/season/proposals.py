@@ -20,6 +20,8 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from puckpilot.season.moves import MoveKind, kind_of
+
 PENDING = "pending"
 APPROVED = "approved"
 REJECTED = "rejected"
@@ -57,6 +59,10 @@ class Proposal:
     @property
     def is_live(self) -> bool:
         return self.status == PENDING and not self.superseded_at
+
+    @property
+    def move_kind(self) -> MoveKind:
+        return kind_of(self.kind)
 
     @property
     def add_name(self) -> str:
@@ -135,10 +141,13 @@ def propose(
     dropping Tuch or Malkin) filled `max_pending` and would have left the new
     engine no room to propose anything on the season's first day.
     """
+    kind = kind_of(kind).value  # refuses a kind nothing knows how to make
     if supersede:
         fresh = {(t.player.player_key, t.drop.player_key if t.drop else ""): t for t in targets}
         now = _now()
         for p in pending(conn, manager, league_key):
+            if p.kind != kind:
+                continue  # another kind's queue: a make-room move is not this search's to drop
             t = fresh.get((p.add_player_key, p.drop_player_key))
             if t is None:
                 _withdraw(conn, p, "a newer search no longer proposes it", now)
@@ -151,8 +160,11 @@ def propose(
     existing = _already_asked(conn, manager, league_key, week)
     # The cap is on what is awaiting a decision. A refusal from earlier this
     # week stops that player coming back, but it is not clutter in the queue,
-    # so it must not use up a slot.
-    room = max_pending - len(pending(conn, manager, league_key))
+    # so it must not use up a slot - and nor does a make-room move, which is
+    # required rather than chosen.
+    room = max_pending - sum(
+        1 for p in pending(conn, manager, league_key) if p.move_kind.is_search_result
+    )
     made: list[Proposal] = []
     for t in targets:
         if room <= 0:
@@ -209,6 +221,99 @@ def refresh(conn: sqlite3.Connection, kept: dict[int, object], lapsed: dict[int,
         if p.is_live:
             _withdraw(conn, p, why, now)
     conn.commit()
+
+
+def propose_fix(
+    conn: sqlite3.Connection,
+    manager: str,
+    league_key: str,
+    team_key: str,
+    fix,
+    week: int,
+    reason: dict | None = None,
+) -> tuple[Proposal, bool]:
+    """Queue one make-room move (`legality.Fix` with a drop). Returns (proposal, new).
+
+    One per returning player: an open one (pending, or approved and not yet
+    made) for the same player is kept - its reason refreshed while pending -
+    unless the drop it names is no longer the right one, in which case a
+    pending one is withdrawn with the reason and replaced. An approved one is
+    never replaced: it was decided, and its drop is held for it.
+    """
+    if fix.player is None or fix.drop is None:
+        raise ProposalError("a make-room proposal needs the returning player and a drop")
+    if fix.player.nhl_player_id is None and fix.drop.nhl_player_id is None:
+        raise ProposalError(f"{fix.player.name} is not in the player map")
+    body = {
+        "week": week,
+        "add_name": fix.player.name,
+        "add_team": fix.player.team,
+        "drop_name": fix.drop.name,
+        "slot": fix.slot,
+        "releases": fix.releases,
+        "why_drop": fix.reason,
+        "timing": "",
+        "helps": [],
+        **(reason or {}),
+    }
+    now = _now()
+    for p in listing(conn, manager, league_key, limit=200):
+        if p.kind != MoveKind.ACTIVATE.value or p.add_player_key != fix.player.player_key:
+            continue
+        if p.status == APPROVED:
+            return p, False
+        if not p.is_live:
+            continue
+        if p.drop_player_key == fix.drop.player_key:
+            merged = {**p.reason, **body}
+            conn.execute(
+                "UPDATE waiver_proposals SET reason_json = ? WHERE id = ?",
+                (json.dumps(merged), p.id),
+            )
+            conn.commit()
+            return get(conn, p.id), False
+        _withdraw(conn, p, f"{fix.drop.name} is now the one to drop instead", now)
+    cur = conn.execute(
+        "INSERT INTO waiver_proposals "
+        "(manager, league_key, team_key, kind, add_pid, drop_pid, "
+        " add_player_key, drop_player_key, reason_json, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            manager,
+            league_key,
+            team_key,
+            MoveKind.ACTIVATE.value,
+            fix.player.nhl_player_id if fix.player.nhl_player_id is not None else 0,
+            fix.drop.nhl_player_id,
+            fix.player.player_key,
+            fix.drop.player_key,
+            json.dumps(body),
+            PENDING,
+        ),
+    )
+    conn.commit()
+    return get(conn, int(cur.lastrowid)), True
+
+
+def retire_fixes(
+    conn: sqlite3.Connection, manager: str, league_key: str, still_stuck: set[str]
+) -> list[Proposal]:
+    """Withdraw pending make-room moves whose player no longer needs room.
+
+    He came back by hand, a spot opened, or his status put him back in line
+    for the IR slot: the drop would now cost a player for nothing. Approved
+    ones are left to the executor's own check (`transactions.still_needed`),
+    which cancels them with the reason.
+    """
+    now = _now()
+    out = []
+    for p in pending(conn, manager, league_key):
+        if p.kind == MoveKind.ACTIVATE.value and p.add_player_key not in still_stuck:
+            _withdraw(conn, p, f"{p.add_name} no longer needs a roster spot made", now)
+            out.append(get(conn, p.id))
+    if out:
+        conn.commit()
+    return out
 
 
 def _withdraw(conn: sqlite3.Connection, p: Proposal, why: str, now: str) -> None:

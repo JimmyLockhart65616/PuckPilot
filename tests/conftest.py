@@ -14,6 +14,8 @@ def _no_actuator(monkeypatch):
     machine that has one would otherwise act on a real league from a unit test.
     """
     monkeypatch.setitem(sys.modules, "puckpilot.local.act", None)
+    # Nor a real transaction executor: a test that wants one passes its own.
+    monkeypatch.setitem(sys.modules, "puckpilot.local.transact", None)
 
 
 @pytest.fixture

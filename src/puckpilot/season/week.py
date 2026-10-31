@@ -32,7 +32,7 @@ from statistics import NormalDist
 from puckpilot.engine.categories import CATALOG, Category
 from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.league import LeagueConfig
-from puckpilot.season import calendar
+from puckpilot.season import calendar, legality
 from puckpilot.season.add_story import SECTIONS, SeasonLeft, games_left, share_of
 from puckpilot.season.pool import PoolPlayer
 from puckpilot.season.roster import RosterPlayer, TeamRoster
@@ -762,7 +762,7 @@ def add_headroom(
     sign the same player three times and each further move displaces a better
     player than the last. An open roster spot is an add with nothing given up.
     """
-    from puckpilot.season.today import ir_changes, open_roster_spots
+    from puckpilot.season.legality import ir_changes, open_roster_spots
 
     games = team_games_in(conn, runtime, week, days)
     if workload is not None:
@@ -1312,32 +1312,18 @@ def _targets(
         raise ValueError(f"time_moves must be one of {TIME_MODES}, not {time_moves!r}")
     if drop_choice not in DROP_CHOICES:
         raise ValueError(f"drop_choice must be one of {DROP_CHOICES}, not {drop_choice!r}")
-    from puckpilot.season.today import ir_changes, open_roster_spots
+    from puckpilot.season.legality import ir_changes, open_roster_spots
 
     cats = league.all_cats
     days = days if days is not None else week.dates()
     # Going to IR is not the same as being worth dropping: an injured regular
     # is put on IR, which frees his spot, rather than cut for a streamer.
     to_ir = {m.player.player_key for m in ir_changes(runtime, ours)[0] if m.is_ir}
-    # An injured or not-active player is never proposed as a drop: whether
-    # "NA" or "O" is a night or a season is a person's call, not a model's.
-    droppable = [
-        p
-        for p in ours.players
-        if not p.is_undroppable
-        and p.nhl_player_id is not None
-        and not p.on_ir
-        and not p.is_out
-        and p.player_key not in to_ir
-        # Next season's best keepers are not this week's to give away.
-        and not getattr(p, "keeper_protected", False)
-        # Already the drop of a move approved and waiting to be made.
-        and p.player_key not in (hold or ())
-    ]
-    counts: dict[str, int] = {}
-    for p in ours.players:
-        if not p.on_ir and p.player_key not in to_ir:
-            counts[p.position] = counts.get(p.position, 0) + 1
+    # Who may be dropped (never one injured, NA, a protected keeper or an
+    # approved move's drop) and the positional counts - roster legality's own,
+    # so a make-room drop and a swap's drop are chosen by the same rule.
+    droppable = legality.droppable(ours, hold or (), to_ir)
+    counts = legality.position_counts(ours, to_ir)
     rules = league.draft_rules()
     spots = open_roster_spots(runtime, ours)
     evaluate = _evaluator(
@@ -1988,6 +1974,17 @@ def _season_value(droppable, values, season_left, day) -> dict[str, float]:
     }
 
 
+def keep_values(conn, runtime, players, values, day: str, workload=None) -> dict[str, float]:
+    """Each mapped player's value over the rest of the season, by player key.
+
+    What letting him go costs - the scale every drop is chosen on, a swap's
+    (`_season_value`) and roster legality's make-room drop alike.
+    """
+    mapped = [p for p in players if p.nhl_player_id is not None]
+    left = _season_left(conn, runtime, day, mapped, workload)
+    return _season_value(mapped, values, left, day)
+
+
 def _season_left(conn, runtime, day: str, players, workload=None) -> SeasonLeft:
     """Each club's games from `day` to the season's end, and - with a goalie
     `workload` - each of these goalies' expected share of his club's."""
@@ -2123,12 +2120,7 @@ def _legal(cand, p, counts, rules) -> bool:
     a position below its minimum - counting the player coming in, so a centre
     for a centre is never refused for leaving the roster a centre short.
     """
-    pos_add = cand.position
-    over_cap = counts.get(pos_add, 0) + 1 > rules.caps.get(pos_add, 99)
-    if over_cap and p.position != pos_add:
-        return False
-    after = counts.get(p.position, 0) - 1 + (1 if p.position == pos_add else 0)
-    return after >= rules.mins.get(p.position, 0)
+    return legality.legal_drop(cand.position, p, counts, rules)
 
 
 def _cheapest_legal_drop(cand, droppable, drop_values, counts, rules):

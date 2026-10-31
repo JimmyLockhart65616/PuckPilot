@@ -48,6 +48,7 @@ LABELS = {
 LOW, HIGH = 0.10, 0.90
 # The order sections are shown in, with their headings.
 SECTIONS = (
+    ("room", "Why this move"),
     ("week", "Day by day"),
     ("odds", "Category odds, before -> after"),
     ("profile", "Who they are"),

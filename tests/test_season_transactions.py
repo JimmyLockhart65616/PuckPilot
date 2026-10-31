@@ -354,7 +354,7 @@ def _pending(db, key="a1", drop=None, **reason):
     cur = db.execute(
         "INSERT INTO waiver_proposals (created_at, add_pid, reason_json, status, manager,"
         " league_key, team_key, kind, add_player_key, drop_player_key) VALUES"
-        " ('2026-10-06 11:00:00', 1, ?, 'pending', 'm', 'L', 'T', 'add', ?, ?)",
+        " ('2026-10-06 11:00:00', 1, ?, 'pending', 'm', 'L', 'T', 'add_drop', ?, ?)",
         (json.dumps({"add_name": "Pickup", **reason}), key, drop),
     )
     db.commit()
