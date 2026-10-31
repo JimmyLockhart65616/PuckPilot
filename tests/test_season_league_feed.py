@@ -278,3 +278,25 @@ def test_a_saved_roster_comes_back_with_positions(db):
     got = g3.saved_roster(db, "L", "L.t.3", "2026-10-19")
     assert [(q.position, q.nhl_player_id, q.selected_slot) for q in got.players] == [("G", 42, "G")]
     assert g3.saved_roster(db, "L", "L.t.3", "2026-10-26") is None
+
+
+def test_rival_rates_are_measured_from_the_league(db):
+    """What the replay's streaming rivals are calibrated on: adds per team a
+    week, and the share that are goalies."""
+    weeks = (SimpleNamespace(number=4, start="2026-10-19"),)
+    lf.sync(db, _Source(), "L", SimpleNamespace(weeks=weeks), "m", today="2026-10-31")
+    when = lf.parse_transactions(TXNS)[0].at[:10]
+    rate, goalie_share, n = lf.rival_rates(db, "L", when, when)
+    # One team, one add (a goalie) in one day: 7 adds a week.
+    assert n == 1 and abs(rate - 7.0) < 1e-9 and goalie_share == 1.0
+    assert lf.rival_rates(db, "L", "2000-01-01", "2000-01-07") == (0.0, 0.0, 0)
+
+
+def test_an_unknown_rival_mode_is_refused(db):
+    import pytest
+
+    from puckpilot.league import DEFAULT_LEAGUE
+    from puckpilot.season.add_gate import add_gate_report
+
+    with pytest.raises(ValueError, match="rivals must be one of"):
+        add_gate_report(db, DEFAULT_LEAGUE, rivals="clever")

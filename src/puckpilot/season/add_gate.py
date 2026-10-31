@@ -84,10 +84,22 @@ Every input is as-of the morning it is used: the value model and the goalie
 start model are clamped to that date (`AsOfValues`, `AsOfGoalieSource`), a
 player who has missed two straight team games is out until he plays again,
 and the banked part of a week is the real production of whoever the lineup
-policy started. The other eleven teams are frozen - nobody else picks anyone
-up - so every arm's gain is an upper bound, shared alike, and the arms are
-compared with each other rather than with zero. The weekly cap is the
+policy started. By default the other eleven teams are frozen - nobody else
+picks anyone up - so every arm's gain is an upper bound, shared alike, and the
+arms are compared with each other rather than with zero. The weekly cap is the
 league's; nothing is held back for playoffs (this is the regular season).
+
+`rivals="stream"` (2026-10-31) has every other team add as real ones do: at
+`rival_rate` adds a week (`rival_goalie_share` of them goalies; both measured
+from a live league's transactions, `league_feed`), each the free agent a
+manager can see is best - a skater's value a game times his club's games that
+week, a goalie's value a start times his expected starts - for that team's
+least valuable like-for-like player from the bottom half of its roster, and
+only when he is worth more that week. Their production, their rosters in the
+odds and the free agents left for the tested team all follow. A separate
+random stream, so rate 0 reproduces the frozen league exactly. Caveat: a
+player a rival drops stays off the tested team's pool (as every drafted player
+does here).
 """
 
 from __future__ import annotations
@@ -104,6 +116,8 @@ from puckpilot.league import LeagueConfig
 from puckpilot.season.calibration import _components, _result, drop_known_absences
 
 ARMS = ("none", "share-weekly", "share-daily", "odds-weekly", "odds-daily", "goalie-odds")
+# How the other teams behave in the replay (`add_gate_report(rivals=...)`).
+RIVALS = ("frozen", "stream")
 
 
 @dataclass
@@ -348,6 +362,9 @@ def add_gate_report(
     goalies: str = "",
     goalies_alt: str = GOALIES_ALT,
     goalie_minimum: bool = True,
+    rivals: str = "frozen",
+    rival_rate: float = 0.0,
+    rival_goalie_share: float = 0.0,
 ) -> AddGateReport:
     from puckpilot.draft.engine import RosterValuePolicy
     from puckpilot.draft.h2h import round_robin_schedule
@@ -383,6 +400,8 @@ def add_gate_report(
     from puckpilot.season.week import build_week_plan, per_game_rates
 
     say = progress or (lambda _m: None)
+    if rivals not in RIVALS:
+        raise ValueError(f"rivals must be one of {RIVALS}, not {rivals!r}")
     if train_seasons is None:
         y = int(season[:4])
         train_seasons = tuple(f"{y - i}{y - i + 1}" for i in range(1, 4))
@@ -551,7 +570,7 @@ def add_gate_report(
         zero_sk = np.zeros(len(skater_keys))
         zero_g = np.zeros(G_WIDTH)
         theirs = projected_side(
-            rosters[opp],
+            list(day_rosters[opp][i]),
             sk_day[opp, opp_done].sum(0) if opp_done else zero_sk,
             g_day[opp, opp_done].sum(0) if opp_done else zero_g,
             rest,
@@ -583,7 +602,7 @@ def add_gate_report(
             roster, sk, g, rest, date, tonight_too=False, line_rates=line_rates, pol=pol
         )
         theirs = projected_side(
-            rosters[opp],
+            list(day_rosters[opp][i]),
             sk_day[opp, opp_done].sum(0) if opp_done else np.zeros(len(skater_keys)),
             g_day[opp, opp_done].sum(0) if opp_done else np.zeros(G_WIDTH),
             rest,
@@ -628,15 +647,7 @@ def add_gate_report(
                 apps += 1
         return apps
 
-    # The frozen league: every team's realised production, day by day.
     n_days = len(data.dates)
-    sk_day = np.zeros((len(rosters), n_days, len(skater_keys)))
-    g_day = np.zeros((len(rosters), n_days, G_WIDTH))
-    apps_day = np.zeros((len(rosters), n_days))
-    for t, roster in enumerate(rosters):
-        for i in range(n_days):
-            apps_day[t, i] = realise(lineup(roster, i), i, sk_day[t, i], g_day[t, i])
-    say(f"{season}: frozen league played")
 
     weeks = [w for w in runtime.weeks if any(d in index for d in w.dates())][: league.regular_weeks]
     week_days = {w.number: [index[d] for d in w.dates() if d in index] for w in weeks}
@@ -650,6 +661,76 @@ def add_gate_report(
     ):
         if r[0] in index:
             plays_on.setdefault(index[r[0]], set()).update((r[1], r[2]))
+
+    rival_adds = [0]  # adds the streaming rivals made, all season
+
+    def streamed() -> list[list[tuple[int, ...]]]:
+        """Every team's roster on every day: the drafted one, changed by the
+        streaming rivals' adds (`rivals="stream"`), made each week's first morning."""
+        cur = [list(r) for r in rosters]
+        out: list[list[tuple[int, ...]]] = [[()] * n_days for _ in rosters]
+        firsts = {week_days[w.number][0]: w for w in weeks if week_days.get(w.number)}
+        srng = np.random.default_rng([seed, 4099])
+        cap = runtime.max_weekly_adds or 99
+        live = rivals == "stream" and rival_rate > 0
+        for i in range(n_days):
+            if live and i in firsts:
+                days = week_days[firsts[i].number]
+                held = {pid for r in cur for pid in r}
+                pool = {pid for pid in everyone if pid not in held}
+                p_by_day = {j: AsOfGoalieSource(policy, data.dates[i]).starts(data.dates[j])
+                            for j in days}  # fmt: skip
+
+                def worth(pid: int, days=days, p_by_day=p_by_day) -> float:
+                    if positions.get(pid) == "G":
+                        starts = sum(p_by_day[j].get(pid, 0.0) for j in days)
+                        return pg_value.get(pid, 0.0) * starts
+                    club = teams.get(pid, [""] * n_days)
+                    return pg_value.get(pid, 0.0) * sum(
+                        1 for j in days if club[j] in plays_on.get(j, set())
+                    )
+
+                for t in range(len(cur)):
+                    for _ in range(min(int(srng.poisson(rival_rate)), cap)):
+                        goalie = bool(srng.random() < rival_goalie_share)
+                        same = [q for q in pool if (positions.get(q) == "G") == goalie]
+                        mine = sorted(
+                            (q for q in cur[t] if (positions.get(q) == "G") == goalie),
+                            key=lambda q: pg_value.get(q, 0.0),
+                        )
+                        bottom = mine[: max(1, len(mine) // 2)]
+                        if not same or not bottom:
+                            continue
+                        best = max(same, key=worth)
+                        drop = min(bottom, key=worth)
+                        if worth(best) <= worth(drop):
+                            continue
+                        cur[t][cur[t].index(drop)] = best
+                        pool.discard(best)
+                        pool.add(drop)
+                        rival_adds[0] += 1
+            for t in range(len(cur)):
+                out[t][i] = tuple(cur[t])
+        return out
+
+    day_rosters = streamed()
+    held_on = [frozenset(pid for r in day_rosters for pid in r[i]) for i in range(n_days)]
+
+    # The league: every team's realised production, day by day, on the
+    # roster it had that day (frozen unless the rivals stream).
+    sk_day = np.zeros((len(rosters), n_days, len(skater_keys)))
+    g_day = np.zeros((len(rosters), n_days, G_WIDTH))
+    apps_day = np.zeros((len(rosters), n_days))
+    for t in range(len(rosters)):
+        for i in range(n_days):
+            day = list(day_rosters[t][i])
+            apps_day[t, i] = realise(lineup(day, i), i, sk_day[t, i], g_day[t, i])
+    per = rival_adds[0] / max(len(rosters) * len(weeks), 1)
+    say(
+        f"{season}: league played ({rivals}"
+        + (f", {rival_adds[0]} rival adds, {per:.2f} a team-week" if rivals == "stream" else "")
+        + ")"
+    )
 
     def out_on(pid: int, i: int) -> bool:
         """Known to be out that morning: his club plays and he is not available."""
@@ -794,9 +875,9 @@ def add_gate_report(
                                 league_key=runtime.league_key,
                                 team_key="them",
                                 date=date,
-                                players=tuple(rp(pid, i) for pid in rosters[nopp]),
+                                players=tuple(rp(pid, i) for pid in day_rosters[nopp][i]),
                             )
-                            taken = frozen_pids | set(roster)
+                            taken = frozen_pids | held_on[i] | set(roster)
                             pool = [
                                 fa(pid, i)
                                 for pid in by_value
@@ -869,10 +950,10 @@ def add_gate_report(
                             league_key=runtime.league_key,
                             team_key="them",
                             date=date,
-                            players=tuple(rp(pid, i) for pid in rosters[opp]),
+                            players=tuple(rp(pid, i) for pid in day_rosters[opp][i]),
                         )
                         pending = {int(x[2].player.player_key) for x in waiting}
-                        taken = frozen_pids | set(roster) | pending
+                        taken = frozen_pids | held_on[i] | set(roster) | pending
                         pool = [
                             fa(pid, i)
                             for pid in by_value
@@ -956,7 +1037,7 @@ def add_gate_report(
                                     league_key=runtime.league_key,
                                     team_key="them",
                                     date=date,
-                                    players=tuple(rp(pid, i) for pid in rosters[nopp]),
+                                    players=tuple(rp(pid, i) for pid in day_rosters[nopp][i]),
                                 ),
                                 [],
                                 frame_now,
@@ -1034,7 +1115,12 @@ def add_gate_report(
 
     report = AddGateReport(season=season, arms=results, adds=made, text="")
     lines = [
-        f"G2 (adds) - {season}: {len(tested)} teams tested x {len(weeks)} weeks, rivals frozen",
+        f"G2 (adds) - {season}: {len(tested)} teams tested x {len(weeks)} weeks, rivals "
+        + (
+            f"stream ({rival_rate:g} adds/week, {rival_goalie_share:.0%} goalies)"
+            if rivals == "stream"
+            else "frozen"
+        ),
         "",
         f"{'arm':14}{'cats/week':>11}{'adds':>7}   (goalie-odds: nights changed)",
     ]

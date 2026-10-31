@@ -1895,6 +1895,9 @@ def _cmd_season_add_gate(args: argparse.Namespace) -> int:
             goalies=args.goalies,
             goalies_alt=args.goalies_alt,
             goalie_minimum=not args.no_goalie_minimum,
+            rivals=args.rivals,
+            rival_rate=args.rival_rate,
+            rival_goalie_share=args.rival_goalie_share,
         )
         print()
         print(report.text)
@@ -2978,6 +2981,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-goalie-minimum",
         action="store_true",
         help="Score weeks without the league's goalie minimum (the gate before 2026-10-11)",
+    )
+    s_ag.add_argument(
+        "--rivals",
+        choices=("frozen", "stream"),
+        default="frozen",
+        help="frozen: nobody else picks anyone up; stream: every other team adds at "
+        "--rival-rate a week (measure it with `season league`)",
+    )
+    s_ag.add_argument("--rival-rate", type=float, default=0.0, help="adds per team a week")
+    s_ag.add_argument(
+        "--rival-goalie-share", type=float, default=0.0, help="share of rival adds that are goalies"
     )
     s_ag.add_argument("--verbose", action="store_true")
     s_ag.set_defaults(func=_cmd_season_add_gate)

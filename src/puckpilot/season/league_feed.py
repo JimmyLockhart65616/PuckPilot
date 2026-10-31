@@ -382,3 +382,25 @@ def summary(conn, league_key: str) -> dict:
             for s in standing
         ],
     }
+
+
+def rival_rates(conn, league_key: str, start: str, end: str) -> tuple[float, float, int]:
+    """(adds per team a week, the share of them goalies, adds counted) between
+    two dates - what the replay's streaming rivals are calibrated on."""
+    from datetime import date as _date
+
+    rows = conn.execute(
+        "SELECT COUNT(*), SUM(CASE WHEN positions LIKE '%G%' THEN 1 ELSE 0 END), "
+        "COUNT(DISTINCT team_key) FROM league_transactions WHERE league_key = ? "
+        "AND action = 'add' AND substr(at, 1, 10) BETWEEN ? AND ?",
+        (league_key, start, end),
+    ).fetchone()
+    adds, goalies = int(rows[0] or 0), int(rows[1] or 0)
+    teams = conn.execute(
+        "SELECT COUNT(DISTINCT team_key) FROM league_standings WHERE league_key = ?",
+        (league_key,),
+    ).fetchone()[0]
+    weeks = max((_date.fromisoformat(end) - _date.fromisoformat(start)).days + 1, 1) / 7
+    if not adds or not teams:
+        return 0.0, 0.0, adds
+    return adds / teams / weeks, goalies / adds, adds
