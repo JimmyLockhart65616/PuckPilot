@@ -92,6 +92,55 @@ def test_the_roster_carries_a_readable_status(db):
     assert [x["status"] for x in rows] == ["", "Out"]
 
 
+def test_the_roster_carries_each_player_s_drop_tier(db):
+    """What the page shows and lets the manager change - and on a card, the
+    drop's tier in words. A run without tiers sends the keys, empty."""
+    from puckpilot.season import tiers
+
+    r = TeamRoster(league_key="999.l.1", team_key="t", date="2026-10-07",
+                   players=(player("Kleven"), player("Star")))  # fmt: skip
+    placed = {
+        "p.Kleven": tiers.Placement(tiers.Tier.ROTATION, tiers.YOU, "set by you"),
+        "p.Star": tiers.Placement(tiers.Tier.NEVER, tiers.KEEPER, "one of next season's keepers"),
+    }
+    [p] = make(db, target())
+    rows = snapshot.build(db, "jimmy", "999.l.1", "T", roster=r, tiers=placed)["roster"]
+    assert [(x["player_key"], x["tier"], x["tier_label"], x["tier_source"]) for x in rows] == [
+        ("p.Kleven", "rotation", "Rotation", "you"),
+        ("p.Star", "never", "Never", "keeper"),
+    ]
+    bare = snapshot.build(db, "jimmy", "999.l.1", "T", roster=r)["roster"]
+    assert {x["tier"] for x in bare} == {""}
+    drop_placed = {p.drop_player_key: tiers.Placement(tiers.Tier.ROTATION, tiers.AUTO, "cheap")}
+    (card,) = snapshot.build(db, "jimmy", "999.l.1", "T", tiers=drop_placed)["proposals"]
+    assert card["drop_tier"] == f"{p.drop_name}: Rotation - cheap"
+
+
+def test_a_tier_set_on_the_page_is_pinned_under_the_run_s_manager(db):
+    from puckpilot.season import tiers
+    from puckpilot.season.fetch import save_roster
+
+    r = TeamRoster(league_key="999.l.1", team_key="t", date="2026-10-07",
+                   players=(player("Kleven"),))  # fmt: skip
+    save_roster(db, "jimmy", r)
+    lines = snapshot.apply_decisions(
+        db,
+        [
+            {"seq": 1, "kind": "tier", "player": "p.Kleven", "tier": "rotation", "at": 1.8e9},
+            {"seq": 2, "kind": "tier", "player": "p.Nobody", "tier": "never"},
+            {"seq": 3, "kind": "tier", "player": "p.Kleven", "tier": "sometimes"},
+        ],
+        manager="jimmy",
+    )
+    assert lines[0] == "Kleven: set to Rotation"
+    assert lines[1].startswith("could not apply tier p.Nobody") and "unknown tier" in lines[2]
+    assert tiers.pins(db, "jimmy", "999.l.1") == {"p.Kleven": tiers.Tier.ROTATION}
+    snapshot.apply_decisions(
+        db, [{"seq": 4, "kind": "tier", "player": "p.Kleven", "tier": "auto"}], manager="jimmy"
+    )
+    assert tiers.pins(db, "jimmy", "999.l.1") == {}
+
+
 # -- decisions coming back --------------------------------------------------
 
 

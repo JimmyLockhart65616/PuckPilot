@@ -32,7 +32,7 @@ from statistics import NormalDist
 from puckpilot.engine.categories import CATALOG, Category
 from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.league import LeagueConfig
-from puckpilot.season import calendar, legality
+from puckpilot.season import calendar, legality, tiers
 from puckpilot.season.add_story import SECTIONS, SeasonLeft, games_left, share_of
 from puckpilot.season.pool import PoolPlayer
 from puckpilot.season.roster import RosterPlayer, TeamRoster
@@ -776,11 +776,10 @@ def add_headroom(
     droppable = [
         p
         for p in ours.players
-        if not p.is_undroppable
+        if not tiers.is_never(p)
         and p.nhl_player_id is not None
         and not p.on_ir
         and p.player_key not in to_ir
-        and not getattr(p, "keeper_protected", False)
     ]
     free = open_roster_spots(runtime, ours)
     n = max(int(adds_left), 0)
@@ -835,6 +834,7 @@ def build_week_plan(
     min_expected_gain: float = 0.1,
     playoff_reserve: int = 0,
     stream_spots: int = 2,
+    upgrade_margin: float = 0.0,
     measure_room: bool = True,
     reprice=None,
     horizon: str = "this week",
@@ -880,6 +880,9 @@ def build_week_plan(
 
     `drop_choice` / `goalie_lane`: which drops each candidate is priced
     against, and how many free-agent goalies are always priced (`_targets`).
+    `stream_spots` / `upgrade_margin` place the drop tiers (`season.tiers`):
+    who rotates, and how much more an upgrade-only player's replacement must
+    be worth over the rest of the season.
     `goalie_floor` > 0 keeps that many goalies on the roster: no drop takes it
     below, and while it is below the best free-agent goalies are priced
     against the cheapest legal skater (`_targets`).
@@ -1119,6 +1122,7 @@ def build_week_plan(
                 None if adds_left_season is None else adds_left_season - playoff_reserve,
             ),
             stream_spots=stream_spots,
+            upgrade_margin=upgrade_margin,
             exclude=exclude,
             horizon=horizon,
             workload=workload,
@@ -1246,6 +1250,7 @@ def _targets(
     odds_ctx: OddsContext | None = None,
     adds_left: int | None = None,
     stream_spots: int = 2,
+    upgrade_margin: float = 0.0,
     exclude: dict[str, set[str]] | None = None,
     horizon: str = "this week",
     workload=None,
@@ -1276,12 +1281,15 @@ def _targets(
     independently, every candidate named the same cheapest drop, and approving
     one made the rest impossible.
 
-    Only the `stream_spots` players worth least over the rest of the season
-    may be dropped for a streamer - a manager rotates a spot or two at the
-    bottom, never the core - unless the player coming in is worth more over
-    the rest of the season anyway, which is not streaming but an upgrade.
-    Without that, the greedy second add reached for the next-cheapest player,
-    and on a real roster that is soon a regular.
+    Who may go is the drop tiers' (`season.tiers`): a rotation player - by
+    default the `stream_spots` worth least over the rest of the season, as a
+    manager rotates a spot or two at the bottom, never the core - for any move
+    that pays; an upgrade-only player only for one worth more over the rest of
+    the season by `upgrade_margin` of his value, which is not streaming but an
+    upgrade; a never-tier player not at all. Without that, the greedy second
+    add reached for the next-cheapest player, and on a real roster that is
+    soon a regular. With nothing pinned and no margin, the rule is the one the
+    add gate measured.
 
     Each step costs an optimizer pass per candidate, so the pool is screened
     cheaply first and only the shortlist is priced properly. `screen_by`
@@ -1369,10 +1377,7 @@ def _targets(
     # regular with one game this week is still a regular.
     season_left = _season_left(conn, runtime, days[0], [*ours.players, *pool], workload)
     keep = _season_value(droppable, values, season_left, days[0])
-    cheapest = sorted(keep.values())
-    stream_floor = (
-        cheapest[min(stream_spots, len(cheapest)) - 1] if cheapest and stream_spots > 0 else None
-    )
+    placed = tiers.board(droppable, keep, stream_spots, upgrade_margin=upgrade_margin)
 
     def may_drop(p, cand) -> bool:
         floor_holds = goalie_floor and p.position == "G" and cand.position != "G"
@@ -1382,12 +1387,12 @@ def _targets(
             # Under the floor a goalie is worth a skater's roster spot - and
             # only a skater's: a goalie for a goalie leaves the count short.
             return p.position != "G"
-        worth = keep.get(p.player_key, 0.0)
-        if stream_floor is not None and worth <= stream_floor:
+        if placed[p.player_key].tier is tiers.Tier.ROTATION:
             return True
         if drop_choice != "cheapest" and (p.position == "G") != (cand.position == "G"):
             return False  # an upgrade is judged on one scale
-        return worth <= values.per_game(cand.nhl_player_id, days[0]) * games_left(season_left, cand)
+        incoming = values.per_game(cand.nhl_player_id, days[0]) * games_left(season_left, cand)
+        return tiers.clears(incoming, keep.get(p.player_key, 0.0), upgrade_margin)
 
     # Cheap screen: his rate times the games he would actually fill - days his
     # team plays AND a slot he can take is empty. Ranking by team games alone

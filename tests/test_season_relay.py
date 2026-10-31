@@ -160,6 +160,54 @@ def test_an_unknown_decision_kind_is_refused(relay):
     assert call(base, "/decide", "KEYJ", {"kind": "trade", "id": 1, "approve": True})[0] == 400
 
 
+ROSTER = {
+    "roster": [
+        {"player_key": "p.1", "name": "Tyler Kleven", "tier": "upgrade",
+         "tier_label": "Upgrade only", "tier_source": "auto",
+         "tier_why": "goes only for a player worth more"},
+        {"player_key": "p.2", "name": "Locked", "tier": "never", "tier_label": "Never",
+         "tier_source": "yahoo", "tier_why": "Yahoo does not let him be dropped"},
+    ]
+}  # fmt: skip
+
+
+def test_a_tier_set_on_the_roster_goes_home_once_and_shows_at_once(relay):
+    _, base = relay
+    call(base, "/push", "KEYJ", {"snapshot": ROSTER})
+    code, _ = call(base, "/tier", "KEYJ", {"player": "p.1", "tier": "rotation"})
+    assert code == 200
+    row = json.loads(call(base, "/state", "KEYJ")[1])["roster"][0]
+    assert (row["tier"], row["tier_label"], row["tier_source"]) == ("rotation", "Rotation", "you")
+    got = json.loads(call(base, "/decisions", "KEYJ")[1])["decisions"]
+    assert [(d["kind"], d["player"], d["tier"]) for d in got] == [("tier", "p.1", "rotation")]
+    assert json.loads(call(base, "/decisions", "KEYJ")[1])["decisions"] == []
+
+
+def test_a_tier_is_refused_for_a_locked_or_unknown_player_or_an_unknown_tier(relay):
+    """Yahoo's lock beats any pin; a player not shown, or a tier nothing knows,
+    is a 400 rather than a decision the run would have to throw away."""
+    state, base = relay
+    call(base, "/push", "KEYJ", {"snapshot": ROSTER})
+    for body in (
+        {"player": "p.2", "tier": "rotation"},
+        {"player": "p.9", "tier": "rotation"},
+        {"player": "p.1", "tier": "sometimes"},
+    ):
+        assert call(base, "/tier", "KEYJ", body)[0] == 400, body
+    assert call(base, "/tier", "KEYD", {"player": "p.1", "tier": "never"})[0] == 400  # not his
+    assert state.drain("jimmy") == []
+    assert call(base, "/tier", "KEYJ", {"player": "p.1", "tier": "auto"})[0] == 200
+
+
+def test_the_relay_tiers_are_the_engine_tiers():
+    """The relay imports no engine, so it carries its own copy of the names."""
+    from puckpilot.season import tiers
+    from puckpilot.web.season_relay import AUTO_TIER, TIER_LABELS
+
+    assert {t.value: t.label for t in tiers.Tier} == TIER_LABELS
+    assert AUTO_TIER == tiers.AUTO
+
+
 def test_undelivered_decisions_do_not_grow_without_bound():
     state = SeasonState()
     for i in range(MAX_PENDING_DECISIONS):

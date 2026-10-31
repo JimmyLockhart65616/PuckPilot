@@ -84,6 +84,14 @@ PAGE = """<!doctype html>
   .why-title { font-size:12px; letter-spacing:.04em; text-transform:uppercase;
                color:var(--dim); font-weight:600; margin:12px 0 3px; }
   .why-line { font-size:13px; padding:2px 0; }
+  .chip { flex:0 0 auto; padding:4px 10px; font-size:12px; font-weight:600;
+          border-radius:999px; white-space:nowrap; }
+  .chip.tier-never { color:var(--bad); }
+  .chip.tier-rotation { color:var(--ok); }
+  .chip.tier-upgrade { color:var(--accent); }
+  .tiers { padding:6px 0 10px; border-bottom:1px solid var(--line); }
+  .tiers .btns { flex-wrap:wrap; }
+  .tiers button { flex:1 1 40%; padding:9px; font-size:14px; }
 </style>
 </head>
 <body>
@@ -230,6 +238,7 @@ function renderProposals(root, list) {
     c.appendChild(el('div', null, p.head ||
       ('Add ' + p.add + (p.drop ? '  \\u2013  drop ' + p.drop : ''))));
     if (p.why) c.appendChild(el('div', 'sub', p.why));
+    if (p.drop_tier) c.appendChild(el('div', 'sub', p.drop_tier));
     if (p.timing) c.appendChild(el('div', 'sub', p.timing));
     // The server words what Approve does, card by card, and the tap sends
     // back whether this card said it makes the move. A push from before that
@@ -330,17 +339,105 @@ function renderWeek(root, w) {
   if (w.note) c.appendChild(el('div', 'sub', w.note));
 }
 
+// Each player's drop tier: who a move may let go, and on what terms. Tapped
+// open, it offers the other tiers; the choice goes back like an approval and
+// the run uses it from its next pass. Open choosers and saved notes have to
+// survive the 20 s redraw, as an opened "why" does.
+var TIERS = [
+  ['never', 'Never', 'never dropped, for anyone'],
+  ['upgrade', 'Upgrade only', 'only for a player worth more over the rest of the season'],
+  ['rotation', 'Rotation', 'for any move that pays this week'],
+  ['auto', 'Automatic', 'back to the rule: the cheapest rotate, the rest upgrade only']
+];
+var tierOpen = {};
+var tierSaved = {};
+
+function tierSource(r) {
+  if (r.tier_source === 'you') return 'yours';
+  if (r.tier_source === 'yahoo') return 'Yahoo';
+  return r.tier_source || '';
+}
+
+function setTier(r, tier, box) {
+  Array.prototype.forEach.call(box.querySelectorAll('button'), function (b) { b.disabled = true; });
+  fetch(q('/tier'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ player: r.player_key, tier: tier })
+  }).then(function (resp) { return resp.json(); }).then(function (out) {
+    if (out.error) {
+      box.textContent = '';
+      box.appendChild(el('div', 'sub err', 'Failed: ' + out.error));
+      return;
+    }
+    tierOpen[r.player_key] = false;
+    tierSaved[r.player_key] = Date.now();
+    var shown = (window.__s && window.__s.roster) || [];
+    shown.forEach(function (x) {
+      if (x.player_key !== r.player_key) return;
+      if (tier === 'auto') {
+        x.tier_source = 'auto';
+      } else {
+        x.tier = tier;
+        x.tier_source = 'you';
+        TIERS.forEach(function (t) { if (t[0] === tier) x.tier_label = t[1]; });
+      }
+    });
+    if (window.__s) render(window.__s);
+  }).catch(function () {
+    box.textContent = '';
+    box.appendChild(el('div', 'sub err', 'Could not reach the server.'));
+  });
+}
+
+function tierChooser(r) {
+  var box = el('div', 'tiers');
+  if (r.tier_why) box.appendChild(el('div', 'sub', r.tier_label + ': ' + r.tier_why));
+  var btns = el('div', 'btns');
+  TIERS.forEach(function (t) {
+    var b = el('button', null, t[1]);
+    b.title = t[2];
+    b.onclick = function () { setTier(r, t[0], box); };
+    btns.appendChild(b);
+  });
+  box.appendChild(btns);
+  TIERS.forEach(function (t) { box.appendChild(el('div', 'sub', t[1] + ' \\u2013 ' + t[2])); });
+  return box;
+}
+
 function renderRoster(root, rows) {
   if (!rows || !rows.length) return;
   h2(root, 'Roster');
   var c = card(root);
+  // When the shown push was made: its age as of the fetch that brought it.
+  var s = window.__s;
+  var pushed = s && s.age_seconds !== null && s.age_seconds !== undefined
+    ? (window.__fetched || Date.now()) - s.age_seconds * 1000 : 0;
   rows.forEach(function (r) {
     var row = el('div', 'move');
     row.appendChild(el('span', 'tag', r.slot));
     var n = el('span', 'name', r.name);
     n.appendChild(el('div', 'sub', [r.team, r.opp, r.status].filter(Boolean).join(' \\u00b7 ')));
+    // Saved since the last push: the run has not used it yet.
+    if (tierSaved[r.player_key] && tierSaved[r.player_key] > pushed) {
+      n.appendChild(el('div', 'done', 'Saved \\u2013 PuckPilot uses it from its next run.'));
+    }
     row.appendChild(n);
+    if (r.tier_label) {
+      var text = r.tier_label + (tierSource(r) ? ' \\u00b7 ' + tierSource(r) : '');
+      if (r.tier_source === 'yahoo' || !r.player_key) {
+        row.appendChild(el('span', 'tag chip tier-' + r.tier, text));
+      } else {
+        var chip = el('button', 'chip tier-' + r.tier, text);
+        chip.onclick = function () {
+          tierOpen[r.player_key] = !tierOpen[r.player_key];
+          if (window.__s) render(window.__s);
+        };
+        row.appendChild(chip);
+      }
+    }
     c.appendChild(row);
+    if (tierOpen[r.player_key]) c.appendChild(tierChooser(r));
   });
 }
 
@@ -395,6 +492,7 @@ function tick() {
     if (redeployed(s)) { location.reload(); return; }
     failures = 0;
     window.__s = s;
+    window.__fetched = Date.now();
     try { render(s); } catch (e) {
       document.getElementById('app').textContent = 'Could not draw this page: ' + e.message;
     }

@@ -280,6 +280,15 @@ def test_a_drop_who_became_a_protected_keeper_is_kept(db, sent):
     assert proposals_mod.get(db, pid).status == proposals_mod.REJECTED
 
 
+def test_a_drop_set_to_never_since_the_tap_is_kept(db, sent):
+    """A Never pin is the manager's latest word, over an approval given before it."""
+    pid = _approved(db)
+    make = _Make()
+    _, report = _run(db, [BEFORE], make, never={"d1"})
+    assert make.calls == [] and "to Never" in report.steps[0].detail
+    assert proposals_mod.get(db, pid).status == proposals_mod.REJECTED
+
+
 def test_protection_comes_from_the_latest_weekly_ranking(db):
     from puckpilot.season import keeper_value
     from puckpilot.season.run import _protected_keepers

@@ -24,9 +24,9 @@ Three refusals sit in front of every attempt:
   again by itself: a second attempt at a transaction that did go through would
   be a second transaction. It is reported, loudly, for a person to look at.
 
-A move that can no longer be made as approved - the drop has left the roster
-or become a keeper to protect, the add has been taken, gone on waivers or been
-listed out since the approval - is cancelled with the reason
+A move that can no longer be made as approved - the drop has left the roster,
+become a keeper to protect or been set to Never, the add has been taken, gone
+on waivers or been listed out since the approval - is cancelled with the reason
 (`proposals.cancel`) rather than retried on every run. An acquisition is not
 spent on a yes given to a different situation. One that failed for a passing
 reason is tried again on the next run, and its failure told once.
@@ -106,6 +106,7 @@ def carry_out(
     page_url: str = "",
     read_adds=None,
     protected=frozenset(),
+    never=frozenset(),
     runtime=None,
 ) -> int:
     """Make every approved move not yet made. Returns how many were made.
@@ -116,7 +117,8 @@ def carry_out(
     the executor (`executors.installed()` by default; a bare function is
     taken to make every kind). `read_adds(keys)` reads the adds as they stand
     now ({player_key: pool.PoolPlayer}); `protected` is the player keys kept
-    for next season, never dropped; `runtime` the league's slots, for whether
+    for next season, never dropped, and `never` those the manager has set to
+    Never since (`season.tiers`) - his latest word; `runtime` the league's slots, for whether
     a make-room move is still needed. A move made, or one that failed for a new
     reason, is pushed to the phone (season/notify.py).
     """
@@ -226,6 +228,10 @@ def carry_out(
             _failed(conn, manager, league_key, team_key, report, p, what,
                     f"{p.add_name} is already on your roster and {p.drop_name} still is too",
                     page_url, final=True)  # fmt: skip
+            continue
+        if drop is not None and drop.player_key in never:
+            _failed(conn, manager, league_key, team_key, report, p, what,
+                    f"you set {p.drop_name} to Never", page_url, final=True)  # fmt: skip
             continue
         if drop is not None and drop.player_key in protected:
             _failed(conn, manager, league_key, team_key, report, p, what,

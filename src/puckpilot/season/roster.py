@@ -50,6 +50,9 @@ class RosterPlayer:
     # him from ever being proposed as a drop.
     keeper_rank: int | None = None
     keeper_protected: bool = False
+    # The manager's drop tier for him (`season.tiers`), set by the run from
+    # `player_tiers`: "never", "upgrade" or "rotation"; empty is the rule.
+    tier_pin: str = ""
 
     @property
     def eligible(self) -> frozenset[str]:

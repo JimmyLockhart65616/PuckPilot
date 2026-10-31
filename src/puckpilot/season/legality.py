@@ -21,9 +21,13 @@ and the league's slot counts) and nothing else:
                  spot is free (lineup authority makes these)
     check        every violation, in words
     resolve      for each violation the lineup cannot fix, the drop that fixes
-                 it: the least valuable legal drop over the rest of the season,
-                 or the returning player himself when he is worth less than
-                 anyone he could replace. Keepers being protected, players
+                 it, by the manager's drop tiers (`season.tiers`): the least
+                 valuable player his tier lets go - a rotation player, or an
+                 upgrade-only one the returning player is a clear upgrade on -
+                 and only when there is none, the least valuable legal player
+                 at all; or the returning player himself when he is worth less
+                 than anyone he could replace.
+                 Never-tier players (protected keepers among them), players
                  listed out or NA, and drops already promised to an approved
                  move are never chosen.
     as_resolved  the roster as it will be once those are made - what the add
@@ -39,6 +43,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 
+from puckpilot.season import tiers
 from puckpilot.season.moves import BENCH, Move
 from puckpilot.season.roster import RosterPlayer, TeamRoster
 from puckpilot.season.settings import IR_SLOTS, LeagueRuntime
@@ -215,22 +220,23 @@ def droppable(
 ) -> list[RosterPlayer]:
     """Players who may be proposed as a drop - the one filter every search uses.
 
-    Never: one Yahoo marks undroppable, one not in the player map (he cannot be
-    valued), one on IR or going there today (an injured regular is put on IR,
-    not cut for a streamer), one listed out or NA (whether that is a night or a
-    season is a person's call), one of next season's protected keepers, or the
-    drop of a move already approved and waiting to be made.
+    Never: one in the never tier (Yahoo marks him undroppable, the manager
+    pinned him there, or he is one of next season's protected keepers -
+    `tiers.is_never`), one not in the player map (he cannot be valued), one on
+    IR or going there today (an injured regular is put on IR, not cut for a
+    streamer), one listed out or NA (whether that is a night or a season is a
+    person's call), or the drop of a move already approved and waiting to be
+    made. Which of the rest a move may let go, and for what, is their tier's.
     """
     hold, to_ir = set(hold), set(to_ir)
     return [
         p
         for p in roster.players
-        if not p.is_undroppable
+        if not tiers.is_never(p)
         and p.nhl_player_id is not None
         and not p.on_ir
         and not p.is_out
         and p.player_key not in to_ir
-        and not p.keeper_protected
         and p.player_key not in hold
     ]
 
@@ -270,6 +276,8 @@ def resolve(
     rules=None,
     hold: Iterable[str] = (),
     promised: Mapping[str, str] | None = None,
+    stream_spots: int = 2,
+    upgrade_margin: float = 0.0,
 ) -> Resolution:
     """The moves that make `roster` legal, cheapest first.
 
@@ -278,12 +286,14 @@ def resolve(
     and minimums (`LeagueConfig.draft_rules()`); `hold` drops already promised
     to other moves; `promised` a make-room drop already approved, by returning
     player - kept while that drop is still on the roster, since a decision
-    was given on it.
+    was given on it. `stream_spots` and `upgrade_margin` place the drop tiers
+    (`tiers.board`) as the add search does.
 
     Returning players are placed most valuable first, so a free spot goes to
-    the one worth most. Each make-room drop is the cheapest legal one not
-    already used; the returning player is released instead when he is worth
-    no more than that drop and may himself be let go.
+    the one worth most. Each make-room drop is picked from the legal ones not
+    already used by tier (`_pick`); the returning player is released instead
+    when he is worth no more than the cheapest of them and is not a never.
+    With nothing pinned, the drop is the cheapest legal one, as before tiers.
     """
     violations = check(runtime, roster)
     if not violations:
@@ -294,6 +304,7 @@ def resolve(
     active = _active(roster) - len(to_ir)
     counts = position_counts(roster, to_ir)
     pool = droppable(roster, hold, to_ir)
+    placed = tiers.board(pool, keep, stream_spots, upgrade_margin=upgrade_margin)
     used: set[str] = set()
 
     def worth(p: RosterPlayer) -> float:
@@ -320,7 +331,7 @@ def resolve(
             for q in sorted(pool, key=worth)
             if q.player_key not in used and legal_drop(p.position, q, counts, rules)
         ]
-        may_release = not p.keeper_protected and not p.is_undroppable
+        may_release = not tiers.is_never(p)
         if may_release and (not legal or worth(p) <= worth(legal[0])):
             fixes.append(
                 Fix(
@@ -334,14 +345,16 @@ def resolve(
         if not legal:
             unresolved.append(
                 f"{p.name} cannot come back from {p.selected_slot}: no player may be dropped "
-                f"for him (keepers, players out and roster minimums rule them all out)"
+                f"for him (players set to Never - keepers among them - players out and roster "
+                f"minimums rule them all out). Set someone to Rotation or Upgrade only on the "
+                f"page's roster to let him go."
             )
             continue
-        q = legal[0]
+        q, why = _pick(legal, worth, placed, upgrade_margin, p)
         used.add(q.player_key)
         counts[q.position] = counts.get(q.position, 0) - 1
         counts[p.position] = counts.get(p.position, 0) + 1
-        fixes.append(Fix(p, q, p.selected_slot, "the least valuable legal drop"))
+        fixes.append(Fix(p, q, p.selected_slot, why))
 
     over = active - limit
     for _ in range(max(over, 0)):
@@ -353,11 +366,37 @@ def resolve(
         if not legal:
             unresolved.append("the active roster is over its limit and nobody may be dropped")
             break
-        q = legal[0]
+        q, why = _pick(legal, worth, placed, upgrade_margin)
         used.add(q.player_key)
         counts[q.position] = counts.get(q.position, 0) - 1
-        fixes.append(Fix(None, q, "", "the active roster is over its limit"))
+        fixes.append(Fix(None, q, "", f"the active roster is over its limit - {why}"))
     return Resolution(violations, tuple(fixes), tuple(unresolved))
+
+
+def _pick(legal, worth, placed, margin: float, back: RosterPlayer | None = None):
+    """(drop, why) from `legal` (cheapest first), by tier.
+
+    The cheapest his tier lets go - a rotation player, or an upgrade-only one
+    the returning player (`back`) is upgrade enough on (`tiers.clears`), the
+    add search's own rule - else the cheapest legal player at all. A roster
+    left illegal refuses every add, so a drop is always named when one is
+    legal: the card says which rule chose it, and only a rotation drop is
+    ever made without a tap (season/standing.py).
+    """
+    for q in legal:
+        if placed[q.player_key].tier is tiers.Tier.ROTATION:
+            return q, "a Rotation player - the least valuable who may go"
+        if back is not None and tiers.clears(worth(back), worth(q), margin):
+            return q, (
+                f"the least valuable who may go - Upgrade only, and {back.name} is worth "
+                f"more over the rest of the season"
+            )
+    if back is None:
+        return legal[0], "the least valuable who may go - nobody on Rotation can"
+    return legal[0], (
+        f"the least valuable who may go - nobody on Rotation can, and {back.name} is not a "
+        f"clear upgrade on anyone Upgrade only"
+    )
 
 
 def as_resolved(roster: TeamRoster, resolution: Resolution) -> TeamRoster:

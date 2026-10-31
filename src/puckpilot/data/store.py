@@ -290,6 +290,21 @@ CREATE TABLE IF NOT EXISTS keeper_ranks (
     PRIMARY KEY (manager, week_start, player_key)
 );
 
+-- A manager's drop tier for a player (season/tiers.py): never, upgrade or
+-- rotation. No row is the automatic rule. Kept when he leaves the roster - it
+-- is the manager's view of the player - and applied if he comes back.
+CREATE TABLE IF NOT EXISTS player_tiers (
+    manager       TEXT NOT NULL,
+    league_key    TEXT NOT NULL,
+    player_key    TEXT NOT NULL,
+    tier          TEXT NOT NULL,
+    name          TEXT,
+    nhl_player_id INTEGER,
+    set_at        TEXT NOT NULL,
+    set_via       TEXT NOT NULL,
+    PRIMARY KEY (manager, league_key, player_key)
+);
+
 -- Every change of tag, between the last run that saw the old one and the first
 -- that saw the new. old_status NULL: the player's first sighting, already tagged.
 CREATE TABLE IF NOT EXISTS player_status_changes (

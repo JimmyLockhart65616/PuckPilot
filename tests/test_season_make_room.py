@@ -235,7 +235,11 @@ def test_an_illegal_roster_fails_the_run_and_proposes_the_fix(db, monkeypatch):
         rp("goalie", "G", eligible=("G",), pos="G"),
         BACK,
     )
-    manager = SimpleNamespace(name="m", league=SimpleNamespace(draft_rules=lambda: RULES))
+    from puckpilot.season.authority import Authority
+
+    manager = SimpleNamespace(
+        name="m", league=SimpleNamespace(draft_rules=lambda: RULES), authority=Authority()
+    )
     ctx = runmod.WeekContext(week=Week(5, "2026-10-26", "2026-11-01"))
     report = RunReport(date=TODAY, manager="m")
     res = runmod._legality(db, manager, "L", SMALL, TODAY, roster(*players), ctx, (None, None),

@@ -657,3 +657,83 @@ def test_the_moves_made_render_with_what_they_did():
     assert "Moves made, and what they did" in app
     assert "#15 Kleven for Gibson" in app and "7 nights in the lineup" in app
     assert "Gibson on those nights: W 3 SV 106" in app and "1 night in the lineup" in app
+
+
+TIER_TAP = r"""
+  const drawn = app.textContent;
+  function find(n, f) {
+    if (f(n)) return n;
+    for (const c of n.children) { const x = find(c, f); if (x) return x; }
+    return null;
+  }
+  const chip = find(app, n => n.tagName === 'button' && n._text.startsWith(CHIP));
+  chip.onclick();
+  const opened = app.textContent;
+  find(app, n => n.tagName === 'button' && n._text === CHOICE).onclick();
+  setTimeout(() => console.log(JSON.stringify(
+    { fresh: fresh.textContent, app: drawn, opened, after: app.textContent, posts })), 30);"""
+
+
+def run_page_and_pick_tier(payload: dict, chip: str, choice: str) -> dict:
+    """Draw the page, open the roster chip that starts `chip`, tap `choice`,
+    and return the page at each step and what the tap sent where."""
+    harness = HARNESS.replace(
+        "fetch: () => Promise.resolve(",
+        "fetch: (u, o) => (o && o.body && posts.push({ url: u, body: JSON.parse(o.body) }), "
+        "Promise.resolve(",
+    ).replace("json: () => Promise.resolve(input) }),", "json: () => Promise.resolve(input) })),")
+    harness = harness.replace(
+        "\n  console.log(JSON.stringify({ fresh: fresh.textContent, app: app.textContent }));",
+        TIER_TAP,
+    )
+    assert harness.count("posts") == 2, "the harness changed shape - update this test"
+    script = re.search(r"<script>(.*?)</script>", PAGE, re.S).group(1)
+    head = f"const posts = [];\nconst CHIP = {json.dumps(chip)}, CHOICE = {json.dumps(choice)};\n"
+    proc = subprocess.run(
+        [NODE, "-e", head + "const SCRIPT = " + json.dumps(script) + ";\n" + harness],
+        input=wire.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_a_tier_is_shown_on_the_roster_and_changed_from_it():
+    """Each row carries its tier and where it came from; a tap sends the new
+    one home and the row says it is saved for the next run. A player Yahoo
+    locks has no chooser - no pin can move him."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [
+                {"id": 4, "add": "Fa", "drop": "Tyler Kleven", "why": "", "timing": "",
+                 "drop_tier": "Tyler Kleven: Upgrade only - goes only for a player worth more"},
+            ],
+            "roster": [
+                {"slot": "D", "name": "Tyler Kleven", "team": "OTT", "opp": "", "status": "",
+                 "player_key": "p.1", "tier": "upgrade", "tier_label": "Upgrade only",
+                 "tier_source": "auto",
+                 "tier_why": "goes only for a player worth more over the rest of the season"},
+                {"slot": "C", "name": "Locked Star", "team": "TOR", "opp": "", "status": "",
+                 "player_key": "p.2", "tier": "never", "tier_label": "Never",
+                 "tier_source": "yahoo", "tier_why": "Yahoo does not let him be dropped"},
+                {"slot": "BN", "name": "Old Push", "team": "MTL", "opp": "", "status": ""},
+            ],
+        },
+    )  # fmt: skip
+    out = run_page_and_pick_tier(state.get("jimmy"), "Upgrade only", "Rotation")
+    for page in ("app", "opened", "after"):
+        assert_clean({"fresh": out["fresh"], "app": out[page]})
+    assert "Upgrade only \u00b7 auto" in out["app"] and "Never \u00b7 Yahoo" in out["app"]
+    assert "Tyler Kleven: Upgrade only - goes only for a player worth more" in out["app"]
+    assert "Old Push" in out["app"]  # a row from before tiers draws without one
+    assert "Rotation \u2013 for any move that pays this week" in out["opened"]
+    assert out["posts"] == [{"url": "/tier?k=test", "body": {"player": "p.1", "tier": "rotation"}}]
+    assert "Rotation \u00b7 yours" in out["after"]
+    assert "Saved \u2013 PuckPilot uses it from its next run." in out["after"]

@@ -1451,7 +1451,7 @@ def _season_publish(
         return
     try:
         decisions = publish.collect(manager.page.url, key)
-        for line in snapshot.apply_decisions(conn, decisions):
+        for line in snapshot.apply_decisions(conn, decisions, manager=manager.name):
             print(f"  from your phone: {line}")
         named = roster or week_plan
         snap = snapshot.build(
@@ -1594,6 +1594,123 @@ def _cmd_season_moves(args: argparse.Namespace) -> int:
     for line in lines:
         print("\n".join(ledger.describe(line, manager.league.all_cats)))
     return 0
+
+
+def _cmd_season_tiers(args: argparse.Namespace) -> int:
+    """Every player's drop tier, and the manager's pins (season/tiers.py)."""
+    from puckpilot.season import cli_support, tiers
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+    roster = _own_saved_roster(conn, manager, league_key)
+    if roster is None:
+        print("No roster saved yet - run `ppilot season run` (or `season today`) first.")
+        return 1
+    changes = [(x, None) for x in args.auto or []]
+    for spec in args.set or []:
+        name, _, tier = spec.rpartition("=")
+        if not name:
+            print(f'--set takes NAME=TIER, e.g. "Tyler Kleven=rotation"; got {spec!r}')
+            return 2
+        changes.append((name, tier))
+    for name, tier in changes:
+        try:
+            player = _roster_player_named(roster, name)
+            wanted = tiers.tier_of(tier)
+        except ValueError as e:
+            print(e)
+            return 2
+        tiers.pin(conn, manager.name, league_key, player.player_key, wanted, name=player.name,
+                  nhl_player_id=player.nhl_player_id, via="cli")  # fmt: skip
+        print(f"{player.name}: " + (f"set to {wanted.label}" if wanted else "back to automatic"))
+    roster = tiers.annotate(roster, tiers.pins(conn, manager.name, league_key))
+    placed = _season_tier_board(conn, manager, league_key, runtime, roster,
+                                args.date or cli_support.today_str())  # fmt: skip
+    order = {tiers.Tier.ROTATION: 0, tiers.Tier.UPGRADE: 1, tiers.Tier.NEVER: 2}
+    print(f"\nDrop tiers for {manager.name} (roster of {roster.date}):")
+    for p in sorted(roster.players, key=lambda q: (order[placed[q.player_key].tier], q.name)):
+        pl = placed[p.player_key]
+        src = {"you": "set by you", "auto": "automatic"}.get(pl.source, pl.source)
+        print(f"  {pl.tier.label:13} {p.name:24} {src} - {pl.why}")
+    gone = [x for x in tiers.listing(conn, manager.name, league_key)
+            if x["player_key"] not in {p.player_key for p in roster.players}]  # fmt: skip
+    if gone:
+        print("\nPinned, not on the roster now (applies if he comes back):")
+        for x in gone:
+            print(f"  {tiers.Tier(x['tier']).label:13} {x['name'] or x['player_key']}  "
+                  f"(set {x['set_at'][:10]} via {x['set_via']})")  # fmt: skip
+    print("\nYahoo's own undroppable flag is not in a saved roster; the run applies it.")
+    return 0
+
+
+def _own_saved_roster(conn, manager, league_key: str):
+    """This manager's own roster as last saved - the league read saves every
+    team's, so the team is the one his runs acted for."""
+    from puckpilot.season import g3, keeper_value
+
+    team_key = manager.team_key or ""
+    if not team_key:
+        row = conn.execute(
+            "SELECT team_key FROM season_actions WHERE manager = ? AND league_key = ? "
+            "AND team_key != '' ORDER BY id DESC LIMIT 1",
+            (manager.name, league_key),
+        ).fetchone()
+        team_key = row[0] if row else ""
+    row = conn.execute(
+        "SELECT MAX(date) FROM yahoo_roster_snapshots WHERE manager = ? AND team_key = ?",
+        (manager.name, team_key),
+    ).fetchone()
+    if not team_key or not row or not row[0]:
+        return None
+    roster = g3.saved_roster(conn, league_key, team_key, row[0])
+    if roster is None:
+        return None
+    latest = conn.execute(
+        "SELECT MAX(week_start) FROM keeper_ranks WHERE manager = ?", (manager.name,)
+    ).fetchone()
+    if latest and latest[0] and manager.authority.transactions.protect_keepers:
+        roster = keeper_value.annotate(roster, keeper_value.load(conn, manager.name, latest[0]))
+    return roster
+
+
+def _roster_player_named(roster, name: str):
+    """The rostered player a typed name means: exact first, then a unique part."""
+    want = name.strip().casefold()
+    exact = [p for p in roster.players if p.name.casefold() == want]
+    if len(exact) == 1:
+        return exact[0]
+    part = [p for p in roster.players if want and want in p.name.casefold()]
+    if len(part) == 1:
+        return part[0]
+    if part:
+        raise ValueError(f"{name!r} could be {', '.join(p.name for p in part)} - be more exact")
+    raise ValueError(f"nobody called {name!r} on the roster")
+
+
+def _season_tier_board(conn, manager, league_key: str, runtime, roster, day: str) -> dict:
+    """The tiers as the run places them: the same values, the same players who may go."""
+    from puckpilot.season import legality, tiers
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.run import _train_seasons
+    from puckpilot.season.values import build_value_model
+
+    season = runtime.nhl_season
+    values = build_value_model(conn, season, _train_seasons(season), manager.league)
+    keep = weekmod.keep_values(
+        conn, runtime, roster.players, values, day, getattr(values, "workload", None)
+    )
+    terms = manager.authority.transactions
+    return tiers.board(
+        roster.players,
+        keep,
+        terms.stream_spots,
+        droppable=legality.droppable(roster),
+        upgrade_margin=terms.upgrade_margin,
+    )
 
 
 def _cmd_season_statuses(args: argparse.Namespace) -> int:
@@ -2194,6 +2311,9 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         return cli_support.report(e)
 
     save_pool_if_any(conn, league_key, today, available)
+    from puckpilot.season import tiers as tiers_mod
+
+    ours = tiers_mod.annotate(ours, tiers_mod.pins(conn, manager.name, league_key))
     season = runtime.nhl_season
     train = [s for s in DEFAULT_SEASONS if s < season][-3:][::-1]
     universe = build_universe(conn, season, tuple(train), manager.league)
@@ -2229,6 +2349,7 @@ def _cmd_season_week(args: argparse.Namespace) -> int:
         min_expected_gain=manager.authority.transactions.min_expected_gain,
         playoff_reserve=manager.authority.transactions.playoff_reserve,
         stream_spots=manager.authority.transactions.stream_spots,
+        upgrade_margin=manager.authority.transactions.upgrade_margin,
         screen_by=manager.authority.transactions.screen,
         **live_inputs(conn, runtime, m.as_week(), live, today),
         **goalie_terms(manager.authority.transactions, runtime, m.as_week(), today, ours, theirs),
@@ -3102,6 +3223,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="The move ledger: what each move made did, against the player let go",
     )
     s_moves.set_defaults(func=_cmd_season_moves)
+
+    s_tiers = season_sub.add_parser(
+        "tiers",
+        parents=[seasonal],
+        help="Drop tiers: who a move may let go (never / upgrade only / rotation), and your pins",
+    )
+    s_tiers.add_argument(
+        "--set",
+        action="append",
+        metavar="NAME=TIER",
+        help='pin a player: never, upgrade or rotation (e.g. "Tyler Kleven=rotation"); repeatable',
+    )
+    s_tiers.add_argument(
+        "--auto", action="append", metavar="NAME", help="take a pin off: back to the rule"
+    )
+    s_tiers.set_defaults(func=_cmd_season_tiers)
 
     s_tags = season_sub.add_parser(
         "statuses",

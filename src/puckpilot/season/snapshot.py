@@ -64,6 +64,7 @@ def build(
     executable_kinds: frozenset[str] | None = None,
     blockers: list[dict] | None = None,
     ledger: list[dict] | None = None,
+    tiers: dict | None = None,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -81,6 +82,9 @@ def build(
     every kind, when `executes_moves`); a card of any other kind says to make
     it yourself, because nothing here would. `blockers` (`Blocker.payload()`)
     lead the page: what stops the tool working comes before anything it says.
+    `tiers` is the run's drop tiers by player key (`tiers.board`): each roster
+    row carries its own, for the page to show and change, and each card says
+    the drop's.
     """
     snap: dict[str, Any] = {
         "team": team_name,
@@ -155,6 +159,7 @@ def build(
             ),
             "add": p.add_name,
             "drop": p.drop_name if p.drop_player_key else "",
+            "drop_tier": _drop_tier(p, tiers),
             "why": _why(p),
             "timing": str(p.reason.get("timing", "")),
             "detail": _reasons(p.reason.get("detail")),
@@ -213,10 +218,34 @@ def build(
                 "team": p.team,
                 "opp": "",
                 "status": p.status_full or p.status,
+                # The key the page sends back with a tier change.
+                "player_key": p.player_key,
+                **_tier_fields((tiers or {}).get(p.player_key)),
             }
             for p in roster.players
         ]
     return snap
+
+
+def _tier_fields(placed) -> dict:
+    """A roster row's drop tier (`tiers.Placement`): empty before the run has one."""
+    if placed is None:
+        return {"tier": "", "tier_label": "", "tier_source": "", "tier_why": ""}
+    out = placed.payload()
+    return {
+        "tier": out["tier"],
+        "tier_label": out["label"],
+        "tier_source": out["source"],
+        "tier_why": out["why"],
+    }
+
+
+def _drop_tier(p, tiers) -> str:
+    """The card's drop, by tier and why: "Kleven: Rotation - one of the 2 worth least ..."."""
+    placed = (tiers or {}).get(p.drop_player_key) if p.drop_player_key else None
+    if placed is None:
+        return ""
+    return f"{p.drop_name}: {placed.tier.label} - {placed.why}"
 
 
 def _acted(acted: dict, tz: str) -> dict:
@@ -433,8 +462,13 @@ def _when(after_games_of: str, today: str = "") -> str:
 MANUAL = "Make it in Yahoo yourself \u2013 PuckPilot never adds or drops."
 
 
-def apply_decisions(conn: sqlite3.Connection, decisions: list[dict]) -> list[str]:
+def apply_decisions(
+    conn: sqlite3.Connection, decisions: list[dict], manager: str = ""
+) -> list[str]:
     """Record decisions collected from the page. Returns what happened, in words.
+
+    `manager` is whose run collected them - the name a tier change is pinned
+    under, whatever the relay calls him.
 
     A decision that cannot be applied - already decided, gone, unknown - is
     reported rather than raised. These arrive in batches from a public endpoint
@@ -448,6 +482,8 @@ def apply_decisions(conn: sqlite3.Connection, decisions: list[dict]) -> list[str
             if kind == "protocol":
                 p = protocol_mod.decide(conn, int(ident), approve)
                 out.append(f"protocol #{p.id} (week {p.week}) {verb}")
+            elif kind == "tier":
+                out.append(_apply_tier(conn, d, manager))
             elif kind == "proposal":
                 p = proposals_mod.decide(
                     conn,
@@ -463,5 +499,39 @@ def apply_decisions(conn: sqlite3.Connection, decisions: list[dict]) -> list[str
             else:
                 out.append(f"ignored decision of unknown kind {kind!r}")
         except (protocol_mod.ProtocolError, proposals_mod.ProposalError, ValueError) as e:
-            out.append(f"could not apply {kind} #{ident}: {e}")
+            what = f"{kind} #{ident}" if ident is not None else f"{kind} {d.get('player', '')}"
+            out.append(f"could not apply {what}: {e}")
     return out
+
+
+def _apply_tier(conn: sqlite3.Connection, d: dict, manager: str = "") -> str:
+    """One tier change from the page: pin the player, or ("auto") take it off.
+
+    The page sends the player's key and name from the roster it showed; the
+    league is the latest roster snapshot that has him, so a change made from
+    an old page still lands on the right row.
+    """
+    from datetime import UTC, datetime
+
+    from puckpilot.season import tiers
+
+    manager = manager or str(d.get("manager") or "")
+    key = str(d.get("player") or "")
+    tier = tiers.tier_of(str(d.get("tier") or ""))
+    row = conn.execute(
+        "SELECT league_key, nhl_player_id, name FROM yahoo_roster_snapshots "
+        "WHERE manager = ? AND player_key = ? ORDER BY date DESC LIMIT 1",
+        (manager, key),
+    ).fetchone()
+    if not manager or not key or row is None:
+        raise ValueError(f"no rostered player {key!r} to set a tier for")
+    league_key, pid, name = row
+    when = d.get("at")
+    at = (
+        datetime.fromtimestamp(float(when), UTC).isoformat(timespec="seconds")
+        if when is not None
+        else None
+    )
+    tiers.pin(conn, manager, league_key, key, tier, name=name or "", nhl_player_id=pid,
+              via="page", at=at)  # fmt: skip
+    return f"{name or key}: " + (f"set to {tier.label}" if tier else "back to automatic")

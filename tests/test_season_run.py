@@ -690,7 +690,9 @@ def test_a_mid_week_swap_must_pay_over_this_week_and_next(monkeypatch):
     manager = SimpleNamespace(
         league=None,
         authority=SimpleNamespace(
-            transactions=SimpleNamespace(add_scoring="odds", playoff_reserve=6, stream_spots=2)
+            transactions=SimpleNamespace(
+                add_scoring="odds", playoff_reserve=6, stream_spots=2, upgrade_margin=0.0
+            )
         ),
     )
     runtime = SimpleNamespace(nhl_season="20262027")
@@ -801,6 +803,7 @@ def test_the_plan_counts_an_approved_move_not_yet_made_and_never_withdraws_it(db
                 min_weekly_gain=0.25,
                 playoff_reserve=6,
                 stream_spots=2,
+                upgrade_margin=0.0,
             )
         ),
     )

@@ -193,8 +193,15 @@ class TransactionAuthority:
     # Roster spots that rotate: only the players worth least over the rest of
     # the season may be dropped for a streamer (an upgrade can replace anyone).
     # Measured 2 v 3 v 4 after week 1 (add gate, both seasons): neither 3 nor 4
-    # was positive in both and clear of noise, so it stays 2.
+    # was positive in both and clear of noise, so it stays 2. These are the
+    # automatic rotation tier (`season.tiers`); a manager's own rotation pins
+    # take them first.
     stream_spots: int = 2
+    # How clear an upgrade must be to let an upgrade-only player go (the
+    # tiers' middle one): the player coming in worth at least this share more
+    # over the rest of the season. 0 = worth more by anything, the rule the add
+    # gate measured; the default moves only on the gate (`-b<nn>` arms).
+    upgrade_margin: float = 0.0
     # The last days of a week on which an add still waiting for a decision must
     # pay over the rest of this week AND the next week together, or it is
     # withdrawn (it never adds a move). 1 = Sunday, 0 = never. Asked for on
@@ -337,6 +344,13 @@ class TransactionAuthority:
             raise AuthorityError("authority.transactions.mid_week_floor cannot be negative")
         if self.keeper_margin < 0:
             raise AuthorityError("authority.transactions.keeper_margin cannot be negative")
+        if self.stream_spots < 0:
+            raise AuthorityError("authority.transactions.stream_spots cannot be negative")
+        if not 0.0 <= self.upgrade_margin <= 10.0:
+            raise AuthorityError(
+                "authority.transactions.upgrade_margin is a share of a player's value, "
+                f"from 0 (worth more by anything) up to 10; got {self.upgrade_margin!r}"
+            )
         if self.drop_choice not in DROP_CHOICES:
             raise AuthorityError(
                 f"authority.transactions.drop_choice must be one of {', '.join(DROP_CHOICES)}; "
@@ -406,6 +420,15 @@ class TransactionAuthority:
                 f"proposed as a drop"
                 if self.protect_keepers
                 else "  next season's keepers are not protected from a drop"
+            ),
+            f"  rotation: your rotation picks, then the cheapest, fill {self.stream_spots} "
+            f"spot(s) - any move that pays may drop one",
+            (
+                f"  upgrade only: dropped only for a player worth {self.upgrade_margin:.0%} "
+                f"more over the rest of the season"
+                if self.upgrade_margin > 0
+                else "  upgrade only: dropped only for a player worth more over the rest of "
+                "the season"
             ),
             (
                 "  each free agent is priced against the cheapest legal drop"

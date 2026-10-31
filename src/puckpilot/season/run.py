@@ -138,6 +138,8 @@ class WeekContext:
     # it will stand once its make-room moves are made - what adds are priced on.
     resolution: object | None = None
     resolved: object | None = None
+    # Every player's drop tier as of this run (`tiers.board`), for the page.
+    tiers: dict | None = None
 
 
 def _priced(ctx):
@@ -342,7 +344,7 @@ def run_day(
 
         def _collect():
             got = publish.collect(manager.page.url, page_key)
-            lines = snapshot.apply_decisions(conn, got)
+            lines = snapshot.apply_decisions(conn, got, manager=manager.name)
             report.add("decisions", True, f"{len(got)} from your phone", lines)
 
         _guard(report, "decisions", _collect)
@@ -385,6 +387,7 @@ def run_day(
         )
         if got is not None:
             roster, keepers = got
+        roster = _with_pins(conn, manager, league_key, roster)
     ctx.roster = roster
     _guard(report, "score", lambda: _log_week(conn, manager, league_key, ctx, report))
     train = _train_seasons(season)
@@ -613,6 +616,15 @@ def run_day(
     if not _league_read_on(conn, manager, day):
         _guard(report, "league", lambda: _league(conn, manager, league_key, runtime, day, report))
 
+    # 4a'. Every player's drop tier, as the searches above placed them - for
+    # the page, and for which waiting moves count as rotation drops.
+    if ctx.roster is not None and models is not None:
+        _guard(
+            report,
+            "tiers",
+            lambda: _tiers(conn, manager, league_key, runtime, ctx, models, day, report),
+        )
+
     # 4b. What stops the tool working - said on the page, in the log as a FAIL,
     # and on the phone - never left as a line under an "ok" step.
     blocked = _guard(report, "blockers", lambda: _blockers(conn, manager, league_key, ctx, report))
@@ -640,6 +652,7 @@ def run_day(
                 today=day,
                 blockers=[b.payload() for b in blocked or ()],
                 ledger=_ledger(conn, manager, league_key, runtime, day, roster),
+                tiers=ctx.tiers,
             )
             publish.push(manager.page.url, page_key, snap)
             report.add("page", True, manager.page.url)
@@ -713,11 +726,17 @@ def _carry_out(conn, manager, league_key, runtime, day, report, pmap) -> int:
         )
         return {a.player_key: a for a in found}
 
+    from puckpilot.season import tiers
+
+    pins = tiers.pins(conn, manager.name, league_key)
     protected = (
         _protected_keepers(conn, manager.name)
         if manager.authority.transactions.protect_keepers
         else set()
     )
+    # A keeper pinned to another tier is the manager's to let go.
+    protected -= {k for k, t in pins.items() if t is not tiers.Tier.NEVER}
+    never = {k for k, t in pins.items() if t is tiers.Tier.NEVER}
     playing = calendar.teams_playing(conn, day, runtime.nhl_season)
     url = manager.page.url if manager.page.publishes else ""
     return carry_out(
@@ -733,6 +752,7 @@ def _carry_out(conn, manager, league_key, runtime, day, report, pmap) -> int:
         page_url=url,
         read_adds=read_adds,
         protected=protected,
+        never=never,
         runtime=runtime,
     )
 
@@ -869,9 +889,19 @@ def _resolution(conn, manager, runtime, roster, values, day, hold=(), ctx=None):
                                        status=proposals_mod.APPROVED, limit=200)
         if p.move_kind is MoveKind.ACTIVATE
     }  # fmt: skip
-    keep = weekmod.keep_values(conn, runtime, roster.players, values, day)
+    keep = weekmod.keep_values(
+        conn, runtime, roster.players, values, day, getattr(values, "workload", None)
+    )
+    terms = manager.authority.transactions
     return legality.resolve(
-        runtime, roster, keep, manager.league.draft_rules(), hold=hold, promised=promised
+        runtime,
+        roster,
+        keep,
+        manager.league.draft_rules(),
+        hold=hold,
+        promised=promised,
+        stream_spots=terms.stream_spots,
+        upgrade_margin=terms.upgrade_margin,
     )
 
 
@@ -923,7 +953,8 @@ def _legality(conn, manager, league_key, runtime, day, roster, ctx, models, repo
         p, new = proposals_mod.propose_fix(
             conn, manager.name, league_key, roster.team_key, f, week_no,
             {"detail": {"room": _room_lines(f, roster, values, day, conn, runtime,
-                                            manager.league.draft_rules())}},
+                                            manager.league.draft_rules(),
+                                            manager.authority.transactions)}},
         )  # fmt: skip
         state = "proposed" if new else p.status
         lines.append(f"{state}: #{p.id} {head} ({f.reason})")
@@ -933,42 +964,69 @@ def _legality(conn, manager, league_key, runtime, day, roster, ctx, models, repo
     return res
 
 
-def _room_lines(fix, roster, values, day, conn, runtime, rules=None) -> list[str]:
+def _room_lines(fix, roster, values, day, conn, runtime, rules=None, terms=None) -> list[str]:
     """Why this drop, for the card: the rule, the cheapest few it was chosen
-    from, and anyone cheaper whom the roster's minimums kept - so "why not
-    him?" is answered on the card."""
-    from puckpilot.season import legality
+    from with each one's tier, and anyone cheaper who was kept and why - the
+    roster's minimums, or his tier - so "why not him?" is answered on the card."""
+    from puckpilot.season import legality, tiers
     from puckpilot.season import week as weekmod
 
-    keep = weekmod.keep_values(conn, runtime, roster.players, values, day)
-    ranked = sorted(legality.droppable(roster), key=lambda q: keep.get(q.player_key, 0.0))
+    keep = weekmod.keep_values(
+        conn, runtime, roster.players, values, day, getattr(values, "workload", None)
+    )
+    able = legality.droppable(roster)
+    placed = tiers.board(
+        roster.players,
+        keep,
+        terms.stream_spots if terms is not None else 2,
+        droppable=able,
+        upgrade_margin=terms.upgrade_margin if terms is not None else 0.0,
+    )
+    ranked = sorted(able, key=lambda q: keep.get(q.player_key, 0.0))
     counts = legality.position_counts(roster)
     pool = [q for q in ranked if legality.legal_drop(fix.player.position, q, counts, rules)]
     floor = keep.get(fix.drop.player_key, 0.0) if fix.drop is not None else 0.0
-    kept = [q for q in ranked if q not in pool and keep.get(q.player_key, 0.0) < floor]
+    gone = fix.drop.player_key if fix.drop is not None else ""
+    cheaper = [q for q in ranked if keep.get(q.player_key, 0.0) < floor and q.player_key != gone]
+    short = [q for q in cheaper if q not in pool]
+    by_tier = [q for q in cheaper if q in pool]
     out = [
         f"{fix.player.name} is cleared to play, but still in {fix.slot}: until he is back on the "
         f"active roster Yahoo refuses every add (Error #845), and all active spots are full.",
-        "The drop is the player worth least over the rest of the season among those who may "
-        "go - never a protected keeper, a player listed out or NA, or one an approved move "
-        "already drops.",
+        "The drop is the player worth least over the rest of the season among those your drop "
+        "tiers let go - a Rotation player, or an Upgrade only one he is a clear upgrade on - "
+        "never a player set to Never (protected keepers among them), one listed out or NA, or "
+        "one an approved move already drops.",
     ]
     if fix.releases:
         out.append(f"{fix.player.name} himself is worth least, so he is the one released.")
-    line = ", ".join(f"{q.name} {keep.get(q.player_key, 0.0):.0f}" for q in pool[:4])
+    line = ", ".join(
+        f"{q.name} {keep.get(q.player_key, 0.0):.0f} ({placed[q.player_key].tier.label})"
+        for q in pool[:4]
+    )
     if line:
         back = keep.get(fix.player.player_key, 0.0)
         out.append(
             f"Rest-of-season value of those who may go, lowest first: {line}; "
             f"{fix.player.name} {back:.0f}."
         )
-    if kept:
-        names = ", ".join(q.name for q in kept)
-        pos = "/".join(sorted({q.position for q in kept}))
+    if short:
+        names = ", ".join(q.name for q in short)
+        pos = "/".join(sorted({q.position for q in short}))
         out.append(
-            f"Worth less but kept: {names} - dropping {'him' if len(kept) == 1 else 'them'} "
+            f"Worth less but kept: {names} - dropping {'him' if len(short) == 1 else 'them'} "
             f"would leave the roster under its minimum at {pos}."
         )
+    if by_tier:
+        names = ", ".join(f"{q.name} ({placed[q.player_key].tier.label})" for q in by_tier)
+        out.append(f"Worth less but kept by tier: {names}.")
+    nevers = [
+        q.name
+        for q in roster.players
+        if tiers.is_never(q) and q.player_key != fix.player.player_key and not q.on_ir
+    ]
+    if nevers:
+        out.append(f"Never dropped: {', '.join(nevers)}.")
     return out
 
 
@@ -1461,6 +1519,7 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propo
         min_expected_gain=terms.min_expected_gain,
         playoff_reserve=terms.playoff_reserve,
         stream_spots=terms.stream_spots,
+        upgrade_margin=terms.upgrade_margin,
         reprice=reprice if approved or waiting else None,
         switch_after=switch_after,
         **live_inputs(conn, runtime, ctx.week, ctx.live, day),
@@ -1564,6 +1623,7 @@ def _next_week(
         add_scoring=terms.add_scoring,
         playoff_reserve=terms.playoff_reserve,
         stream_spots=terms.stream_spots,
+        upgrade_margin=terms.upgrade_margin,
         screen_by=terms.screen,
         **goalie_terms(terms, runtime, nxt),
     )
@@ -1658,7 +1718,7 @@ def _workable(conn, manager, league_key, ctx, waiting):
     """
     from dataclasses import replace
 
-    from puckpilot.season import cli_support
+    from puckpilot.season import cli_support, tiers
     from puckpilot.season import pool as pool_mod
     from puckpilot.yahoo import playermap
 
@@ -1684,7 +1744,11 @@ def _workable(conn, manager, league_key, ctx, waiting):
                 f"{p.drop_name} is now {drop.status or drop.selected_slot} - "
                 f"not a player to drop on that"
             )
-        elif drop is not None and drop.keeper_protected:
+        elif drop is not None and tiers.pinned(drop) is tiers.Tier.NEVER:
+            lapsed[p.id] = f"you set {p.drop_name} to Never"
+        elif drop is not None and drop.is_undroppable:
+            lapsed[p.id] = f"Yahoo does not let {p.drop_name} be dropped"
+        elif drop is not None and tiers.is_never(drop):
             lapsed[p.id] = (
                 f"{p.drop_name} ranks {drop.keeper_rank} of your keepers for next season - "
                 f"not one to give away"
@@ -1950,6 +2014,7 @@ def _weekly(
         min_expected_gain=bar,
         playoff_reserve=terms.playoff_reserve,
         stream_spots=terms.stream_spots,
+        upgrade_margin=terms.upgrade_margin,
         screen_by=terms.screen,
         hold=hold,
         **live_inputs(conn, runtime, week, live, day),
@@ -2122,6 +2187,7 @@ def _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models):
         min_expected_gain=-1e9,
         playoff_reserve=terms.playoff_reserve,
         stream_spots=terms.stream_spots,
+        upgrade_margin=terms.upgrade_margin,
         measure_room=False,
         horizon="next week",
         **goalie_terms(terms, runtime, nxt),
@@ -2155,6 +2221,61 @@ def _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models):
         detail["week"] = [line, *detail.get("week", [])]
         kept.append(replace(t, detail=detail))
     return kept, notes
+
+
+def _with_pins(conn, manager, league_key: str, roster):
+    """The roster with the manager's drop tiers on it (`tiers.annotate`)."""
+    from puckpilot.season import tiers
+
+    return tiers.annotate(roster, tiers.pins(conn, manager.name, league_key))
+
+
+def _tiers(conn, manager, league_key: str, runtime, ctx, models, day: str, report) -> dict:
+    """Every player's drop tier this run - the board the searches use, on the
+    same values and the same players who may be dropped today."""
+    from puckpilot.season import legality, tiers
+    from puckpilot.season import week as weekmod
+
+    roster = ctx.roster
+    values, _ = models
+    terms = manager.authority.transactions
+    hold = {
+        p.drop_player_key
+        for p in committed_moves(conn, manager.name, league_key, roster, ctx.week)
+        if p.drop_player_key
+    }
+    to_ir = {m.player.player_key for m in legality.ir_changes(runtime, roster)[0] if m.is_ir}
+    keep = weekmod.keep_values(
+        conn, runtime, roster.players, values, day, getattr(values, "workload", None)
+    )
+    placed = tiers.board(
+        roster.players,
+        keep,
+        terms.stream_spots,
+        droppable=legality.droppable(roster, hold, to_ir),
+        upgrade_margin=terms.upgrade_margin,
+    )
+    ctx.tiers = placed
+    names = {p.player_key: p.name for p in roster.players}
+
+    def who(tier, source=None) -> list[str]:
+        return [
+            names[k]
+            for k, pl in placed.items()
+            if pl.tier is tier and (source is None or pl.source == source)
+        ]
+
+    rot = who(tiers.Tier.ROTATION)
+    mine = who(tiers.Tier.ROTATION, tiers.YOU) + who(tiers.Tier.UPGRADE, tiers.YOU)
+    mine += who(tiers.Tier.NEVER, tiers.YOU)
+    report.add(
+        "tiers",
+        True,
+        f"rotation: {', '.join(rot) or 'nobody'}; never: {len(who(tiers.Tier.NEVER))}; "
+        f"upgrade only: {len(who(tiers.Tier.UPGRADE))}",
+        [f"set by you: {', '.join(sorted(mine))}"] if mine else [],
+    )
+    return placed
 
 
 def _keepers(conn, manager, runtime, roster, day, report):

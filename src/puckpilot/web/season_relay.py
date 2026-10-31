@@ -19,7 +19,8 @@ lost - and the consequence of that is the proposal reappearing on the next
 push for you to decide again. That is the direction the failure has to fall:
 losing an approval costs a tap, while inventing one spends an acquisition. So
 nothing here is durable on purpose, and the local side treats a drained
-decision as the only decision.
+decision as the only decision. A drop tier set from the roster (`/tier`) goes
+back the same way: lost, it is set again; it is never made up.
 
 No engine imports; this file is copied into a standard-library-only image.
 """
@@ -54,6 +55,12 @@ NEXT_RUN_GRACE_S = 45 * 60.0
 # More than this waiting to be drained means nobody is collecting them, which
 # is worth failing loudly about rather than growing without bound.
 MAX_PENDING_DECISIONS = 200
+
+# The drop tiers a manager can set from the roster, and "auto" to go back to
+# the rule. Mirrors `season.tiers` (this file imports no engine); a contract
+# test holds the two together.
+TIER_LABELS = {"never": "Never", "upgrade": "Upgrade only", "rotation": "Rotation"}
+AUTO_TIER = "auto"
 
 BUILD_FILES = ("season_page.py", "season_relay.py", "wire.py")
 
@@ -199,6 +206,48 @@ class SeasonState:
             self._mark_decided(manager, kind, int(ident), bool(approve))
         return row
 
+    def set_tier(self, manager: str, player_key: str, tier: str) -> dict:
+        """Queue a drop tier for one rostered player, and show it at once.
+
+        Only a player on the roster this manager was last shown, and never one
+        the platform locks (`tier_source` "yahoo") - no pin can move him.
+        """
+        if tier != AUTO_TIER and tier not in TIER_LABELS:
+            known = ", ".join([*TIER_LABELS, AUTO_TIER])
+            raise ValueError(f"unknown tier {tier!r} (known: {known})")
+        with self._lock:
+            snap = self._snap.get(manager) or {}
+            row = next(
+                (r for r in snap.get("roster", []) if r.get("player_key") == player_key), None
+            )
+            if row is None:
+                raise ValueError("that player is not on the roster shown")
+            if row.get("tier_source") == "yahoo":
+                raise ValueError(f"Yahoo does not let {row.get('name', 'him')} be dropped")
+            if len(self._decisions) >= MAX_PENDING_DECISIONS:
+                raise RuntimeError("too many undelivered decisions; is the local job running?")
+            self._seq += 1
+            out = {
+                "seq": self._seq,
+                "manager": manager,
+                "kind": "tier",
+                "player": player_key,
+                "tier": tier,
+                "at": time.time(),
+            }
+            self._decisions.append(out)
+            # Shown as set until the next push, which says what the run made of it.
+            if tier == AUTO_TIER:
+                row.update(tier_source="auto", tier_why="automatic - from PuckPilot's next run")
+            else:
+                row.update(
+                    tier=tier,
+                    tier_label=TIER_LABELS[tier],
+                    tier_source="you",
+                    tier_why="set by you - used from PuckPilot's next run",
+                )
+        return out
+
     def _mark_decided(self, manager: str, kind: str, ident: int, approve: bool) -> None:
         snap = self._snap.get(manager)
         if not snap:
@@ -320,6 +369,17 @@ def make_handler(state: SeasonState, keys: dict[str, str]):
                 # strict wire can still send NaN, and JSON.parse rejects it.
                 state.push(manager, wire.clean(snap))
                 self._send(200, wire.dumps({"ok": True, "manager": manager}), "application/json")
+            elif route == "/tier":
+                try:
+                    row = state.set_tier(
+                        manager, str(body.get("player") or ""), str(body.get("tier") or "")
+                    )
+                except (TypeError, ValueError) as e:
+                    self._refuse(400, str(e))
+                except RuntimeError as e:
+                    self._refuse(503, str(e))
+                else:
+                    self._send(200, wire.dumps({"ok": True, "seq": row["seq"]}), "application/json")
             elif route == "/decide":
                 try:
                     row = state.decide(
