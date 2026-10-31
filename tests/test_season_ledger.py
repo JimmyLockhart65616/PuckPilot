@@ -48,3 +48,15 @@ def test_a_move_is_judged_on_the_nights_it_was_for(db):
     assert line.drop_nights == 1 and line.drop_totals["saves"] == 28
     text = "\n".join(ledger.describe(line, [CATALOG[k] for k in ("G", "SOG", "W", "SV", "SV%")]))
     assert "2 night(s) in the lineup" in text and "SV 28" in text and "SV% 0.933" in text
+
+
+def test_the_page_line_leaves_the_zeros_out():
+    line = ledger.LedgerLine(15, "add_drop", "2026-10-13", "Kleven", "Gibson", nights=7,
+                             add_totals={"goals": 1.0, "assists": 0.0, "blocks": 16.0},
+                             drop_totals={"wins": 3.0, "saves": 106.0, "shots_against": 120.0},
+                             drop_nights=5)  # fmt: skip
+    cats = [CATALOG[k] for k in ("G", "A", "BLK", "W", "SV", "SV%")]
+    got = ledger.summary(line, cats)
+    assert got["head"] == "#15 Kleven for Gibson" and got["nights"] == 7
+    assert got["add"] == "Kleven: G 1 BLK 16"
+    assert got["drop"] == "Gibson on those nights: W 3 SV 106 SV% 0.883"

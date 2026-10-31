@@ -639,6 +639,7 @@ def run_day(
                 executable_kinds=_executable_kinds(),
                 today=day,
                 blockers=[b.payload() for b in blocked or ()],
+                ledger=_ledger(conn, manager, league_key, runtime, day, roster),
             )
             publish.push(manager.page.url, page_key, snap)
             report.add("page", True, manager.page.url)
@@ -747,6 +748,21 @@ def _protected_keepers(conn, manager_name: str) -> set[str]:
     if not row or not row[0]:
         return set()
     return {k.player_key for k in keeper_value.load(conn, manager_name, row[0]) if k.protected}
+
+
+def _ledger(conn, manager, league_key: str, runtime, day: str, roster) -> list[dict]:
+    """The last few moves made, and what each did - for the page (ledger.py)."""
+    from puckpilot.season import ledger
+
+    team_key = manager.team_key or getattr(roster, "team_key", "")
+    if not team_key:
+        return []
+    lines = ledger.build(conn, manager.name, league_key, team_key, runtime.nhl_season, day)
+    return [ledger.summary(x, manager.league.all_cats) for x in lines[-LEDGER_SHOWN:]][::-1]
+
+
+# Moves the page lists, newest first.
+LEDGER_SHOWN = 6
 
 
 def _league_read_on(conn, manager, day: str) -> bool:

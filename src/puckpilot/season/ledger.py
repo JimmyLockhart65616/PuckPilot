@@ -75,9 +75,7 @@ def _games(conn, season: str, pids) -> dict[tuple[int, str], dict[str, float]]:
         f"WHERE g.season = ? AND g.player_id IN ({marks})",
         (season, *pids),
     )
-    return {
-        (pid, day): _line(json.loads(s), json.loads(b) if b else {}) for pid, day, s, b in rows
-    }
+    return {(pid, day): _line(json.loads(s), json.loads(b) if b else {}) for pid, day, s, b in rows}
 
 
 def _slots(conn, team_key: str) -> dict[str, dict[str, str]]:
@@ -134,6 +132,36 @@ def build(conn, manager: str, league_key: str, team_key: str, season: str, today
             day += timedelta(days=1)
         lines.append(line)
     return lines
+
+
+def summary(line: LedgerLine, cats) -> dict:
+    """One move for the page: what it was, and both sides' lines in the
+    league's categories - the categories only, the zeros left out."""
+
+    def short(totals: dict[str, float]) -> str:
+        bits = []
+        for c in cats:
+            if c.key == "save_pct":
+                sa = totals.get("shots_against", 0.0)
+                if sa:
+                    bits.append(f"{c.label} {totals.get('saves', 0.0) / sa:.3f}")
+            elif totals.get(c.key):
+                bits.append(f"{c.label} {totals[c.key]:g}")
+        return " ".join(bits) or "nothing"
+
+    head = f"#{line.proposal_id} {line.add_name}" + (
+        f" for {line.drop_name}" if line.drop_name else " into an open spot"
+    )
+    out = {
+        "head": head,
+        "since": line.made_on,
+        "nights": line.nights,
+        "add": f"{line.add_name}: {short(line.add_totals)}",
+        "drop": "",
+    }
+    if line.drop_name:
+        out["drop"] = f"{line.drop_name} on those nights: {short(line.drop_totals)}"
+    return out
 
 
 def describe(line: LedgerLine, cats) -> list[str]:

@@ -159,6 +159,7 @@ class SeasonState:
                 "acted": None,
                 "withdrawn": [],
                 "blockers": [],
+                "ledger": [],
                 "build": served_build(),
             }
         age = time.time() - at

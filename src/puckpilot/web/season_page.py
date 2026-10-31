@@ -241,6 +241,19 @@ function renderProposals(root, list) {
   });
 }
 
+// The moves made, newest first, and what each did against the player let go.
+function renderLedger(root, list) {
+  if (!list || !list.length) return;
+  h2(root, 'Moves made, and what they did');
+  var c = card(root);
+  list.forEach(function (m) {
+    c.appendChild(el('div', null, m.head + (m.since ? ' \\u00b7 from ' + m.since : '') +
+      ' \\u00b7 ' + (m.nights || 0) + ' night' + (m.nights === 1 ? '' : 's') + ' in the lineup'));
+    if (m.add) c.appendChild(el('div', 'sub', m.add));
+    if (m.drop) c.appendChild(el('div', 'sub', m.drop));
+  });
+}
+
 function renderWithdrawn(root, list) {
   if (!list || !list.length) return;
   h2(root, 'Withdrawn');
@@ -356,6 +369,7 @@ function render(s) {
   renderPlan(app, s.week);
   renderProtocol(app, s.protocol);
   renderWeek(app, s.week);
+  renderLedger(app, s.ledger);
   renderRoster(app, s.roster);
 }
 

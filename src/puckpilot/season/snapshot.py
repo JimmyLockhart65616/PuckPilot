@@ -63,6 +63,7 @@ def build(
     today: str = "",
     executable_kinds: frozenset[str] | None = None,
     blockers: list[dict] | None = None,
+    ledger: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -106,6 +107,8 @@ def build(
         "withdrawn": [],
         # What stops the tool working, above everything else (season/blockers.py).
         "blockers": list(blockers or []),
+        # The moves made and what each did, against the player let go (ledger.py).
+        "ledger": list(ledger or []),
     }
     if next_run is not None:
         from datetime import UTC

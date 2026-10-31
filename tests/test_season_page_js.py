@@ -623,3 +623,37 @@ def test_a_blocker_leads_the_page():
     app = out["app"]
     assert app.index("BLOCKED: Roster illegal") < app.index("Tonight")
     assert "Approve the make-room move (#17)" in app and "since 2026-10-19" in app
+
+
+def test_the_moves_made_render_with_what_they_did():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [],
+            "ledger": [
+                {
+                    "head": "#15 Kleven for Gibson",
+                    "since": "2026-10-13",
+                    "nights": 7,
+                    "add": "Kleven: G 1 SOG 11 HIT 10 BLK 16",
+                    "drop": "Gibson on those nights: W 3 SV 106 SV% 0.883",
+                },
+                {
+                    "head": "#13 Rossi into an open spot",
+                    "since": "2026-10-08",
+                    "nights": 1,
+                    "add": "Rossi: SOG 6 HIT 5",
+                    "drop": "",
+                },  # fmt: skip
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    app = out["app"]
+    assert "Moves made, and what they did" in app
+    assert "#15 Kleven for Gibson" in app and "7 nights in the lineup" in app
+    assert "Gibson on those nights: W 3 SV 106" in app and "1 night in the lineup" in app
