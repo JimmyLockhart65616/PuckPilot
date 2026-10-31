@@ -62,6 +62,7 @@ def build(
     executes_moves: bool = False,
     today: str = "",
     executable_kinds: frozenset[str] | None = None,
+    blockers: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -77,7 +78,8 @@ def build(
     `today` dates the cards' "made when" words when there is no `plan` to.
     `executable_kinds`: the move kinds the installed executor can make (None:
     every kind, when `executes_moves`); a card of any other kind says to make
-    it yourself, because nothing here would.
+    it yourself, because nothing here would. `blockers` (`Blocker.payload()`)
+    lead the page: what stops the tool working comes before anything it says.
     """
     snap: dict[str, Any] = {
         "team": team_name,
@@ -102,6 +104,8 @@ def build(
         # Proposals withdrawn undecided in the last day, and why - a card that
         # just vanishes reads as a bug.
         "withdrawn": [],
+        # What stops the tool working, above everything else (season/blockers.py).
+        "blockers": list(blockers or []),
     }
     if next_run is not None:
         from datetime import UTC

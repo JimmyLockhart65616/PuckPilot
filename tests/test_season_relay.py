@@ -99,7 +99,7 @@ def test_a_cold_relay_returns_a_drawable_payload(relay):
     _, base = relay
     s = json.loads(call(base, "/state", "KEYJ")[1])
     assert s["empty"] is True and s["stale"] is True
-    for key in ("moves", "proposals", "roster", "week", "protocol", "age_seconds"):
+    for key in ("moves", "proposals", "roster", "week", "protocol", "age_seconds", "blockers"):
         assert key in s
 
 

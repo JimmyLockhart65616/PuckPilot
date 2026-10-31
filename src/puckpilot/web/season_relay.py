@@ -158,6 +158,7 @@ class SeasonState:
                 "next_local": "",
                 "acted": None,
                 "withdrawn": [],
+                "blockers": [],
                 "build": served_build(),
             }
         age = time.time() - at

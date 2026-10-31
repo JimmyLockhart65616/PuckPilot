@@ -62,6 +62,7 @@ PAGE = """<!doctype html>
   .tag.move  { background:rgba(91,157,255,.16); color:var(--accent); }
   .tag.ir, .tag.activate { background:rgba(255,196,0,.16); color:var(--warn); }
   .alert { color:var(--bad); font-weight:600; margin:6px 0; }
+  .blocked { border:2px solid var(--bad); }
   .name { flex:1; }
   .sub { font-size:13px; color:var(--dim); }
   table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
@@ -108,6 +109,19 @@ function ageText(sec) {
   if (sec < 90) return 'updated just now';
   if (sec < 5400) return 'updated ' + Math.round(sec / 60) + ' min ago';
   return 'updated ' + Math.round(sec / 3600) + ' h ago';
+}
+
+// What stops the tool working, above everything: a blocked roster said under
+// "Tonight" sat unread for twelve days.
+function renderBlockers(root, list) {
+  if (!list || !list.length) return;
+  list.forEach(function (b) {
+    var c = card(root);
+    c.className = 'card blocked';
+    c.appendChild(el('div', 'alert', 'BLOCKED: ' + (b.title || '')));
+    if (b.message) c.appendChild(el('div', null, b.message));
+    if (b.since) c.appendChild(el('div', 'sub', 'since ' + b.since));
+  });
 }
 
 function renderMoves(root, s) {
@@ -335,6 +349,7 @@ function render(s) {
     return;
   }
   app.appendChild(el('h1', null, s.team || 'PuckPilot'));
+  renderBlockers(app, s.blockers);
   renderMoves(app, s);
   renderProposals(app, s.proposals);
   renderWithdrawn(app, s.withdrawn);

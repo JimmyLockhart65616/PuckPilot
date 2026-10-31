@@ -597,3 +597,29 @@ def test_a_make_room_card_leads_with_its_own_words():
     assert "Add Back" not in out["app"]
     assert "Why this move" in out["app"]
     assert "Add Old Card" in out["app"] and "drop Someone" in out["app"]
+
+
+def test_a_blocker_leads_the_page():
+    """What stops the tool working comes before anything it says."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [],
+            "blockers": [
+                {
+                    "kind": "roster_illegal",
+                    "title": "Roster illegal - no add can be made",
+                    "message": "Approve the make-room move (#17) to clear it.",
+                    "since": "2026-10-19T22:41:00+00:00",
+                }
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    app = out["app"]
+    assert app.index("BLOCKED: Roster illegal") < app.index("Tonight")
+    assert "Approve the make-room move (#17)" in app and "since 2026-10-19" in app

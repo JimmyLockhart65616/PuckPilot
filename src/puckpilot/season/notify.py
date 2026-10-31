@@ -104,6 +104,15 @@ def ask_again(what: str, page_url: str = "", post=None) -> bool:
     )
 
 
+def blocked(title: str, message: str, page_url: str = "", post=None) -> bool:
+    """Something stops the tool working (`season/blockers.py`) - once a day
+    while it stands, at high priority."""
+    return send(
+        f"Blocked: {title}", message, click=page_url, priority="high", tags="rotating_light",
+        post=post,
+    )  # fmt: skip
+
+
 def failed(what: str, why: str, page_url: str = "", post=None) -> bool:
     """Something the manager is relying on did not happen."""
     title = f"NOT done: {what}"

@@ -594,6 +594,10 @@ def run_day(
             ),
         )
 
+    # 4b. What stops the tool working - said on the page, in the log as a FAIL,
+    # and on the phone - never left as a line under an "ok" step.
+    blocked = _guard(report, "blockers", lambda: _blockers(conn, manager, league_key, ctx, report))
+
     # 5. Publish whatever we managed to work out.
     if manager.page.publishes and page_key:
 
@@ -615,6 +619,7 @@ def run_day(
                 executes_moves=_executes(manager),
                 executable_kinds=_executable_kinds(),
                 today=day,
+                blockers=[b.payload() for b in blocked or ()],
             )
             publish.push(manager.page.url, page_key, snap)
             report.add("page", True, manager.page.url)
@@ -631,7 +636,14 @@ def run_day(
         )
 
     # 7. Tell the phone about anything that needs the manager.
-    _guard(report, "notify", lambda: _notify(conn, manager, league_key, report, started))
+    _guard(
+        report,
+        "notify",
+        lambda: _notify(conn, manager, league_key, report, started, blocked or ()),
+    )
+    from puckpilot.season import blockers as blockers_mod
+
+    blockers_mod.mark_run(conn, manager.name)
 
     say(report.text)
     return report
@@ -716,6 +728,46 @@ def _protected_keepers(conn, manager_name: str) -> set[str]:
     if not row or not row[0]:
         return set()
     return {k.player_key for k in keeper_value.load(conn, manager_name, row[0]) if k.protected}
+
+
+def _blockers(conn, manager, league_key: str, ctx, report: RunReport) -> list:
+    """This run's blockers (`season/blockers.py`), recorded, as a step that
+    FAILs while any stands."""
+    from puckpilot.season import blockers as blockers_mod
+    from puckpilot.season.transactions import executor
+
+    read = next((s for s in report.steps if s.name == "roster"), None)
+    approved = [
+        p
+        for p in proposals_mod.listing(conn, manager.name, league_key,
+                                       status=proposals_mod.APPROVED, limit=200)
+        if p.reason.get("approved_to_execute") and not p.reason.get("submitted_at")
+    ]  # fmt: skip
+    pending_fixes = [
+        p for p in proposals_mod.pending(conn, manager.name, league_key)
+        if p.move_kind is MoveKind.ACTIVATE
+    ]  # fmt: skip
+    found, failures = blockers_mod.detect(
+        resolution=getattr(ctx, "resolution", None),
+        pending_fixes=pending_fixes,
+        execute_approved=bool(manager.authority.transactions.execute_approved),
+        executor=executor(),
+        approved=approved,
+        read_failed=read is not None and not read.ok,
+        read_error=read.detail if read is not None and not read.ok else "",
+        previous_failures=blockers_mod.read_failures(conn, manager.name),
+        last_run_at=blockers_mod.last_run(conn, manager.name),
+    )
+    blockers_mod.set_read_failures(conn, manager.name, failures)
+    recorded = blockers_mod.record(conn, manager.name, found)
+    if recorded:
+        report.add(
+            "blockers",
+            False,
+            "; ".join(b.title for b in recorded),
+            [f"{b.title} (since {b.since}): {b.message}" for b in recorded],
+        )
+    return recorded
 
 
 def _after_ir(roster, moves):
@@ -942,11 +994,14 @@ def _odds_model():
     return OddsModel()
 
 
-def _notify(conn, manager, league_key: str, report: RunReport, since: str) -> None:
-    """New pickups this run queued, and tonight's lineup if it was not made.
+def _notify(conn, manager, league_key: str, report: RunReport, since: str, blocked=()) -> None:
+    """New pickups this run queued, tonight's lineup if it was not made, and
+    each blocker once a day while it stands.
 
     Quiet unless `PUCKPILOT_NOTIFY_URL` is set (season/notify.py). A lineup
-    switched off on purpose (the kill switch) is not news.
+    switched off on purpose (the kill switch) is not news. A make-room card
+    pushed this run already says the roster is illegal, so that blocker waits
+    for tomorrow's push rather than doubling today's.
     """
     from puckpilot.season import notify
 
@@ -963,6 +1018,13 @@ def _notify(conn, manager, league_key: str, report: RunReport, since: str) -> No
         lineup_missed = s.name == "act" and not s.ok and "switched off" not in s.detail
         if lineup_missed and notify.failed("tonight's lineup", s.detail, url):
             sent.append("lineup not made")
+    from puckpilot.season import blockers as blockers_mod
+
+    told = {blockers_mod.ROSTER_ILLEGAL} if any(not p.move_kind.spends_acquisition
+                                                for p in new) else set()  # fmt: skip
+    for b in blockers_mod.due(conn, manager.name, [b for b in blocked if b.kind not in told]):
+        if notify.blocked(b.title, b.message, url):
+            sent.append(b.title.lower())
     if sent:
         report.add("notify", True, "sent to your phone: " + ", ".join(sent))
 
