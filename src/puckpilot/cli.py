@@ -1567,6 +1567,35 @@ def _cmd_season_g3(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_moves(args: argparse.Namespace) -> int:
+    """What each move PuckPilot made actually did (season/ledger.py)."""
+    from puckpilot.season import cli_support, ledger
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+    team_key = manager.team_key or ""
+    if not team_key:
+        row = conn.execute(
+            "SELECT team_key FROM waiver_proposals WHERE manager = ? AND team_key != '' LIMIT 1",
+            (manager.name,),
+        ).fetchone()
+        team_key = row[0] if row else ""
+    today = args.date or cli_support.today_str()
+    lines = ledger.build(conn, manager.name, league_key, team_key, runtime.nhl_season, today)
+    if not lines:
+        print("No move made yet.")
+        return 0
+    print("Each move: the nights the player brought in was in a starting slot and played,")
+    print("and what the player let go did on those same nights.\n")
+    for line in lines:
+        print("\n".join(ledger.describe(line, manager.league.all_cats)))
+    return 0
+
+
 def _cmd_season_statuses(args: argparse.Namespace) -> int:
     """Every tag seen since logging began, what followed, and the play rate by tag."""
     from puckpilot.season import cli_support, status_log
@@ -3052,6 +3081,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s_g3.add_argument("--weeks", default="", help="comma list of week numbers (default: all final)")
     s_g3.set_defaults(func=_cmd_season_g3)
+
+    s_moves = season_sub.add_parser(
+        "moves",
+        parents=[seasonal],
+        help="The move ledger: what each move made did, against the player let go",
+    )
+    s_moves.set_defaults(func=_cmd_season_moves)
 
     s_tags = season_sub.add_parser(
         "statuses",
