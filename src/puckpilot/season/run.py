@@ -607,6 +607,12 @@ def run_day(
             ),
         )
 
+    # 4a. The whole league, once a day: every team's moves, standings, the
+    # week's scores and week-start rosters (season/league_feed.py) - what the
+    # live calibration and the replay's rivals are measured against.
+    if not _league_read_on(conn, manager, day):
+        _guard(report, "league", lambda: _league(conn, manager, league_key, runtime, day, report))
+
     # 4b. What stops the tool working - said on the page, in the log as a FAIL,
     # and on the phone - never left as a line under an "ok" step.
     blocked = _guard(report, "blockers", lambda: _blockers(conn, manager, league_key, ctx, report))
@@ -741,6 +747,34 @@ def _protected_keepers(conn, manager_name: str) -> set[str]:
     if not row or not row[0]:
         return set()
     return {k.player_key for k in keeper_value.load(conn, manager_name, row[0]) if k.protected}
+
+
+def _league_read_on(conn, manager, day: str) -> bool:
+    from puckpilot.data import store
+
+    return store.get_meta(conn, f"league:{manager.name}:{day}") is not None
+
+
+def _league(conn, manager, league_key: str, runtime, day: str, report: RunReport) -> None:
+    from puckpilot.data import store
+    from puckpilot.season import cli_support
+    from puckpilot.season import league_feed as lf
+    from puckpilot.yahoo import playermap
+
+    pmap = playermap.load_map(conn, league_key)
+    got = cli_support.run_session(
+        manager,
+        lambda s: lf.sync(conn, lf.YahooLeagueSource(s), league_key, runtime, manager.name,
+                          day, pmap),
+    )  # fmt: skip
+    store.set_meta(conn, f"league:{manager.name}:{day}", "read")
+    conn.commit()
+    report.add(
+        "league",
+        True,
+        f"{got['transactions']} transaction rows, {got['weeks']} week(s) of scores, "
+        f"{got['rosters']} week-start roster(s)",
+    )
 
 
 def _blockers(conn, manager, league_key: str, ctx, report: RunReport) -> list:

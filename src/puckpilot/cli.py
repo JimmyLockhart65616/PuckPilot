@@ -1503,6 +1503,70 @@ def _cmd_season_locks(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_league(args: argparse.Namespace) -> int:
+    """The whole league: standings, each team's adds, and the latest moves."""
+    from puckpilot.season import cli_support
+    from puckpilot.season import league_feed as lf
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.yahoo import playermap
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+        if not args.no_read:
+            pmap = playermap.load_map(conn, league_key)
+            today = args.date or cli_support.today_str()
+            got = cli_support.run_session(
+                manager,
+                lambda s: lf.sync(conn, lf.YahooLeagueSource(s), league_key, runtime,
+                                  manager.name, today, pmap, rosters=not args.no_rosters),
+            )  # fmt: skip
+            print(
+                f"  read: {got['transactions']} transaction rows, {got['standings']} teams, "
+                f"{got['weeks']} week(s) of scores, {got['rosters']} week-start roster(s)"
+            )
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    view = lf.summary(conn, league_key)
+    print(f"\n  Standings {view['date']} (categories W-L-T), and adds this season:")
+    for t in view["teams"]:
+        print(f"    {t['rank']:>2}  {t['name'][:24]:24}  {t['record']:>9}   "
+              f"{t['adds']:>2} adds ({t['goalie_adds']} goalies)")  # fmt: skip
+    recent = conn.execute(
+        "SELECT at, team_key, action, name, positions FROM league_transactions "
+        "WHERE league_key = ? AND action IN ('add', 'drop') ORDER BY at DESC LIMIT ?",
+        (league_key, args.recent),
+    ).fetchall()
+    names = {t["team_key"]: t["name"] for t in view["teams"]}
+    if recent:
+        print(f"\n  Latest {len(recent)} moves:")
+        for r in recent:
+            sign = "+" if r[2] == "add" else "-"
+            print(f"    {r[0][:16].replace('T', ' ')}Z  {names.get(r[1], r[1])[:20]:20}  "
+                  f"{sign}{r[3]} ({r[4]})")  # fmt: skip
+    return 0
+
+
+def _cmd_season_g3(args: argparse.Namespace) -> int:
+    """Live calibration over every team in the league (season/g3.py)."""
+    from puckpilot.season import cli_support, g3
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+    weeks = {int(w) for w in args.weeks.split(",")} if args.weeks else None
+    report = g3.build(conn, runtime, manager.league, our_team=manager.team_key or "", weeks=weeks)
+    if not report.cases:
+        print("No final week with every team's week-start roster saved - `ppilot season league`.")
+        return 0
+    print(report.text())
+    return 0
+
+
 def _cmd_season_statuses(args: argparse.Namespace) -> int:
     """Every tag seen since logging began, what followed, and the play rate by tag."""
     from puckpilot.season import cli_support, status_log
@@ -2968,6 +3032,26 @@ def build_parser() -> argparse.ArgumentParser:
         "locks", parents=[seasonal], help="When today's slots close, player by player"
     )
     s_locks.set_defaults(func=_cmd_season_locks)
+
+    s_league = season_sub.add_parser(
+        "league",
+        parents=[seasonal],
+        help="The whole league: standings, every team's adds and the latest moves",
+    )
+    s_league.add_argument("--no-read", action="store_true", help="Show what is saved; read nothing")
+    s_league.add_argument(
+        "--no-rosters", action="store_true", help="Skip the week-start rosters (12 reads a week)"
+    )
+    s_league.add_argument("--recent", type=int, default=15, help="How many latest moves to list")
+    s_league.set_defaults(func=_cmd_season_league)
+
+    s_g3 = season_sub.add_parser(
+        "g3",
+        parents=[seasonal],
+        help="Live calibration: every team's week-start projection against what happened",
+    )
+    s_g3.add_argument("--weeks", default="", help="comma list of week numbers (default: all final)")
+    s_g3.set_defaults(func=_cmd_season_g3)
 
     s_tags = season_sub.add_parser(
         "statuses",

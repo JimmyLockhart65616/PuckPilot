@@ -306,6 +306,51 @@ CREATE TABLE IF NOT EXISTS player_status_changes (
     old_seen_at   TEXT,
     new_seen_at   TEXT NOT NULL
 );
+
+-- The whole league, not only our matchup (season/league_feed.py): every
+-- transaction, the standings by day, and every team's weekly totals.
+CREATE TABLE IF NOT EXISTS league_transactions (
+    league_key   TEXT NOT NULL,
+    txn_key      TEXT NOT NULL,
+    at           TEXT NOT NULL,          -- UTC ISO
+    type         TEXT NOT NULL,          -- add | drop | add/drop | trade
+    status       TEXT,
+    team_key     TEXT NOT NULL,          -- the team the player moved to or from
+    action       TEXT NOT NULL,          -- add | drop
+    player_key   TEXT NOT NULL,
+    nhl_player_id INTEGER,
+    name         TEXT,
+    nhl_team     TEXT,
+    positions    TEXT,
+    source_type  TEXT,                   -- freeagents | waivers | team
+    PRIMARY KEY (league_key, txn_key, player_key, action)
+);
+CREATE TABLE IF NOT EXISTS league_standings (
+    league_key TEXT NOT NULL,
+    date       TEXT NOT NULL,
+    team_key   TEXT NOT NULL,
+    name       TEXT,
+    rank       INTEGER,
+    wins       INTEGER,
+    losses     INTEGER,
+    ties       INTEGER,
+    moves      INTEGER,
+    trades     INTEGER,
+    PRIMARY KEY (league_key, date, team_key)
+);
+CREATE TABLE IF NOT EXISTS league_week_stats (
+    league_key      TEXT NOT NULL,
+    week            INTEGER NOT NULL,
+    team_key        TEXT NOT NULL,
+    name            TEXT,
+    opponent_key    TEXT,
+    status          TEXT,                -- preevent | midevent | postevent
+    cats_won        REAL,
+    completed_games INTEGER,
+    stats_json      TEXT NOT NULL,       -- {stat_id: value}
+    fetched_at      TEXT NOT NULL,
+    PRIMARY KEY (league_key, week, team_key)
+);
 """
 
 # `waiver_proposals` predates the in-season work and shipped without a manager,
