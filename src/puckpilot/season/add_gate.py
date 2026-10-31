@@ -56,6 +56,9 @@ Asked for after the goalie audit (2026-10-11), and tested the same way:
              are always priced (`goalie_lane`)
     -w       the odds price the weekly goalie minimum: a side short of it
              wins no goalie category (`goalie_minimum`)
+    -gf<n>   keep n goalies (`goalie_floor`): no drop for a skater below it,
+             and under it the free agents with most expected starts priced
+             against the cheapest skater; -gfa is the league's G slots + 1
     -a       the tested team's in-season pricing uses goalie projections
              aged on games played, not per-start volume
              (`projections.GOALIE_AGE_ON`); the draft is the same in every arm
@@ -150,6 +153,8 @@ class ArmSpec:
     lane: int = 0
     # -w: the weekly goalie minimum priced into the odds.
     minimum: bool = False
+    # -gfN / -gfa: goalies kept (`goalie_floor`); "auto" = G slots + 1.
+    floor: int | str | None = None
     # -a: in-season rates and values from the goalie projection aged on games.
     age_games: bool = False
     # -yN / -zN: swaps timed to their best day ("search" / "shift"), waiting
@@ -170,6 +175,13 @@ def _pair(target) -> tuple[str, str]:
 
 def _worth(target) -> float:
     return target.gain if target.gain is not None else target.score
+
+
+def _floor(spec: ArmSpec, runtime) -> int:
+    """The arm's goalie floor as a count (`run.goalie_floor`)."""
+    from puckpilot.season.run import goalie_floor
+
+    return goalie_floor(spec.floor, runtime)
 
 
 def week_result(cats, ours, theirs, our_short: bool = False, their_short: bool = False) -> float:
@@ -219,6 +231,10 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.drops = "goalies" if tok == "dg" else "all"
         elif tok == "w":
             spec.minimum = True
+        elif tok == "gfa":
+            spec.floor = "auto"
+        elif tok.startswith("gf") and tok[2:].isdigit():
+            spec.floor = int(tok[2:])
         elif tok == "a":
             spec.age_games = True
         elif len(tok) > 1 and tok[0] in "spqfxknjyz" and tok[1:].isdigit():
@@ -817,6 +833,7 @@ def add_gate_report(
                                 screen=spec.screen,
                                 drop_choice=spec.drops,
                                 goalie_lane=spec.lane,
+                                goalie_floor=_floor(spec, runtime),
                                 goalie_minimum=(
                                     runtime.min_goalie_games(nw.number) if spec.minimum else 0
                                 ),
@@ -907,6 +924,7 @@ def add_gate_report(
                             screen=spec.screen,
                             drop_choice=spec.drops,
                             goalie_lane=spec.lane,
+                            goalie_floor=_floor(spec, runtime),
                             goalie_minimum=(
                                 runtime.min_goalie_games(w.number) if spec.minimum else 0
                             ),

@@ -75,6 +75,9 @@ def test_an_arm_names_its_options():
     goalies = parse_arm("odds-daily-h-f25-x1-g-l", 2)
     assert (goalies.goalies, goalies.workload, goalies.skip_last) == (True, True, 1)
     assert not parse_arm("odds-daily", 2).goalies
+    assert parse_arm("odds-daily-h-f25-x1-k1-r-gfa", 2).floor == "auto"
+    assert parse_arm("odds-daily-gf3-dg", 2).floor == 3
+    assert parse_arm("odds-daily", 2).floor is None
     with pytest.raises(ValueError, match="unknown option"):
         parse_arm("odds-weekly-zz", 2)
     with pytest.raises(ValueError, match="unknown arm"):

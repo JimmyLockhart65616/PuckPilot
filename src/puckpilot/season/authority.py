@@ -284,6 +284,14 @@ class TransactionAuthority:
     # fresh leagues; with `drop_choice = "goalies"`, +0.024 +/- 0.026. The
     # gate itself now scores the minimum, so this is what pricing it buys.
     price_goalie_minimum: bool = False
+    # Goalies kept on the roster: no drop for a skater takes it below this,
+    # and while it is below, the free agents with the most expected starts are
+    # priced against the cheapest legal skater. None = off; an integer; or
+    # "auto" = the league's G slots + 1 (read from Yahoo, never a literal).
+    # Asked for by the 2026-10-31 review: a 10-12 drop left a roster two
+    # goalies, one lost his net, and goalie categories went 1 for 4 weeks.
+    # Off until the pre-registered add-gate arms (`-gf<N>` / `-gfa`) say.
+    min_goalies: int | str | None = None
     # Make a swap on its best day of the week, not the day it is found: after
     # the games the player going out still has, on days the one coming in
     # does not play ("make it Wednesday morning"). The card says when and the
@@ -336,6 +344,19 @@ class TransactionAuthority:
             )
         if self.goalie_lane < 0:
             raise AuthorityError("authority.transactions.goalie_lane cannot be negative")
+        if (
+            self.min_goalies is not None
+            and self.min_goalies != "auto"
+            and (
+                not isinstance(self.min_goalies, int)
+                or isinstance(self.min_goalies, bool)
+                or self.min_goalies < 1
+            )
+        ):
+            raise AuthorityError(
+                "authority.transactions.min_goalies must be a whole number of goalies or "
+                f'"auto"; got {self.min_goalies!r}'
+            )
         if self.time_moves not in TIME_MODES:
             raise AuthorityError(
                 f"authority.transactions.time_moves must be one of {', '.join(TIME_MODES)}; "

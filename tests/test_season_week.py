@@ -1463,3 +1463,87 @@ def test_shift_never_chooses_a_swap_that_does_not_pay_today(db):
     assert [t.after_games_of for t in run("search")] == ["2026-10-06"]
     with pytest.raises(ValueError):
         run("sometimes")
+
+
+def test_the_goalie_floor_prices_a_goalie_against_a_skater_and_never_cuts_below_it(db, monkeypatch):
+    """10-12: a drop left a roster two goalies, and with its goalies its
+    cheapest players no skater was ever a streamer to give up for a third.
+    Under the floor the best free-agent goalie is priced against the cheapest
+    skater; at the floor no goalie is offered up for a skater."""
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season import week as W
+    from puckpilot.season.goalies import StaticGoalieSource
+    from puckpilot.season.roster import TeamRoster
+    from tests.test_season_settings import _slots
+
+    priced: list[tuple[str, str]] = []
+    real = W._price
+
+    def spy(*a):
+        priced.append((a[8].name, a[9].name if a[9] is not None else ""))
+        return real(*a)
+
+    monkeypatch.setattr(W, "_price", spy)
+    _week_games(db)
+    rt = _runtime_for_week(roster_positions=_slots(("C", 2, 1), ("G", 2, 1)))
+    skaters = (
+        _rp("p.1", "Star", 1, "MTL", "C"),
+        _rp("p.2", "Depth", 2, "TOR", "C"),
+        _rp("p.3", "Extra", 3, "TOR", "BN"),
+    )
+
+    def goalie(key, name, pid, team):
+        from puckpilot.season.roster import RosterPlayer
+
+        return RosterPlayer(
+            player_key=key, yahoo_id=key, name=name, team=team, primary_position="G",
+            yahoo_eligible=frozenset({"G"}), selected_slot="G", nhl_player_id=pid,
+        )  # fmt: skip
+
+    two = (goalie("g.1", "Keeper", 21, "MTL"), goalie("g.2", "Backup", 22, "TOR"))
+    tor_days = ("2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08")
+    source = StaticGoalieSource({d: {11: 0.7, 21: 0.6, 22: 0.4} for d in tor_days})
+    rates = {1: {"goals": 0.5}, 2: {"goals": 0.2}, 3: {"goals": 0.1}, 9: {"goals": 0.3}}
+    rates.update({11: {"goals": 0.0}, 21: {"goals": 0.0}, 22: {"goals": 0.0}})
+    # The free-agent goalie is worth less a game than any skater (as goalies
+    # are on this scale) and more than the two on the roster.
+    values = _PerGame({1: 1.5, 2: 0.5, 3: 0.4, 9: 1.0, 11: 0.15, 21: 0.12, 22: 0.1})
+    names = {"Star", "Depth", "Extra"}
+
+    def run(players, floor):
+        priced.clear()
+        ours = TeamRoster(league_key="999.l.1", team_key="t", date="2026-10-05", players=players)
+        W._targets(
+            db, rt, LeagueConfig(skater_cats=(resolve("G"),), goalie_cats=()), rt.week(1), ours,
+            [_fa("fa.1", "Streamer", 9), _goalie_fa("fa.2", "Stopper", 11)], rates, {}, source,
+            values, 1e9, 1, screen=1, goalie_floor=floor,
+        )  # fmt: skip
+        return set(priced)
+
+    off = run(skaters + two, 0)
+    assert not any(add == "Stopper" and drop in names for add, drop in off)
+    under = run(skaters + two, 3)
+    assert ("Stopper", "Extra") in under  # the cheapest skater, not a goalie
+    assert not any(add == "Stopper" and drop in ("Keeper", "Backup") for add, drop in under)
+    at = run(skaters + two + (goalie("g.3", "Third", 23, "TOR"),), 3)
+    assert not any(add == "Streamer" and drop in ("Keeper", "Backup", "Third")
+                   for add, drop in at)  # fmt: skip
+
+
+def test_the_goalie_floor_setting_reads_the_league_and_refuses_nonsense():
+    from types import SimpleNamespace
+
+    from puckpilot.season.authority import AuthorityError, TransactionAuthority
+    from puckpilot.season.run import goalie_floor, goalie_terms
+
+    rt = SimpleNamespace(
+        slots=(SimpleNamespace(position="G", count=2), SimpleNamespace(position="C", count=2)),
+        min_goalie_games=lambda n: 3,
+    )
+    assert goalie_floor(None, rt) == 0 and goalie_floor(4, rt) == 4
+    assert goalie_floor("auto", rt) == 3  # the league's two G slots, plus one
+    assert goalie_terms(TransactionAuthority(min_goalies="auto"), rt, None)["goalie_floor"] == 3
+    assert "goalie_floor" not in goalie_terms(TransactionAuthority(), rt, None)
+    for bad in (0, -1, "three", True, 2.5):
+        with pytest.raises(AuthorityError):
+            TransactionAuthority(min_goalies=bad)

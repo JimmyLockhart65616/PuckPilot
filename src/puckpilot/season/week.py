@@ -844,6 +844,7 @@ def build_week_plan(
     screen: int = 20,
     drop_choice: str = "cheapest",
     goalie_lane: int = 0,
+    goalie_floor: int = 0,
     goalie_minimum: int = 0,
     goalie_appearances: float = 0.0,
     their_goalie_appearances: float | None = None,
@@ -879,6 +880,9 @@ def build_week_plan(
 
     `drop_choice` / `goalie_lane`: which drops each candidate is priced
     against, and how many free-agent goalies are always priced (`_targets`).
+    `goalie_floor` > 0 keeps that many goalies on the roster: no drop takes it
+    below, and while it is below the best free-agent goalies are priced
+    against the cheapest legal skater (`_targets`).
 
     `goalie_minimum` > 0 prices the league's weekly goalie minimum into the
     odds: a side short of it wins no goalie category, so each side's chance of
@@ -1123,6 +1127,7 @@ def build_week_plan(
             leverage=leverage,
             drop_choice=drop_choice,
             goalie_lane=goalie_lane,
+            goalie_floor=goalie_floor,
             misses=misses,
             time_moves=time_moves if horizon == "this week" else "off",
             wait_hazard=wait_hazard,
@@ -1248,6 +1253,7 @@ def _targets(
     leverage: dict[str, float] | None = None,
     drop_choice: str = "cheapest",
     goalie_lane: int = 0,
+    goalie_floor: int = 0,
     misses: list | None = None,
     time_moves: str = "off",
     wait_hazard: float = WAIT_HAZARD,
@@ -1297,6 +1303,15 @@ def _targets(
     slot is empty, which on a roster with goalies to spare is almost never,
     and ignores whether he starts at all.
 
+    `goalie_floor` goalies are kept: no drop for a skater takes the roster
+    below it, and while it is below, the `FLOOR_LANE` free agents with the most
+    expected starts' worth are priced against the cheapest legal skater - the
+    only way a goalie add is ever priced on a roster whose goalies are its
+    cheapest players, since no skater is then a streamer to give up for one.
+    On 2026-10-12 a drop took a roster to two goalies; one lost his net, and
+    weeks with two or three goalie appearances followed (one under the
+    minimum, which forfeits every goalie category).
+
     `misses`, when given, collects every swap priced and turned down.
 
     `time_moves`: "shift" prices the swap each step chose on today's price
@@ -1326,6 +1341,12 @@ def _targets(
     counts = legality.position_counts(ours, to_ir)
     rules = league.draft_rules()
     spots = open_roster_spots(runtime, ours)
+    # Goalies on the roster who can play: the count `goalie_floor` keeps.
+    n_goalies = sum(
+        1 for p in ours.players
+        if p.position == "G" and not p.on_ir and not p.is_out and p.player_key not in to_ir
+    )  # fmt: skip
+    below_floor = goalie_floor > 0 and n_goalies < goalie_floor
     evaluate = _evaluator(
         conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx, exclude
     )
@@ -1354,6 +1375,13 @@ def _targets(
     )
 
     def may_drop(p, cand) -> bool:
+        floor_holds = goalie_floor and p.position == "G" and cand.position != "G"
+        if floor_holds and n_goalies - 1 < goalie_floor:
+            return False  # the floor: a goalie goes only for a goalie
+        if below_floor and cand.position == "G":
+            # Under the floor a goalie is worth a skater's roster spot - and
+            # only a skater's: a goalie for a goalie leaves the count short.
+            return p.position != "G"
         worth = keep.get(p.player_key, 0.0)
         if stream_floor is not None and worth <= stream_floor:
             return True
@@ -1406,6 +1434,25 @@ def _targets(
             reverse=True,
         )
         screened += [c for c in lane[:goalie_lane] if starts_worth(c) > 0]
+
+    if below_floor:
+        p_floor = {d: (goalie_source.starts(d) if goalie_source else {}) for d in days}
+
+        def floor_worth(c) -> float:
+            starts = sum(
+                float(p_floor[d].get(c.nhl_player_id, 0.0))
+                for d in days
+                if c.team in playing.get(d, ())
+            )
+            return values.per_game(c.nhl_player_id, days[0]) * starts
+
+        seen = {c.player_key for c in screened}
+        floor_lane = sorted(
+            (c for c in eligible if c.position == "G" and c.player_key not in seen),
+            key=floor_worth,
+            reverse=True,
+        )
+        screened += [c for c in floor_lane[:FLOOR_LANE] if floor_worth(c) > 0]
 
     steps = max_targets if adds_left is None else min(max_targets, adds_left)
     chosen: list[AddTarget] = []
@@ -2128,6 +2175,9 @@ def _cheapest_legal_drop(cand, droppable, drop_values, counts, rules):
     legal = _legal_drops(cand, droppable, drop_values, counts, rules)
     return legal[0] if legal else None
 
+
+# Free-agent goalies priced while a roster is under its `goalie_floor`.
+FLOOR_LANE = 3
 
 # Which drops a candidate is priced against (`_targets`' `drop_choice`).
 DROP_CHOICES = ("cheapest", "goalies", "all")

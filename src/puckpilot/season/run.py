@@ -203,6 +203,9 @@ def goalie_terms(terms, runtime, week, day: str | None = None, ours=None, theirs
         "drop_choice": getattr(terms, "drop_choice", "cheapest"),
         "goalie_lane": getattr(terms, "goalie_lane", 0),
     }
+    floor = goalie_floor(getattr(terms, "min_goalies", None), runtime)
+    if floor:
+        out["goalie_floor"] = floor
     if not getattr(terms, "price_goalie_minimum", False) or week is None:
         return out
     need = runtime.min_goalie_games(week.number)
@@ -219,6 +222,16 @@ def goalie_terms(terms, runtime, week, day: str | None = None, ours=None, theirs
         their_goalie_appearances=None if got is None else float(got),
     )
     return out
+
+
+def goalie_floor(setting, runtime) -> int:
+    """`authority.transactions.min_goalies` as a count: off (0), a number, or
+    "auto" - the league's G slots plus one, from the league's own settings."""
+    if setting is None:
+        return 0
+    if setting == "auto":
+        return sum(s.count for s in runtime.slots if s.position == "G") + 1
+    return int(setting)
 
 
 def timing_terms(terms) -> dict:
