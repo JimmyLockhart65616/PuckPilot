@@ -157,6 +157,61 @@ def test_an_approved_make_room_move_is_made_first_and_proven(db, sent):
     assert ("made", f"#{room.id} drop Streamer so Back comes back") in sent
 
 
+def test_a_player_brought_straight_into_tonight_s_lineup_leaves_the_run_legal(db, monkeypatch):
+    """2026-11-01: the drop made room at 07:01, and at 07:02 the lineup brought
+    him back from IR+ straight into a free D slot - a lineup move, not one of
+    the plan's IR moves - so the run kept the roster as first read: it still
+    said the roster was illegal, and pushed that to the phone."""
+    from puckpilot.season import run as runmod
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.authority import Authority
+    from puckpilot.season.moves import Move
+    from puckpilot.season.settings import Week
+    from tests.test_season_legality import KEEP, RULES, SMALL
+
+    monkeypatch.setattr(weekmod, "keep_values", lambda *a, **k: KEEP)
+    before = roster(
+        rp("centre", "C", eligible=("C", "Util"), pos="C"),
+        rp("goalie", "G", eligible=("G",), pos="G"),
+        BACK,
+    )
+    manager = SimpleNamespace(
+        name="m", league=SimpleNamespace(draft_rules=lambda: RULES), authority=Authority()
+    )
+    ctx = runmod.WeekContext(week=Week(5, "2026-10-26", "2026-11-01"))
+    report = RunReport(date=TODAY, manager="m")
+    runmod._legality(db, manager, "L", SMALL, TODAY, before, ctx, (None, None), report,
+                     propose=True)  # fmt: skip
+    assert report.failed and "A spot is free" in " ".join(report.steps[-1].lines)
+    plan = SimpleNamespace(ir_moves=(), ir_within_authority=True, within_authority=True,
+                           moves=(Move(BACK, "D", "IR+"),))  # fmt: skip
+    after = runmod._after_act(db, manager, "L", SMALL, TODAY, before, ctx, (None, None),
+                              report, True, plan, {"ok": True})  # fmt: skip
+    assert {p.player_key: p.selected_slot for p in after.players}["back"] == "D"
+    assert ctx.roster is after and ctx.resolution.legal
+    (step,) = [s for s in report.steps if s.name == "legality"]
+    assert step.ok and step.detail.startswith("the roster is legal again")
+    assert "made: ACTIVATE Back IR+ -> D" in step.lines and not report.failed
+    assert runmod._blockers(db, manager, "L", ctx, report) == []
+
+
+def test_only_moves_the_actuator_made_count_as_made():
+    from puckpilot.season.moves import Move
+    from puckpilot.season.run import ir_made
+
+    to_ir, back_in = Move(rp("hurt", "D"), "IR+", "D"), Move(BACK, "D", "IR+")
+    start = Move(DROP, "C", "BN")
+
+    def plan(ir_ok=True, ok=True):
+        return SimpleNamespace(ir_moves=(to_ir,), ir_within_authority=ir_ok,
+                               within_authority=ok, moves=(back_in, start))  # fmt: skip
+
+    assert ir_made(plan(), {"ok": True}) == (to_ir, back_in)
+    assert ir_made(plan(ok=False), {"ok": True}) == (to_ir,)
+    assert ir_made(plan(ir_ok=False), {"ok": True}) == (back_in,)
+    assert ir_made(plan(), {"ok": False}) == () and ir_made(plan(), None) == ()
+
+
 def test_a_roster_that_became_legal_loses_nobody(db, sent):
     room, _ = proposals_mod.propose_fix(db, "m", "L", "T", _fix(), week=5)
     _approve(db, room.id)

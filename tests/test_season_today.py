@@ -677,6 +677,31 @@ def test_an_activated_player_with_a_game_goes_straight_into_the_lineup(db_with_g
     assert [m.describe() for m in p.moves] == ["ACTIVATE Back IR+ -> C"]
 
 
+def test_an_activation_is_made_even_when_tonight_s_lineup_is_not(db_with_games):
+    """Folded into a lineup outside authority (here it benches a never-bench
+    player), the activation would never be made and the roster would stay
+    illegal. He comes back by his IR move, to the bench, and the suggestion
+    starts him from there."""
+    p = build_plan(
+        db_with_games,
+        _ir_runtime(),
+        roster(
+            player("p.1", "Back", 1, "TOR", "C", "IR+", eligible=("C", "Util")),
+            player("p.2", "Favourite", 2, "TOR", "C", "C"),
+        ),
+        Values({1: 9.0, 2: 1.0}),
+        StaticGoalieSource(),
+        DATE,
+        manager="test",
+        authority=LineupAuthority(
+            enabled=True, min_gain=0.0, manage_ir=True, never_bench=("Favourite",)
+        ),
+    )
+    assert (p.within_authority, p.ir_within_authority) == (False, True)
+    assert [m.describe() for m in p.ir_moves] == ["ACTIVATE Back IR+ -> BN"]
+    assert "START Back in C" in [m.describe() for m in p.moves]
+
+
 def test_an_illegal_ir_with_no_room_is_an_alert_not_a_move(db_with_games):
     """Yahoo refuses every add and drop while it stands, so it is said first."""
     healthy = [player(f"p.{i}", f"Body {i}", 10 + i, "VAN", "C", "BN") for i in range(8)]

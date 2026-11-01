@@ -63,6 +63,18 @@ class RunReport:
     def add(self, name: str, ok: bool, detail: str, lines: list[str] | None = None) -> None:
         self.steps.append(Step(name, ok, detail, lines or []))
 
+    def settle(self, name: str, detail: str, lines: list[str] | None = None) -> bool:
+        """This run's failed `name` step, made good later in the same run: ok
+        now, with what it said kept above what changed. False when no step of
+        that name failed."""
+        for i, s in enumerate(self.steps):
+            if s.name == name and not s.ok:
+                self.steps[i] = Step(
+                    name, True, detail, [f"was: {s.detail}", *s.lines, *(lines or [])]
+                )
+                return True
+        return False
+
     @property
     def text(self) -> str:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -487,33 +499,13 @@ def run_day(
             acted = _guard(
                 report, "act", lambda: act(conn, manager, league_key, roster, plan, report)
             )
-            if plan.ir_moves and plan.ir_within_authority and acted and acted.get("ok"):
-                # The actuator re-read every slot before saying ok, so the moves
-                # stand; the week below and the page work from the roster as it
-                # is now, not as it was read before them.
-                roster = _after_ir(roster, plan.ir_moves)
-                ctx.roster = roster
-                _guard(
-                    report,
-                    "legality",
-                    lambda: _legality(conn, manager, league_key, runtime, day, roster, ctx,
-                                      models, report, propose),
-                )  # fmt: skip
-                if manager.authority.transactions.execute_approved and _waiting_swaps(
-                    conn, manager, league_key
-                ):
-                    # A make-room move made at 2b leaves approved adds that
-                    # Yahoo refused until the player was back: make them now.
-                    _guard(
-                        report,
-                        "transactions",
-                        lambda: _carry_out(conn, manager, league_key, runtime, day, report, pmap),
-                    )
+            roster = _after_act(conn, manager, league_key, runtime, day, roster, ctx, models,
+                                report, propose, plan, acted, pmap)  # fmt: skip
 
         # 3b. The rest of the week, set in Yahoo, so a run that never happens
         # leaves a planned day rather than a copy of the last one set.
         if plan is not None and week is not None:
-            ir_done = bool(plan.ir_moves) and bool(acted and acted.get("ok"))
+            ir_done = bool(ir_made(plan, acted))
             _guard(
                 report,
                 "ahead",
@@ -899,6 +891,56 @@ def _blockers(conn, manager, league_key: str, ctx, report: RunReport) -> list:
     return recorded
 
 
+def ir_made(plan, acted) -> tuple:
+    """The moves between IR and the active roster the actuator made tonight.
+
+    The plan's IR moves, and an activation straight into tonight's lineup:
+    `today.build_plan` files that one with the lineup moves, in place of his
+    move to the bench. Read off `ir_moves` alone, a run kept the roster as it
+    was read before them - on 2026-11-01 a player brought back from IR+ into
+    a free D slot at 07:02 left the run saying the roster was illegal, and the
+    phone was told so.
+    """
+    if not (acted and acted.get("ok")):
+        return ()
+    made = list(plan.ir_moves) if plan.ir_within_authority else []
+    if plan.within_authority:
+        made += [m for m in plan.moves if m.is_activation]
+    return tuple(made)
+
+
+def _after_act(conn, manager, league_key, runtime, day, roster, ctx, models, report, propose,
+               plan, acted, pmap=None):  # fmt: skip
+    """The roster once tonight's moves between IR and the active roster are
+    made, and what follows from them: legality checked again, and approved
+    adds Yahoo refused until the player was back made now."""
+    made = ir_made(plan, acted)
+    if not made:
+        return roster
+    # The actuator re-read every slot before saying ok, so the moves stand;
+    # the week below and the page work from the roster as it is now, not as
+    # it was read before them.
+    roster = _after_ir(roster, made)
+    ctx.roster = roster
+    _guard(
+        report,
+        "legality",
+        lambda: _legality(conn, manager, league_key, runtime, day, roster, ctx, models, report,
+                          propose, made=made),
+    )  # fmt: skip
+    if manager.authority.transactions.execute_approved and _waiting_swaps(
+        conn, manager, league_key
+    ):
+        # A make-room move made at 2b leaves approved adds that Yahoo refused
+        # until the player was back: make them now.
+        _guard(
+            report,
+            "transactions",
+            lambda: _carry_out(conn, manager, league_key, runtime, day, report, pmap),
+        )
+    return roster
+
+
 def _after_ir(roster, moves):
     """`roster` with tonight's IR moves made (the actuator verified them)."""
     to = {m.player.player_key: m.to_slot for m in moves}
@@ -951,7 +993,8 @@ def _resolution(conn, manager, runtime, roster, values, day, hold=(), ctx=None):
     )
 
 
-def _legality(conn, manager, league_key, runtime, day, roster, ctx, models, report, propose):
+def _legality(conn, manager, league_key, runtime, day, roster, ctx, models, report, propose,
+              made=()):  # fmt: skip
     """Roster legality: what Yahoo refuses today, and the make-room moves that fix it.
 
     A violation is a FAIL on the run, not a note: on 2026-10-19 one sat as a
@@ -959,6 +1002,8 @@ def _legality(conn, manager, league_key, runtime, day, roster, ctx, models, repo
     Each fix that needs a drop is proposed (`MoveKind.ACTIVATE`) - required,
     so never weighed against the add bar - and one no longer needed is
     withdrawn. A fix the lineup can make (a free spot) needs no proposal.
+    `made`: the IR moves this run made since the roster was read - the check
+    after them settles this run's earlier FAIL when they made it legal.
     """
     values, _ = models
     hold = {
@@ -978,6 +1023,12 @@ def _legality(conn, manager, league_key, runtime, day, roster, ctx, models, repo
         gone = proposals_mod.retire_fixes(conn, manager.name, league_key, stuck)
         lines += [f"#{p.id} withdrawn: {p.reason.get('withdrawn', '')}" for p in gone]
     if res.legal:
+        if made and report.settle(
+            "legality",
+            "the roster is legal again - tonight's lineup made the fix",
+            [*lines, *(f"made: {m.describe()}" for m in made)],
+        ):
+            return res
         if lines:
             report.add("legality", True, "the roster is legal", lines)
         return res

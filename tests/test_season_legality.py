@@ -109,6 +109,26 @@ def test_a_free_spot_needs_no_drop_at_all():
     assert [f.drop for f in res.fixes] == [None] and res.transactions == ()
 
 
+def test_a_free_spot_is_said_and_no_drop_is_asked_for():
+    """2026-11-01: the drop that freed a spot was made at 07:01, and at 07:02
+    the run still said "there is no free spot: a drop has to come first"."""
+    (v,) = legality.check(SMALL, team(CENTRE, DEFENCE, GOALIE, BACK))
+    assert "A spot is free" in v.message and "drop has to come first" not in v.message
+    # A player going onto IR today frees his spot, counted as `resolve` counts it.
+    hurt = p("streamer", "C", "BN", eligible=("C", "IR", "Util"), status="O")
+    (v,) = legality.check(SMALL, team(CENTRE, hurt, DEFENCE, GOALIE, BACK))
+    assert "A spot is free" in v.message
+    res = legality.resolve(SMALL, team(CENTRE, hurt, DEFENCE, GOALIE, BACK), KEEP, RULES)
+    assert [f.drop for f in res.fixes] == [None]
+
+
+def test_two_coming_back_to_one_free_spot_need_a_drop_for_the_other():
+    second = p("second", "C", "IR", eligible=("C", "Util"))
+    got = legality.check(SMALL, team(CENTRE, DEFENCE, GOALIE, BACK, second))
+    assert len(got) == 2
+    assert all("1 active spot is free for the 2 players coming back" in v.message for v in got)
+
+
 def test_the_returning_player_is_released_when_he_is_worth_least():
     cheap_back = {**KEEP, "back": 10.0}
     res = legality.resolve(SMALL, team(CENTRE, STREAMER, DEFENCE, GOALIE, BACK), cheap_back, RULES)

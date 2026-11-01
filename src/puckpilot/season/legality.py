@@ -133,12 +133,29 @@ def _stuck(roster: TeamRoster) -> tuple[RosterPlayer, ...]:
     return tuple(p for p in roster.players if p.on_ir and p.selected_slot not in p.yahoo_eligible)
 
 
-def _ir_text(p: RosterPlayer) -> str:
-    return (
+def _ir_text(p: RosterPlayer, free: int = 0, returning: int = 1) -> str:
+    """Why he makes the roster illegal, and whether a drop has to come first:
+    `free` active spots for the `returning` players coming back from IR."""
+    head = (
         f"{p.name} is no longer eligible for {p.selected_slot}, which makes the roster "
-        f"illegal - Yahoo refuses every add until he is back on the active roster, and "
-        f"there is no free spot: a drop has to come first."
+        f"illegal - Yahoo refuses every add until he is back on the active roster"
     )
+    if free <= 0:
+        return f"{head}, and there is no free spot: a drop has to come first."
+    if free >= returning:
+        return f"{head}. A spot is free, so no drop is needed: the lineup brings him back."
+    return (
+        f"{head}. {free} active spot{'s are' if free > 1 else ' is'} free for the "
+        f"{returning} players coming back: a drop has to come first for the rest."
+    )
+
+
+def _spots_for_returns(runtime: LeagueRuntime, roster: TeamRoster) -> int:
+    """Active spots free for players coming back from IR, counted as `resolve`
+    counts them: once today's moves onto IR are made."""
+    moves, _ = ir_changes(runtime, roster)
+    going = sum(1 for m in moves if m.is_ir)
+    return max(active_cap(runtime) - (_active(roster) - going), 0)
 
 
 @dataclass(frozen=True)
@@ -154,12 +171,18 @@ def check(runtime: LeagueRuntime, roster: TeamRoster) -> tuple[Violation, ...]:
     """Every violation on `roster` as Yahoo has it now.
 
     An ineligible IR player is a violation even when today's IR moves will
-    bring him back by themselves: until they are made, an add is refused.
+    bring him back by themselves: until they are made, an add is refused. The
+    words say which it is - a free spot, and the lineup brings him back; a
+    full roster, and a drop comes first. (On 2026-11-01 "there is no free
+    spot" was said of a roster with one, the morning the drop that freed it
+    was made.)
     """
     out: list[Violation] = []
     limit = active_cap(runtime)
-    for p in _stuck(roster):
-        out.append(Violation(IR_INELIGIBLE, (p,), _ir_text(p)))
+    stuck = _stuck(roster)
+    free = _spots_for_returns(runtime, roster) if stuck else 0
+    for p in stuck:
+        out.append(Violation(IR_INELIGIBLE, (p,), _ir_text(p, free, len(stuck))))
     over = _active(roster) - limit
     if over > 0:
         out.append(

@@ -391,12 +391,19 @@ def build_plan(
         )
         moves, gain = [], 0.0
 
-    # Activated straight into tonight's lineup: that move replaces "to BN".
-    straight_in = {m.player.player_key for m in moves if m.is_activation}
-    ir_moves = [m for m in ir_moves if m.player.player_key not in straight_in]
-
     lock = calendar.first_lock(conn, [p.team for p in roster.players if p.team], date, season)
     within, reason = _check_authority(auth, moves, notes)
+
+    # Activated straight into tonight's lineup: that move replaces "to BN" -
+    # unless the IR moves are made tonight and the lineup is not (outside
+    # authority). Folded into a lineup nobody makes, he would stay in IR and
+    # the roster illegal; so he comes back by his IR move, to the bench, and
+    # the lineup's suggestion starts him from there.
+    if within or not (auth.enabled and auth.manage_ir):
+        straight_in = {m.player.player_key for m in moves if m.is_activation}
+        ir_moves = [m for m in ir_moves if m.player.player_key not in straight_in]
+    else:
+        moves = [replace(m, from_slot=BENCH) if m.is_activation else m for m in moves]
     return LineupPlan(
         date=date,
         team_key=roster.team_key,
