@@ -11,6 +11,11 @@ The asymmetry is structural rather than configured. `take_for_execution` is the
 only function that hands an executor anything, and it will only ever return a
 row a person has approved. There is no argument that makes it return a pending
 one, and nothing else in the package returns a proposal at all.
+
+A row becomes approved two ways, both one row at a time: `decide`, a tap, and
+`approve_standing`, the manager's approval given in advance for a rotation
+player's drop (season/standing.py) - which refuses any row that was not shown
+on the page with the time it would be made, before that time comes.
 """
 
 from __future__ import annotations
@@ -155,7 +160,7 @@ def propose(
                 # Kept, with today's reasons: the numbers move every day.
                 conn.execute(
                     "UPDATE waiver_proposals SET reason_json = ? WHERE id = ?",
-                    (json.dumps(_reason(t, week, horizon)), p.id),
+                    (json.dumps(_kept(p.reason, _reason(t, week, horizon))), p.id),
                 )
     existing = _already_asked(conn, manager, league_key, week)
     # The cap is on what is awaiting a decision. A refusal from earlier this
@@ -211,7 +216,9 @@ def refresh(conn: sqlite3.Connection, kept: dict[int, object], lapsed: dict[int,
         p = get(conn, pid)
         if not p.is_live:
             continue
-        reason = _reason(t, int(p.reason.get("week", 0)), str(p.reason.get("horizon", "")))
+        reason = _kept(
+            p.reason, _reason(t, int(p.reason.get("week", 0)), str(p.reason.get("horizon", "")))
+        )
         reason["checked_at"] = now
         conn.execute(
             "UPDATE waiver_proposals SET reason_json = ? WHERE id = ?", (json.dumps(reason), pid)
@@ -338,6 +345,15 @@ def withdrawn_since(
     return [_row_to_proposal(r) for r in rows]
 
 
+# What a re-priced card keeps from before: what it was offered and shown under.
+STICKY = ("standing", "standing_not")
+
+
+def _kept(old: dict, new: dict) -> dict:
+    """`new` reasons, with what the card was offered and shown under kept."""
+    return {**new, **{k: old[k] for k in STICKY if k in old}}
+
+
 def _reason(t, week: int, horizon: str = "") -> dict:
     """What a proposal records about why it was made."""
     out = {
@@ -354,6 +370,9 @@ def _reason(t, week: int, horizon: str = "") -> dict:
         "timing": t.timing,
         "add_name": t.player.name,
         "add_team": t.player.team,
+        # Whether a goalie or a skater comes in - a standing approval can
+        # cover same-kind swaps and not the other kind.
+        "add_position": getattr(t.player, "position", ""),
         "drop_name": t.drop.name if t.drop else "",
         # The reasons behind it, section -> lines (season/add_story.py).
         "detail": getattr(t, "detail", {}) or {},
@@ -463,6 +482,47 @@ def decide(
     conn.execute(
         "UPDATE waiver_proposals SET status = ?, decided_at = ?, reason_json = ? WHERE id = ?",
         (APPROVED if approve else REJECTED, _now(), json.dumps(reason), proposal_id),
+    )
+    conn.commit()
+    return get(conn, proposal_id)
+
+
+def approve_standing(
+    conn: sqlite3.Connection, proposal_id: int, grant: str, now: datetime | None = None
+) -> Proposal:
+    """Approve a card under the manager's standing approval: the one way but a tap.
+
+    Only a card offered under it (`reason.standing`, by season/standing.py),
+    shown on the page with the time it would be made (`shown_at`), once that
+    time (`due_at`) has come, and still waiting - not stopped, decided or
+    withdrawn. There is no argument that skips any of those: an approval in
+    advance is consent to a move the manager could see coming and stop.
+    `grant` records the settings it was given under.
+    """
+    p = get(conn, proposal_id)
+    if p.status != PENDING:
+        raise ProposalError(f"proposal #{proposal_id} is already {p.status}")
+    if p.superseded_at:
+        raise ProposalError(f"proposal #{proposal_id} was withdrawn")
+    st = p.reason.get("standing") or {}
+    if not st:
+        raise ProposalError(f"proposal #{proposal_id} was not offered under a standing approval")
+    if not st.get("shown_at") or not st.get("due_at"):
+        raise ProposalError(
+            f"proposal #{proposal_id} has not been shown with the time it would be made"
+        )
+    at = now or datetime.now(UTC)
+    if datetime.fromisoformat(str(st["due_at"])) > at:
+        raise ProposalError(f"proposal #{proposal_id} is not due until {st['due_at']}")
+    reason = {
+        **p.reason,
+        "approved_to_execute": True,
+        "approved_by": "standing",
+        "grant": grant,
+    }
+    conn.execute(
+        "UPDATE waiver_proposals SET status = ?, decided_at = ?, reason_json = ? WHERE id = ?",
+        (APPROVED, at.isoformat(timespec="seconds"), json.dumps(reason), proposal_id),
     )
     conn.commit()
     return get(conn, proposal_id)

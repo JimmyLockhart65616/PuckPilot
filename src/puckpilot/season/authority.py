@@ -16,6 +16,15 @@ waiver league it can be won by somebody else while you sleep. So it is
 `TransactionAuthority` has no `enabled` flag, and the executor takes an
 approved `waiver_proposals` id it cannot mint itself. Turning transactions
 autonomous is not a config change; it would require deleting the mechanism.
+
+Approval comes one of two ways, and both are per move. A tap on the card; or,
+for a move whose drop is one of the manager's rotation players
+(`season.tiers`), given in advance - `StandingApproval`, written down here
+like the lineup's criteria. A card under it is still shown first, says when
+the move will be made, and is made only if nobody stopped it by then
+(`season.standing`, `proposals.approve_standing`). Neither is a way round the
+queue: the executor still takes only an approved row, and a standing approval
+can only be given to a card that was shown with its time.
 """
 
 from __future__ import annotations
@@ -388,7 +397,8 @@ class TransactionAuthority:
 
     def describe(self) -> list[str]:
         return [
-            "Transactions (add / drop / claim): APPROVAL REQUIRED, always.",
+            "Transactions (add / drop / claim): APPROVAL REQUIRED, always - by a tap, or in "
+            "advance (below).",
             (
                 f"  proposed only when it adds {self.min_expected_gain:.2f} expected categories"
                 if self.add_scoring == "odds"
@@ -462,12 +472,90 @@ class TransactionAuthority:
 
 
 @dataclass(frozen=True)
+class StandingApproval:
+    """Moves approved in advance: a rotation player's drop, shown first with a
+    window to stop it (season/standing.py).
+
+    It changes what saying yes takes - a tap, or letting the window pass - not
+    whether a move is shown and decided one at a time. Off unless agreed:
+    asked for on 2026-10-31, when 4 of 5 cards had each waited 11-12 hours
+    for a tap, so a move found in the morning was made after that night's
+    games.
+    """
+
+    enabled: bool = False
+    # How long a card is shown before it is made, unless stopped. 0 = made on
+    # the run that shows it - still shown and pushed first, with no window.
+    veto_minutes: int = 120
+    # Which moves it covers, each only when its drop is a rotation player:
+    # dropping one so a player back from IR can play (no acquisition spent),
+    # a free agent for one of the same kind (goalie for goalie, skater for
+    # skater), and one of the other kind.
+    make_room: bool = True
+    same_kind: bool = True
+    cross_kind: bool = False
+    # Moves made without a tap in a week. None: the league's own weekly cap
+    # and the playoff reserve are the only bound, as for a tapped move.
+    max_per_week: int | None = None
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.veto_minutes <= 24 * 60:
+            raise AuthorityError(
+                "authority.standing.veto_minutes is minutes a card is shown before it is made, "
+                f"from 0 to a day; got {self.veto_minutes!r}"
+            )
+        if self.max_per_week is not None and (
+            not isinstance(self.max_per_week, int)
+            or isinstance(self.max_per_week, bool)
+            or self.max_per_week < 0
+        ):
+            raise AuthorityError(
+                "authority.standing.max_per_week is a whole number of moves, or left out"
+            )
+
+    def covers(self, what: str) -> bool:
+        """Whether `what` ("make_room", "same_kind", "cross_kind") is covered."""
+        return what in COVERS and bool(getattr(self, what))
+
+    def describe(self) -> list[str]:
+        if not self.enabled:
+            return ["Moves without a tap: NONE (no standing approval given)."]
+        kinds = [label for key, label in COVERS.items() if getattr(self, key)]
+        window = (
+            f"shown {self.veto_minutes} min before it is made, to stop it"
+            if self.veto_minutes
+            else "made on the run that shows it - no window to stop it"
+        )
+        return [
+            "Moves without a tap: a ROTATION player's drop, approved in advance -",
+            f"  covers: {', '.join(kinds) or 'nothing'}",
+            f"  each one {window}",
+            (
+                f"  at most {self.max_per_week} a week"
+                if self.max_per_week is not None
+                else "  no weekly limit beyond the league's own"
+            ),
+            "  a drop set to Never or Upgrade only, or a Stop on the card, is never made this way",
+        ]
+
+
+# What a standing approval can cover, and how it is said.
+COVERS = {
+    "make_room": "make-room drops",
+    "same_kind": "same-kind swaps",
+    "cross_kind": "skater-for-goalie swaps",
+}
+
+
+@dataclass(frozen=True)
 class Authority:
     lineup: LineupAuthority = field(default_factory=LineupAuthority)
     transactions: TransactionAuthority = field(default_factory=TransactionAuthority)
+    standing: StandingApproval = field(default_factory=StandingApproval)
 
     def describe(self) -> str:
-        return "\n".join([*self.lineup.describe(), "", *self.transactions.describe()])
+        parts = [self.lineup.describe(), self.transactions.describe(), self.standing.describe()]
+        return "\n\n".join("\n".join(x) for x in parts)
 
     @classmethod
     def from_config(cls, cfg: dict) -> Authority:
@@ -478,6 +566,7 @@ class Authority:
         """
         lineup_cfg = dict(cfg.get("lineup", {}) or {})
         tx_cfg = dict(cfg.get("transactions", {}) or {})
+        standing_cfg = dict(cfg.get("standing", {}) or {})
 
         if "enabled" in tx_cfg:
             raise AuthorityError(
@@ -487,12 +576,14 @@ class Authority:
         _refuse_removed("authority.lineup", lineup_cfg)
         _refuse_unknown("authority.lineup", lineup_cfg, LineupAuthority)
         _refuse_unknown("authority.transactions", tx_cfg, TransactionAuthority)
+        _refuse_unknown("authority.standing", standing_cfg, StandingApproval)
 
         if "never_bench" in lineup_cfg:
             lineup_cfg["never_bench"] = tuple(str(n) for n in lineup_cfg["never_bench"])
         return cls(
             lineup=LineupAuthority(**lineup_cfg),
             transactions=TransactionAuthority(**tx_cfg),
+            standing=StandingApproval(**standing_cfg),
         )
 
 

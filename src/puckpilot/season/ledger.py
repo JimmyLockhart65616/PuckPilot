@@ -42,6 +42,8 @@ class LedgerLine:
     add_totals: dict[str, float] = field(default_factory=dict)
     drop_totals: dict[str, float] = field(default_factory=dict)
     drop_nights: int = 0
+    # Approved in advance - made after its window - rather than by a tap.
+    standing: bool = False
 
     def delta(self, key: str) -> float:
         return self.add_totals.get(key, 0.0) - self.drop_totals.get(key, 0.0)
@@ -110,7 +112,8 @@ def build(conn, manager: str, league_key: str, team_key: str, season: str, today
     lines = []
     for p in made:
         line = LedgerLine(p.id, p.kind, _first_day(p.executed_at), p.add_name,
-                          p.drop_name if p.drop_player_key else "")  # fmt: skip
+                          p.drop_name if p.drop_player_key else "",
+                          standing=p.reason.get("approved_by") == "standing")  # fmt: skip
         day = _date.fromisoformat(line.made_on)
         end = _date.fromisoformat(today)
         while day <= end:
@@ -152,6 +155,8 @@ def summary(line: LedgerLine, cats) -> dict:
     head = f"#{line.proposal_id} {line.add_name}" + (
         f" for {line.drop_name}" if line.drop_name else " into an open spot"
     )
+    if line.standing:
+        head += " (approved in advance)"
     out = {
         "head": head,
         "since": line.made_on,
@@ -181,6 +186,8 @@ def describe(line: LedgerLine, cats) -> list[str]:
     head = f"#{line.proposal_id} {line.add_name}" + (
         f" for {line.drop_name}" if line.drop_name else " (added into an open spot)"
     )
+    if line.standing:
+        head += " (approved in advance)"
     out = [f"{head}, from {line.made_on}: {line.nights} night(s) in the lineup"]
     out.append(f"    {line.add_name:22s} {fmt(line.add_totals)}")
     if line.drop_name:

@@ -65,6 +65,7 @@ def build(
     blockers: list[dict] | None = None,
     ledger: list[dict] | None = None,
     tiers: dict | None = None,
+    standing_on: bool = False,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -84,7 +85,9 @@ def build(
     lead the page: what stops the tool working comes before anything it says.
     `tiers` is the run's drop tiers by player key (`tiers.board`): each roster
     row carries its own, for the page to show and change, and each card says
-    the drop's.
+    the drop's. A card a standing approval covers (season/standing.py) says
+    when it will be made unless stopped; with one given (`standing_on`), every
+    other card says why it still needs a tap.
     """
     snap: dict[str, Any] = {
         "team": team_name,
@@ -160,6 +163,12 @@ def build(
             "add": p.add_name,
             "drop": p.drop_name if p.drop_player_key else "",
             "drop_tier": _drop_tier(p, tiers),
+            "standing": _standing(p, tz),
+            "needs_tap": (
+                f"Needs your tap: {p.reason['standing_not']}"
+                if standing_on and p.reason.get("standing_not") and not p.reason.get("standing")
+                else ""
+            ),
             "why": _why(p),
             "timing": str(p.reason.get("timing", "")),
             "detail": _reasons(p.reason.get("detail")),
@@ -168,6 +177,7 @@ def build(
                 executes_moves
                 and (executable_kinds is None or p.move_kind.value in executable_kinds),
                 snap["date"] or today,
+                tz,
             ),
         }
         for p in pending
@@ -237,6 +247,22 @@ def _tier_fields(placed) -> dict:
         "tier_label": out["label"],
         "tier_source": out["source"],
         "tier_why": out["why"],
+    }
+
+
+def _standing(p, tz: str) -> dict | None:
+    """A card a standing approval covers: when it will be made, unless stopped."""
+    from puckpilot.season import standing
+
+    st = p.reason.get("standing") or {}
+    if not st.get("due_at"):
+        return None
+    when = standing.due_local(p, tz)
+    return {
+        "at": str(st["due_at"]),
+        "due_local": when,
+        "text": f"PuckPilot makes this at {when} unless you stop it - your standing approval "
+        f"for a Rotation player's drop.",
     }
 
 
@@ -400,7 +426,7 @@ def _week_note(wp) -> str:
     return ""
 
 
-def _approve_means(p, executes_moves: bool, today: str = "") -> dict:
+def _approve_means(p, executes_moves: bool, today: str = "", tz: str = DEFAULT_TZ) -> dict:
     """What Approve does for this card, in words, and whether it makes the move.
 
     The page shows the words and sends `executes` back with the tap; the run
@@ -413,6 +439,14 @@ def _approve_means(p, executes_moves: bool, today: str = "") -> dict:
 
     if not executes_moves:
         return {"executes": False, "approve_means": MANUAL}
+    standing = _standing(p, tz)
+    if standing is not None:
+        return {
+            "executes": True,
+            "approve_means": f"Nothing to do: PuckPilot makes it at {standing['due_local']}, "
+            f"checking each step and then your roster. Make it now: on its next run instead. "
+            f"Stop: it is not made.",
+        }
     if p.move_kind is MoveKind.ACTIVATE:
         back = p.add_name
         if p.drop_player_key == p.add_player_key:

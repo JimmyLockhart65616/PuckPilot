@@ -349,6 +349,10 @@ def run_day(
 
         _guard(report, "decisions", _collect)
 
+    # 2a. Moves approved in advance whose time has come (season/standing.py) -
+    # after the phone's decisions, so a Stop or a tier change made there counts.
+    _guard(report, "standing", lambda: _standing_due(conn, manager, league_key, report))
+
     # 2b. Moves approved to be made, made - before the roster is read, so the
     # lineup below already has the new player in it.
     pmap = playermap.load_map(conn, league_key)
@@ -624,6 +628,18 @@ def run_day(
             "tiers",
             lambda: _tiers(conn, manager, league_key, runtime, ctx, models, day, report),
         )
+    # ...and which waiting cards a standing approval covers: a rotation
+    # player's drop, made after the window unless stopped (season/standing.py).
+    # Only where a page shows them: the window is the manager's to stop it.
+    offered = []
+    showable = manager.page.publishes and page_key
+    if ctx.tiers is not None and manager.authority.standing.enabled and showable:
+        offered = (
+            _guard(
+                report, "standing", lambda: _standing_offer(conn, manager, league_key, ctx, report)
+            )
+            or []
+        )
 
     # 4b. What stops the tool working - said on the page, in the log as a FAIL,
     # and on the phone - never left as a line under an "ok" step.
@@ -633,6 +649,9 @@ def run_day(
     if manager.page.publishes and page_key:
 
         def _push():
+            from puckpilot.season import standing
+
+            standing.stamp(conn, manager.name, league_key, datetime.now(UTC))
             snap = snapshot.build(
                 conn,
                 manager.name,
@@ -653,11 +672,30 @@ def run_day(
                 blockers=[b.payload() for b in blocked or ()],
                 ledger=_ledger(conn, manager, league_key, runtime, day, roster),
                 tiers=ctx.tiers,
+                standing_on=manager.authority.standing.enabled,
             )
             publish.push(manager.page.url, page_key, snap)
+            # The window of each card it showed for the first time starts now.
+            standing.shown(conn, manager.name, league_key, datetime.now(UTC))
             report.add("page", True, manager.page.url)
 
         _guard(report, "page", _push)
+
+    # 5b. With no window (`veto_minutes = 0`) a card shown just now is due now:
+    # made on this run, the push having told the phone first.
+    grant = manager.authority.standing
+    if (
+        offered
+        and grant.enabled
+        and grant.veto_minutes == 0
+        and _guard(report, "standing", lambda: _standing_due(conn, manager, league_key, report))
+        and manager.authority.transactions.execute_approved
+    ):
+        _guard(
+            report,
+            "transactions",
+            lambda: _carry_out(conn, manager, league_key, runtime, day, report, pmap),
+        )
 
     # 6. Line up the rest of today against the real game times.
     if reschedule:
@@ -672,7 +710,7 @@ def run_day(
     _guard(
         report,
         "notify",
-        lambda: _notify(conn, manager, league_key, report, started, blocked or ()),
+        lambda: _notify(conn, manager, league_key, report, started, blocked or (), offered),
     )
     from puckpilot.season import blockers as blockers_mod
 
@@ -1115,24 +1153,33 @@ def _odds_model():
     return OddsModel()
 
 
-def _notify(conn, manager, league_key: str, report: RunReport, since: str, blocked=()) -> None:
+def _notify(
+    conn, manager, league_key: str, report: RunReport, since: str, blocked=(), offered=()
+) -> None:
     """New pickups this run queued, tonight's lineup if it was not made, and
     each blocker once a day while it stands.
 
     Quiet unless `PUCKPILOT_NOTIFY_URL` is set (season/notify.py). A lineup
     switched off on purpose (the kill switch) is not news. A make-room card
     pushed this run already says the roster is illegal, so that blocker waits
-    for tomorrow's push rather than doubling today's.
+    for tomorrow's push rather than doubling today's. A card this run offered
+    under a standing approval (`offered`) is told on its own, with the time it
+    will be made - once the page shows it, which is when its window starts.
     """
-    from puckpilot.season import notify
+    from puckpilot.season import notify, standing
 
     url = manager.page.url if manager.page.publishes else ""
+    ahead = [proposals_mod.get(conn, p.id) for p in offered]
+    ahead = [p for p in ahead if p.is_live and standing.due_at(p) is not None]
+    mine = {p.id for p in offered}
     new = [
         p
         for p in proposals_mod.listing(conn, manager.name, league_key, status=proposals_mod.PENDING)
-        if p.created_at >= since and not p.superseded_at
+        if p.created_at >= since and not p.superseded_at and p.id not in mine
     ]
     sent = []
+    if ahead and notify.standing_offers([(p, standing.due_local(p)) for p in ahead], url):
+        sent.append(f"{len(ahead)} move(s) made unless you stop them")
     if new and notify.new_pickups(new, url):
         sent.append(f"{len(new)} new pickup(s)")
     for s in report.steps:
@@ -1142,7 +1189,7 @@ def _notify(conn, manager, league_key: str, report: RunReport, since: str, block
     from puckpilot.season import blockers as blockers_mod
 
     told = {blockers_mod.ROSTER_ILLEGAL} if any(not p.move_kind.spends_acquisition
-                                                for p in new) else set()  # fmt: skip
+                                                for p in [*new, *ahead]) else set()  # fmt: skip
     for b in blockers_mod.due(conn, manager.name, [b for b in blocked if b.kind not in told]):
         if notify.blocked(b.title, b.message, url):
             sent.append(b.title.lower())
@@ -1301,13 +1348,15 @@ def _set_ahead(
 
 def _next_run(conn, manager, runtime, day, roster):
     """When the scheduler will next run, for the page's freshness line."""
-    from puckpilot.season import locks, schedule
+    from puckpilot.season import locks, schedule, standing
 
     try:
         own = manager.team_key or getattr(roster, "team_key", "")
-        return locks.next_run(
+        nxt = locks.next_run(
             conn, manager.name, runtime.nhl_season, day, own, anchor=schedule.ANCHOR_TIMES[0]
         )
+        due = standing.next_due(conn, manager.name)
+        return min(nxt, due) if due is not None and nxt is not None else nxt or due
     except Exception:  # noqa: BLE001 - freshness is advisory; never fail the push
         return None
 
@@ -1326,19 +1375,25 @@ def _plan_rest_of_day(conn, manager, runtime, day, report, team_key: str = ""):
     if day != _date.today().isoformat():
         report.add("schedule", True, f"not planning {day}; only today is schedulable")
         return
+    from puckpilot.season import standing
+
     teams = locks.roster_teams(conn, manager.name, team_key, day)
     if not teams:
         report.add("schedule", True, "no roster snapshot yet, so nothing to plan against")
         return
     todays = locks.locks_for(conn, runtime.nhl_season, day, teams)
     ahead = locks.upcoming(todays)
-    times = locks.run_times(ahead)
+    # A card made after its window is made at its time, not the next lock's.
+    due = standing.due_times(conn, manager.name, day)
+    times = sorted(set(locks.run_times(ahead)) | set(due))
     lines = schedule.plan_day(manager.name, REPO_ROOT, times)
     detail = (
         f"{len(ahead)} lock(s) left today: " + ", ".join(x.pretty for x in ahead)
         if ahead
         else "no locks left today"
     )
+    if due:
+        detail += f"; moves due at {', '.join(due)} unless stopped"
     report.add("schedule", True, detail, lines)
 
 
@@ -2221,6 +2276,52 @@ def _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models):
         detail["week"] = [line, *detail.get("week", [])]
         kept.append(replace(t, detail=detail))
     return kept, notes
+
+
+def _standing_due(conn, manager, league_key: str, report) -> int:
+    """Approve every card a standing approval covers whose time has come; put
+    back any the manager has said otherwise about since. Returns how many."""
+    from puckpilot.season import standing
+
+    grant = manager.authority.standing
+    approved, back = standing.approve_due(conn, manager.name, league_key, grant)
+    if approved or back:
+        report.add(
+            "standing",
+            True,
+            f"{len(approved)} made unless stopped - none was"
+            if approved and not back
+            else f"{len(approved)} approved in advance, {len(back)} back to wait for a tap",
+            [f"{_label(p)}: approved in advance - its window passed" for p in approved]
+            + [f"{_label(p)}: needs a tap - {why}" for p, why in back],
+        )
+    return len(approved)
+
+
+def _standing_offer(conn, manager, league_key: str, ctx, report) -> list:
+    """Offer the waiting cards a standing approval covers (season/standing.py)."""
+    from puckpilot.season import standing
+
+    offered = standing.offer(
+        conn,
+        manager.name,
+        league_key,
+        manager.authority.standing,
+        ctx.tiers,
+        ctx.roster,
+        _executes(manager),
+        _executable_kinds(),
+        ctx.week.number if ctx.week is not None else 0,
+    )
+    if offered:
+        window = manager.authority.standing.veto_minutes
+        report.add(
+            "standing",
+            True,
+            f"{len(offered)} card(s) made {window} min after the page shows them, unless stopped",
+            [f"{_label(p)}" for p in offered],
+        )
+    return offered
 
 
 def _with_pins(conn, manager, league_key: str, roster):

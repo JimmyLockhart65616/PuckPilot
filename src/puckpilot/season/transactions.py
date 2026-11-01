@@ -358,11 +358,12 @@ def _drop(p) -> str:
 def _what(p) -> str:
     """The move in the run log's words: "#13 add Marco Rossi, drop X", or a
     make-room move's own line."""
+    ahead = " (approved in advance)" if p.reason.get("approved_by") == "standing" else ""
     if kind_of(p.kind) is MoveKind.ACTIVATE:
         if p.drop_player_key == p.add_player_key:
-            return f"#{p.id} release {p.add_name}"
-        return f"#{p.id} drop {p.drop_name} so {p.add_name} comes back"
-    return f"#{p.id} add {p.add_name}{_drop(p)}"
+            return f"#{p.id} release {p.add_name}{ahead}"
+        return f"#{p.id} drop {p.drop_name} so {p.add_name} comes back{ahead}"
+    return f"#{p.id} add {p.add_name}{_drop(p)}{ahead}"
 
 
 def _audit(conn, manager, league_key, team_key, p, outcome, message, lines=()) -> None:

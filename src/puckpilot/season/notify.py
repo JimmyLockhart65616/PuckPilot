@@ -83,6 +83,30 @@ def new_pickups(proposals, page_url: str = "", post=None) -> bool:
     return send(title, "\n".join(lines), click=page_url, tags="ice_hockey", post=post)
 
 
+def standing_offers(items, page_url: str = "", post=None) -> bool:
+    """Moves PuckPilot makes under the manager's standing approval unless he
+    stops them, each with its time - the window is what makes it his yes, so
+    the push says when. `items` is (proposal, "9:05 PM") pairs."""
+    if not items:
+        return False
+    from puckpilot.season.moves import kind_of
+
+    lines = [
+        kind_of(getattr(p, "kind", None)).head(
+            p.add_name, p.drop_name if p.drop_player_key else "", str(p.reason.get("slot", ""))
+        )
+        + f" - at {when} unless you stop it"
+        for p, when in items
+    ]
+    first = items[0][1]
+    title = (
+        f"PuckPilot makes this at {first} unless you stop it"
+        if len(items) == 1
+        else f"{len(items)} moves PuckPilot makes unless you stop them"
+    )
+    return send(title, "\n".join(lines), click=page_url, tags="hourglass", post=post)
+
+
 def made(what: str, page_url: str = "", post=None) -> bool:
     """An approved move went through: the roster read afterwards shows it."""
     return send(

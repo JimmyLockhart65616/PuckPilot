@@ -76,6 +76,7 @@ PAGE = """<!doctype html>
            border:1px solid var(--line); background:var(--chip); color:var(--fg); }
   button.yes { background:var(--ok); color:#06210f; border-color:transparent; }
   button.no  { background:transparent; color:var(--dim); }
+  button.stop { background:var(--bad); color:#fff; border-color:transparent; }
   button:disabled { opacity:.45; }
   .err { color:var(--bad); }
   .done { color:var(--ok); font-weight:600; margin-top:8px; }
@@ -160,7 +161,7 @@ function renderMoves(root, s) {
   }
 }
 
-function decide(kind, id, approve, btn, executes) {
+function decide(kind, id, approve, btn, executes, stopped) {
   var box = btn.parentNode;
   Array.prototype.forEach.call(box.querySelectorAll('button'), function (b) { b.disabled = true; });
   fetch(q('/decide'), {
@@ -172,8 +173,9 @@ function decide(kind, id, approve, btn, executes) {
   }).then(function (r) { return r.json(); }).then(function (out) {
     // Say exactly what happens next. "Applied" once let a decision read as
     // done when nothing made it.
-    var said = approve ? 'Approved' : 'Rejected';
-    var then = kind === 'proposal' && approve
+    var said = approve ? 'Approved' : (stopped ? 'Stopped' : 'Rejected');
+    var then = stopped && !approve ? ' \\u2013 PuckPilot will not make it.'
+      : kind === 'proposal' && approve
       ? (executes === true
         ? ' \\u2013 PuckPilot makes it in Yahoo on its next run, then checks your roster.'
         : ' \\u2013 now make it in Yahoo. PuckPilot records it but makes no adds or drops.')
@@ -186,13 +188,16 @@ function decide(kind, id, approve, btn, executes) {
   });
 }
 
-function decisionButtons(c, kind, id, executes) {
+function decisionButtons(c, kind, id, executes, standing) {
   var box = el('div', 'btns');
-  var yes = el('button', 'yes', 'Approve');
-  var no = el('button', 'no', 'Reject');
-  yes.onclick = function () { decide(kind, id, true, yes, executes); };
-  no.onclick = function () { decide(kind, id, false, no, executes); };
-  box.appendChild(yes); box.appendChild(no);
+  // Under a standing approval the move happens unless stopped: Stop comes
+  // first, and Approve only makes it sooner.
+  var yes = el('button', standing ? null : 'yes', standing ? 'Make it now' : 'Approve');
+  var no = el('button', standing ? 'stop' : 'no', standing ? 'Stop' : 'Reject');
+  yes.onclick = function () { decide(kind, id, true, yes, executes, standing); };
+  no.onclick = function () { decide(kind, id, false, no, executes, standing); };
+  if (standing) { box.appendChild(no); box.appendChild(yes); }
+  else { box.appendChild(yes); box.appendChild(no); }
   c.appendChild(box);
 }
 
@@ -228,26 +233,36 @@ function renderProtocol(root, p) {
   else c.appendChild(el('div', 'sub', p.status));
 }
 
+// Cards a standing approval covers come first: they happen on their own,
+// so the time to stop one is the thing to see.
 function renderProposals(root, list) {
   if (!list || !list.length) return;
-  h2(root, 'Needs your decision');
-  list.forEach(function (p) {
-    var c = card(root);
-    // The server words the first line per kind of move (`head`); a push from
-    // before it did carries none, and every card then was an add.
-    c.appendChild(el('div', null, p.head ||
-      ('Add ' + p.add + (p.drop ? '  \\u2013  drop ' + p.drop : ''))));
-    if (p.why) c.appendChild(el('div', 'sub', p.why));
-    if (p.drop_tier) c.appendChild(el('div', 'sub', p.drop_tier));
-    if (p.timing) c.appendChild(el('div', 'sub', p.timing));
-    // The server words what Approve does, card by card, and the tap sends
-    // back whether this card said it makes the move. A push from before that
-    // carries neither, and every card then was "make it yourself".
-    c.appendChild(el('div', 'sub', p.approve_means ||
-      'Make it in Yahoo yourself \\u2013 PuckPilot never adds or drops.'));
-    renderReasons(c, p);
-    decisionButtons(c, 'proposal', p.id, p.executes === true);
-  });
+  var soon = list.filter(function (p) { return p.standing; });
+  var asks = list.filter(function (p) { return !p.standing; });
+  if (soon.length) h2(root, 'Making soon unless you stop it');
+  soon.forEach(function (p) { proposalCard(root, p); });
+  if (asks.length) h2(root, 'Needs your decision');
+  asks.forEach(function (p) { proposalCard(root, p); });
+}
+
+function proposalCard(root, p) {
+  var c = card(root);
+  // The server words the first line per kind of move (`head`); a push from
+  // before it did carries none, and every card then was an add.
+  c.appendChild(el('div', null, p.head ||
+    ('Add ' + p.add + (p.drop ? '  \\u2013  drop ' + p.drop : ''))));
+  if (p.standing) c.appendChild(el('div', 'close', p.standing.text));
+  if (p.why) c.appendChild(el('div', 'sub', p.why));
+  if (p.drop_tier) c.appendChild(el('div', 'sub', p.drop_tier));
+  if (p.needs_tap) c.appendChild(el('div', 'sub', p.needs_tap));
+  if (p.timing) c.appendChild(el('div', 'sub', p.timing));
+  // The server words what Approve does, card by card, and the tap sends
+  // back whether this card said it makes the move. A push from before that
+  // carries neither, and every card then was "make it yourself".
+  c.appendChild(el('div', 'sub', p.approve_means ||
+    'Make it in Yahoo yourself \\u2013 PuckPilot never adds or drops.'));
+  renderReasons(c, p);
+  decisionButtons(c, 'proposal', p.id, p.executes === true, !!p.standing);
 }
 
 // The moves made, newest first, and what each did against the player let go.

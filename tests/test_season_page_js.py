@@ -38,10 +38,11 @@ function node(tag) {
     get textContent() {
       return this._text + this.children.map(c => ' ' + c.textContent).join('');
     },
-    appendChild(c) { this.children.push(c); return c; },
+    appendChild(c) { this.children.push(c); c._parent = this; return c; },
     replaceChild(a, b) {
       const i = this.children.indexOf(b);
       if (i >= 0) this.children[i] = a; else this.children.push(a);
+      a._parent = this;
     },
     querySelectorAll() { return []; },
     addEventListener() {},
@@ -737,3 +738,73 @@ def test_a_tier_is_shown_on_the_roster_and_changed_from_it():
     assert out["posts"] == [{"url": "/tier?k=test", "body": {"player": "p.1", "tier": "rotation"}}]
     assert "Rotation \u00b7 yours" in out["after"]
     assert "Saved \u2013 PuckPilot uses it from its next run." in out["after"]
+
+
+def run_page_and_tap(payload: dict, label: str) -> dict:
+    """Draw the page, tap the first button reading `label`, and return the
+    page before and after and what the tap sent."""
+    tap = (
+        "\n  const drawn = app.textContent;\n"
+        "  function find(n) {\n"
+        "    if (n.tagName === 'button' && n._text === LABEL) return n;\n"
+        "    for (const c of n.children) { const x = find(c); if (x) return x; }\n"
+        "    return null;\n"
+        "  }\n"
+        "  find(app).onclick();\n"
+        "  setTimeout(() => console.log(JSON.stringify(\n"
+        "    { fresh: fresh.textContent, app: drawn, after: app.textContent, posts })), 30);"
+    )
+    harness = HARNESS.replace(
+        "fetch: () => Promise.resolve(",
+        "fetch: (u, o) => (o && o.body && posts.push({ url: u, body: JSON.parse(o.body) }), "
+        "Promise.resolve(",
+    ).replace("json: () => Promise.resolve(input) }),", "json: () => Promise.resolve(input) })),")
+    harness = harness.replace(
+        "\n  console.log(JSON.stringify({ fresh: fresh.textContent, app: app.textContent }));", tap
+    )
+    assert harness.count("posts") == 2, "the harness changed shape - update this test"
+    script = re.search(r"<script>(.*?)</script>", PAGE, re.S).group(1)
+    head = f"const posts = [];\nconst LABEL = {json.dumps(label)};\n"
+    proc = subprocess.run(
+        [NODE, "-e", head + "const SCRIPT = " + json.dumps(script) + ";\n" + harness],
+        input=wire.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_a_card_made_unless_stopped_leads_with_its_time_and_a_stop():
+    """Under a standing approval the move happens on its own: its section comes
+    first, it says when, and Stop sends a no that the run will not make."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [
+                {"id": 31, "add": "Streamer", "drop": "Dustin Wolf", "why": "", "timing": "",
+                 "executes": True, "approve_means": "Nothing to do: PuckPilot makes it at 9:05 PM",
+                 "standing": {"at": "2026-11-03T02:05:00+00:00", "due_local": "9:05 PM",
+                              "text": "PuckPilot makes this at 9:05 PM unless you stop it"}},
+                {"id": 32, "add": "Upgrade", "drop": "Tyler Kleven", "why": "", "timing": "",
+                 "executes": True, "approve_means": "Approve and PuckPilot makes this add",
+                 "needs_tap": "Needs your tap: Tyler Kleven is Upgrade only, not Rotation"},
+            ],
+        },
+    )  # fmt: skip
+    out = run_page_and_tap(state.get("jimmy"), "Stop")
+    assert_clean(out)
+    app = out["app"]
+    assert app.index("Making soon unless you stop it") < app.index("Needs your decision")
+    assert "PuckPilot makes this at 9:05 PM unless you stop it" in app
+    assert "Make it now" in app and "Needs your tap: Tyler Kleven is Upgrade only" in app
+    assert out["posts"] == [
+        {"url": "/decide?k=test",
+         "body": {"kind": "proposal", "id": 31, "approve": False, "executes": True}}
+    ]  # fmt: skip
+    assert "Stopped \u2013 PuckPilot will not make it." in out["after"]
