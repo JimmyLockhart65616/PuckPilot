@@ -110,7 +110,14 @@ def test_the_roster_carries_each_player_s_drop_tier(db):
         ("p.Star", "never", "Never", "keeper"),
     ]
     bare = snapshot.build(db, "jimmy", "999.l.1", "T", roster=r)["roster"]
-    assert {x["tier"] for x in bare} == {""}
+    assert {x["tier"] for x in bare} == {""} and {x["stats"] for x in bare} == {""}
+    stats = {"p.Kleven": {"season_rank": 109, "season_vorp": 1.4, "rest": 304, "rest_place": 15,
+                          "rest_of": 18, "text": "Season #109, VORP +1.4"}}  # fmt: skip
+    rows = snapshot.build(db, "jimmy", "999.l.1", "T", roster=r, player_stats=stats)["roster"]
+    assert (rows[0]["stats"], rows[0]["season_rank"], rows[0]["rest_place"]) == (
+        "Season #109, VORP +1.4", 109, 15
+    )  # fmt: skip
+    assert rows[1]["stats"] == ""
     drop_placed = {p.drop_player_key: tiers.Placement(tiers.Tier.ROTATION, tiers.AUTO, "cheap")}
     (card,) = snapshot.build(db, "jimmy", "999.l.1", "T", tiers=drop_placed)["proposals"]
     assert card["drop_tier"] == f"{p.drop_name}: Rotation - cheap"

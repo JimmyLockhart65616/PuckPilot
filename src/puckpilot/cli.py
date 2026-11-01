@@ -1627,15 +1627,21 @@ def _cmd_season_tiers(args: argparse.Namespace) -> int:
         tiers.pin(conn, manager.name, league_key, player.player_key, wanted, name=player.name,
                   nhl_player_id=player.nhl_player_id, via="cli")  # fmt: skip
         print(f"{player.name}: " + (f"set to {wanted.label}" if wanted else "back to automatic"))
+    from puckpilot.season import roster_stats
+
     roster = tiers.annotate(roster, tiers.pins(conn, manager.name, league_key))
-    placed = _season_tier_board(conn, manager, league_key, runtime, roster,
-                                args.date or cli_support.today_str())  # fmt: skip
+    day = args.date or cli_support.today_str()
+    placed, keep = _season_tier_board(conn, manager, league_key, runtime, roster, day)
+    stats = roster_stats.describe(
+        roster, keep, roster_stats.season_ranks(conn, manager.league, runtime.nhl_season, day)
+    )
     order = {tiers.Tier.ROTATION: 0, tiers.Tier.UPGRADE: 1, tiers.Tier.NEVER: 2}
     print(f"\nDrop tiers for {manager.name} (roster of {roster.date}):")
     for p in sorted(roster.players, key=lambda q: (order[placed[q.player_key].tier], q.name)):
         pl = placed[p.player_key]
         src = {"you": "set by you", "auto": "automatic"}.get(pl.source, pl.source)
         print(f"  {pl.tier.label:13} {p.name:24} {src} - {pl.why}")
+        print(f"  {'':13} {'':24} {stats[p.player_key]['text']}")
     gone = [x for x in tiers.listing(conn, manager.name, league_key)
             if x["player_key"] not in {p.player_key for p in roster.players}]  # fmt: skip
     if gone:
@@ -1691,8 +1697,9 @@ def _roster_player_named(roster, name: str):
     raise ValueError(f"nobody called {name!r} on the roster")
 
 
-def _season_tier_board(conn, manager, league_key: str, runtime, roster, day: str) -> dict:
-    """The tiers as the run places them: the same values, the same players who may go."""
+def _season_tier_board(conn, manager, league_key: str, runtime, roster, day: str):
+    """(the tiers as the run places them, the rest-of-season values they are
+    placed by): the same values, the same players who may go."""
     from puckpilot.season import legality, tiers
     from puckpilot.season import week as weekmod
     from puckpilot.season.run import _train_seasons
@@ -1704,13 +1711,14 @@ def _season_tier_board(conn, manager, league_key: str, runtime, roster, day: str
         conn, runtime, roster.players, values, day, getattr(values, "workload", None)
     )
     terms = manager.authority.transactions
-    return tiers.board(
+    placed = tiers.board(
         roster.players,
         keep,
         terms.stream_spots,
         droppable=legality.droppable(roster),
         upgrade_margin=terms.upgrade_margin,
     )
+    return placed, keep
 
 
 def _cmd_season_statuses(args: argparse.Namespace) -> int:

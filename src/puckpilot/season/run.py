@@ -138,8 +138,12 @@ class WeekContext:
     # it will stand once its make-room moves are made - what adds are priced on.
     resolution: object | None = None
     resolved: object | None = None
-    # Every player's drop tier as of this run (`tiers.board`), for the page.
+    # Every player's drop tier as of this run (`tiers.board`), for the page;
+    # the rest-of-season values it placed them by; and the roster's numbers
+    # for the page (`roster_stats.describe`).
     tiers: dict | None = None
+    keep: dict | None = None
+    player_stats: dict | None = None
 
 
 def _priced(ctx):
@@ -628,6 +632,9 @@ def run_day(
             "tiers",
             lambda: _tiers(conn, manager, league_key, runtime, ctx, models, day, report),
         )
+    # ...with the numbers a tier is decided by, on the page's roster.
+    if ctx.keep is not None:
+        _guard(report, "stats", lambda: _roster_stats(conn, manager, runtime, ctx, day))
     # ...and which waiting cards a standing approval covers: a rotation
     # player's drop, made after the window unless stopped (season/standing.py).
     # Only where a page shows them: the window is the manager's to stop it.
@@ -672,6 +679,7 @@ def run_day(
                 blockers=[b.payload() for b in blocked or ()],
                 ledger=_ledger(conn, manager, league_key, runtime, day, roster),
                 tiers=ctx.tiers,
+                player_stats=ctx.player_stats,
                 standing_on=manager.authority.standing.enabled,
             )
             publish.push(manager.page.url, page_key, snap)
@@ -2324,6 +2332,16 @@ def _standing_offer(conn, manager, league_key: str, ctx, report) -> list:
     return offered
 
 
+def _roster_stats(conn, manager, runtime, ctx, day: str) -> dict:
+    """This season's rank and VORP, and the rest-of-season value the tiers were
+    placed by, for every rostered player (season/roster_stats.py)."""
+    from puckpilot.season import roster_stats
+
+    ranks = roster_stats.season_ranks(conn, manager.league, runtime.nhl_season, day)
+    ctx.player_stats = roster_stats.describe(ctx.roster, ctx.keep, ranks)
+    return ctx.player_stats
+
+
 def _with_pins(conn, manager, league_key: str, roster):
     """The roster with the manager's drop tiers on it (`tiers.annotate`)."""
     from puckpilot.season import tiers
@@ -2357,6 +2375,7 @@ def _tiers(conn, manager, league_key: str, runtime, ctx, models, day: str, repor
         upgrade_margin=terms.upgrade_margin,
     )
     ctx.tiers = placed
+    ctx.keep = keep
     names = {p.player_key: p.name for p in roster.players}
 
     def who(tier, source=None) -> list[str]:

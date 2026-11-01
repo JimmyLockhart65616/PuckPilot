@@ -90,9 +90,10 @@ PAGE = """<!doctype html>
   .chip.tier-never { color:var(--bad); }
   .chip.tier-rotation { color:var(--ok); }
   .chip.tier-upgrade { color:var(--accent); }
-  .tiers { padding:6px 0 10px; border-bottom:1px solid var(--line); }
-  .tiers .btns { flex-wrap:wrap; }
+  .tiers { padding:6px 0 2px; }
+  .tiers .btns { flex-wrap:wrap; margin-top:6px; }
   .tiers button { flex:1 1 40%; padding:9px; font-size:14px; }
+  .tiers button.on { background:var(--accent); color:#fff; border-color:transparent; }
 </style>
 </head>
 <body>
@@ -354,16 +355,19 @@ function renderWeek(root, w) {
   if (w.note) c.appendChild(el('div', 'sub', w.note));
 }
 
-// Each player's drop tier: who a move may let go, and on what terms. Tapped
-// open, it offers the other tiers; the choice goes back like an approval and
-// the run uses it from its next pass. Open choosers and saved notes have to
+// The roster is where drop tiers are decided: each row has the player's
+// tier beside his name and the numbers it is set by - this season's rank and
+// VORP, and his rest-of-season value with his place on the roster by it.
+// Tapped, the tier opens its choice in the row itself; the choice goes back
+// like an approval and the run uses it from its next pass. What each tier
+// means is said once, above the list. Open choices and saved notes have to
 // survive the 20 s redraw, as an opened "why" does.
 var TIERS = [
-  ['never', 'Never', 'never dropped, for anyone'],
-  ['upgrade', 'Upgrade only', 'only for a player worth more over the rest of the season'],
-  ['rotation', 'Rotation', 'for any move that pays this week'],
-  ['auto', 'Automatic', 'back to the rule: the cheapest rotate, the rest upgrade only']
+  ['never', 'Never'], ['upgrade', 'Upgrade only'], ['rotation', 'Rotation'], ['auto', 'Automatic']
 ];
+var TIER_LEGEND = 'Tap a tier to change it. Never: never dropped. Upgrade only: only for a ' +
+  'player worth more over the rest of the season. Rotation: for any move that pays this ' +
+  'week. Automatic: your cheapest rotate, the rest are upgrade only.';
 var tierOpen = {};
 var tierSaved = {};
 
@@ -405,18 +409,19 @@ function setTier(r, tier, box) {
   });
 }
 
-function tierChooser(r) {
+// The choice, in the row: why he is where he is, and the four tiers with the
+// one that decides now lit - his pin, or Automatic when the rule does.
+function tierChoices(r) {
   var box = el('div', 'tiers');
-  if (r.tier_why) box.appendChild(el('div', 'sub', r.tier_label + ': ' + r.tier_why));
+  if (r.tier_why) box.appendChild(el('div', 'sub', r.tier_label + ' \\u2013 ' + r.tier_why));
+  var now = r.tier_source === 'you' ? r.tier : 'auto';
   var btns = el('div', 'btns');
   TIERS.forEach(function (t) {
-    var b = el('button', null, t[1]);
-    b.title = t[2];
+    var b = el('button', t[0] === now ? 'on' : null, t[1]);
     b.onclick = function () { setTier(r, t[0], box); };
     btns.appendChild(b);
   });
   box.appendChild(btns);
-  TIERS.forEach(function (t) { box.appendChild(el('div', 'sub', t[1] + ' \\u2013 ' + t[2])); });
   return box;
 }
 
@@ -424,6 +429,9 @@ function renderRoster(root, rows) {
   if (!rows || !rows.length) return;
   h2(root, 'Roster');
   var c = card(root);
+  if (rows.some(function (r) { return r.tier_label; })) {
+    c.appendChild(el('div', 'sub', TIER_LEGEND));
+  }
   // When the shown push was made: its age as of the fetch that brought it.
   var s = window.__s;
   var pushed = s && s.age_seconds !== null && s.age_seconds !== undefined
@@ -433,10 +441,12 @@ function renderRoster(root, rows) {
     row.appendChild(el('span', 'tag', r.slot));
     var n = el('span', 'name', r.name);
     n.appendChild(el('div', 'sub', [r.team, r.opp, r.status].filter(Boolean).join(' \\u00b7 ')));
+    if (r.stats) n.appendChild(el('div', 'sub', r.stats));
     // Saved since the last push: the run has not used it yet.
     if (tierSaved[r.player_key] && tierSaved[r.player_key] > pushed) {
       n.appendChild(el('div', 'done', 'Saved \\u2013 PuckPilot uses it from its next run.'));
     }
+    if (tierOpen[r.player_key]) n.appendChild(tierChoices(r));
     row.appendChild(n);
     if (r.tier_label) {
       var text = r.tier_label + (tierSource(r) ? ' \\u00b7 ' + tierSource(r) : '');
@@ -452,7 +462,6 @@ function renderRoster(root, rows) {
       }
     }
     c.appendChild(row);
-    if (tierOpen[r.player_key]) c.appendChild(tierChooser(r));
   });
 }
 

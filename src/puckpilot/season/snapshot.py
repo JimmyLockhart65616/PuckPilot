@@ -66,6 +66,7 @@ def build(
     ledger: list[dict] | None = None,
     tiers: dict | None = None,
     standing_on: bool = False,
+    player_stats: dict | None = None,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -85,7 +86,9 @@ def build(
     lead the page: what stops the tool working comes before anything it says.
     `tiers` is the run's drop tiers by player key (`tiers.board`): each roster
     row carries its own, for the page to show and change, and each card says
-    the drop's. A card a standing approval covers (season/standing.py) says
+    the drop's; `player_stats` (`roster_stats.describe`) puts this season's
+    rank and VORP and the rest-of-season value on each row, the numbers a
+    tier is set by. A card a standing approval covers (season/standing.py) says
     when it will be made unless stopped; with one given (`standing_on`), every
     other card says why it still needs a tap.
     """
@@ -231,6 +234,7 @@ def build(
                 # The key the page sends back with a tier change.
                 "player_key": p.player_key,
                 **_tier_fields((tiers or {}).get(p.player_key)),
+                **_stat_fields((player_stats or {}).get(p.player_key)),
             }
             for p in roster.players
         ]
@@ -263,6 +267,20 @@ def _standing(p, tz: str) -> dict | None:
         "due_local": when,
         "text": f"PuckPilot makes this at {when} unless you stop it - your standing approval "
         f"for a Rotation player's drop.",
+    }
+
+
+def _stat_fields(stats) -> dict:
+    """A roster row's numbers (`roster_stats.describe`): empty before the run has them."""
+    if not stats:
+        return {"stats": ""}
+    return {
+        "stats": stats["text"],
+        "season_rank": stats["season_rank"],
+        "season_vorp": stats["season_vorp"],
+        "rest": stats["rest"],
+        "rest_place": stats["rest_place"],
+        "rest_of": stats["rest_of"],
     }
 
 

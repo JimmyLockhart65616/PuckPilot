@@ -703,9 +703,11 @@ def run_page_and_pick_tier(payload: dict, chip: str, choice: str) -> dict:
 
 
 def test_a_tier_is_shown_on_the_roster_and_changed_from_it():
-    """Each row carries its tier and where it came from; a tap sends the new
-    one home and the row says it is saved for the next run. A player Yahoo
-    locks has no chooser - no pin can move him."""
+    """Each row carries its tier, where it came from and the numbers it is set
+    by; a tap opens the choice in the row - the tiers said once, above the
+    list, not again under it - and sends the new one home, and the row says it
+    is saved for the next run. A player Yahoo locks has no choice - no pin can
+    move him."""
     state = SeasonState()
     state.push(
         "jimmy",
@@ -720,7 +722,8 @@ def test_a_tier_is_shown_on_the_roster_and_changed_from_it():
                 {"slot": "D", "name": "Tyler Kleven", "team": "OTT", "opp": "", "status": "",
                  "player_key": "p.1", "tier": "upgrade", "tier_label": "Upgrade only",
                  "tier_source": "auto",
-                 "tier_why": "goes only for a player worth more over the rest of the season"},
+                 "tier_why": "goes only for a player worth more over the rest of the season",
+                 "stats": "Season #109, VORP +1.4 \u00b7 Rest of season 304, 15th of 18"},
                 {"slot": "C", "name": "Locked Star", "team": "TOR", "opp": "", "status": "",
                  "player_key": "p.2", "tier": "never", "tier_label": "Never",
                  "tier_source": "yahoo", "tier_why": "Yahoo does not let him be dropped"},
@@ -734,7 +737,12 @@ def test_a_tier_is_shown_on_the_roster_and_changed_from_it():
     assert "Upgrade only \u00b7 auto" in out["app"] and "Never \u00b7 Yahoo" in out["app"]
     assert "Tyler Kleven: Upgrade only - goes only for a player worth more" in out["app"]
     assert "Old Push" in out["app"]  # a row from before tiers draws without one
-    assert "Rotation \u2013 for any move that pays this week" in out["opened"]
+    assert "Season #109, VORP +1.4 \u00b7 Rest of season 304, 15th of 18" in out["app"]
+    assert "Rotation: for any move that pays this week" in out["app"]  # the legend, once
+    opened = out["opened"]
+    assert opened.count("for any move that pays") == 1  # not repeated under the row
+    assert "Upgrade only \u2013 goes only for a player worth more" in opened
+    assert "Never Upgrade only Rotation Automatic" in opened
     assert out["posts"] == [{"url": "/tier?k=test", "body": {"player": "p.1", "tier": "rotation"}}]
     assert "Rotation \u00b7 yours" in out["after"]
     assert "Saved \u2013 PuckPilot uses it from its next run." in out["after"]
