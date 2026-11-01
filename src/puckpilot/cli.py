@@ -1640,7 +1640,8 @@ def _cmd_season_tiers(args: argparse.Namespace) -> int:
     for p in sorted(roster.players, key=lambda q: (order[placed[q.player_key].tier], q.name)):
         pl = placed[p.player_key]
         src = {"you": "set by you", "auto": "automatic"}.get(pl.source, pl.source)
-        print(f"  {pl.tier.label:13} {p.name:24} {src} - {pl.why}")
+        why = "" if pl.source == tiers.YOU else f" - {pl.why}"
+        print(f"  {pl.tier.label:13} {p.name:24} {src}{why}")
         print(f"  {'':13} {'':24} {stats[p.player_key]['text']}")
     gone = [x for x in tiers.listing(conn, manager.name, league_key)
             if x["player_key"] not in {p.player_key for p in roster.players}]  # fmt: skip
