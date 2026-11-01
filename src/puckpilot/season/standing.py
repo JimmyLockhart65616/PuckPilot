@@ -50,6 +50,10 @@ from puckpilot.season.moves import MoveKind
 
 KILL_SWITCH = "PUCKPILOT_STANDING_OFF"
 DEFAULT_TZ = "America/Toronto"
+# A card whose time passed this long before a run came - the machine was off
+# - is not made on numbers that old: it goes back, and the run's search offers
+# it again with a new time if it still pays.
+MISSED_HOURS = 3.0
 
 
 def killed() -> bool:
@@ -221,19 +225,29 @@ def _since(p, st: dict, grant, pins) -> str:
 
 
 def approve_due(
-    conn: sqlite3.Connection, manager: str, league_key: str, grant, now: datetime | None = None
+    conn: sqlite3.Connection,
+    manager: str,
+    league_key: str,
+    grant,
+    now: datetime | None = None,
+    missed_hours: float = MISSED_HOURS,
 ) -> tuple[list, list]:
     """(approved, (card, why) put back to wait for a tap) - every offered card
-    whose time has come."""
+    whose time has come. One whose time passed more than `missed_hours`
+    before this run goes back too: the search re-prices it, and the offer
+    that follows gives it a new time."""
     at = now or datetime.now(UTC)
     pins = tiers.pins(conn, manager, league_key)
     approved, back = [], []
     for p, st in sorted(_offers(conn, manager, league_key), key=lambda x: x[0].id):
         if not st.get("shown_at") or not st.get("due_at"):
             continue
-        if datetime.fromisoformat(str(st["due_at"])) > at:
+        when = datetime.fromisoformat(str(st["due_at"]))
+        if when > at:
             continue
         why = _since(p, st, grant, pins)
+        if not why and at - when > timedelta(hours=missed_hours):
+            why = "its time passed with no run to make it - offered again with a new one"
         if why:
             proposals_mod.annotate(conn, p.id, standing=None, standing_not=why)
             back.append((proposals_mod.get(conn, p.id), why))

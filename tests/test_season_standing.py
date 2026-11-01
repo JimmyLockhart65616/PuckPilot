@@ -334,3 +334,15 @@ def test_the_grant_is_read_from_config_and_wrong_settings_are_refused():
     words = Authority.from_config({"standing": {"enabled": True}}).describe()
     assert "Moves without a tap: a ROTATION player's drop" in words
     assert "Moves without a tap: NONE" in Authority().describe()
+
+
+def test_a_card_whose_time_passed_with_no_run_is_offered_again_not_made(db):
+    """The machine was off: a move is not made on numbers that old. It goes
+    back, and the run's offer gives it a new time once the search re-priced it."""
+    [p] = make(db, target())
+    offer(db)
+    show(db)
+    approved, back = due(db, T0 + timedelta(hours=6))
+    assert approved == [] and "offered again" in back[0][1]
+    (again,) = offer(db)
+    assert again.id == p.id and again.reason["standing"]["shown_at"] is None
