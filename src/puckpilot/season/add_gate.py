@@ -70,6 +70,18 @@ Asked for after the goalie audit (2026-10-11), and tested the same way:
     -z<n>    the same, `time_moves="shift"`: only the swaps chosen on today's
              price are moved to their best day - never an extra move
 
+Asked for with the drop tiers (2026-10-31):
+
+    -b<nn>   an upgrade-only player is dropped only for one worth nn% more over
+             the rest of the season (`upgrade_margin`); rotation players as before
+    -o<pct>  a tap: each swap is approved with pct% chance on the day it is
+             found and made after that day's games - the live pattern since
+             PuckPilot began making approved moves (4 of 5 approved, each 11-12
+             hours later); one not approved is found again the next morning
+             if it still pays, and spends no acquisition
+    -ow      with -o, a swap whose drop is a rotation player is made at once,
+             as a standing approval's window would make it before the games
+
 `versus` compares every arm with one named arm - the live baseline.
 
 A week is scored as Yahoo scores it, including the weekly goalie minimum: a
@@ -175,6 +187,12 @@ class ArmSpec:
     # priced (and lost) at N% a day.
     timing: float | None = None
     timing_mode: str = "off"
+    # -bNN: an upgrade-only player's replacement must be worth NN% more.
+    margin: float = 0.0
+    # -oPCT: a swap waits for a tap - approved with this chance, made after
+    # the day's games; -ow: one dropping a rotation player is made at once.
+    tap: float | None = None
+    standing: bool = False
 
 
 def _swap(roster: list[int], target) -> None:
@@ -251,9 +269,15 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.floor = int(tok[2:])
         elif tok == "a":
             spec.age_games = True
-        elif len(tok) > 1 and tok[0] in "spqfxknjyz" and tok[1:].isdigit():
+        elif tok == "ow":
+            spec.standing = True
+        elif tok.startswith("o") and tok[1:].isdigit():
+            spec.tap = int(tok[1:]) / 100
+        elif len(tok) > 1 and tok[0] in "spqfxknjyzb" and tok[1:].isdigit():
             n = int(tok[1:])
-            if tok[0] in "yz":
+            if tok[0] == "b":
+                spec.margin = n / 100
+            elif tok[0] in "yz":
                 spec.timing = n / 100
                 spec.timing_mode = "search" if tok[0] == "y" else "shift"
             elif tok[0] == "j":
@@ -274,6 +298,8 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
                 spec.mid_floor = n / 100
         else:
             raise ValueError(f"unknown option {tok!r} in arm {arm!r}")
+    if spec.standing and spec.tap is None:
+        raise ValueError(f"-ow needs -o<pct> (a tap to make the rest) in arm {arm!r}")
     return spec
 
 
@@ -797,6 +823,7 @@ def add_gate_report(
     made: dict[str, int] = dict.fromkeys(arms, 0)
     timed_made: dict[str, int] = {}  # -y arms: swaps put off to a later morning
     timed_lost: dict[str, int] = {}  # ... and of those, the free agent taken first
+    tapped: dict[str, list[int]] = {}  # -o arms: [after the games, never approved, at once]
     tested = list(range(min(n_tested, len(rosters))))
     for t in tested:
         for arm in arms:
@@ -813,6 +840,8 @@ def add_gate_report(
             # -y arms: (date index to make it on, index it was found on, target)
             waiting: list = []
             lost = np.random.default_rng([seed, t, arms.index(arm)])
+            # -o arms: a draw of their own, so the other arms' streams are untouched.
+            taps = np.random.default_rng([seed, t, arms.index(arm), 7919])
             # Moves queued at the end of a week for the rosters' unlock are made
             # the next morning, so they count against the week that starts then.
             carry = 0
@@ -907,6 +936,7 @@ def add_gate_report(
                                 min_expected_gain=min_expected_gain,
                                 playoff_reserve=0,
                                 stream_spots=spots,
+                                upgrade_margin=spec.margin,
                                 measure_room=False,
                                 workload=wl,
                                 form_rates=spec.form_rates,
@@ -998,6 +1028,7 @@ def add_gate_report(
                             min_expected_gain=floor_now,
                             playoff_reserve=0,
                             stream_spots=spots,
+                            upgrade_margin=spec.margin,
                             measure_room=False,
                             workload=wl,
                             form_rates=spec.form_rates,
@@ -1051,6 +1082,7 @@ def add_gate_report(
                                 min_expected_gain=-1e9,
                                 playoff_reserve=0,
                                 stream_spots=spots,
+                                upgrade_margin=spec.margin,
                                 measure_room=False,
                                 workload=wl,
                                 form_rates=spec.form_rates,
@@ -1074,6 +1106,24 @@ def add_gate_report(
                                 for j in days[k + 1 :]
                                 if target.after_games_of and data.dates[j] > target.after_games_of
                             ]
+                            if spec.tap is not None and not (
+                                spec.standing and target.drop_tier == "rotation"
+                            ):
+                                # Waiting for a tap: made after tonight's
+                                # games if one comes today; if not, found again
+                                # tomorrow - no acquisition spent on it.
+                                counts = tapped.setdefault(arm, [0, 0, 0])
+                                if taps.random() >= spec.tap:
+                                    counts[1] += 1
+                                    continue
+                                adds_week += 1
+                                adds_season += 1
+                                queued.append(target)
+                                counts[0] += 1
+                                made[arm] += 1
+                                continue
+                            if spec.tap is not None:
+                                tapped.setdefault(arm, [0, 0, 0])[2] += 1
                             adds_week += 1
                             adds_season += 1
                             if spec.timing is not None and on_days:
@@ -1130,6 +1180,11 @@ def add_gate_report(
             line += f"   steered lineups: {steered[arm]} nights changed"
         if arm in timed_made:
             line += f"   timed: {timed_made[arm]} put off, {timed_lost.get(arm, 0)} lost waiting"
+        if arm in tapped:
+            late, never, now = tapped[arm]
+            line += f"   taps: {late} after the games, {never} not approved that day"
+            if now:
+                line += f", {now} rotation drops at once"
         lines.append(line)
     lines.append("")
     pairs = [(a, "none") for a in arms if a != "none" and "none" in arms]

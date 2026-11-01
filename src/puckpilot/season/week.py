@@ -225,6 +225,9 @@ class AddTarget:
     # Queued: to be made only after this date's games, because the drop plays
     # that day (`run._recheck_both`). Empty: made as soon as it is approved.
     after_games_of: str = ""
+    # The drop's tier when the search chose the swap (`season.tiers`): what
+    # the replay's standing-approval arm makes at once.
+    drop_tier: str = ""
 
     def moved(self, limit: int = 4) -> str:
         """The biggest category changes, in the league's own units and labels."""
@@ -1550,6 +1553,7 @@ def _targets(
                 notes[_pair_key(best)] = timed[2]
         best = replace(
             best,
+            drop_tier=placed[best.drop.player_key].tier.value if best.drop is not None else "",
             detail=_explain(
                 conn,
                 runtime,

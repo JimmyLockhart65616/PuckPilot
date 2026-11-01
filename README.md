@@ -21,7 +21,10 @@ validation, not gut feel.
 - **Waiver & free-agent engine** — ranked pickup and drop proposals, scored
   against a weekly backtest. Proposals are recorded for you to review; executing
   them through the Yahoo Fantasy API is designed but not built, and is gated on
-  API approval.
+  API approval. Every player carries a drop tier — never, upgrade only, or
+  rotation — that decides who a proposal may let go; a manager can approve
+  rotation drops in advance, each still shown first with the time it would be
+  made and a way to stop it.
 
 ## Why PuckPilot
 

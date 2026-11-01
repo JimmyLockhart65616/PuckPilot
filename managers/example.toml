@@ -133,3 +133,41 @@ max_pending = 5
 # waiting costs. wait_hazard is the chance a day that the free agent is taken.
 # time_moves = "off"
 # wait_hazard = 0.10
+
+# Drop tiers: who a move may let go. Every player is one of
+#   Never         never dropped (Yahoo's own lock, your pin, or a protected keeper)
+#   Upgrade only  dropped only for a player worth more over the rest of the season
+#   Rotation      dropped for any move that pays this week (a streamer spot)
+# Set a player's tier from the page's roster (tap his tier) or with
+# `ppilot season tiers --set "Name=rotation"`; unset players follow the rule:
+# your Rotation picks fill `stream_spots` first, then the cheapest players,
+# and everyone else is Upgrade only.
+# stream_spots = 2
+# How much more an Upgrade only player's replacement must be worth over the
+# rest of the season: 0.25 = at least 25% more. 0 = more by anything, the rule
+# the add gate measured.
+# upgrade_margin = 0.0
+
+
+[authority.standing]
+# Moves approved in advance: a ROTATION player's drop, each still shown on the
+# page first with the time it will be made ("PuckPilot makes this at 9:05 PM
+# unless you stop it"), pushed to your phone, and made by the run at that time
+# only if you did not tap Stop. A Stop, setting the drop to another tier, or
+# turning this off sends a card back to wait for your tap. Waiver claims and
+# adds that drop nobody always wait for a tap. Needs a page (it is where you
+# stop one) and PuckPilot making your approved moves (execute_approved).
+# Emergency stop without editing this file: PUCKPILOT_STANDING_OFF=1.
+enabled = false
+
+# Minutes a card is shown before it is made. 0 = made on the run that shows
+# it (still pushed to you first, with no time to stop it).
+veto_minutes = 120
+
+# Which moves it covers, each only when the drop is a Rotation player:
+make_room = true     # drop one so a player back from IR can play (no acquisition spent)
+same_kind = true     # a free agent for one of the same kind: goalie for goalie, skater for skater
+cross_kind = false   # a skater for a goalie, or the reverse
+
+# Moves made without a tap in a week; leave out for only the league's own cap.
+# max_per_week = 2

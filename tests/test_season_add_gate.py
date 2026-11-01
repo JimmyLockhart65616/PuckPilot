@@ -130,3 +130,19 @@ def test_the_timing_option_parses():
     assert (z.timing, z.timing_mode) == (0.1, "shift")
     assert parse_arm("odds-weekly-y0").timing == 0.0
     assert parse_arm("odds-weekly").timing is None
+
+
+def test_the_drop_tier_options_parse():
+    """-b: the upgrade-only margin; -o: a tap's chance and delay; -ow: rotation
+    drops made at once, as a standing approval would - only beside a tap."""
+    import pytest
+
+    from puckpilot.season.add_gate import parse_arm
+
+    spec = parse_arm("odds-daily-h-f25-x1-k1-r-b25")
+    assert spec.margin == 0.25 and spec.tap is None and not spec.standing
+    spec = parse_arm("odds-daily-h-f25-x1-k1-r-o80-ow")
+    assert spec.tap == 0.8 and spec.standing and spec.margin == 0.0
+    assert parse_arm("odds-daily").margin == 0.0
+    with pytest.raises(ValueError, match="-ow needs -o"):
+        parse_arm("odds-daily-ow")
