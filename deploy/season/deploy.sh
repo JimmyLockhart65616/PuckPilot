@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Create the in-season relay from nothing: resource group, registry,
+# Create the in-season relay from nothing: resource group, state storage,
 # environment, container app. Prints the URL and the per-manager keys.
 #
-# Re-running is safe for the group/registry/environment, but the app is created
+# The image comes from GitHub's container registry, where
+# .github/workflows/publish-season-image.yml publishes it - push first.
+#
+# Re-running is safe for the group/storage/environment, but the app is created
 # here - use update.sh to redeploy an existing one and keep its URL and keys.
 #
 #   MANAGERS=jimmy,sam deploy/season/deploy.sh
@@ -12,8 +15,11 @@ RG=${RG:-puckpilot-rg}
 LOC=${LOC:-eastus2}
 APP=${APP:-puckpilot-season}
 ENVNAME=${ENVNAME:-puckpilot-cae}
-ACR=${ACR:-puckpilot$RANDOM}
-IMAGE_TAG=${IMAGE_TAG:-$(git rev-parse --short=12 HEAD 2>/dev/null || date +%s)}
+STORE=${STORE:-puckpilot$RANDOM}
+SHA=$(git log -1 --format=%H -- src/puckpilot/__init__.py src/puckpilot/web deploy/season \
+  .github/workflows/publish-season-image.yml)
+IMAGE=${IMAGE:-ghcr.io/jimmylockhart65616/puckpilot-season:${SHA:0:12}}
+EXPIRY=${EXPIRY:-$(date -u -d '+2 years' +%Y-%m-%dT%H:%MZ)}
 PY=${PY:-python}
 MANAGERS=${MANAGERS:-jimmy}
 
@@ -31,35 +37,35 @@ done
 echo "==> resource group $RG ($LOC)"
 az group create -n "$RG" -l "$LOC" -o none
 
-echo "==> container registry $ACR"
-az acr create -n "$ACR" -g "$RG" --sku Basic --admin-enabled true -o none
-
-# The build context is the repo root, and `az acr build` uploads it. Without a
-# deny-by-default .dockerignore this ships secrets/chrome-profile (a logged-in
-# Yahoo session) and data/captures to a cloud registry.
-if ! head -n 20 .dockerignore 2>/dev/null | grep -qx '\*'; then
-  echo "refusing to build: .dockerignore is missing or does not deny by default" >&2
-  exit 1
-fi
-
-echo "==> build image in ACR"
-az acr build --registry "$ACR" --image "puckpilot-season:$IMAGE_TAG" \
-  --file deploy/season/Dockerfile \
-  --build-arg GIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)" . -o none
+# Between runs the relay scales to zero, so the snapshot and the decisions on
+# their way home live in one blob. The app's token hangs off a stored access
+# policy, so it can be extended or revoked without minting a new one.
+echo "==> state storage $STORE"
+az storage account create -n "$STORE" -g "$RG" -l "$LOC" --sku Standard_LRS --kind StorageV2 \
+  --min-tls-version TLS1_2 --allow-blob-public-access false -o none
+az storage container create --account-name "$STORE" -n season --auth-mode key -o none
+az storage container policy create --account-name "$STORE" -c season -n relay \
+  --permissions rw --expiry "$EXPIRY" -o none
+SAS=$(az storage container generate-sas --account-name "$STORE" -n season --policy-name relay -o tsv)
+STATE_URL="https://$STORE.blob.core.windows.net/season/state.json?$SAS"
 
 echo "==> container apps environment $ENVNAME"
-az containerapp env create -n "$ENVNAME" -g "$RG" -l "$LOC" -o none 2>/dev/null || true
+# No Log Analytics workspace: console logs stream live (az containerapp logs show).
+az containerapp env create -n "$ENVNAME" -g "$RG" -l "$LOC" --logs-destination none \
+  -o none 2>/dev/null || true
 
 echo "==> container app $APP"
-# One replica, never zero: the snapshot and any undelivered decisions live in
-# memory, so a second instance would answer reads that never saw the push.
+# At most one replica: a second would answer reads that never saw the push.
+# At least none: the state is in the blob, so between runs the relay costs
+# nothing, and the first request after a quiet spell waits a few seconds for it.
 az containerapp create -n "$APP" -g "$RG" --environment "$ENVNAME" \
-  --image "$ACR.azurecr.io/puckpilot-season:$IMAGE_TAG" \
-  --registry-server "$ACR.azurecr.io" \
+  --image "$IMAGE" \
   --target-port 8080 --ingress external \
-  --min-replicas 1 --max-replicas 1 \
-  --secrets "manager-keys=$KEYSPEC" \
+  --cpu 0.25 --memory 0.5Gi \
+  --min-replicas 0 --max-replicas 1 \
+  --secrets "manager-keys=$KEYSPEC" "state-url=$STATE_URL" \
   --env-vars "PUCKPILOT_MANAGER_KEYS=secretref:manager-keys" \
+    "PUCKPILOT_STATE_URL=secretref:state-url" \
   -o none
 
 FQDN=$(az containerapp show -n "$APP" -g "$RG" --query properties.configuration.ingress.fqdn -o tsv)
@@ -71,5 +77,6 @@ for row in "${SHOW[@]}"; do
   echo "$1      https://$FQDN/?k=$2"
 done
 echo
-echo "Registry: ACR=$ACR (needed by update.sh)"
+echo "State:  $STORE/season/state.json; its token lapses $EXPIRY. Extend it with:"
+echo "  az storage container policy update --account-name $STORE -c season -n relay --expiry <date>"
 echo "Tear down with: az containerapp delete -n $APP -g $RG --yes"

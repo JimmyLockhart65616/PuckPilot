@@ -14,7 +14,10 @@ import pytest
 
 from puckpilot.web.season_relay import (
     MAX_PENDING_DECISIONS,
+    BlobStore,
     SeasonState,
+    StoreConflict,
+    StoreUnavailable,
     build_id,
     parse_keys,
     serve,
@@ -292,12 +295,13 @@ print('ok')
     assert r.returncode == 0, r.stdout + r.stderr
 
 
-def test_the_deploy_script_refuses_a_permissive_dockerignore():
-    """`az acr build` uploads the repo root. Without deny-by-default that is a
-    logged-in Yahoo session and a gigabyte of captures, sent to a registry."""
+def test_the_image_build_refuses_a_permissive_dockerignore():
+    """The build context is the repo root. Without deny-by-default, a logged-in
+    Yahoo session and a gigabyte of captures are one careless COPY away from a
+    public image."""
     root = Path(__file__).resolve().parents[1]
-    script = (root / "deploy/season/deploy.sh").read_text(encoding="utf-8")
-    assert "refusing to build" in script
+    workflow = (root / ".github/workflows/publish-season-image.yml").read_text(encoding="utf-8")
+    assert "refusing to build" in workflow
     head = (root / ".dockerignore").read_text(encoding="utf-8").splitlines()[:20]
     assert "*" in [ln.strip() for ln in head]
 
@@ -342,3 +346,147 @@ def test_every_state_carries_the_build_the_page_checks_against():
     assert state.get("jimmy")["build"] == build_id()
     state.push("jimmy", {"team": "Home Team", "moves": []})
     assert state.get("jimmy")["build"] == build_id()
+
+
+# -- kept in a blob, so it survives scaling to zero ----------------------------
+
+
+class MemoryStore:
+    """BlobStore's contract without the network: writes conditional on an ETag."""
+
+    def __init__(self):
+        self.data: dict | None = None
+        self.etag = 0
+        self.fail_next_save = False
+        self.before_next_save = None
+
+    def load(self):
+        if self.data is None:
+            return {}, None
+        return json.loads(json.dumps(self.data)), str(self.etag)
+
+    def save(self, data, etag):
+        hook, self.before_next_save = self.before_next_save, None
+        if hook:
+            hook()
+        if self.fail_next_save:
+            self.fail_next_save = False
+            raise StoreUnavailable("storage is down")
+        if etag != (str(self.etag) if self.data is not None else None):
+            raise StoreConflict
+        self.data = json.loads(json.dumps(data))
+        self.etag += 1
+        return str(self.etag)
+
+
+def test_a_restart_keeps_the_view_and_what_is_waiting():
+    store = MemoryStore()
+    before = SeasonState(store=store)
+    before.push("jimmy", {"team": "X", "proposals": [{"id": 7}]})
+    before.decide("jimmy", "proposal", 7, True)
+
+    after = SeasonState(store=store)  # the next replica, after scaling to zero
+    assert after.get("jimmy")["empty"] is False
+    assert after.get("jimmy")["proposals"] == []  # still shown as decided
+    assert [d["id"] for d in after.drain("jimmy")] == [7]
+
+
+def test_two_processes_never_hand_over_the_same_decision():
+    """A deploy briefly runs the old replica beside the new one."""
+    store = MemoryStore()
+    old, new = SeasonState(store=store), SeasonState(store=store)
+    old.push("jimmy", {"team": "X", "proposals": [{"id": 7}]})
+    old.decide("jimmy", "proposal", 7, True)
+    assert [d["id"] for d in new.drain("jimmy")] == [7]
+    assert old.drain("jimmy") == []
+    assert new.drain("jimmy") == []
+
+
+def test_a_drain_that_cannot_be_stored_hands_over_nothing():
+    store = MemoryStore()
+    state = SeasonState(store=store)
+    state.push("jimmy", {"team": "X", "proposals": [{"id": 7}]})
+    state.decide("jimmy", "proposal", 7, True)
+    store.fail_next_save = True
+    with pytest.raises(StoreUnavailable):
+        state.drain("jimmy")
+    assert [d["id"] for d in state.drain("jimmy")] == [7]  # still waiting, handed over once
+
+
+def test_a_write_that_loses_a_race_starts_again_from_the_winner():
+    store = MemoryStore()
+    a, b = SeasonState(store=store), SeasonState(store=store)
+    a.push("jimmy", {"team": "X"})
+    # b writes between a's read and a's write
+    store.before_next_save = lambda: b.push("sam", {"team": "Y"})
+    a.decide("jimmy", "protocol", 1, True)
+
+    view = SeasonState(store=store)
+    assert view.get("sam")["team"] == "Y"
+    assert [d["id"] for d in view.drain("jimmy")] == [1]
+
+
+def test_a_storage_fault_is_a_503_the_local_job_retries():
+    store = MemoryStore()
+    server = serve(SeasonState(store=store), KEYS, 0, host="127.0.0.1")
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        store.fail_next_save = True
+        assert call(base, "/push", "KEYJ", {"snapshot": {"team": "X"}})[0] == 503
+        assert call(base, "/push", "KEYJ", {"snapshot": {"team": "X"}})[0] == 200
+        assert json.loads(call(base, "/healthz")[1])["stored"] is True
+    finally:
+        server.shutdown()
+
+
+def test_the_blob_store_only_writes_over_what_it_read():
+    """BlobStore against a stand-in for Azure's conditional PUT."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    blob = {"body": None, "etag": 0}
+
+    class FakeBlob(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _status(self, code):
+            self.send_response(code)
+            if blob["body"] is not None:
+                self.send_header("ETag", f'"{blob["etag"]}"')
+            self.send_header("Content-Length", "0" if code != 200 else str(len(blob["body"])))
+            self.end_headers()
+
+        def do_GET(self):
+            if blob["body"] is None:
+                self._status(404)
+                return
+            self._status(200)
+            self.wfile.write(blob["body"])
+
+        def do_PUT(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            current = f'"{blob["etag"]}"' if blob["body"] is not None else None
+            if self.headers.get("If-None-Match") == "*" and current is not None:
+                self._status(409)
+            elif "If-Match" in self.headers and self.headers["If-Match"] != current:
+                self._status(412)
+            else:
+                blob["body"], blob["etag"] = body, blob["etag"] + 1
+                self._status(201)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeBlob)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        store = BlobStore(f"http://127.0.0.1:{server.server_address[1]}/season/state.json?sig=x")
+        assert store.load() == ({}, None)
+        first = store.save({"seq": 1}, None)
+        with pytest.raises(StoreConflict):
+            store.save({"seq": 2}, None)  # somebody created it already
+        assert store.load() == ({"seq": 1}, first)
+        second = store.save({"seq": 2}, first)
+        with pytest.raises(StoreConflict):
+            store.save({"seq": 3}, first)  # written over since
+        assert store.load() == ({"seq": 2}, second)
+    finally:
+        server.shutdown()

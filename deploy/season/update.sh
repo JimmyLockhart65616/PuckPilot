@@ -1,34 +1,37 @@
 #!/usr/bin/env bash
-# Redeploy the existing in-season relay, keeping its URL and its keys.
-#   ACR=<registry> deploy/season/update.sh
+# Redeploy the existing in-season relay, keeping its URL, its keys and its state.
+#   deploy/season/update.sh
+#
+# .github/workflows/publish-season-image.yml builds the image when a push to
+# in-season touches the relay. This deploys the image of the last commit that
+# did, waiting for its build if it is still running - so push first.
 set -euo pipefail
 
 RG=${RG:-puckpilot-rg}
 APP=${APP:-puckpilot-season}
-IMAGE_TAG=${IMAGE_TAG:-$(git rev-parse --short=12 HEAD 2>/dev/null || date +%s)}
 PY=${PY:-python}
 
-ACR=${ACR:-$(az acr list -g "$RG" --query "[0].name" -o tsv)}
-[ -n "$ACR" ] || { echo "no registry in $RG; set ACR=" >&2; exit 1; }
+SHA=$(git log -1 --format=%H -- src/puckpilot/__init__.py src/puckpilot/web deploy/season \
+  .github/workflows/publish-season-image.yml)
+git merge-base --is-ancestor "$SHA" "@{upstream}" 2>/dev/null \
+  || { echo "push first: no image is built from ${SHA:0:12} until it is on GitHub" >&2; exit 1; }
+IMAGE=${IMAGE:-ghcr.io/jimmylockhart65616/puckpilot-season:${SHA:0:12}}
 
-if ! head -n 20 .dockerignore 2>/dev/null | grep -qx '\*'; then
-  echo "refusing to build: .dockerignore is missing or does not deny by default" >&2
-  exit 1
-fi
+RUN=$(gh run list --workflow publish-season-image.yml --commit "$SHA" --limit 1 \
+  --json databaseId --jq '.[0].databaseId // empty')
+[ -n "$RUN" ] || { echo "no image build ran for ${SHA:0:12}" >&2; exit 1; }
+echo "==> waiting for the image build of ${SHA:0:12} (run $RUN)"
+gh run watch "$RUN" --exit-status > /dev/null
 
 BUILD=$("$PY" -c "import sys;sys.path.insert(0,'src');from puckpilot.web.season_relay import build_id;print(build_id())")
 echo "==> local build id $BUILD"
 
-az acr build --registry "$ACR" --image "puckpilot-season:$IMAGE_TAG" \
-  --file deploy/season/Dockerfile \
-  --build-arg GIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)" . -o none
-
 PREV=$(az containerapp show -n "$APP" -g "$RG" --query properties.template.containers[0].image -o tsv)
-az containerapp update -n "$APP" -g "$RG" \
-  --image "$ACR.azurecr.io/puckpilot-season:$IMAGE_TAG" -o none
+az containerapp update -n "$APP" -g "$RG" --image "$IMAGE" -o none
 
 FQDN=$(az containerapp show -n "$APP" -g "$RG" --query properties.configuration.ingress.fqdn -o tsv)
 echo
-echo "deployed. check it serves what this checkout computes:"
+echo "deployed. check it serves what this checkout computes (the first call may wait"
+echo "a few seconds for the relay to start):"
 echo "  curl -s https://$FQDN/healthz   # build should be $BUILD"
 echo "rollback: az containerapp update -n $APP -g $RG --image $PREV"

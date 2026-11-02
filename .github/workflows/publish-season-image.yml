@@ -1,0 +1,49 @@
+name: season image
+
+# Builds the in-season relay's image and publishes it to GitHub's container
+# registry: free for a public repo's public package, where the Azure registry it
+# replaced billed every day whether or not anything was pushed. The image is
+# Python plus five files of this repo's public source; the keys and the state
+# arrive at runtime and are never in it. deploy/season/update.sh waits for the
+# run of the commit it deploys.
+
+on:
+  push:
+    branches: [in-season]
+    paths:
+      - "src/puckpilot/__init__.py"
+      - "src/puckpilot/web/**"
+      - "deploy/season/**"
+      - ".github/workflows/publish-season-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The build context is the repo root. Deny-by-default keeps a stray local
+      # file - a logged-in Yahoo session, a gigabyte of captures - out of reach
+      # of a careless COPY into a public image.
+      - name: Refuse a permissive .dockerignore
+        run: |
+          if ! head -n 20 .dockerignore | grep -qx '\*'; then
+            echo "::error::refusing to build: .dockerignore does not deny by default"
+            exit 1
+          fi
+      - name: Build and push
+        run: |
+          set -eu
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/$owner/puckpilot-season:${GITHUB_SHA::12}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build -f deploy/season/Dockerfile \
+            --build-arg GIT_SHA="$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            -t "$image" .
+          docker push "$image"
+          echo "published \`$image\`" >> "$GITHUB_STEP_SUMMARY"

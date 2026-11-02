@@ -13,20 +13,27 @@ rivals; a key admits you to your own view and to nothing else. There is no
 guest role, because there is no second person who should see a manager's
 waiver plan.
 
-**Decisions are collected, not stored.** A decision lands here and waits for
-the local job to drain it. If this process restarts first, the decision is
-lost - and the consequence of that is the proposal reappearing on the next
-push for you to decide again. That is the direction the failure has to fall:
-losing an approval costs a tap, while inventing one spends an acquisition. So
-nothing here is durable on purpose, and the local side treats a drained
-decision as the only decision. A drop tier set from the roster (`/tier`) goes
-back the same way: lost, it is set again; it is never made up.
+**A decision can be lost, never repeated.** A decision lands here and waits
+for the local job to drain it. Losing one costs a tap - the proposal reappears
+on the next push for you to decide again - while inventing or replaying one
+spends an acquisition, so every failure has to fall the first way, and the
+local side treats a drained decision as the only decision. A drop tier set
+from the roster (`/tier`) goes back the same way: lost, it is set again; it is
+never made up.
+
+Held in memory alone, a restart loses everything waiting. The hosted relay
+scales to zero between runs, so there it keeps its state in one blob
+(`PUCKPILOT_STATE_URL`) and keeps the rule: every write is conditional on the
+blob still being what this process last read, and a drain stores the removal
+before it hands anything over. A drain that cannot be stored hands over
+nothing, and two processes overlapping during a deploy cannot both deliver.
 
 No engine imports; this file is copied into a standard-library-only image.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -35,7 +42,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 from puckpilot.web import wire
 from puckpilot.web.season_page import PAGE
@@ -123,27 +132,133 @@ def _stale(snap: dict, age: float, stale_after: float) -> bool:
     return age > stale_after
 
 
-class SeasonState:
-    """The last snapshot per manager, and the decisions waiting to be collected."""
+class StoreConflict(Exception):
+    """The stored state changed after this process read it."""
 
-    def __init__(self, stale_after: float = STALE_AFTER_S):
+
+class StoreUnavailable(RuntimeError):
+    """The state blob could not be read or written. A RuntimeError, so the
+    handler answers 503 and the local job simply tries again on its next run."""
+
+
+class BlobStore:
+    """The relay's state as one JSON blob, reached through a SAS URL.
+
+    Every write is conditional - If-Match on the ETag last read, If-None-Match
+    for the first - so one process can never overwrite what another wrote.
+    """
+
+    API_VERSION = "2021-08-06"
+
+    def __init__(self, url: str, timeout: float = 10.0):
+        self.url = url
+        self.timeout = timeout
+
+    def load(self) -> tuple[dict, str | None]:
+        req = Request(self.url, headers={"x-ms-version": self.API_VERSION})
+        try:
+            with urlopen(req, timeout=self.timeout) as r:
+                return json.loads(r.read().decode("utf-8")), r.headers.get("ETag")
+        except HTTPError as e:
+            if e.code == 404:
+                return {}, None
+            raise StoreUnavailable(f"state read failed: HTTP {e.code}") from e
+        except (URLError, OSError, ValueError) as e:
+            raise StoreUnavailable(f"state read failed: {e}") from e
+
+    def save(self, data: dict, etag: str | None) -> str | None:
+        headers = {
+            "x-ms-version": self.API_VERSION,
+            "x-ms-blob-type": "BlockBlob",
+            "Content-Type": "application/json",
+        }
+        if etag:
+            headers["If-Match"] = etag
+        else:
+            headers["If-None-Match"] = "*"
+        body = wire.dumps(data).encode("utf-8")
+        req = Request(self.url, data=body, method="PUT", headers=headers)
+        try:
+            with urlopen(req, timeout=self.timeout) as r:
+                return r.headers.get("ETag")
+        except HTTPError as e:
+            if e.code in (409, 412):
+                raise StoreConflict from e
+            raise StoreUnavailable(f"state write failed: HTTP {e.code}") from e
+        except (URLError, OSError) as e:
+            raise StoreUnavailable(f"state write failed: {e}") from e
+
+
+class SeasonState:
+    """The last snapshot per manager, and the decisions waiting to be collected.
+
+    Without a store it all lives in memory. With one, every call starts from
+    what is stored, and every change is stored before it is answered.
+    """
+
+    def __init__(self, stale_after: float = STALE_AFTER_S, store: BlobStore | None = None):
         self._lock = threading.Lock()
         self._snap: dict[str, dict] = {}
         self._at: dict[str, float] = {}
         self._decisions: list[dict] = []
         self._seq = 0
+        self._store = store
+        self._etag: str | None = None
         self.stale_after = stale_after
         self.started = time.time()
+
+    # -- storage -----------------------------------------------------------
+
+    def _read(self) -> None:
+        """Replace what is held with what is stored. The caller holds the lock."""
+        if self._store is None:
+            return
+        data, self._etag = self._store.load()
+        self._snap = data.get("snap", {})
+        self._at = data.get("at", {})
+        self._decisions = data.get("decisions", [])
+        self._seq = data.get("seq", 0)
+
+    def _change(self, fn):
+        """Apply `fn` to the current state and store the result before returning.
+
+        A write that loses a race starts over from what the winner stored, so
+        nothing is applied twice and nothing a drain removed comes back. A write
+        that fails outright leaves the change unstored - and, because every call
+        starts by reading, unapplied.
+        """
+        with self._lock:
+            for _ in range(5):
+                self._read()
+                result = fn()
+                if self._store is None:
+                    return result
+                stored = {
+                    "v": 1,
+                    "snap": self._snap,
+                    "at": self._at,
+                    "decisions": self._decisions,
+                    "seq": self._seq,
+                }
+                try:
+                    self._etag = self._store.save(stored, self._etag)
+                except StoreConflict:
+                    continue
+                return result
+            raise StoreUnavailable("the stored state kept changing underneath this write")
 
     # -- the view ----------------------------------------------------------
 
     def push(self, manager: str, snapshot: dict) -> None:
-        with self._lock:
+        def keep():
             self._snap[manager] = snapshot
             self._at[manager] = time.time()
 
+        self._change(keep)
+
     def get(self, manager: str) -> dict:
         with self._lock:
+            self._read()
             snap = self._snap.get(manager)
             at = self._at.get(manager)
         if snap is None:
@@ -185,7 +300,8 @@ class SeasonState:
     ) -> dict:
         if kind not in ("proposal", "protocol"):
             raise ValueError(f"unknown decision kind {kind!r}")
-        with self._lock:
+
+        def record() -> dict:
             if len(self._decisions) >= MAX_PENDING_DECISIONS:
                 raise RuntimeError("too many undelivered decisions; is the local job running?")
             self._seq += 1
@@ -204,7 +320,9 @@ class SeasonState:
             # Reflect it immediately so the page does not show a decided item
             # as still pending until the next push.
             self._mark_decided(manager, kind, int(ident), bool(approve))
-        return row
+            return row
+
+        return self._change(record)
 
     def set_tier(self, manager: str, player_key: str, tier: str) -> dict:
         """Queue a drop tier for one rostered player, and show it at once.
@@ -215,7 +333,8 @@ class SeasonState:
         if tier != AUTO_TIER and tier not in TIER_LABELS:
             known = ", ".join([*TIER_LABELS, AUTO_TIER])
             raise ValueError(f"unknown tier {tier!r} (known: {known})")
-        with self._lock:
+
+        def record() -> dict:
             snap = self._snap.get(manager) or {}
             row = next(
                 (r for r in snap.get("roster", []) if r.get("player_key") == player_key), None
@@ -246,7 +365,9 @@ class SeasonState:
                     tier_source="you",
                     tier_why="set by you - used from PuckPilot's next run",
                 )
-        return out
+            return out
+
+        return self._change(record)
 
     def _mark_decided(self, manager: str, kind: str, ident: int, approve: bool) -> None:
         snap = self._snap.get(manager)
@@ -261,14 +382,29 @@ class SeasonState:
             snap["proposals"] = [p for p in snap.get("proposals", []) if p.get("id") != ident]
 
     def drain(self, manager: str) -> list[dict]:
-        """Hand over this manager's decisions exactly once."""
+        """Hand over this manager's decisions exactly once.
+
+        They are stored as gone before they are handed over, so a failure on
+        the way loses them rather than repeating them.
+        """
         with self._lock:
+            # Most runs find nothing waiting; they need not write to find that out.
+            self._read()
+            if not any(d["manager"] == manager for d in self._decisions):
+                return []
+
+        def take() -> list[dict]:
             mine = [d for d in self._decisions if d["manager"] == manager]
             self._decisions = [d for d in self._decisions if d["manager"] != manager]
-        return mine
+            return mine
+
+        return self._change(take)
 
     def health(self) -> dict:
         with self._lock:
+            # The process is up either way; a storage fault shows on /state, as a 503.
+            with contextlib.suppress(StoreUnavailable):
+                self._read()
             managers = sorted(self._snap)
             waiting = len(self._decisions)
         return {
@@ -278,6 +414,7 @@ class SeasonState:
             "uptime_s": round(time.time() - self.started, 1),
             "managers": len(managers),
             "decisions_waiting": waiting,
+            "stored": self._store is not None,
         }
 
 
@@ -329,12 +466,18 @@ def make_handler(state: SeasonState, keys: dict[str, str]):
                     # message, which beats a bare 403 for someone on a phone.
                     self._send(200, PAGE, "text/html; charset=utf-8")
                 return
-            if route == "/state":
-                self._send(200, wire.dumps(state.get(manager)), "application/json")
-            elif route == "/decisions":
-                self._send(200, wire.dumps({"decisions": state.drain(manager)}), "application/json")
-            else:
+            if route not in ("/state", "/decisions"):
                 self._send(200, PAGE, "text/html; charset=utf-8")
+                return
+            try:
+                if route == "/state":
+                    out = state.get(manager)
+                else:
+                    out = {"decisions": state.drain(manager)}
+            except RuntimeError as e:
+                self._refuse(503, str(e))
+                return
+            self._send(200, wire.dumps(out), "application/json")
 
         def _body(self) -> dict | None:
             try:
@@ -367,7 +510,11 @@ def make_handler(state: SeasonState, keys: dict[str, str]):
                     return
                 # Cleaned on the way in as well as out: a client older than the
                 # strict wire can still send NaN, and JSON.parse rejects it.
-                state.push(manager, wire.clean(snap))
+                try:
+                    state.push(manager, wire.clean(snap))
+                except RuntimeError as e:
+                    self._refuse(503, str(e))
+                    return
                 self._send(200, wire.dumps({"ok": True, "manager": manager}), "application/json")
             elif route == "/tier":
                 try:
@@ -423,8 +570,16 @@ def main() -> int:
         )
         return 2
     port = int(os.environ.get("PORT", "8080"))
-    serve(SeasonState(), keys, port)
-    print(f"season relay listening on :{port} for {len(keys)} manager(s)", flush=True)
+    # A SAS URL for one blob, from a container app secret. Unset, state lives in
+    # memory and is gone on restart - fine locally, not when scaled to zero.
+    url = os.environ.get("PUCKPILOT_STATE_URL", "")
+    store = BlobStore(url) if url else None
+    serve(SeasonState(store=store), keys, port)
+    where = "blob storage" if store else "memory"
+    print(
+        f"season relay listening on :{port} for {len(keys)} manager(s), state in {where}",
+        flush=True,
+    )
     threading.Event().wait()
     return 0
 
