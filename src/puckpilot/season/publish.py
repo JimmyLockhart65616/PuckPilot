@@ -13,9 +13,10 @@ import json
 import urllib.error
 import urllib.request
 
-# The hosted relay scales to zero between runs, so a run's first call often waits
-# for it to start: seconds, sometimes more than ten.
-TIMEOUT_S = 30.0
+# The hosted relay scales to zero between runs, so a run's first call usually
+# waits for it to start - 21 seconds, measured from cold. A scheduled run can
+# afford to wait; a timeout there means that run's view and decisions are lost.
+TIMEOUT_S = 60.0
 
 
 class PublishError(RuntimeError):
