@@ -412,3 +412,37 @@ def test_games_already_played_are_never_aged():
 def test_an_unknown_age_mode_is_refused():
     with pytest.raises(ValueError):
         project_goalies([(_veteran(), 82)], 82, (1.0,), age_on="vibes")
+
+
+def test_goalie_starts_are_projected_as_games_times_the_share_started():
+    from puckpilot.engine.projections import project_goalies
+
+    recent = _frame({1: {"gp": 10, "starts": 9, "wins": 5, "shutouts": 0,
+                         "shots_against": 250, "goals_against": 25, "toi_hours": 9.5}})  # fmt: skip
+    older = _frame({1: {"gp": 20, "starts": 16, "wins": 8, "shutouts": 0,
+                        "shots_against": 500, "goals_against": 50, "toi_hours": 19.0}})  # fmt: skip
+    out = project_goalies([(recent, 80), (older, 80)], 84, (0.5, 0.3), team_win_blend=0.0)
+    share = (0.5 * 9 + 0.3 * 16) / (0.5 * 10 + 0.3 * 20)
+    assert out.loc[1, "proj_gs"] == pytest.approx(out.loc[1, "proj_gp"] * share)
+    no_starts = project_goalies([(recent.drop(columns="starts"), 80)], 84, (1.0,))
+    assert "proj_gs" not in no_starts.columns  # nothing to say: the per-game line stands
+
+
+def test_a_goalie_line_per_start_divides_by_his_starts_and_a_skaters_is_unchanged():
+    import pandas as pd
+
+    from puckpilot.engine.categories import resolve
+    from puckpilot.season.week import per_game_rates
+
+    frame = pd.DataFrame(
+        {"proj_gp": [50.0, 80.0], "proj_gs": [45.0, float("nan")],
+         "saves": [1125.0, 0.0], "shots_against": [1250.0, 0.0], "goals": [0.0, 40.0]},
+        index=[1, 2],
+    )  # fmt: skip
+    cats = (resolve("G"), resolve("SV"))
+    gp = per_game_rates(frame, cats)
+    start = per_game_rates(frame, cats, "start")
+    assert gp[1]["saves"] == pytest.approx(22.5) and start[1]["saves"] == pytest.approx(25.0)
+    assert gp[2] == start[2]
+    with pytest.raises(ValueError):
+        per_game_rates(frame, cats, "minute")

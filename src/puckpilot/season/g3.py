@@ -444,6 +444,8 @@ def build(
     progress=None,
     goalie_count: str = "top",
     streams: str = "none",
+    goalie_rates_per: str | None = None,
+    goalie_age_on: str | None = None,
 ) -> G3Report:
     """Every final team-week projected as of its first morning, against the result.
 
@@ -452,12 +454,14 @@ def build(
     gets from in-week adds (`season.streams`), measured per team over the
     weeks before the one projected: to the opponent only ("theirs", as the
     live search would price it) or to both sides ("both": every team adds, so
-    the forecast is judged against what really happened)."""
+    the forecast is judged against what really happened).
+    `goalie_rates_per` / `goalie_age_on`: the goalie line's unit
+    (`week.GOALIE_RATES_PER`) and where the age curve lands
+    (`values.IN_SEASON_GOALIE_AGE_ON`)."""
     from puckpilot.season import streams as streams_mod
 
     if streams not in STREAMS:
         raise ValueError(f"streams must be one of {STREAMS}, not {streams!r}")
-    from puckpilot.draft.sim import build_universe
     from puckpilot.season.add_gate import AsOfValues
     from puckpilot.season.goalies import AsOfGoalieSource, TrailingStartShareSource
     from puckpilot.season.odds import OddsModel
@@ -468,9 +472,16 @@ def build(
     lk = runtime.league_key
     season = runtime.nhl_season
     train = _train_seasons(season)
-    values = build_value_model(conn, season, train, league)
+    values = build_value_model(
+        conn,
+        season,
+        train,
+        league,
+        goalie_age_on=goalie_age_on,
+        goalie_rates_per=goalie_rates_per,
+    )
     source = TrailingStartShareSource(conn, season, fallback_season=train[0])
-    frame = build_universe(conn, season, train, league).frame
+    frame = values.frame
     label_of = runtime.stat_labels()
     final = {
         int(r[0])

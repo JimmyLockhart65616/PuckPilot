@@ -28,6 +28,7 @@ import numpy as np
 
 from puckpilot.engine.lineup import optimize_lineup, slot_instances
 from puckpilot.season import calendar
+from puckpilot.season.goalie_count import counted_starts
 
 # Skater categories worth a place in the range summary, and their labels.
 RANGE_KEYS = ("goals", "assists", "points", "ppp", "sog", "hits", "blocks", "pim")
@@ -147,13 +148,11 @@ def _day_lineup(
             continue
         v = values.per_game(pid, day)
         if p.position == "G":
-            ps = float(p_starts.get(pid, 0.0))
-            goalies.append((ps * v, ps, p.player_key))
+            goalies.append((v, float(p_starts.get(pid, 0.0)), p.player_key, p.team))
         else:
             skaters.append((p.player_key, p.eligible, v))
     g_slots = sum(n for pos, n in shape.slots if pos == "G")
-    goalies.sort(key=lambda x: -x[0])
-    in_goal = {key: ps for _, ps, key in goalies[:g_slots] if ps > 0}
+    in_goal = {key: ps for key, ps in counted_starts(goalies, g_slots).items() if ps > 0}
     return optimize_lineup(skaters, shape), in_goal, playing
 
 

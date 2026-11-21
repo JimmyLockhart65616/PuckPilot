@@ -68,6 +68,8 @@ class ValueModel:
     keepers: object | None = None
     # form.FormRates: per-category rates that have seen this season
     form: object | None = None
+    # What a goalie's line is divided by (`week.GOALIE_RATES_PER`); None: that.
+    goalie_rates_per: str | None = None
     # per_game from `form` for skaters rather than the 14-day blend; None
     # follows `form.FORM_VALUE`
     form_value: bool | None = None
@@ -101,7 +103,7 @@ class ValueModel:
             return self.form.rates(date)
         from puckpilot.season.week import per_game_rates
 
-        return per_game_rates(self.frame, cats)
+        return per_game_rates(self.frame, cats, self.goalie_rates_per)
 
     def projected(self, pid: int) -> float:
         """The preseason number alone, for showing what form has moved."""
@@ -188,13 +190,15 @@ def build_value_model(
     scale_season: str | None = None,
     goalie_workload: bool | None = None,
     goalie_age_on: str | None = None,
+    goalie_rates_per: str | None = None,
 ) -> ValueModel:
     """Assemble the live value model.
 
     `scale_season` is the season whose game lines set the category scales;
     it defaults to the most recent training season, which is the most recent
     completed one. `goalie_workload` defaults to `GOALIE_WORKLOAD`, and
-    `goalie_age_on` to `IN_SEASON_GOALIE_AGE_ON`.
+    `goalie_age_on` to `IN_SEASON_GOALIE_AGE_ON`, `goalie_rates_per` to
+    `week.GOALIE_RATES_PER`.
     """
     from puckpilot.draft.sim import build_universe
 
@@ -213,7 +217,7 @@ def build_value_model(
     from puckpilot.season.week import per_game_rates
 
     skaters = {int(p) for p, pos in universe.frame["position"].items() if pos != "G"}
-    prior = per_game_rates(universe.frame, league.all_cats)
+    prior = per_game_rates(universe.frame, league.all_cats, goalie_rates_per)
     usage = Usage(conn, season, live.dates)
     streaks = StreakFinder(live, prior, usage=usage)
     form = FormRates(
@@ -243,4 +247,5 @@ def build_value_model(
         workload=workload,
         form=form,
         streaks=streaks,
+        goalie_rates_per=goalie_rates_per,
     )

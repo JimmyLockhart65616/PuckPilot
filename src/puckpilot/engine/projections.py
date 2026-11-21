@@ -235,6 +235,18 @@ def project_goalies(
     out["save_pct"] = (1.0 - ga / sa.where(sa > 0)).fillna(0.0)
     out["gaa"] = (ga / out["toi_hours"].where(out["toi_hours"] > 0)).fillna(0.0)
     out["saves"] = sa - ga
+    # Projected starts: his games times the share of them he started, blended
+    # like every count and never aged (the age curve is on the games or the
+    # volume already). The in-season engine counts starts, so a line "given he
+    # starts" divides by these rather than by games that include relief.
+    with_starts = [(df, g) for df, g in frames if not df.empty and "starts" in df.columns]
+    if with_starts and len(with_starts) == len([f for f in frames if not f[0].empty]):
+        gs = blend_counting(
+            frames, weights, ["starts"], target_games, MIN_TRAIN_GP_GOALIE,
+            GOALIE_GP_REGRESS_SEASONS,
+        )  # fmt: skip
+        share = (gs["starts"] / gs["proj_gp"].where(gs["proj_gp"] > 0)).clip(0.0, 1.0)
+        out["proj_gs"] = (out["proj_gp"] * share.reindex(out.index)).fillna(0.0)
     return out
 
 

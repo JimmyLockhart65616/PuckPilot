@@ -375,19 +375,37 @@ class WeekPlan:
 # -- projection -------------------------------------------------------------
 
 
-def per_game_rates(frame, cats: tuple[Category, ...]) -> dict[int, dict[str, float]]:
+# What a goalie's line is divided by. "gp" (as first built): his projected
+# games, relief appearances included - so a line read as "given he starts"
+# (`odds.GoalieGame`) is diluted by games he only finished. "start": his
+# projected starts (`projections.project_goalies` `proj_gs`), the unit every
+# in-season count is in.
+GOALIE_RATES_PER = "gp"
+GOALIE_RATE_UNITS = ("gp", "start")
+
+
+def per_game_rates(
+    frame, cats: tuple[Category, ...], goalie_per: str | None = None
+) -> dict[int, dict[str, float]]:
     """player -> per-game rate for each category the league scores.
 
     Rate categories are carried as their components (saves and shots against,
     not save percentage) because a week's save percentage is the ratio of the
-    totals, not the average of the rates.
+    totals, not the average of the rates. `goalie_per` (`GOALIE_RATES_PER`) is
+    whether a goalie's line is a game's or a start's.
     """
+    per = goalie_per or GOALIE_RATES_PER
+    if per not in GOALIE_RATE_UNITS:
+        raise ValueError(f"goalie_per must be one of {GOALIE_RATE_UNITS}, not {per!r}")
     needed: set[str] = set()
     for c in cats:
         needed.update(DERIVED.get(c.key, (c.key,)))
+    by_start = per == "start" and "proj_gs" in frame.columns
     out: dict[int, dict[str, float]] = {}
     for pid, row in frame.iterrows():
         gp = max(_f(row.get("proj_gp")), 1.0)
+        if by_start and _f(row.get("proj_gs")) >= 1.0:
+            gp = _f(row.get("proj_gs"))
         out[int(pid)] = {k: _f(row.get(k)) / gp for k in needed if k in frame.columns}
     return out
 

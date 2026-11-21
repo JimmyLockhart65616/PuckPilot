@@ -152,12 +152,15 @@ def build_cases(
     goalies: str = "",
     rates_mode: str = "pre",
     goalie_count: str = "top",
+    goalie_rates_per: str | None = None,
 ) -> list[Case]:
     """Every matchup-morning of one replayed season, with how its week ended.
 
     `goalies` is the starting-goalie model, as `goalies.parse_spec` reads it.
     `goalie_count` is how a night's goalie starts are counted
     (`goalie_count.GOALIE_COUNTS`); the replay's lineups play "top".
+    `goalie_rates_per`: a goalie's line per game or per start
+    (`week.GOALIE_RATES_PER`).
     `rates_mode` "form" forecasts each morning with per-category rates that have
     seen the season so far (`season.form`); "pre" with the preseason rates.
     """
@@ -192,7 +195,7 @@ def build_cases(
     vm = GameValueModel(data, set(u.ids.tolist()), league.goalie_cats)
     pg_value = projected_pg_values(u.frame, vm, skater_keys)
     positions = dict(zip(u.ids.tolist(), u.pos.tolist(), strict=True))
-    rates = per_game_rates(u.frame, cats)
+    rates = per_game_rates(u.frame, cats, goalie_rates_per)
     form = None
     if rates_mode == "form":
         from puckpilot.season.form import FormRates
@@ -496,6 +499,7 @@ def calibration_report(
     progress: Callable[[str], None] | None = None,
     goalies: str = "",
     rates_mode: str = "pre",
+    goalie_rates_per: str | None = None,
 ) -> CalibrationReport:
     say = progress or (lambda _m: None)
     cats = league.all_cats
@@ -505,10 +509,26 @@ def calibration_report(
         return tuple(f"{y - i}{y - i + 1}" for i in range(1, 4))
 
     fit_cases = build_cases(
-        conn, fit_season, train(fit_season), league, seed, say, goalies, rates_mode
+        conn,
+        fit_season,
+        train(fit_season),
+        league,
+        seed,
+        say,
+        goalies,
+        rates_mode,
+        goalie_rates_per=goalie_rates_per,
     )
     test_cases = build_cases(
-        conn, test_season, train(test_season), league, seed, say, goalies, rates_mode
+        conn,
+        test_season,
+        train(test_season),
+        league,
+        seed,
+        say,
+        goalies,
+        rates_mode,
+        goalie_rates_per=goalie_rates_per,
     )
     say("fitting")
     model = fit(fit_cases, cats, say)

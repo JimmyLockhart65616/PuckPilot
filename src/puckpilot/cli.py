@@ -1621,6 +1621,8 @@ def _cmd_season_g3(args: argparse.Namespace) -> int:
         weeks=weeks,
         goalie_count=args.goalie_count,
         streams=args.streams,
+        goalie_rates_per=args.goalie_rates,
+        goalie_age_on=args.goalie_age,
     )
     if not report.cases:
         print("No final week with every team's week-start roster saved - `ppilot season league`.")
@@ -2057,6 +2059,7 @@ def _cmd_season_calibrate(args: argparse.Namespace) -> int:
         progress=print if args.verbose else None,
         goalies=args.goalies,
         rates_mode=args.rates,
+        goalie_rates_per=args.goalie_rates,
     )
     print()
     print(report.text)
@@ -3148,6 +3151,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="pre",
         help="Forecast with preseason rates, or rates that have seen the season so far",
     )
+    s_cal.add_argument(
+        "--goalie-rates",
+        default=None,
+        choices=("gp", "start"),
+        help="a goalie line per game played or per start (week.GOALIE_RATES_PER)",
+    )
     s_cal.add_argument("--verbose", action="store_true")
     s_cal.set_defaults(func=_cmd_season_calibrate)
 
@@ -3297,6 +3306,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         choices=("none", "theirs", "both"),
         help="add each side's in-week goalie adds, measured on the weeks before (season.streams)",
+    )
+    s_g3.add_argument(
+        "--goalie-rates",
+        default=None,
+        choices=("gp", "start"),
+        help="a goalie line per game played or per start (week.GOALIE_RATES_PER)",
+    )
+    s_g3.add_argument(
+        "--goalie-age",
+        default=None,
+        choices=("volume", "games"),
+        help="where the goalie age curve lands (projections.GOALIE_AGE_MODES)",
     )
     s_g3.set_defaults(func=_cmd_season_g3)
 
