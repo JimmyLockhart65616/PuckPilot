@@ -122,8 +122,27 @@ class LineupAuthority:
     # changes 14-20 nights a team-season; there are not enough bench calls for
     # the odds to matter. The fixed-weight protocol measured the same way.
     steer: str = "off"
+    # Yahoo's call on who starts in goal (`season.starters`). "record" reads
+    # every goalie's call on each run and stores it - no decision changes; it is
+    # the data that measures how early and how right the calls are
+    # (`ppilot season starters --check`). "use" also puts the calls in front
+    # of the start model, for tonight's lineup and the week's odds alike, the
+    # model answering for every club not yet called. "off": no read at all.
+    announced_starters: str = "record"
+    # Every goalie's injury tag, not just ours and the opponent's: a club whose
+    # starter is tagged out today gives his partner the share today, not two
+    # undressed games later. Needs the calls' read (`announced_starters` not
+    # "off"). Off until measured.
+    league_statuses: bool = False
 
     def __post_init__(self) -> None:
+        from puckpilot.season.starters import ANNOUNCED_MODES
+
+        if self.announced_starters not in ANNOUNCED_MODES:
+            raise AuthorityError(
+                f"authority.lineup.announced_starters must be one of "
+                f"{', '.join(ANNOUNCED_MODES)}; got {self.announced_starters!r}"
+            )
         if self.steer not in STEER_MODES:
             raise AuthorityError(
                 f"authority.lineup.steer must be one of {', '.join(STEER_MODES)}; "

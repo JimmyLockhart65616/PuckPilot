@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 
 from puckpilot.season import proposals as proposals_mod
 from puckpilot.season import protocol as protocol_mod
+from puckpilot.season import starters
 from puckpilot.season.moves import MoveKind
 from puckpilot.season.preflight import age_days as _age_days
 
@@ -156,6 +157,44 @@ class WeekContext:
     tiers: dict | None = None
     keep: dict | None = None
     player_stats: dict | None = None
+    # Yahoo's starting-goalie calls read this run (`season.starters`).
+    calls: list | None = None
+    calls_error: str = ""
+
+
+def _record_calls(conn, ctx, report, used: bool) -> None:
+    """Store this run's goalie calls; say how many clubs are called.
+
+    A failed read fails the step only when the calls are `used`: recorded
+    alone they change no decision, so the run is not one with failures.
+    """
+    if ctx.calls is None:
+        detail = f"not read - {ctx.calls_error or 'no session'}"
+        report.add("starters", not used, detail if used else f"{detail} (recording only)")
+        return
+    starters.save_calls(conn, ctx.calls)
+    called = sorted({c.team for c in ctx.calls if c.is_starting is not None})
+    report.add("starters", True, f"{len(ctx.calls)} goalies read, {len(called)} clubs called")
+
+
+def _goalie_tags(conn, manager, day, *rosters) -> tuple[set[int], set[int]]:
+    """Goalies ruled out and goalies known fit, for the start model.
+
+    From the rosters read this run; with `league_statuses`, also from every
+    goalie's tag in this run's calls - so a club whose starter is tagged out
+    today gives his partner the share today.
+    """
+    out, fit = _out_goalies(*rosters), _healthy_goalies(*rosters)
+    if manager.authority.lineup.league_statuses:
+        from puckpilot.season.settings import is_out_status
+
+        try:
+            tags = starters.statuses(conn, day)
+        except sqlite3.Error:  # no calls table yet (`ppilot data init` makes it)
+            tags = {}
+        out |= {pid for pid, s in tags.items() if is_out_status(s)}
+        fit |= {pid for pid, s in tags.items() if not s} - out
+    return out, fit
 
 
 def _priced(ctx):
@@ -385,9 +424,17 @@ def run_day(
     week = week_for(runtime, day)
     ctx = WeekContext(week=week)
 
+    announced = manager.authority.lineup.announced_starters
+
     def _read(session):
         key = manager.team_key or discover_team_key(session, league_key)
         roster = fetch_roster(session, key, day, player_map=pmap)
+        if announced != "off":
+            try:
+                keys = starters.goalie_keys(conn, league_key, (season, *_train_seasons(season)[:1]))
+                ctx.calls = starters.fetch_calls(session, league_key, keys, day, pmap)
+            except Exception as e:  # noqa: BLE001 - a call is a bonus; the lineup must not wait
+                ctx.calls_error = f"{type(e).__name__}: {e}"
         if week is not None:
             try:
                 ctx.live, ctx.raw = fetch_live(session, key, week.number)
@@ -410,6 +457,9 @@ def run_day(
         roster = _with_pins(conn, manager, league_key, roster)
     ctx.roster = roster
     _guard(report, "score", lambda: _log_week(conn, manager, league_key, ctx, report))
+    if announced != "off":
+        _guard(report, "starters", lambda: _record_calls(conn, ctx, report, announced == "use"))
+    out_g, healthy_g = _goalie_tags(conn, manager, day, roster, ctx.theirs)
     train = _train_seasons(season)
     models = _guard(
         report,
@@ -417,13 +467,14 @@ def run_day(
         lambda: (
             build_value_model(conn, season, train, manager.league),
             ChainedGoalieSource(
+                starters.AnnouncedStartSource(conn) if announced == "use" else None,
                 TrailingStartShareSource(
                     conn,
                     season,
                     fallback_season=train[0],
-                    unavailable=_out_goalies(roster, ctx.theirs),
-                    healthy=_healthy_goalies(roster, ctx.theirs),
-                )
+                    unavailable=out_g,
+                    healthy=healthy_g,
+                ),
             ),
         ),
     )

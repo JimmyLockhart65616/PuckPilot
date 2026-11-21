@@ -1548,6 +1548,60 @@ def _cmd_season_league(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_starters(args: argparse.Namespace) -> int:
+    """Announced starting goalies (season/starters.py)."""
+    from datetime import date as _date
+
+    from puckpilot.data import store
+    from puckpilot.season import cli_support, starters
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.run import _train_seasons
+    from puckpilot.yahoo import playermap
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+    store.init_db(conn)
+    if args.check:
+        from puckpilot.season.goalies import AsOfGoalieSource, trailing_model
+
+        season = runtime.nhl_season
+        model = trailing_model(conn, season, _train_seasons(season)[0], "")
+        print(
+            starters.check(
+                conn, since=args.since, model_on=lambda d: AsOfGoalieSource(model, d).starts(d)
+            ).text()
+        )
+        return 0
+    day = args.date or _date.today().isoformat()
+    if args.read:
+        season = runtime.nhl_season
+        keys = starters.goalie_keys(conn, league_key, (season, *_train_seasons(season)[:1]))
+        pmap = playermap.load_map(conn, league_key)
+        calls = cli_support.run_session(
+            manager, lambda s: starters.fetch_calls(s, league_key, keys, day, pmap)
+        )
+        starters.save_calls(conn, calls)
+        print(f"read {len(calls)} goalies")
+    names = dict(conn.execute("SELECT player_id, full_name FROM nhl_players"))
+    by_team: dict[str, list[str]] = {}
+    for pid, (team, call, status) in sorted(starters.latest_calls(conn, day).items()):
+        if call is None and not status:
+            continue
+        mark = {True: "starts", False: "sits", None: "no call"}[call]
+        tag = f" [{status}]" if status else ""
+        by_team.setdefault(team, []).append(f"{names.get(pid, pid)} {mark}{tag}")
+    if not by_team:
+        print(f"No calls kept for {day}.")
+        return 0
+    print(f"Starting-goalie calls for {day}:")
+    for team in sorted(by_team):
+        print(f"  {team:4} " + "; ".join(by_team[team]))
+    return 0
+
+
 def _cmd_season_g3(args: argparse.Namespace) -> int:
     """Live calibration over every team in the league (season/g3.py)."""
     from puckpilot.season import cli_support, g3
@@ -3238,6 +3292,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="how both sides' goalie starts are counted (goalie_count.GOALIE_COUNTS)",
     )
     s_g3.set_defaults(func=_cmd_season_g3)
+
+    s_starters = season_sub.add_parser(
+        "starters",
+        parents=[seasonal],
+        help="Yahoo's starting-goalie calls: today's, a fresh read, or how right they have been",
+    )
+    s_starters.add_argument(
+        "--read", action="store_true", help="read every goalie's call from Yahoo now and keep it"
+    )
+    s_starters.add_argument(
+        "--check",
+        action="store_true",
+        help="score every call kept, made before puck drop, against who started",
+    )
+    s_starters.add_argument("--since", default="", help="with --check: from this date")
+    s_starters.set_defaults(func=_cmd_season_starters)
 
     s_moves = season_sub.add_parser(
         "moves",

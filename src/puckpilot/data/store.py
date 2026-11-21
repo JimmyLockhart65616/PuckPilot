@@ -305,6 +305,21 @@ CREATE TABLE IF NOT EXISTS player_tiers (
     PRIMARY KEY (manager, league_key, player_key)
 );
 
+-- Announced starting goalies (`season.starters`): every goalie of one read, a
+-- call (1 start / 0 sit) or none yet (NULL), kept per read so how early and
+-- how right the calls are is measured from what was seen and when.
+CREATE TABLE IF NOT EXISTS goalie_start_calls (
+    game_date   TEXT NOT NULL,
+    player_key  TEXT NOT NULL,
+    player_id   INTEGER,
+    team        TEXT,
+    is_starting INTEGER,
+    status      TEXT,
+    read_at     TEXT NOT NULL,
+    PRIMARY KEY (game_date, player_key, read_at)
+);
+CREATE INDEX IF NOT EXISTS ix_goalie_calls_date ON goalie_start_calls(game_date, player_id);
+
 -- Every change of tag, between the last run that saw the old one and the first
 -- that saw the new. old_status NULL: the player's first sighting, already tagged.
 CREATE TABLE IF NOT EXISTS player_status_changes (

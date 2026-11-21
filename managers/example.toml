@@ -95,6 +95,17 @@ never_bench = []
 # weight to change. The protocol still steers the ADDS, where the lever is.
 follow_protocol = false
 
+# Yahoo's call on who starts in goal tonight. "record" reads and stores every
+# goalie's call each run and changes nothing - the data that measures how early
+# and how right the calls are (`ppilot season starters --check`). "use" also
+# trusts the calls ahead of the history-based start model, for every club that
+# has been called. "off" reads nothing.
+announced_starters = "record"
+
+# Every goalie's injury tag from that same read, not just yours and your
+# opponent's: a partner takes the share the day a starter is tagged out.
+league_statuses = false
+
 
 [authority.transactions]
 # NOTE: there is no `enabled` here, and adding one is an error rather than a
