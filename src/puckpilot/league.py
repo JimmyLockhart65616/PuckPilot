@@ -72,6 +72,15 @@ class LeagueConfig:
     playoff_teams: int = 8
     playoff_weeks: int = 3
 
+    # The positional caps and minimums an in-season drop must respect
+    # (`legality.legal_drop`, the add search's `may_drop`). None = the draft's
+    # (`DraftRules`: a cap that stops bots hoarding a position on draft day),
+    # which is how the season engines were first built. A platform with no
+    # positional maximum in season (Yahoo's: a bench takes anyone) is written
+    # `caps = {}`; a position not named has no cap / no minimum.
+    in_season_caps: dict[str, int] | None = None
+    in_season_mins: dict[str, int] | None = None
+
     @property
     def all_cats(self) -> tuple[Category, ...]:
         return self.skater_cats + self.goalie_cats
@@ -96,6 +105,15 @@ class LeagueConfig:
 
     def draft_rules(self, **overrides) -> DraftRules:
         return DraftRules(shape=self.shape, rounds=self.draft_rounds, **overrides)
+
+    def roster_rules(self) -> DraftRules:
+        """The draft rules with the in-season caps and minimums, where written."""
+        over: dict[str, dict[str, int]] = {}
+        if self.in_season_caps is not None:
+            over["caps"] = dict(self.in_season_caps)
+        if self.in_season_mins is not None:
+            over["mins"] = dict(self.in_season_mins)
+        return self.draft_rules(**over)
 
 
 def _shape_from(cfg: dict) -> LeagueShape:
@@ -169,6 +187,7 @@ def load_league(path: str | Path) -> LeagueConfig:
         raise LeagueConfigError(
             f"{p}: keepers.placement must be 'first' or 'last', got {placement!r}"
         )
+    in_season = cfg.get("roster", {}).get("in_season", {})
     traded: dict[str, tuple[tuple[int, int, int], ...]] = {}
     n_teams = int(cfg.get("roster", {}).get("teams", 12))
     for season, picks in (draft.get("traded_picks") or {}).items():
@@ -207,7 +226,22 @@ def load_league(path: str | Path) -> LeagueConfig:
         regular_weeks=int(schedule.get("regular_weeks", 19)),
         playoff_teams=int(schedule.get("playoff_teams", 8)),
         playoff_weeks=int(schedule.get("playoff_weeks", 3)),
+        in_season_caps=_positions(p, in_season, "caps"),
+        in_season_mins=_positions(p, in_season, "mins"),
     )
+
+
+def _positions(p: Path, table: dict, key: str) -> dict[str, int] | None:
+    """`roster.in_season.<key>` as {position: count}; None when not written."""
+    raw = table.get(key)
+    if raw is None:
+        return None
+    try:
+        return {str(pos): int(n) for pos, n in dict(raw).items()}
+    except (TypeError, ValueError) as e:
+        raise LeagueConfigError(
+            f"{p}: roster.in_season.{key} must map positions to counts, e.g. {{ G = 2 }}"
+        ) from e
 
 
 def load_default_league() -> LeagueConfig:

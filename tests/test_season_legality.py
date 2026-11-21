@@ -277,3 +277,17 @@ def test_a_returning_player_whose_game_has_begun_comes_back_tomorrow():
     assert moves == [] and "comes back tomorrow morning" in alerts[0]
     moves, _ = legality.ir_changes(SMALL, team(CENTRE, DEFENCE, GOALIE, BACK))
     assert [m.describe() for m in moves] == ["ACTIVATE Back IR+ -> BN"]
+
+
+def test_open_in_season_caps_let_a_fourth_goalie_come_in_for_a_skater():
+    from dataclasses import replace
+
+    from puckpilot.league import LeagueConfig
+
+    skater = p("s", "C", "BN")
+    counts = {"C": 3, "L": 2, "R": 2, "D": 4, "G": 3}
+    draft = LeagueConfig()
+    assert not legality.legal_drop("G", skater, counts, draft.roster_rules())
+    assert legality.legal_drop(
+        "G", skater, counts, replace(draft, in_season_caps={}).roster_rules()
+    )

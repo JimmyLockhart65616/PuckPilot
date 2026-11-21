@@ -176,7 +176,7 @@ def test_a_player_brought_straight_into_tonight_s_lineup_leaves_the_run_legal(db
         BACK,
     )
     manager = SimpleNamespace(
-        name="m", league=SimpleNamespace(draft_rules=lambda: RULES), authority=Authority()
+        name="m", league=SimpleNamespace(roster_rules=lambda: RULES), authority=Authority()
     )
     ctx = runmod.WeekContext(week=Week(5, "2026-10-26", "2026-11-01"))
     report = RunReport(date=TODAY, manager="m")
@@ -293,7 +293,7 @@ def test_an_illegal_roster_fails_the_run_and_proposes_the_fix(db, monkeypatch):
     from puckpilot.season.authority import Authority
 
     manager = SimpleNamespace(
-        name="m", league=SimpleNamespace(draft_rules=lambda: RULES), authority=Authority()
+        name="m", league=SimpleNamespace(roster_rules=lambda: RULES), authority=Authority()
     )
     ctx = runmod.WeekContext(week=Week(5, "2026-10-26", "2026-11-01"))
     report = RunReport(date=TODAY, manager="m")

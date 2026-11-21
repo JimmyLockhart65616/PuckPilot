@@ -306,7 +306,7 @@ def resolve(
 
     `keep` is each player's rest-of-season value by player key (what letting
     him go costs - `week.keep_values`); `rules` the roster's positional caps
-    and minimums (`LeagueConfig.draft_rules()`); `hold` drops already promised
+    and minimums (`LeagueConfig.roster_rules()`); `hold` drops already promised
     to other moves; `promised` a make-room drop already approved, by returning
     player - kept while that drop is still on the roster, since a decision
     was given on it. `stream_spots` and `upgrade_margin` place the drop tiers

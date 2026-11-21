@@ -193,6 +193,9 @@ class ArmSpec:
     # the day's games; -ow: one dropping a rotation player is made at once.
     tap: float | None = None
     standing: bool = False
+    # -co: no in-season positional caps (`LeagueConfig.in_season_caps = {}`):
+    # a drop need not come from a position at its draft cap.
+    open_caps: bool = False
 
 
 def _swap(roster: list[int], target) -> None:
@@ -271,6 +274,8 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.age_games = True
         elif tok == "ow":
             spec.standing = True
+        elif tok == "co":
+            spec.open_caps = True
         elif tok.startswith("o") and tok[1:].isdigit():
             spec.tap = int(tok[1:]) / 100
         elif len(tok) > 1 and tok[0] in "spqfxknjyzb" and tok[1:].isdigit():
@@ -848,6 +853,7 @@ def add_gate_report(
         for arm in arms:
             spec = parse_arm(arm, stream_spots)
             kind, spots = spec.kind, spec.spots
+            arm_league = replace(league, in_season_caps={}) if spec.open_caps else league
             pol = policy_alt if spec.goalies else policy
             wl = workload if spec.workload else None
             vals = values_for(spec)
@@ -935,7 +941,7 @@ def add_gate_report(
                             plan = build_week_plan(
                                 conn,
                                 runtime,
-                                league,
+                                arm_league,
                                 nw,
                                 "opp",
                                 ours,
@@ -1026,7 +1032,7 @@ def add_gate_report(
                         plan = build_week_plan(
                             conn,
                             runtime,
-                            league,
+                            arm_league,
                             w,
                             "opp",
                             ours,
@@ -1081,7 +1087,7 @@ def add_gate_report(
                             nplan = build_week_plan(
                                 conn,
                                 runtime,
-                                league,
+                                arm_league,
                                 weeks[nxt_wi],
                                 "opp",
                                 ours,

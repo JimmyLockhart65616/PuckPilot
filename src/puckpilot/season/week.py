@@ -1372,7 +1372,7 @@ def _targets(
     # so a make-room drop and a swap's drop are chosen by the same rule.
     droppable = legality.droppable(ours, hold or (), to_ir)
     counts = legality.position_counts(ours, to_ir)
-    rules = league.draft_rules()
+    rules = league.roster_rules()
     spots = open_roster_spots(runtime, ours)
     # Goalies on the roster who can play: the count `goalie_floor` keeps.
     n_goalies = sum(

@@ -128,3 +128,25 @@ def test_traded_picks_round_trip_and_bad_ones_are_refused(tmp_path):
     )
     with pytest.raises(LeagueConfigError, match="outside a 4-team draft"):
         load_league(bad)
+
+
+def test_in_season_rules_default_to_the_drafts(tmp_path):
+    lg = load_league(_write(tmp_path, MINIMAL))
+    assert (lg.in_season_caps, lg.in_season_mins) == (None, None)
+    assert lg.roster_rules() == lg.draft_rules()
+
+
+def test_in_season_caps_and_minimums_are_read_from_the_roster_table(tmp_path):
+    text = MINIMAL.replace(
+        "bench = 2\n", "bench = 2\n[roster.in_season]\ncaps = {}\nmins = { G = 1 }\n"
+    )
+    lg = load_league(_write(tmp_path, text))
+    rules = lg.roster_rules()
+    assert (rules.caps, rules.mins) == ({}, {"G": 1})
+    assert lg.draft_rules().caps["G"] == 3  # the draft keeps its own
+
+
+def test_malformed_in_season_rules_explain_the_expected_shape(tmp_path):
+    text = MINIMAL.replace("bench = 2\n", 'bench = 2\n[roster.in_season]\ncaps = { G = "x" }\n')
+    with pytest.raises(LeagueConfigError, match="roster.in_season.caps"):
+        load_league(_write(tmp_path, text))

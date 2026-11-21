@@ -985,7 +985,7 @@ def _resolution(conn, manager, runtime, roster, values, day, hold=(), ctx=None):
         runtime,
         roster,
         keep,
-        manager.league.draft_rules(),
+        manager.league.roster_rules(),
         hold=hold,
         promised=promised,
         stream_spots=terms.stream_spots,
@@ -1050,7 +1050,7 @@ def _legality(conn, manager, league_key, runtime, day, roster, ctx, models, repo
         p, new = proposals_mod.propose_fix(
             conn, manager.name, league_key, roster.team_key, f, week_no,
             {"detail": {"room": _room_lines(f, roster, values, day, conn, runtime,
-                                            manager.league.draft_rules(),
+                                            manager.league.roster_rules(),
                                             manager.authority.transactions)}},
         )  # fmt: skip
         state = "proposed" if new else p.status

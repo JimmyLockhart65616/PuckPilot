@@ -19,6 +19,14 @@ slots = [
 util = 1                     # UTIL slots (any skater)
 bench = 3                    # bench spots; IR slots are not modelled
 
+# In-season add/drop rules: the positional caps and minimums a drop must keep.
+# Left out, the draft's apply (caps C 4, L 4, R 4, D 6, G 3; minimums C 2, L 2,
+# R 2, D 4, G 2). A platform with no positional maximum in season - a bench
+# takes anyone - is `caps = {}`; a position not named has no cap / minimum.
+# [roster.in_season]
+# caps = {}
+# mins = { G = 2 }
+
 [scoring]
 type = "h2h"                 # "h2h" (weekly category matchups) or "roto"
 # Categories by label. Skaters: G A P +/- PIM PPP SHP GWG SOG HIT BLK

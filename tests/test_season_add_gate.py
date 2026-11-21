@@ -146,3 +146,10 @@ def test_the_drop_tier_options_parse():
     assert parse_arm("odds-daily").margin == 0.0
     with pytest.raises(ValueError, match="-ow needs -o"):
         parse_arm("odds-daily-ow")
+
+
+def test_co_opens_the_in_season_caps():
+    from puckpilot.season.add_gate import parse_arm
+
+    assert parse_arm("odds-daily-co").open_caps
+    assert not parse_arm("odds-daily").open_caps
