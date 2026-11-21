@@ -150,12 +150,13 @@ max_pending = 5
 
 
 [authority.standing]
-# Moves approved in advance: a ROTATION player's drop, each still shown on the
-# page first with the time it will be made ("PuckPilot makes this at 9:05 PM
-# unless you stop it"), pushed to your phone, and made by the run at that time
-# only if you did not tap Stop. A Stop, setting the drop to another tier, or
-# turning this off sends a card back to wait for your tap. Waiver claims and
-# adds that drop nobody always wait for a tap. Needs a page (it is where you
+# Moves approved in advance: a ROTATION player's drop - and, if you set
+# open_spot below, an add that drops nobody - each still shown on the page
+# first with the time it will be made ("PuckPilot makes this at 9:05 PM unless
+# you stop it"), pushed to your phone, and made by the run at that time only if
+# you did not tap Stop. A Stop, setting the drop to another tier, or turning
+# this off sends a card back to wait for your tap. Waiver claims always wait
+# for a tap. Needs a page (it is where you
 # stop one) and PuckPilot making your approved moves (execute_approved).
 # Emergency stop without editing this file: PUCKPILOT_STANDING_OFF=1.
 enabled = false
@@ -168,6 +169,9 @@ veto_minutes = 120
 make_room = true     # drop one so a player back from IR can play (no acquisition spent)
 same_kind = true     # a free agent for one of the same kind: goalie for goalie, skater for skater
 cross_kind = false   # a skater for a goalie, or the reverse
+# And one with no drop: a free agent into an empty active spot (say, one freed
+# by a player going to IR). Nobody leaves the roster; it spends an acquisition.
+open_spot = false
 
 # Moves made without a tap in a week; leave out for only the league's own cap.
 # max_per_week = 2

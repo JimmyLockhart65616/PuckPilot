@@ -1,4 +1,5 @@
-"""Standing approval: a rotation player's drop, approved in advance.
+"""Standing approval: a rotation player's drop, approved in advance - and, where
+granted, an add that drops nobody.
 
 Asked for on 2026-10-31. Of the five cards since PuckPilot began making
 approved moves, four were approved - each 11 to 12 hours after it went out,
@@ -13,6 +14,13 @@ he stopped it. It is still a card. It is shown first with the time it will be
 made and pushed to the phone, and it is approved by
 `proposals.approve_standing`, which refuses one that was not shown with that
 time, or whose time has not come.
+
+An add that drops nobody - a free agent into an empty active spot, such as one
+a player's move to IR freed - is its own kind, `open_spot`, covered only where
+the manager granted it. No tier is asked about because nobody leaves; what it
+spends is an acquisition, bounded by the league's caps, the playoff reserve
+and `max_per_week` like any other. Added 2026-11-21, after such an add waited
+for a tap while the free agent was first come, first served.
 
     offer        mark a waiting card as covered - its drop is a rotation
                  player, its kind is covered, PuckPilot makes it - or record
@@ -66,13 +74,14 @@ def grant_hash(grant) -> str:
     return hashlib.sha256(json.dumps(asdict(grant), sort_keys=True).encode()).hexdigest()[:12]
 
 
-def move_kind(p, drop, add_position: str | None) -> str | None:
-    """Which of the grant's kinds `p` is (`authority.COVERS`), or None when it
-    drops nobody. A swap whose add's position is not known is the wider kind."""
+def move_kind(p, drop, add_position: str | None) -> str:
+    """Which of the grant's kinds `p` is (`authority.COVERS`). An add that drops
+    nobody is `open_spot`; a swap whose add's position is not known is the
+    wider kind."""
     if p.move_kind is MoveKind.ACTIVATE:
         return "make_room"
     if not p.drop_player_key:
-        return None
+        return "open_spot"
     if not add_position or drop is None:
         return "cross_kind"
     return "same_kind" if (add_position == "G") == (drop.position == "G") else "cross_kind"
@@ -95,8 +104,10 @@ def refusal(p, grant, placed, roster, executes: bool, kinds=None, used: int = 0)
         return "a waiver claim is made by hand"
     drop = next((q for q in roster.players if q.player_key == p.drop_player_key), None)
     what = move_kind(p, drop, p.reason.get("add_position"))
-    if what is None:
-        return "it drops nobody - only a Rotation player's drop is covered"
+    if what == "open_spot":
+        if not grant.covers(what):
+            return f"it drops nobody, and {COVERS[what]} are not covered"
+        return _over_limit(grant, used)
     where = (placed or {}).get(p.drop_player_key)
     if drop is None or where is None:
         return f"{p.drop_name} is not on the roster"
@@ -104,6 +115,10 @@ def refusal(p, grant, placed, roster, executes: bool, kinds=None, used: int = 0)
         return f"{p.drop_name} is {where.tier.label}, not Rotation"
     if not grant.covers(what):
         return f"{COVERS[what]} are not covered"
+    return _over_limit(grant, used)
+
+
+def _over_limit(grant, used: int) -> str:
     if grant.max_per_week is not None and used >= grant.max_per_week:
         return f"this week's {grant.max_per_week} without a tap are made"
     return ""
@@ -152,13 +167,15 @@ def offer(
             if grant.enabled and p.reason.get("standing_not") != why:
                 proposals_mod.annotate(conn, p.id, standing_not=why)
             continue
-        drop = next(q for q in roster.players if q.player_key == p.drop_player_key)
+        drop = next((q for q in roster.players if q.player_key == p.drop_player_key), None)
+        where = (placed or {}).get(p.drop_player_key) if drop is not None else None
         proposals_mod.annotate(
             conn,
             p.id,
             standing={
                 "kind": move_kind(p, drop, p.reason.get("add_position")),
-                "tier_source": placed[p.drop_player_key].source,
+                # None for an open-spot add: there is no drop to have a tier.
+                "tier_source": where.source if where is not None else None,
                 "grant": grant_hash(grant),
                 "window": grant.veto_minutes,
                 "offered_at": at,

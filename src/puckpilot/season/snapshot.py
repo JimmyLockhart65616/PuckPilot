@@ -262,11 +262,14 @@ def _standing(p, tz: str) -> dict | None:
     if not st.get("due_at"):
         return None
     when = standing.due_local(p, tz)
+    under = (
+        "adds into an open spot" if st.get("kind") == "open_spot" else "a Rotation player's drop"
+    )
     return {
         "at": str(st["due_at"]),
         "due_local": when,
         "text": f"PuckPilot makes this at {when} unless you stop it - your standing approval "
-        f"for a Rotation player's drop.",
+        f"for {under}.",
     }
 
 

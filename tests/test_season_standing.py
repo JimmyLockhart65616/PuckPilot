@@ -93,6 +93,7 @@ def test_what_a_standing_approval_does_not_cover(db, monkeypatch):
     assert "waiver claim" in why(card=claim)
     [lone] = make(db, target(name="No Drop", key="p.nodrop", pid=9002, drop=False))
     assert "drops nobody" in why(card=lone)
+    assert "open spot" in why(card=lone)
     monkeypatch.setenv(standing.KILL_SWITCH, "1")
     assert standing.KILL_SWITCH in why(card=proposals.get(db, p.id))
 
@@ -110,6 +111,80 @@ def test_a_make_room_move_is_its_own_kind(db):
     no_room = StandingApproval(enabled=True, make_room=False)
     why = standing.refusal(p, no_room, ROTATION, roster(), True)
     assert why == "make-room drops are not covered"
+
+
+# -- an add that drops nobody -----------------------------------------------------
+
+OPEN = StandingApproval(enabled=True, veto_minutes=120, open_spot=True)
+
+
+def lone(db, name="No Drop", key="p.nodrop", pid=9002):
+    [p] = make(db, target(name=name, key=key, pid=pid, drop=False))
+    return p
+
+
+def test_an_add_that_drops_nobody_waits_for_a_tap_unless_open_spots_are_granted(db):
+    p = lone(db)
+    assert standing.move_kind(p, None, "C") == "open_spot"
+    assert offer(db) == []
+    assert proposals.get(db, p.id).reason["standing_not"] == (
+        "it drops nobody, and adds into an open spot are not covered"
+    )
+    # No tier is asked about - there is no drop to have one - so an empty
+    # tier board and a roster without him are no reason to refuse it.
+    (got,) = offer(db, grant=OPEN, placed={})
+    st = got.reason["standing"]
+    assert (st["kind"], st["tier_source"], st["window"]) == ("open_spot", None, 120)
+    assert got.reason["standing_not"] is None
+
+
+def test_an_open_spot_add_is_shown_first_and_made_when_its_window_passes(db):
+    p = lone(db)
+    offer(db, grant=OPEN)
+    show(db)
+    assert due(db, T0 + timedelta(minutes=119), grant=OPEN) == ([], [])
+    (made,), back = due(db, T0 + timedelta(minutes=120), grant=OPEN)
+    assert back == [] and made.id == p.id and made.reason["approved_by"] == "standing"
+    assert proposals.take_for_execution(db, p.id).id == p.id
+
+
+def test_an_open_spot_add_goes_back_when_the_grant_is_narrowed(db):
+    p = lone(db)
+    offer(db, grant=OPEN)
+    show(db)
+    approved, back = due(db, T0 + timedelta(minutes=120))  # GRANT: open_spot off
+    assert approved == [] and back[0][0].id == p.id
+    assert back[0][1] == "adds into an open spot are no longer covered"
+
+
+def test_an_open_spot_add_keeps_every_other_bound(db):
+    p = lone(db)
+
+    def why(grant=OPEN, executes=True, used=0, card=None):
+        card = card or proposals.get(db, p.id)
+        return standing.refusal(card, grant, {}, roster(), executes, None, used)
+
+    assert why() == ""
+    assert "does not make" in why(executes=False)
+    capped = StandingApproval(enabled=True, open_spot=True, max_per_week=1)
+    assert "this week's 1" in why(grant=capped, used=1)
+    claim = proposals.annotate(db, p.id, timing="on waivers until Thu")
+    assert "waiver claim" in why(card=claim)
+
+
+def test_an_open_spot_card_says_what_it_was_approved_under(db):
+    from puckpilot.season import snapshot
+
+    lone(db)
+    make(db, target())
+    offer(db, grant=OPEN)
+    show(db)
+    cards = snapshot.build(db, "jimmy", LK, "T", executes_moves=True, standing_on=True)["proposals"]
+    texts = {c["standing"]["text"].split(" - ", 1)[1] for c in cards if c["standing"]}
+    assert texts == {
+        "your standing approval for adds into an open spot.",
+        "your standing approval for a Rotation player's drop.",
+    }
 
 
 def test_a_weekly_limit_counts_moves_made_and_offered(db):
@@ -325,6 +400,9 @@ def test_the_grant_is_read_from_config_and_wrong_settings_are_refused():
     a = Authority.from_config(cfg)
     assert a.standing.enabled and a.standing.veto_minutes == 30 and a.standing.covers("cross_kind")
     assert not Authority().standing.enabled
+    # Open-spot adds are consent of their own: never covered unless granted.
+    assert not a.standing.covers("open_spot")
+    assert Authority.from_config({"standing": {"open_spot": True}}).standing.covers("open_spot")
     with pytest.raises(AuthorityError, match="unknown setting"):
         Authority.from_config({"standing": {"enable": True}})
     with pytest.raises(AuthorityError):
@@ -332,7 +410,10 @@ def test_the_grant_is_read_from_config_and_wrong_settings_are_refused():
     with pytest.raises(AuthorityError):
         StandingApproval(max_per_week=True)
     words = Authority.from_config({"standing": {"enabled": True}}).describe()
-    assert "Moves without a tap: a ROTATION player's drop" in words
+    assert "Moves without a tap, approved in advance" in words
+    assert "adds into an open spot" not in words
+    wider = Authority.from_config({"standing": {"enabled": True, "open_spot": True}}).describe()
+    assert "adds into an open spot" in wider
     assert "Moves without a tap: NONE" in Authority().describe()
 
 

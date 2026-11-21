@@ -19,8 +19,9 @@ autonomous is not a config change; it would require deleting the mechanism.
 
 Approval comes one of two ways, and both are per move. A tap on the card; or,
 for a move whose drop is one of the manager's rotation players
-(`season.tiers`), given in advance - `StandingApproval`, written down here
-like the lineup's criteria. A card under it is still shown first, says when
+(`season.tiers`) - or, where he grants it, an add that drops nobody into an
+open spot - given in advance - `StandingApproval`, written down here like the
+lineup's criteria. A card under it is still shown first, says when
 the move will be made, and is made only if nobody stopped it by then
 (`season.standing`, `proposals.approve_standing`). Neither is a way round the
 queue: the executor still takes only an approved row, and a standing approval
@@ -494,6 +495,11 @@ class StandingApproval:
     make_room: bool = True
     same_kind: bool = True
     cross_kind: bool = False
+    # And one with no drop at all: a free agent into an empty active spot (a
+    # player gone to IR, say). Nobody leaves the roster; it spends one
+    # acquisition, bounded like any other. Off unless granted - asked for on
+    # 2026-11-21, when such an add waited for a tap in a first-come race.
+    open_spot: bool = False
     # Moves made without a tap in a week. None: the league's own weekly cap
     # and the playoff reserve are the only bound, as for a tapped move.
     max_per_week: int | None = None
@@ -514,7 +520,7 @@ class StandingApproval:
             )
 
     def covers(self, what: str) -> bool:
-        """Whether `what` ("make_room", "same_kind", "cross_kind") is covered."""
+        """Whether `what` (a key of `COVERS`) is covered."""
         return what in COVERS and bool(getattr(self, what))
 
     def describe(self) -> list[str]:
@@ -527,7 +533,7 @@ class StandingApproval:
             else "made on the run that shows it - no window to stop it"
         )
         return [
-            "Moves without a tap: a ROTATION player's drop, approved in advance -",
+            "Moves without a tap, approved in advance -",
             f"  covers: {', '.join(kinds) or 'nothing'}",
             f"  each one {window}",
             (
@@ -544,6 +550,7 @@ COVERS = {
     "make_room": "make-room drops",
     "same_kind": "same-kind swaps",
     "cross_kind": "skater-for-goalie swaps",
+    "open_spot": "adds into an open spot",
 }
 
 

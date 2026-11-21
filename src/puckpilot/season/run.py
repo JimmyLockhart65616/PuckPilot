@@ -628,7 +628,8 @@ def run_day(
     if ctx.keep is not None:
         _guard(report, "stats", lambda: _roster_stats(conn, manager, runtime, ctx, day))
     # ...and which waiting cards a standing approval covers: a rotation
-    # player's drop, made after the window unless stopped (season/standing.py).
+    # player's drop, or where granted an add into an open spot, made after the
+    # window unless stopped (season/standing.py).
     # Only where a page shows them: the window is the manager's to stop it.
     offered = []
     showable = manager.page.publishes and page_key
