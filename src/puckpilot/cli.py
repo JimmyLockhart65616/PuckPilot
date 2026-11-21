@@ -1764,6 +1764,39 @@ def _cmd_season_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_goalies(args: argparse.Namespace) -> int:
+    """Every club's goalies: who starts, how often, and whose (season/goalie_board.py)."""
+    from puckpilot.data import store
+    from puckpilot.season import cli_support, goalie_board, starters
+    from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.run import _train_seasons, week_for
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+    store.init_db(conn)
+    if args.check:
+        print(goalie_board.check(conn, since=args.since))
+        return 0
+    day = args.date or cli_support.today_str()
+    week = week_for(runtime, day)
+    if week is None:
+        print(f"{day} is not in a week of this league's season.")
+        return 1
+    season = runtime.nhl_season
+    model = TrailingStartShareSource(conn, season, fallback_season=_train_seasons(season)[0])
+    use = manager.authority.lineup.announced_starters == "use"
+    source = ChainedGoalieSource(starters.AnnouncedStartSource(conn) if use else None, model)
+    rows = goalie_board.board(
+        conn, runtime, week, day, source, goalie_board.owners(conn, league_key, day)
+    )
+    print(goalie_board.text(rows, day))
+    return 0
+
+
 def _own_saved_roster(conn, manager, league_key: str):
     """This manager's own roster as last saved - the league read saves every
     team's, so the team is the one his runs acted for."""
@@ -3394,6 +3427,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s_starters.add_argument("--since", default="", help="with --check: from this date")
     s_starters.set_defaults(func=_cmd_season_starters)
+
+    s_goalies = season_sub.add_parser(
+        "goalies",
+        parents=[seasonal],
+        help="Every club's goalies: tonight's chance, Yahoo's call, starts ahead, whose",
+    )
+    s_goalies.add_argument(
+        "--check", action="store_true", help="score the kept forecasts against the starts made"
+    )
+    s_goalies.add_argument("--since", default="", help="with --check: from this date")
+    s_goalies.set_defaults(func=_cmd_season_goalies)
 
     s_plan = season_sub.add_parser(
         "plan",

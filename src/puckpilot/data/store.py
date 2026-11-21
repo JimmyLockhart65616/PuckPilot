@@ -317,6 +317,21 @@ CREATE TABLE IF NOT EXISTS category_plan (
     PRIMARY KEY (manager, league_key, category)
 );
 
+-- Every club's goalies as one run forecast them (`season.goalie_board`): one
+-- row a goalie a day, the latest run's, scored against the starts he made.
+CREATE TABLE IF NOT EXISTS goalie_forecasts (
+    date          TEXT NOT NULL,
+    player_id     INTEGER NOT NULL,
+    club          TEXT,
+    tonight       REAL,
+    week_starts   REAL NOT NULL,
+    week_end      TEXT NOT NULL,
+    season_starts REAL NOT NULL,
+    owner         TEXT,
+    made_at       TEXT NOT NULL,
+    PRIMARY KEY (date, player_id)
+);
+
 -- Announced starting goalies (`season.starters`): every goalie of one read, a
 -- call (1 start / 0 sit) or none yet (NULL), kept per read so how early and
 -- how right the calls are is measured from what was seen and when.

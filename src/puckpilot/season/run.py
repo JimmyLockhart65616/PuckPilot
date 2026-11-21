@@ -520,6 +520,12 @@ def run_day(
     )
     if models is not None and keepers is not None:
         models[0].keepers = keepers  # read by the add cards
+    if models is not None and week is not None:
+        _guard(
+            report,
+            "goalie board",
+            lambda: _keep_goalie_board(conn, league_key, runtime, week, day, models[1], report),
+        )
     plan = None
     acted = None
     if roster is not None:
@@ -903,6 +909,18 @@ def _protected_keepers(conn, manager_name: str) -> set[str]:
     if not row or not row[0]:
         return set()
     return {k.player_key for k in keeper_value.load(conn, manager_name, row[0]) if k.protected}
+
+
+def _keep_goalie_board(conn, league_key, runtime, week, day, source, report) -> None:
+    """Keep this run's forecast of every club's goalies (`season.goalie_board`)."""
+    from puckpilot.season import goalie_board
+
+    rows = goalie_board.board(
+        conn, runtime, week, day, source, goalie_board.owners(conn, league_key, day)
+    )
+    goalie_board.save(conn, rows, day, week.end)
+    free = sum(1 for r in rows if r.owner == "free agent" and r.week_starts >= 1.0)
+    report.add("goalie board", True, f"{len(rows)} goalies; {free} free agents with a start ahead")
 
 
 def _category_plan(conn, manager, runtime, day: str, roster, models) -> dict | None:

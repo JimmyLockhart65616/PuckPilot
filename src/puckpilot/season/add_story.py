@@ -108,6 +108,10 @@ def explain(
         out["odds"] = odds_lines(base_odds, after_odds)
     if season_left is not None and days:
         out["season"] = season_lines(cand, drop, base, values, season_left, days[0])
+        for p in (cand, drop):
+            line = goalie_starts_line(p, goalie_source, days, season_left)
+            if line:
+                out["season"].append(line)
     if days:
         out["profile"] = profile_lines(
             conn, runtime, cand, drop, days[0], streaks=getattr(values, "streaks", None)
@@ -565,6 +569,30 @@ def share_of(season_left, p) -> float:
 def games_left(season_left, p) -> float:
     """Games a player has left: his club's, times his share of them."""
     return season_left.get(p.team, 0) * share_of(season_left, p)
+
+
+def goalie_starts_line(p, goalie_source, days, season_left) -> str:
+    """ "Gibson: starts 62% of his club's games lately - about 31 of the 50 left."
+
+    A goalie's season is his starts, not his club's games: his mean P(start)
+    over the days priced where the start model has him, times his club's games
+    left. Empty for a skater, or a goalie the model gives no game.
+    """
+    if p is None or getattr(p, "position", "") != "G" or goalie_source is None:
+        return ""
+    ps = [
+        float(goalie_source.starts(d).get(p.nhl_player_id, 0.0))
+        for d in days
+        if p.nhl_player_id in goalie_source.starts(d)
+    ]
+    left = season_left.get(p.team, 0) if season_left is not None else 0
+    if not ps or not left:
+        return ""
+    share = sum(ps) / len(ps)
+    return (
+        f"{p.name}: starts {share:.0%} of his club's games lately - about "
+        f"{share * left:.0f} of the {left} left"
+    )
 
 
 def season_lines(cand, drop, roster, values, season_left, day) -> list[str]:
