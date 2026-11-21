@@ -300,3 +300,28 @@ def test_an_unknown_rival_mode_is_refused(db):
 
     with pytest.raises(ValueError, match="rivals must be one of"):
         add_gate_report(db, DEFAULT_LEAGUE, rivals="clever")
+
+
+def test_g3_goalie_week_splits_the_saves_miss_into_parts_that_sum_to_it():
+    from puckpilot.season import g3
+
+    gw = g3.GoalieWeek(
+        week=3, team_key="a", goalies=3, projected_starts=4.0, sum_p=4.6, real_starts=6,
+        slot_starts=5, projected_saves=96.0, actual_saves=150.0, start_saves=150.0,
+        added_goalies=1, added_starts=1, added_saves=20.0,
+    )  # fmt: skip
+    assert gw.per_start_projected == 24.0 and gw.per_start_actual == 25.0
+    assert gw.miss == 54.0
+    assert gw.starts_part == 24.0  # one more start than projected, at the projected rate
+    assert gw.per_start_part == 5.0  # five counted starts, one more save each
+    assert gw.added_part == 20.0
+    assert gw.starts_part + gw.per_start_part + gw.added_part + gw.rest == gw.miss
+
+    unknown = g3.GoalieWeek(3, "b", 2, 4.0, 4.0, 0, 0, 96.0, None, 0.0, 0, 0, 0.0)
+    assert unknown.miss is None and unknown.rest is None and unknown.per_start_part == 0.0
+
+    rep = g3.G3Report([], our_team="a", goalie_weeks=[gw, unknown])
+    mean, _se, n = rep.goalie_part("miss")
+    assert (mean, n) == (54.0, 1)  # the week with no Yahoo total is left out
+    assert rep.goalie_part("projected_starts", exclude="a")[0] == 4.0
+    assert "Goalie starts and saves per team-week" in rep.text()

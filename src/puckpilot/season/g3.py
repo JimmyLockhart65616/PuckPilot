@@ -52,12 +52,102 @@ class CatCase:
         return self.p_win + 0.5 * self.p_tie
 
 
+@dataclass(frozen=True)
+class GoalieWeek:
+    """One team-week's goalie volume: what was projected and where it went.
+
+    The saves a projection missed split into four parts that sum to the miss:
+
+    - `starts_part`: the week-start goalies started more or fewer games than
+      projected - of the starts a lineup could count (`slot_starts`: each
+      night, no more than there are G slots);
+    - `per_start_part`: they saved more or fewer a start than their rate;
+    - `added_part`: saves by goalies added during the week (all of them, so
+      an upper bound - not every one was in a slot);
+    - `rest`: everything else - starts left on the bench, goalies dropped
+      mid-week, relief appearances, a night with more starters than slots.
+    """
+
+    week: int
+    team_key: str
+    goalies: int  # healthy goalies on the week-start roster
+    projected_starts: float  # as the odds count them
+    sum_p: float  # every rostered goalie's P(start), no slot limit
+    real_starts: int  # starts those goalies made
+    slot_starts: int  # of them, what the G slots could hold
+    projected_saves: float
+    actual_saves: float | None  # Yahoo's total
+    start_saves: float  # saves those goalies made in their starts
+    added_goalies: int
+    added_starts: int
+    added_saves: float
+
+    @property
+    def per_start_projected(self) -> float:
+        return self.projected_saves / self.projected_starts if self.projected_starts else 0.0
+
+    @property
+    def per_start_actual(self) -> float:
+        return self.start_saves / self.real_starts if self.real_starts else 0.0
+
+    @property
+    def miss(self) -> float | None:
+        return None if self.actual_saves is None else self.actual_saves - self.projected_saves
+
+    @property
+    def starts_part(self) -> float:
+        return (self.slot_starts - self.projected_starts) * self.per_start_projected
+
+    @property
+    def per_start_part(self) -> float:
+        if not self.real_starts:
+            return 0.0
+        return self.slot_starts * (self.per_start_actual - self.per_start_projected)
+
+    @property
+    def added_part(self) -> float:
+        return self.added_saves
+
+    @property
+    def rest(self) -> float | None:
+        m = self.miss
+        if m is None:
+            return None
+        return m - self.starts_part - self.per_start_part - self.added_part
+
+
+GOALIE_PARTS = (
+    ("goalies held at week start", "goalies"),
+    ("projected starts", "projected_starts"),
+    ("  every goalie's P(start), no slot limit", "sum_p"),
+    ("starts made by the week-start goalies", "real_starts"),
+    ("  of them, what the G slots could hold", "slot_starts"),
+    ("saves a start, projected", "per_start_projected"),
+    ("saves a start, made", "per_start_actual"),
+    ("saves: actual - projected", "miss"),
+    ("  from starts (slots - projected)", "starts_part"),
+    ("  from saves a start", "per_start_part"),
+    ("  from goalies added in-week (at most)", "added_part"),
+    ("  the rest (bench, drops, relief)", "rest"),
+)
+
+
 @dataclass
 class G3Report:
     cases: list[CatCase]
     goalie_adds: dict[tuple[int, str], int] = field(default_factory=dict)
     unmapped: int = 0
     our_team: str = ""
+    goalie_weeks: list[GoalieWeek] = field(default_factory=list)
+
+    def goalie_part(self, attr: str, team: str | None = None, exclude: str | None = None):
+        """Mean of one `GoalieWeek` number per team-week, its SE and n."""
+        xs = [
+            getattr(g, attr)
+            for g in self.goalie_weeks
+            if (team is None or g.team_key == team) and (exclude is None or g.team_key != exclude)
+        ]
+        return _mean_se([x for x in xs if x is not None])
 
     def brier(self, cases=None) -> float:
         cs = self.cases if cases is None else cases
@@ -152,6 +242,16 @@ class G3Report:
                     f"  {cat:3s} added a goalie that week {sm:+7.2f} +/- {sse:.2f} (n={sn})   "
                     f"did not {rm:+7.2f} +/- {rse:.2f} (n={rn})"
                 )
+        if self.goalie_weeks:
+            lines += ["", "Goalie starts and saves per team-week (all teams | ours | the rest):"]
+            for label, attr in GOALIE_PARTS:
+                a = self.goalie_part(attr)
+                row = f"  {label:40s} {a[0]:+8.2f} +/- {a[1]:.2f}"
+                if self.our_team:
+                    o = self.goalie_part(attr, team=self.our_team)
+                    r = self.goalie_part(attr, exclude=self.our_team)
+                    row += f"   | {o[0]:+8.2f} +/- {o[1]:.2f} | {r[0]:+8.2f} +/- {r[1]:.2f}"
+                lines.append(row)
         return "\n".join(lines)
 
 
@@ -233,8 +333,112 @@ def goalie_adds_by_week(conn, league_key: str, weeks) -> dict[tuple[int, str], i
     return out
 
 
-def build(conn, runtime, league, our_team: str = "", weeks=None, progress=None) -> G3Report:
-    """Every final team-week projected as of its first morning, against the result."""
+def _goalie_lines(conn, season: str, pids, start: str, end: str) -> dict[int, list[tuple]]:
+    """pid -> [(date, started, saves)] for each goalie game from `start` to `end`."""
+    out: dict[int, list[tuple]] = {}
+    for pid in pids:
+        for day, stats_json in conn.execute(
+            "SELECT game_date, stats_json FROM nhl_game_logs WHERE player_id = ? AND season = ? "
+            "AND game_type = 2 AND game_date BETWEEN ? AND ? ORDER BY game_date",
+            (pid, season, start, end),
+        ):
+            s = json.loads(stats_json)
+            saves = float(s.get("shotsAgainst", 0) or 0) - float(s.get("goalsAgainst", 0) or 0)
+            out.setdefault(pid, []).append((day, int(s.get("gamesStarted", 0) or 0) == 1, saves))
+    return out
+
+
+def goalie_week(
+    conn,
+    runtime,
+    week,
+    team_key: str,
+    roster,
+    goalie_source,
+    values,
+    projected_saves: float,
+    actual_saves: float | None,
+    goalie_count: str = "top",
+) -> GoalieWeek:
+    """One team-week's goalie volume, projected and made (`GoalieWeek`)."""
+    from puckpilot.season.week import expected_starts
+
+    season = runtime.nhl_season
+    g_slots = sum(n for pos, n in runtime.shape().slots if pos == "G")
+    games: dict[int, list[float]] = {}
+    expected_starts(
+        conn,
+        runtime,
+        week,
+        roster.players,
+        goalie_source,
+        values,
+        goalie_games=games,
+        goalie_count=goalie_count,
+    )
+    held = [
+        p.nhl_player_id
+        for p in roster.players
+        if p.position == "G" and p.nhl_player_id is not None and not p.is_out and not p.on_ir
+    ]
+    sum_p = 0.0
+    for day in week.dates():
+        p_starts = goalie_source.starts(day)
+        sum_p += sum(float(p_starts.get(pid, 0.0)) for pid in held)
+
+    by_day: dict[str, int] = {}
+    real = 0
+    start_saves = 0.0
+    for rows in _goalie_lines(conn, season, held, week.start, week.end).values():
+        for day, started, saves in rows:
+            if started:
+                real += 1
+                start_saves += saves
+                by_day[day] = by_day.get(day, 0) + 1
+    slot_starts = sum(min(n, g_slots) for n in by_day.values())
+
+    added = [
+        (pid, at[:10])
+        for pid, at in conn.execute(
+            "SELECT nhl_player_id, at FROM league_transactions WHERE league_key = ? "
+            "AND team_key = ? AND action = 'add' AND positions LIKE '%G%' "
+            "AND nhl_player_id IS NOT NULL AND substr(at, 1, 10) BETWEEN ? AND ?",
+            (runtime.league_key, team_key, week.start, week.end),
+        )
+        if pid not in held
+    ]
+    added_starts = 0
+    added_saves = 0.0
+    for pid, since in added:
+        for _day, started, saves in _goalie_lines(conn, season, [pid], since, week.end).get(
+            pid, []
+        ):
+            added_starts += int(started)
+            added_saves += saves
+    return GoalieWeek(
+        week=week.number,
+        team_key=team_key,
+        goalies=len(held),
+        projected_starts=sum(sum(ps) for ps in games.values()),
+        sum_p=sum_p,
+        real_starts=real,
+        slot_starts=slot_starts,
+        projected_saves=projected_saves,
+        actual_saves=actual_saves,
+        start_saves=start_saves,
+        added_goalies=len({pid for pid, _ in added}),
+        added_starts=added_starts,
+        added_saves=added_saves,
+    )
+
+
+def build(
+    conn, runtime, league, our_team: str = "", weeks=None, progress=None, goalie_count: str = "top"
+) -> G3Report:
+    """Every final team-week projected as of its first morning, against the result.
+
+    `goalie_count` is how both sides' goalie starts are counted
+    (`week.GOALIE_COUNTS`)."""
     from puckpilot.draft.sim import build_universe
     from puckpilot.season.add_gate import AsOfValues
     from puckpilot.season.goalies import AsOfGoalieSource, TrailingStartShareSource
@@ -261,6 +465,7 @@ def build(conn, runtime, league, our_team: str = "", weeks=None, progress=None) 
     wanted = final if weeks is None else final & set(weeks)
     chosen = [w for w in runtime.weeks if w.number in wanted]
     cases: list[CatCase] = []
+    goalie_weeks: list[GoalieWeek] = []
     unmapped = 0
     for w in chosen:
         cutoff = (_date.fromisoformat(w.start) - timedelta(days=1)).isoformat()
@@ -283,11 +488,28 @@ def build(conn, runtime, league, our_team: str = "", weeks=None, progress=None) 
                 conn, runtime, league, w, rows[opp][1], ours, theirs, [], frame, goalies, vals,
                 find_targets=False, measure_room=False, odds_model=OddsModel(),
                 add_scoring="odds", from_day=w.start,
+                goalie_count=goalie_count, their_goalie_count=goalie_count,
             )  # fmt: skip
             opp_stats = rows[opp][2]
             by_label = {label_of.get(int(k), k): v for k, v in stats.items() if k.isdigit()}
             opp_by_label = {label_of.get(int(k), k): v for k, v in opp_stats.items()
                             if k.isdigit()}  # fmt: skip
+            saves = next((o for o in plan.outlook if o.category.key == "saves"), None)
+            if saves is not None:
+                goalie_weeks.append(
+                    goalie_week(
+                        conn,
+                        runtime,
+                        w,
+                        team,
+                        ours,
+                        goalies,
+                        vals,
+                        float(saves.ours),
+                        by_label.get(saves.category.label),
+                        goalie_count=goalie_count,
+                    )
+                )
             for o in plan.outlook:
                 if o.p_win is None:
                     continue
@@ -311,4 +533,4 @@ def build(conn, runtime, league, our_team: str = "", weeks=None, progress=None) 
                 )
             if progress:
                 progress(f"  week {w.number} {team}: {plan.expected:.2f} expected")
-    return G3Report(cases, goalie_adds_by_week(conn, lk, chosen), unmapped, our_team)
+    return G3Report(cases, goalie_adds_by_week(conn, lk, chosen), unmapped, our_team, goalie_weeks)

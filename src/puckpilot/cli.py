@@ -1559,7 +1559,14 @@ def _cmd_season_g3(args: argparse.Namespace) -> int:
     except (ManagerError, cli_support.SeasonCliError) as e:
         return cli_support.report(e)
     weeks = {int(w) for w in args.weeks.split(",")} if args.weeks else None
-    report = g3.build(conn, runtime, manager.league, our_team=manager.team_key or "", weeks=weeks)
+    report = g3.build(
+        conn,
+        runtime,
+        manager.league,
+        our_team=manager.team_key or "",
+        weeks=weeks,
+        goalie_count=args.goalie_count,
+    )
     if not report.cases:
         print("No final week with every team's week-start roster saved - `ppilot season league`.")
         return 0
@@ -3224,6 +3231,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Live calibration: every team's week-start projection against what happened",
     )
     s_g3.add_argument("--weeks", default="", help="comma list of week numbers (default: all final)")
+    s_g3.add_argument(
+        "--goalie-count",
+        default="top",
+        choices=("top", "min"),
+        help="how both sides' goalie starts are counted (week.GOALIE_COUNTS)",
+    )
     s_g3.set_defaults(func=_cmd_season_g3)
 
     s_moves = season_sub.add_parser(

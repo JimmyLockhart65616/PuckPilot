@@ -511,6 +511,43 @@ def banked_components(by_label: dict[str, float]) -> dict[str, float]:
     return out
 
 
+# How a roster's goalie starts are counted on a night with more goalies than G
+# slots. "top" (as first built): the slots' worth with the most expected value
+# each count their whole P(start), and the rest nothing - a lineup set in the
+# morning by P(start) and left. "min": every goalie counts for the chance that
+# he starts AND a slot is free of better goalies who start - the lineup of a
+# manager who plays whoever is confirmed, so a night's count is
+# E[min(slots, goalies starting)]. Measured live (`season g3`, weeks 1-7 of
+# 2026-27, 84 team-weeks): rosters averaged 4.52 countable starts a week
+# against 3.97 counted by "top".
+GOALIE_COUNTS = ("top", "min")
+
+
+def slot_chances(goalies: list[tuple[float, float, int, str]], slots: int) -> dict[int, float]:
+    """pid -> P(he starts and is in a G slot), for (value, P(start), pid, club).
+
+    A goalie is in a slot when fewer than `slots` goalies worth more than him
+    start. Two goalies of one club cannot both start, so a club's better
+    goalies count as one chance, and his own club-mates not at all - if he
+    starts, they do not. The values sum to E[min(slots, clubs starting)].
+    """
+    from puckpilot.season.odds import trials_pmf
+
+    order = sorted(goalies, key=lambda g: (-g[0], g[2]))
+    out: dict[int, float] = {}
+    for i, (_v, p, pid, club) in enumerate(order):
+        if p <= 0 or slots <= 0:
+            continue
+        ahead: dict[str, float] = {}
+        for _v2, p2, _pid2, club2 in order[:i]:
+            if club2 != club and p2 > 0:
+                ahead[club2] = min(ahead.get(club2, 0.0) + p2, 1.0)
+        free = float(trials_pmf(list(ahead.values()))[:slots].sum()) if ahead else 1.0
+        if free > 0:
+            out[pid] = p * free
+    return out
+
+
 def expected_starts(
     conn: sqlite3.Connection,
     runtime: LeagueRuntime,
@@ -523,8 +560,12 @@ def expected_starts(
     exclude: dict[str, set[str]] | None = None,
     goalie_games: dict[int, list[float]] | None = None,
     benched: dict[str, int] | None = None,
+    goalie_count: str = "top",
 ) -> dict[int, float]:
     """Expected *starts* for each player over the week, not team games.
+
+    `goalie_count` is how goalies are counted on a night with more of them
+    than G slots (`GOALIE_COUNTS`).
 
     `benched`, when given, collects day -> how many players with a game would
     sit: the nights the lineup has a choice to make at all.
@@ -547,6 +588,8 @@ def expected_starts(
     order the lineup would start them. Summing every goalie's P(start) counted a
     third goalie's start on nights when he could only have sat.
     """
+    if goalie_count not in GOALIE_COUNTS:
+        raise ValueError(f"goalie_count must be one of {GOALIE_COUNTS}, not {goalie_count!r}")
     season = runtime.nhl_season
     shape = runtime.shape()
     g_slots = sum(n for pos, n in shape.slots if pos == "G")
@@ -557,6 +600,7 @@ def expected_starts(
         p_starts = goalie_source.starts(day) if goalie_source else {}
         cands = []
         goalies = []
+        clubs: dict[int, tuple[float, str]] = {}
         for p in players:
             pid = p.nhl_player_id
             if pid is None or getattr(p, "is_out", False) or p.team not in playing:
@@ -567,13 +611,24 @@ def expected_starts(
             if p.position == "G":
                 p_start = float(p_starts.get(pid, 0.0))
                 goalies.append((p_start * v, p_start, pid))
+                clubs[pid] = (v, p.team)
                 continue
             cands.append((pid, p.eligible, v))
         goalies.sort(reverse=True)
-        for _, p_start, pid in goalies[:g_slots]:
-            out[pid] = out.get(pid, 0.0) + p_start
-            if goalie_games is not None and p_start > 0:
-                goalie_games.setdefault(pid, []).append(p_start)
+        if goalie_count == "min":
+            counted = slot_chances(
+                [(clubs[pid][0], p_start, pid, clubs[pid][1]) for _, p_start, pid in goalies],
+                g_slots,
+            )
+        else:
+            counted = {pid: p_start for _, p_start, pid in goalies[:g_slots]}
+        for _, _p, pid in goalies:
+            if pid not in counted:
+                continue
+            chance = counted[pid]
+            out[pid] = out.get(pid, 0.0) + chance
+            if goalie_games is not None and chance > 0:
+                goalie_games.setdefault(pid, []).append(chance)
         slotted = optimize_lineup(cands, shape)
         for pid in slotted:
             out[pid] = out.get(pid, 0.0) + 1.0
@@ -855,6 +910,8 @@ def build_week_plan(
     wait_hazard: float = WAIT_HAZARD,
     switch_after: dict[tuple[str, str], str] | None = None,
     hold: set[str] | None = None,
+    goalie_count: str = "top",
+    their_goalie_count: str = "top",
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -903,8 +960,16 @@ def build_week_plan(
     {(add key, drop key): date} re-prices a queued swap as made after that
     date's games, the day it was planned for. `hold` is player keys no search
     may drop - the drops of moves approved and not yet made.
+
+    `their_goalie_count` / `goalie_count` are how each side's goalie starts
+    are counted (`GOALIE_COUNTS`). Ours other than "top" is for a projection
+    only (`find_targets=False`, as `season g3` asks): the search prices our
+    side as the tool's own lineup plays it, by P(start) in the morning.
     """
     from puckpilot.season.form import FORM_RATES
+
+    if find_targets and goalie_count != "top":
+        raise ValueError("goalie_count other than 'top' is for a projection (find_targets=False)")
 
     cats = league.all_cats
     if workload is None:
@@ -934,6 +999,7 @@ def build_week_plan(
         exclude=exclude,
         goalie_games=our_goalie_games,
         benched=bench_calls,
+        goalie_count=goalie_count,
     )
     their_games = expected_starts(
         conn,
@@ -945,6 +1011,7 @@ def build_week_plan(
         days=days,
         exclude=exclude,
         goalie_games=their_goalie_games,
+        goalie_count=their_goalie_count,
     )
     our_rest = project_totals(our_games, rates, cats)
     our_totals = project_totals(our_games, rates, cats, base=base_ours)

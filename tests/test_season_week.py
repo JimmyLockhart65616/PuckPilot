@@ -1547,3 +1547,28 @@ def test_the_goalie_floor_setting_reads_the_league_and_refuses_nonsense():
     for bad in (0, -1, "three", True, 2.5):
         with pytest.raises(AuthorityError):
             TransactionAuthority(min_goalies=bad)
+
+
+def test_slot_chances_sum_to_the_expected_slots_filled():
+    from puckpilot.season.week import slot_chances
+
+    # Three goalies of three clubs, each a coin flip, two G slots: the better
+    # two always have a slot; the third needs one of them to sit.
+    got = slot_chances([(3.0, 0.5, 1, "AAA"), (2.0, 0.5, 2, "BBB"), (1.0, 0.5, 3, "CCC")], 2)
+    assert got == {1: 0.5, 2: 0.5, 3: pytest.approx(0.375)}
+    assert sum(got.values()) == pytest.approx(1.375)  # E[min(2, Binomial(3, 0.5))]
+
+    # A club-mate ahead of him is no rival for the slot: if he starts, the
+    # club-mate does not.
+    mates = slot_chances([(3.0, 0.6, 1, "AAA"), (2.0, 0.5, 2, "BBB"), (1.0, 0.4, 3, "AAA")], 2)
+    assert mates[3] == pytest.approx(0.4)
+    one_slot = slot_chances([(3.0, 0.6, 1, "AAA"), (1.0, 0.4, 3, "AAA")], 1)
+    assert one_slot == {1: 0.6, 3: pytest.approx(0.4)}
+    assert slot_chances([(3.0, 0.0, 1, "AAA")], 2) == {}
+
+
+def test_expected_starts_refuses_an_unknown_goalie_count():
+    from puckpilot.season.week import expected_starts
+
+    with pytest.raises(ValueError, match="goalie_count"):
+        expected_starts(None, None, None, [], None, None, goalie_count="all")
