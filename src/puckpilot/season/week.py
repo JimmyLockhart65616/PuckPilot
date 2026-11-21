@@ -893,6 +893,7 @@ def build_week_plan(
     our_stream=None,
     season_rivals=None,
     season_weight: float = 0.0,
+    season_tilt: dict[str, float] | None = None,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -950,7 +951,8 @@ def build_week_plan(
     `season_rivals` (every other team's roster as it stands) and
     `season_weight` > 0 price every swap over the rest of the season as well
     (`season.outlook`): its gain is this week's plus the weight times the
-    season's. 0 or no rivals: this week only, as built.
+    season's. 0 or no rivals: this week only, as built. `season_tilt` weights
+    a category's season leverage (`category_plan.tilt`, a pinned stance).
 
     `their_stream` / `our_stream` (`streams.GoalieStream`) add the goalie
     starts a side will get from adds not yet made this week, as one
@@ -1157,7 +1159,7 @@ def build_week_plan(
 
         season_outlook = build_outlook(
             conn, runtime, league, week, ours, list(season_rivals), rates, goalie_source,
-            values, season_weight, model=odds_model,
+            values, season_weight, model=odds_model, tilt=season_tilt,
         )  # fmt: skip
     if reprice is not None and days:
         targets, lapsed = _reprice(

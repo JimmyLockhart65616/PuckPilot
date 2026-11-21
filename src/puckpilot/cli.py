@@ -1719,6 +1719,65 @@ def _cmd_season_tiers(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_plan(args: argparse.Namespace) -> int:
+    """The season's category plan, and the manager's stances (season/category_plan.py)."""
+    from puckpilot.data import store
+    from puckpilot.season import category_plan, cli_support
+    from puckpilot.season.goalies import TrailingStartShareSource
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.outlook import build_outlook, typical_week
+    from puckpilot.season.run import _train_seasons, rival_rosters, week_for
+    from puckpilot.season.values import build_value_model
+    from puckpilot.season.week import expected_starts
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+    store.init_db(conn)
+    keys = {c.label.casefold(): c.key for c in manager.league.all_cats}
+    for spec in args.set or []:
+        label, _, stance = spec.partition("=")
+        key = keys.get(label.strip().casefold())
+        if key is None or stance not in {"chase", "hold", "concede", "auto"}:
+            print(f"--set takes CATEGORY=chase|hold|concede|auto, e.g. A=chase; got {spec!r}")
+            return 2
+        wanted = None if stance == "auto" else category_plan.Stance(stance)
+        category_plan.pin(conn, manager.name, league_key, key, wanted, via="cli")
+        print(f"{label.strip()}: " + (f"pinned {stance}" if wanted else "back to the proposal"))
+    roster = _own_saved_roster(conn, manager, league_key)
+    if roster is None:
+        print("No roster saved yet - run `ppilot season run` (or `season today`) first.")
+        return 1
+    day = args.date or cli_support.today_str()
+    week = week_for(runtime, day)
+    if week is None:
+        print(f"{day} is not in a week of this league's season.")
+        return 1
+    season = runtime.nhl_season
+    train = _train_seasons(season)
+    values = build_value_model(conn, season, train, manager.league)
+    goalies = TrailingStartShareSource(conn, season, fallback_season=train[0])
+    rates = values.rates(manager.league.all_cats, day)
+    rivals = rival_rosters(conn, league_key, roster.team_key, day)
+    outlook = build_outlook(
+        conn, runtime, manager.league, week, roster, rivals, rates, goalies, values, 1.0
+    )
+    games = expected_starts(conn, runtime, typical_week(runtime, week), roster.players, goalies,
+                            values)  # fmt: skip
+    lines = category_plan.build(
+        category_plan.records(conn, runtime, manager.league, roster.team_key),
+        manager.league,
+        outlook.leverage if outlook else None,
+        category_plan.starter_weeks(games, rates, [c.key for c in manager.league.all_cats]),
+        outlook.weeks if outlook else 0,
+        category_plan.pins(conn, manager.name, league_key),
+    )
+    print(category_plan.text(lines, manager.authority.transactions.season_weight))
+    return 0
+
+
 def _own_saved_roster(conn, manager, league_key: str):
     """This manager's own roster as last saved - the league read saves every
     team's, so the team is the one his runs acted for."""
@@ -3349,6 +3408,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s_starters.add_argument("--since", default="", help="with --check: from this date")
     s_starters.set_defaults(func=_cmd_season_starters)
+
+    s_plan = season_sub.add_parser(
+        "plan",
+        parents=[seasonal],
+        help="The season's category plan: each category's record, all-play and stance",
+    )
+    s_plan.add_argument(
+        "--set",
+        action="append",
+        metavar="CAT=STANCE",
+        help="pin a stance: chase, hold, concede, or auto to unpin (e.g. A=chase); repeatable",
+    )
+    s_plan.set_defaults(func=_cmd_season_plan)
 
     s_moves = season_sub.add_parser(
         "moves",

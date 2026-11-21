@@ -125,10 +125,13 @@ def build_outlook(
     values,
     weight: float,
     model=None,
+    tilt: dict[str, float] | None = None,
 ) -> SeasonOutlook | None:
     """The season outlook for `ours` against `rivals` (their current rosters).
 
-    None when there is nothing to judge: no week left, or no rival read.
+    `tilt` weights a category's leverage (`category_plan.tilt`: a manager's
+    pinned stance); absent = 1. None when there is nothing to judge: no week
+    left, or no rival read.
     """
     from puckpilot.season import odds as odds_mod
     from puckpilot.season.week import _skaters_only, expected_starts
@@ -160,7 +163,7 @@ def build_outlook(
         for pid, p in source.starts(d).items():
             seen.setdefault(pid, []).append(float(p))
     return SeasonOutlook(
-        leverage={k: v / len(rivals) for k, v in total.items()},
+        leverage={k: v / len(rivals) * (tilt or {}).get(k, 1.0) for k, v in total.items()},
         rest_games=_club_games(conn, runtime, days),
         goalie_share={pid: sum(ps) / len(ps) for pid, ps in seen.items() if ps},
         rivals=len(rivals),

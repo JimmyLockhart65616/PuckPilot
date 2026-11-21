@@ -305,6 +305,18 @@ CREATE TABLE IF NOT EXISTS player_tiers (
     PRIMARY KEY (manager, league_key, player_key)
 );
 
+-- The season's category plan (`season.category_plan`): a stance a manager
+-- pinned on a category - chase, hold or concede. No row is the proposal.
+CREATE TABLE IF NOT EXISTS category_plan (
+    manager    TEXT NOT NULL,
+    league_key TEXT NOT NULL,
+    category   TEXT NOT NULL,
+    stance     TEXT NOT NULL,
+    set_at     TEXT NOT NULL,
+    set_via    TEXT NOT NULL,
+    PRIMARY KEY (manager, league_key, category)
+);
+
 -- Announced starting goalies (`season.starters`): every goalie of one read, a
 -- call (1 start / 0 sit) or none yet (NULL), kept per read so how early and
 -- how right the calls are is measured from what was seen and when.

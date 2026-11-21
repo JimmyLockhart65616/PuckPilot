@@ -303,14 +303,18 @@ def season_terms(conn, manager, league_key: str, ours, day: str) -> dict:
     """The season-horizon arguments for `build_week_plan` (`season.outlook`).
 
     Off (nothing) unless `season_weight` > 0. The rivals are every other team
-    in the league as last saved by the league feed (week-start rosters).
+    in the league as last saved by the league feed (week-start rosters); the
+    tilt is the manager's pinned category stances (`season.category_plan`).
     """
     weight = float(getattr(manager.authority.transactions, "season_weight", 0.0) or 0.0)
     if weight <= 0 or ours is None:
         return {}
+    from puckpilot.season import category_plan
+
     return {
         "season_rivals": rival_rosters(conn, league_key, ours.team_key, day),
         "season_weight": weight,
+        "season_tilt": category_plan.tilt(category_plan.pins(conn, manager.name, league_key)),
     }
 
 

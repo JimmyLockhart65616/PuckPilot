@@ -100,3 +100,24 @@ def test_parse_arm_reads_a_season_weight():
 
     assert parse_arm("odds-daily-c50").season_weight == 0.5
     assert parse_arm("odds-daily").season_weight == 0.0
+
+
+def test_a_pinned_stance_weights_its_categorys_season_leverage(monkeypatch):
+    from puckpilot.season import odds, outlook
+    from puckpilot.season import week as weekmod
+
+    monkeypatch.setattr(odds, "leverage", lambda *a, **k: {"assists": 0.2, "ppp": 0.1})
+    monkeypatch.setattr(weekmod, "expected_starts", lambda *a, **k: {})
+    monkeypatch.setattr(outlook, "_club_games", lambda *a: {})
+    weeks = [_week(1, "a1", "a7"), _week(2, "b1", "b7")]
+    rt = SimpleNamespace(weeks=weeks, playoff_start_week=0)
+    league = SimpleNamespace(all_cats=())
+    ours = SimpleNamespace(team_key="us", players=())
+    rival = SimpleNamespace(team_key="r", players=())
+    plain = outlook.build_outlook(None, rt, league, weeks[0], ours, [rival], {}, None, None, 1.0)
+    tilted = outlook.build_outlook(
+        None, rt, league, weeks[0], ours, [rival], {}, None, None, 1.0,
+        tilt={"assists": 1.5, "ppp": 0.0},
+    )  # fmt: skip
+    assert plain.leverage == {"assists": 0.2, "ppp": 0.1}
+    assert tilted.leverage == {"assists": pytest.approx(0.3), "ppp": 0.0}
