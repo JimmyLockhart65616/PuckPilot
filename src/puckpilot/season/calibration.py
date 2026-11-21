@@ -151,10 +151,13 @@ def build_cases(
     progress: Callable[[str], None] | None = None,
     goalies: str = "",
     rates_mode: str = "pre",
+    goalie_count: str = "top",
 ) -> list[Case]:
     """Every matchup-morning of one replayed season, with how its week ended.
 
     `goalies` is the starting-goalie model, as `goalies.parse_spec` reads it.
+    `goalie_count` is how a night's goalie starts are counted
+    (`goalie_count.GOALIE_COUNTS`); the replay's lineups play "top".
     `rates_mode` "form" forecasts each morning with per-category rates that have
     seen the season so far (`season.form`); "pre" with the preseason rates.
     """
@@ -169,8 +172,12 @@ def build_cases(
         projected_pg_values,
         skater_availability,
     )
+    from puckpilot.season.goalie_count import GOALIE_COUNTS, counted_starts
     from puckpilot.season.goalies import AsOfGoalieSource, trailing_model
-    from puckpilot.season.replay import _week_day_ranges
+    from puckpilot.season.replay import _week_day_ranges, team_by_day
+
+    if goalie_count not in GOALIE_COUNTS:
+        raise ValueError(f"goalie_count must be one of {GOALIE_COUNTS}, not {goalie_count!r}")
     from puckpilot.season.week import per_game_rates
 
     say = progress or (lambda _m: None)
@@ -214,6 +221,9 @@ def build_cases(
     avail = drop_known_absences(skater_availability(conn, season, data, all_pids), played)
     policy = trailing_model(conn, season, train_seasons[0], goalies)
     g_slots = sum(n for pos, n in shape.slots if pos == "G")
+    no_club = [""] * len(data.dates)
+    # Clubs matter only to the "min" count (two goalies of one club never both start).
+    clubs = team_by_day(conn, season, data, all_pids) if goalie_count == "min" else {}
 
     # Each team's season as the policy plays it: who started each day, and the
     # real line each of them produced.
@@ -263,16 +273,18 @@ def build_cases(
             if key not in frozen_cache:
                 frozen_cache[key] = AsOfGoalieSource(policy, cutoff).starts(data.dates[i])
             p = frozen_cache[key]
-            gs = sorted(
-                (
-                    (p.get(pid, 0.0) * pg_value.get(pid, 0.0), p.get(pid, 0.0), pid)
+            gs = counted_starts(
+                [
+                    (pg_value.get(pid, 0.0), p[pid], pid, (clubs.get(pid) or no_club)[i])
                     for pid in rosters[t]
                     if positions.get(pid) == "G" and p.get(pid, 0.0) > 0
-                ),
-                reverse=True,
-            )[:g_slots]
-            for _, ps, pid in gs:
-                goalie_games.setdefault(pid, []).append(ps)
+                ],
+                g_slots,
+                goalie_count,
+            )
+            for pid, ps in gs.items():
+                if ps > 0:
+                    goalie_games.setdefault(pid, []).append(ps)
         return skater_games, goalie_games
 
     def side_of(t, banked, skater_games, goalie_games, at: str) -> Side:

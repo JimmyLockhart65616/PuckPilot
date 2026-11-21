@@ -438,7 +438,7 @@ def build(
     """Every final team-week projected as of its first morning, against the result.
 
     `goalie_count` is how both sides' goalie starts are counted
-    (`week.GOALIE_COUNTS`)."""
+    (`goalie_count.GOALIE_COUNTS`)."""
     from puckpilot.draft.sim import build_universe
     from puckpilot.season.add_gate import AsOfValues
     from puckpilot.season.goalies import AsOfGoalieSource, TrailingStartShareSource

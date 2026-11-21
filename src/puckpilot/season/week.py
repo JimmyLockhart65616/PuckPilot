@@ -34,6 +34,7 @@ from puckpilot.engine.lineup import optimize_lineup
 from puckpilot.league import LeagueConfig
 from puckpilot.season import calendar, legality, tiers
 from puckpilot.season.add_story import SECTIONS, SeasonLeft, games_left, share_of
+from puckpilot.season.goalie_count import GOALIE_COUNTS, counted_starts
 from puckpilot.season.pool import PoolPlayer
 from puckpilot.season.roster import RosterPlayer, TeamRoster
 from puckpilot.season.settings import LeagueRuntime, Week
@@ -511,43 +512,6 @@ def banked_components(by_label: dict[str, float]) -> dict[str, float]:
     return out
 
 
-# How a roster's goalie starts are counted on a night with more goalies than G
-# slots. "top" (as first built): the slots' worth with the most expected value
-# each count their whole P(start), and the rest nothing - a lineup set in the
-# morning by P(start) and left. "min": every goalie counts for the chance that
-# he starts AND a slot is free of better goalies who start - the lineup of a
-# manager who plays whoever is confirmed, so a night's count is
-# E[min(slots, goalies starting)]. Measured live (`season g3`, weeks 1-7 of
-# 2026-27, 84 team-weeks): rosters averaged 4.52 countable starts a week
-# against 3.97 counted by "top".
-GOALIE_COUNTS = ("top", "min")
-
-
-def slot_chances(goalies: list[tuple[float, float, int, str]], slots: int) -> dict[int, float]:
-    """pid -> P(he starts and is in a G slot), for (value, P(start), pid, club).
-
-    A goalie is in a slot when fewer than `slots` goalies worth more than him
-    start. Two goalies of one club cannot both start, so a club's better
-    goalies count as one chance, and his own club-mates not at all - if he
-    starts, they do not. The values sum to E[min(slots, clubs starting)].
-    """
-    from puckpilot.season.odds import trials_pmf
-
-    order = sorted(goalies, key=lambda g: (-g[0], g[2]))
-    out: dict[int, float] = {}
-    for i, (_v, p, pid, club) in enumerate(order):
-        if p <= 0 or slots <= 0:
-            continue
-        ahead: dict[str, float] = {}
-        for _v2, p2, _pid2, club2 in order[:i]:
-            if club2 != club and p2 > 0:
-                ahead[club2] = min(ahead.get(club2, 0.0) + p2, 1.0)
-        free = float(trials_pmf(list(ahead.values()))[:slots].sum()) if ahead else 1.0
-        if free > 0:
-            out[pid] = p * free
-    return out
-
-
 def expected_starts(
     conn: sqlite3.Connection,
     runtime: LeagueRuntime,
@@ -600,7 +564,6 @@ def expected_starts(
         p_starts = goalie_source.starts(day) if goalie_source else {}
         cands = []
         goalies = []
-        clubs: dict[int, tuple[float, str]] = {}
         for p in players:
             pid = p.nhl_player_id
             if pid is None or getattr(p, "is_out", False) or p.team not in playing:
@@ -609,20 +572,12 @@ def expected_starts(
                 continue
             v = values.per_game_tilted(pid, day, weights) if weights else values.per_game(pid, day)
             if p.position == "G":
-                p_start = float(p_starts.get(pid, 0.0))
-                goalies.append((p_start * v, p_start, pid))
-                clubs[pid] = (v, p.team)
+                goalies.append((v, float(p_starts.get(pid, 0.0)), pid, p.team))
                 continue
             cands.append((pid, p.eligible, v))
-        goalies.sort(reverse=True)
-        if goalie_count == "min":
-            counted = slot_chances(
-                [(clubs[pid][0], p_start, pid, clubs[pid][1]) for _, p_start, pid in goalies],
-                g_slots,
-            )
-        else:
-            counted = {pid: p_start for _, p_start, pid in goalies[:g_slots]}
-        for _, _p, pid in goalies:
+        counted = counted_starts(goalies, g_slots, goalie_count)
+        ranked = sorted(((p * v, p, pid) for v, p, pid, _ in goalies), reverse=True)
+        for _, _p, pid in ranked:
             if pid not in counted:
                 continue
             chance = counted[pid]
@@ -634,7 +589,7 @@ def expected_starts(
             out[pid] = out.get(pid, 0.0) + 1.0
         if benched is not None:
             sat = sum(1 for pid, _, _ in cands if pid not in slotted) + sum(
-                1 for _, p_start, _ in goalies[g_slots:] if p_start >= BENCH_START
+                1 for _, p_start, _ in ranked[g_slots:] if p_start >= BENCH_START
             )
             if sat:
                 benched[day] = sat

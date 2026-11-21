@@ -391,6 +391,7 @@ def add_gate_report(
     rivals: str = "frozen",
     rival_rate: float = 0.0,
     rival_goalie_share: float = 0.0,
+    their_goalie_count: str = "top",
 ) -> AddGateReport:
     from puckpilot.draft.engine import RosterValuePolicy
     from puckpilot.draft.h2h import round_robin_schedule
@@ -404,6 +405,10 @@ def add_gate_report(
         skater_availability,
     )
     from puckpilot.season.form import FormRates, Usage
+    from puckpilot.season.goalie_count import GOALIE_COUNTS, counted_starts
+
+    if their_goalie_count not in GOALIE_COUNTS:
+        raise ValueError(f"their_goalie_count must be one of {GOALIE_COUNTS}")
     from puckpilot.season.goalies import (
         AsOfGoalieSource,
         GoalieWorkload,
@@ -549,10 +554,19 @@ def add_gate_report(
 
     rates = per_game_rates(u.frame, cats)
     g_slots = sum(n for pos, n in shape.slots if pos == "G")
+    no_club = [""] * len(data.dates)
     model = OddsModel()
 
     def projected_side(
-        roster, banked_sk, banked_g, rest, cutoff, tonight_too=True, line_rates=None, pol=None
+        roster,
+        banked_sk,
+        banked_g,
+        rest,
+        cutoff,
+        tonight_too=True,
+        line_rates=None,
+        pol=None,
+        count="top",
     ):
         """Banked totals plus the as-of projection of `rest` (date indices)."""
         line_rates = line_rates if line_rates is not None else rates
@@ -566,15 +580,18 @@ def add_gate_report(
             if not tonight_too and j == rest[0]:
                 continue
             p = frozen.starts(data.dates[j])
-            gs = sorted(
-                (
-                    (p.get(pid, 0.0) * pg_value.get(pid, 0.0), p.get(pid, 0.0), pid)
+            gs = counted_starts(
+                [
+                    (pg_value.get(pid, 0.0), p[pid], pid, (teams.get(pid) or no_club)[j])
                     for pid in roster
                     if positions.get(pid) == "G" and p.get(pid, 0.0) > 0
-                ),
-                reverse=True,
-            )[:g_slots]
-            goalies += [goalie_game(line_rates.get(pid) or {}, ps) for _, ps, pid in gs]
+                ],
+                g_slots,
+                count,
+            )
+            goalies += [
+                goalie_game(line_rates.get(pid) or {}, ps) for pid, ps in gs.items() if ps > 0
+            ]
         return Side(
             banked=_components(banked_sk, banked_g, skater_keys), skaters=skaters, goalies=goalies
         )
@@ -601,6 +618,7 @@ def add_gate_report(
             g_day[opp, opp_done].sum(0) if opp_done else zero_g,
             rest,
             date,
+            count=their_goalie_count,
         )
         p = policy.starts(date)
         tonight = {
@@ -635,6 +653,7 @@ def add_gate_report(
             date,
             line_rates=line_rates,
             pol=pol,
+            count=their_goalie_count,
         )
         lev = leverage(model, cats, ours, theirs)
         cands = [
@@ -944,6 +963,7 @@ def add_gate_report(
                                 screen=spec.screen,
                                 drop_choice=spec.drops,
                                 goalie_lane=spec.lane,
+                                their_goalie_count=their_goalie_count,
                                 goalie_floor=_floor(spec, runtime),
                                 goalie_minimum=(
                                     runtime.min_goalie_games(nw.number) if spec.minimum else 0
@@ -1036,6 +1056,7 @@ def add_gate_report(
                             screen=spec.screen,
                             drop_choice=spec.drops,
                             goalie_lane=spec.lane,
+                            their_goalie_count=their_goalie_count,
                             goalie_floor=_floor(spec, runtime),
                             goalie_minimum=(
                                 runtime.min_goalie_games(w.number) if spec.minimum else 0
@@ -1086,6 +1107,7 @@ def add_gate_report(
                                 measure_room=False,
                                 workload=wl,
                                 form_rates=spec.form_rates,
+                                their_goalie_count=their_goalie_count,
                                 goalie_minimum=(
                                     runtime.min_goalie_games(weeks[nxt_wi].number)
                                     if spec.minimum

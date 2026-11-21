@@ -3235,7 +3235,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--goalie-count",
         default="top",
         choices=("top", "min"),
-        help="how both sides' goalie starts are counted (week.GOALIE_COUNTS)",
+        help="how both sides' goalie starts are counted (goalie_count.GOALIE_COUNTS)",
     )
     s_g3.set_defaults(func=_cmd_season_g3)
 

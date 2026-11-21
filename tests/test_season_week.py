@@ -1550,7 +1550,7 @@ def test_the_goalie_floor_setting_reads_the_league_and_refuses_nonsense():
 
 
 def test_slot_chances_sum_to_the_expected_slots_filled():
-    from puckpilot.season.week import slot_chances
+    from puckpilot.season.goalie_count import slot_chances
 
     # Three goalies of three clubs, each a coin flip, two G slots: the better
     # two always have a slot; the third needs one of them to sit.
