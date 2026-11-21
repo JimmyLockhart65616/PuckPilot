@@ -2169,10 +2169,28 @@ def _cmd_season_add_gate(args: argparse.Namespace) -> int:
             rivals=args.rivals,
             rival_rate=args.rival_rate,
             rival_goalie_share=args.rival_goalie_share,
+            rival_goalies=args.rival_goalies,
+            rival_goalie_rate=args.rival_goalie_rate,
         )
         print()
         print(report.text)
+        if args.realism:
+            print()
+            print(_realism(report))
     return 0
+
+
+def _realism(report) -> str:
+    """The replay's league beside the live one (season/realism.py)."""
+    from puckpilot.season import cli_support, realism
+
+    try:
+        manager = cli_support.resolve_manager(None)
+        conn = cli_support.open_db(manager)
+        runtime = cli_support.load_rules(conn, cli_support.resolve_league_key(conn, manager))
+    except Exception as e:  # noqa: BLE001 - the gate's own result still stands
+        return f"Realism: no live league to compare with ({type(e).__name__}: {e})"
+    return realism.text(report.profile, realism.live_profile(conn, runtime), report.season)
 
 
 def _cmd_season_goalie_check(args: argparse.Namespace) -> int:
@@ -3270,7 +3288,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s_ag.add_argument(
         "--rivals",
-        choices=("frozen", "stream"),
+        choices=("frozen", "stream", "depth"),
         default="frozen",
         help="frozen: nobody else picks anyone up; stream: every other team adds at "
         "--rival-rate a week (measure it with `season league`)",
@@ -3278,6 +3296,20 @@ def build_parser() -> argparse.ArgumentParser:
     s_ag.add_argument("--rival-rate", type=float, default=0.0, help="adds per team a week")
     s_ag.add_argument(
         "--rival-goalie-share", type=float, default=0.0, help="share of rival adds that are goalies"
+    )
+    s_ag.add_argument(
+        "--rival-goalies", type=int, default=0, help="depth: goalies every rival keeps at least"
+    )
+    s_ag.add_argument(
+        "--rival-goalie-rate",
+        type=float,
+        default=0.0,
+        help="depth: in-week goalie streams a rival makes a week",
+    )
+    s_ag.add_argument(
+        "--realism",
+        action="store_true",
+        help="also set the replay league's team-weeks beside the live league's",
     )
     s_ag.add_argument("--verbose", action="store_true")
     s_ag.set_defaults(func=_cmd_season_add_gate)

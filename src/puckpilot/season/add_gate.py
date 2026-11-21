@@ -119,7 +119,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -129,7 +129,11 @@ from puckpilot.season.calibration import _components, _result, drop_known_absenc
 
 ARMS = ("none", "share-weekly", "share-daily", "odds-weekly", "odds-daily", "goalie-odds")
 # How the other teams behave in the replay (`add_gate_report(rivals=...)`).
-RIVALS = ("frozen", "stream")
+# "depth" streams like "stream" and also plays goalies as the live league
+# does: every rival keeps at least `rival_goalies`, and swaps a goalie for the
+# free agent likeliest to start tonight at `rival_goalie_rate` a team-week,
+# any day of the week - where "stream" adds only on a week's first morning.
+RIVALS = ("frozen", "stream", "depth")
 
 
 @dataclass
@@ -369,6 +373,9 @@ class AddGateReport:
     arms: dict[str, list[float]]  # arm -> categories won, per tested team-week
     adds: dict[str, int]  # arm -> acquisitions made
     text: str
+    # The replay league's team-weeks, for `season.realism` to set beside the
+    # live league's: key -> one value per team-week.
+    profile: dict[str, list[float]] = field(default_factory=dict)
 
     def mean(self, arm: str) -> float:
         v = self.arms[arm]
@@ -402,6 +409,8 @@ def add_gate_report(
     rival_rate: float = 0.0,
     rival_goalie_share: float = 0.0,
     their_goalie_count: str = "top",
+    rival_goalies: int = 0,
+    rival_goalie_rate: float = 0.0,
 ) -> AddGateReport:
     from puckpilot.draft.engine import RosterValuePolicy
     from puckpilot.draft.h2h import round_robin_schedule
@@ -718,6 +727,7 @@ def add_gate_report(
             plays_on.setdefault(index[r[0]], set()).update((r[1], r[2]))
 
     rival_adds = [0]  # adds the streaming rivals made, all season
+    rival_goalie_adds: dict[tuple[int, int], int] = {}  # (team, week) -> goalies added
 
     def streamed() -> list[list[tuple[int, ...]]]:
         """Every team's roster on every day: the drafted one, changed by the
@@ -727,8 +737,54 @@ def add_gate_report(
         firsts = {week_days[w.number][0]: w for w in weeks if week_days.get(w.number)}
         srng = np.random.default_rng([seed, 4099])
         cap = runtime.max_weekly_adds or 99
-        live = rivals == "stream" and rival_rate > 0
+        live = rivals in ("stream", "depth") and rival_rate > 0
+        depth = rivals == "depth"
+        week_of = {j: w.number for w in weeks for j in week_days.get(w.number, ())}
+
+        def goalie_swap(t: int, i: int, drop_skater: bool) -> None:
+            """Rival t takes the free-agent goalie likeliest to start over the
+            week's days left, for its least likely goalie (or its least
+            valuable bottom-half skater, when short of goalies)."""
+            left = [j for j in week_days.get(week_of.get(i, -1), ()) if j >= i]
+            if not left:
+                return
+            asof = AsOfGoalieSource(policy, data.dates[i])
+            p = {j: asof.starts(data.dates[j]) for j in left}
+
+            def starts(pid: int) -> float:
+                return sum(p[j].get(pid, 0.0) for j in left)
+
+            held = {q for r in cur for q in r}
+            free = [q for q in everyone if positions.get(q) == "G" and q not in held]
+            if not free:
+                return
+            best = max(free, key=starts)
+            if drop_skater:
+                mine = sorted(
+                    (q for q in cur[t] if positions.get(q) != "G"),
+                    key=lambda q: pg_value.get(q, 0.0),
+                )
+                out = mine[0] if mine else None
+            else:
+                mine = [q for q in cur[t] if positions.get(q) == "G"]
+                out = min(mine, key=starts) if mine else None
+                if out is not None and starts(best) <= starts(out):
+                    return
+            if out is None or starts(best) <= 0:
+                return
+            cur[t][cur[t].index(out)] = best
+            rival_adds[0] += 1
+            key = (t, week_of.get(i, -1))
+            rival_goalie_adds[key] = rival_goalie_adds.get(key, 0) + 1
+
         for i in range(n_days):
+            if depth:
+                for t in range(len(cur)):
+                    n_g = sum(1 for q in cur[t] if positions.get(q) == "G")
+                    if n_g < rival_goalies:
+                        goalie_swap(t, i, drop_skater=True)
+                    elif rival_goalie_rate > 0 and srng.random() < rival_goalie_rate / 7.0:
+                        goalie_swap(t, i, drop_skater=False)
             if live and i in firsts:
                 days = week_days[firsts[i].number]
                 held = {pid for r in cur for pid in r}
@@ -764,6 +820,9 @@ def add_gate_report(
                         pool.discard(best)
                         pool.add(drop)
                         rival_adds[0] += 1
+                        if goalie:
+                            key = (t, firsts[i].number)
+                            rival_goalie_adds[key] = rival_goalie_adds.get(key, 0) + 1
             for t in range(len(cur)):
                 out[t][i] = tuple(cur[t])
         return out
@@ -783,7 +842,7 @@ def add_gate_report(
     per = rival_adds[0] / max(len(rosters) * len(weeks), 1)
     say(
         f"{season}: league played ({rivals}"
-        + (f", {rival_adds[0]} rival adds, {per:.2f} a team-week" if rivals == "stream" else "")
+        + (f", {rival_adds[0]} rival adds, {per:.2f} a team-week" if rivals != "frozen" else "")
         + ")"
     )
 
@@ -1215,12 +1274,31 @@ def add_gate_report(
                 made[arm] = changed[0]
             say(f"{season}: team {t + 1}/{len(tested)} {arm}: {made[arm]} adds so far")
 
-    report = AddGateReport(season=season, arms=results, adds=made, text="")
+    from puckpilot.draft.replay import G_GA, G_SA, G_WINS
+
+    profile: dict[str, list[float]] = {k: [] for k in (
+        "goalies held", "goalie appearances", "saves", "wins", "goalie adds")}  # fmt: skip
+    for t in range(len(rosters)):
+        for w in weeks:
+            days = week_days.get(w.number) or []
+            if not days:
+                continue
+            first = day_rosters[t][days[0]]
+            profile["goalies held"].append(sum(1 for q in first if positions.get(q) == "G"))
+            profile["goalie appearances"].append(float(apps_day[t, days].sum()))
+            g = g_day[t, days].sum(0)
+            profile["saves"].append(float(g[G_SA] - g[G_GA]))
+            profile["wins"].append(float(g[G_WINS]))
+            profile["goalie adds"].append(float(rival_goalie_adds.get((t, w.number), 0)))
+    report = AddGateReport(season=season, arms=results, adds=made, text="", profile=profile)
     lines = [
         f"G2 (adds) - {season}: {len(tested)} teams tested x {len(weeks)} weeks, rivals "
         + (
             f"stream ({rival_rate:g} adds/week, {rival_goalie_share:.0%} goalies)"
             if rivals == "stream"
+            else f"depth ({rival_rate:g} adds/week, {rival_goalie_share:.0%} goalies; "
+            f"{rival_goalies} goalies kept, {rival_goalie_rate:g} goalie streams/week)"
+            if rivals == "depth"
             else "frozen"
         ),
         "",
