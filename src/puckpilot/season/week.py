@@ -1662,6 +1662,7 @@ def _targets(
             detail = dict(best.detail)
             detail["week"] = [notes[_pair_key(best)], *detail.get("week", [])]
             best = replace(best, detail=detail)
+        best = _season_noted(best, outlook)
         chosen.append(best)
         # Make it, and price the next one against the roster it leaves.
         if best.drop is None:
@@ -1777,6 +1778,7 @@ def _reprice(
             detail = dict(t.detail)
             detail["week"] = [_planned(days[k], drop).capitalize(), *detail.get("week", [])]
             t = replace(t, detail=detail)
+        t = _season_noted(t, outlook)
         kept.append(t)
         base_players = after_week[0]
         base_starts, base_totals, base_odds = evaluate(base_players)
@@ -2032,6 +2034,20 @@ def _with_season(t: AddTarget, outlook, conn, runtime, days, rates):
     return replace(
         t, week_gain=t.gain, season_gain=season, gain=t.gain + extra, score=t.score + extra
     )
+
+
+def _season_noted(t: AddTarget, outlook) -> AddTarget:
+    """`t` with its price's two parts said on the card, when it has them."""
+    if t.season_gain is None or t.week_gain is None or outlook is None:
+        return t
+    detail = dict(t.detail)
+    detail["week"] = [
+        f"Priced {t.gain:+.2f}: this week {t.week_gain:+.2f}, and over the rest of the season "
+        f"{t.season_gain:+.2f} categories against every rival's roster, counted at "
+        f"{outlook.weight:g}",
+        *detail.get("week", []),
+    ]
+    return replace(t, detail=detail)
 
 
 def _near_misses(misses, chosen, limit: int = 5) -> tuple[AddTarget, ...]:

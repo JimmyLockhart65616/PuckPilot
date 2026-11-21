@@ -121,3 +121,24 @@ def test_a_pinned_stance_weights_its_categorys_season_leverage(monkeypatch):
     )  # fmt: skip
     assert plain.leverage == {"assists": 0.2, "ppp": 0.1}
     assert tilted.leverage == {"assists": pytest.approx(0.3), "ppp": 0.0}
+
+
+def test_a_card_says_both_parts_of_a_season_price():
+    from puckpilot.season.week import AddTarget, _season_noted
+
+    t = AddTarget(
+        player=_p(1, "AAA"), starts=3.0, drop_starts=0.0, deltas={}, helps=(), drop=None,
+        score=0.5, timing="", gain=0.5, week_gain=0.2, season_gain=0.6,
+        detail={"week": ["Starts 3 of 3"]},
+    )  # fmt: skip
+    got = _season_noted(t, _outlook())
+    assert got.detail["week"][0].startswith("Priced +0.50: this week +0.20, and over the rest")
+    assert "+0.60 categories" in got.detail["week"][0] and got.detail["week"][1] == "Starts 3 of 3"
+    plain = replace_gain(t)
+    assert _season_noted(plain, _outlook()) is plain
+
+
+def replace_gain(t):
+    from dataclasses import replace
+
+    return replace(t, week_gain=None, season_gain=None)

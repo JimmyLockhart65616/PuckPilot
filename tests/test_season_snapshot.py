@@ -445,3 +445,23 @@ def test_the_plan_lists_this_week_s_approved_adds_not_yet_made(db):
     plan = snapshot.build(db, "jimmy", "999.l.1", "Home Team", week_plan=wp, roster=made)
     titles = [g["title"] for g in plan["week"]["plan"]["groups"]]
     assert "Approved, not made yet" not in titles
+
+
+def test_a_stance_from_the_page_is_pinned_in_the_managers_league(db):
+    from puckpilot.season import category_plan
+    from puckpilot.season.snapshot import apply_decisions
+
+    db.execute(
+        "INSERT INTO yahoo_roster_snapshots (manager, league_key, team_key, date, player_key,"
+        " name, selected_slot) VALUES ('jimmy', '999.l.1', 't', '2026-11-20', 'p', 'P', 'C')"
+    )
+    out = apply_decisions(
+        db,
+        [{"kind": "stance", "category": "saves", "label": "SV", "stance": "chase", "seq": 1},
+         {"kind": "stance", "category": "ppp", "stance": "tank", "seq": 2}],
+        manager="jimmy",
+    )  # fmt: skip
+    assert out[0] == "SV: pinned chase" and out[1].startswith("could not apply stance")
+    assert category_plan.pins(db, "jimmy", "999.l.1") == {"saves": category_plan.Stance.CHASE}
+    apply_decisions(db, [{"kind": "stance", "category": "saves", "stance": "auto"}], "jimmy")
+    assert category_plan.pins(db, "jimmy", "999.l.1") == {}

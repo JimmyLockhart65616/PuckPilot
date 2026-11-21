@@ -1725,10 +1725,8 @@ def _cmd_season_plan(args: argparse.Namespace) -> int:
     from puckpilot.season import category_plan, cli_support
     from puckpilot.season.goalies import TrailingStartShareSource
     from puckpilot.season.manager import ManagerError
-    from puckpilot.season.outlook import build_outlook, typical_week
-    from puckpilot.season.run import _train_seasons, rival_rosters, week_for
+    from puckpilot.season.run import _train_seasons, week_for
     from puckpilot.season.values import build_value_model
-    from puckpilot.season.week import expected_starts
 
     try:
         manager, conn, league_key, _ = _season_setup(args)
@@ -1759,20 +1757,8 @@ def _cmd_season_plan(args: argparse.Namespace) -> int:
     train = _train_seasons(season)
     values = build_value_model(conn, season, train, manager.league)
     goalies = TrailingStartShareSource(conn, season, fallback_season=train[0])
-    rates = values.rates(manager.league.all_cats, day)
-    rivals = rival_rosters(conn, league_key, roster.team_key, day)
-    outlook = build_outlook(
-        conn, runtime, manager.league, week, roster, rivals, rates, goalies, values, 1.0
-    )
-    games = expected_starts(conn, runtime, typical_week(runtime, week), roster.players, goalies,
-                            values)  # fmt: skip
-    lines = category_plan.build(
-        category_plan.records(conn, runtime, manager.league, roster.team_key),
-        manager.league,
-        outlook.leverage if outlook else None,
-        category_plan.starter_weeks(games, rates, [c.key for c in manager.league.all_cats]),
-        outlook.weeks if outlook else 0,
-        category_plan.pins(conn, manager.name, league_key),
+    lines = category_plan.for_roster(
+        conn, runtime, manager.league, manager.name, roster, week, day, values, goalies
     )
     print(category_plan.text(lines, manager.authority.transactions.season_weight))
     return 0

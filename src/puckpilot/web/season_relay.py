@@ -71,6 +71,12 @@ MAX_PENDING_DECISIONS = 200
 TIER_LABELS = {"never": "Never", "upgrade": "Upgrade only", "rotation": "Rotation"}
 AUTO_TIER = "auto"
 
+# The category stances a manager can pin from the plan, and "auto" to go back
+# to the proposal. Mirrors `season.category_plan.Stance`; a contract test
+# holds the two together.
+STANCES = ("chase", "hold", "concede")
+AUTO_STANCE = "auto"
+
 BUILD_FILES = ("season_page.py", "season_relay.py", "wire.py")
 
 
@@ -282,6 +288,7 @@ class SeasonState:
                 "withdrawn": [],
                 "blockers": [],
                 "ledger": [],
+                "category_plan": None,
                 "build": served_build(),
             }
         age = time.time() - at
@@ -365,6 +372,40 @@ class SeasonState:
                     tier_source="you",
                     tier_why="set by you - used from PuckPilot's next run",
                 )
+            return out
+
+        return self._change(record)
+
+    def set_stance(self, manager: str, category: str, stance: str) -> dict:
+        """Queue a category stance from the plan, and show it at once.
+
+        Only a category of the plan this manager was last shown.
+        """
+        if stance != AUTO_STANCE and stance not in STANCES:
+            known = ", ".join([*STANCES, AUTO_STANCE])
+            raise ValueError(f"unknown stance {stance!r} (known: {known})")
+
+        def record() -> dict:
+            snap = self._snap.get(manager) or {}
+            plan = snap.get("category_plan") or {}
+            row = next((r for r in plan.get("categories", []) if r.get("key") == category), None)
+            if row is None:
+                raise ValueError("that category is not in the plan shown")
+            if len(self._decisions) >= MAX_PENDING_DECISIONS:
+                raise RuntimeError("too many undelivered decisions; is the local job running?")
+            self._seq += 1
+            out = {
+                "seq": self._seq,
+                "manager": manager,
+                "kind": "stance",
+                "category": category,
+                "label": row.get("label", category),
+                "stance": stance,
+                "at": time.time(),
+            }
+            self._decisions.append(out)
+            # Shown as set until the next push, which says what the run made of it.
+            row["pinned"] = None if stance == AUTO_STANCE else stance
             return out
 
         return self._change(record)
@@ -520,6 +561,17 @@ def make_handler(state: SeasonState, keys: dict[str, str]):
                 try:
                     row = state.set_tier(
                         manager, str(body.get("player") or ""), str(body.get("tier") or "")
+                    )
+                except (TypeError, ValueError) as e:
+                    self._refuse(400, str(e))
+                except RuntimeError as e:
+                    self._refuse(503, str(e))
+                else:
+                    self._send(200, wire.dumps({"ok": True, "seq": row["seq"]}), "application/json")
+            elif route == "/stance":
+                try:
+                    row = state.set_stance(
+                        manager, str(body.get("category") or ""), str(body.get("stance") or "")
                     )
                 except (TypeError, ValueError) as e:
                     self._refuse(400, str(e))

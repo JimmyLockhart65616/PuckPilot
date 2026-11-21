@@ -816,3 +816,37 @@ def test_a_card_made_unless_stopped_leads_with_its_time_and_a_stop():
          "body": {"kind": "proposal", "id": 31, "approve": False, "executes": True}}
     ]  # fmt: skip
     assert "Stopped \u2013 PuckPilot will not make it." in out["after"]
+
+
+def test_the_season_plan_shows_each_categorys_numbers_and_takes_a_stance():
+    """Per category: its record, all-play and what a starter buys, beside its
+    stance; what a stance does is said once; a tap opens the choice in the row
+    and sends it home."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "category_plan": {
+                "weeks_left": 15,
+                "season_weight": 0.0,
+                "categories": [
+                    {"key": "saves", "label": "SV", "record": "1-6-0", "all_play": 0.14,
+                     "buys": 5.0, "proposed": "chase", "pinned": None},
+                    {"key": "ppp", "label": "PPP", "record": "2-4-1", "all_play": 0.33,
+                     "buys": 0.74, "proposed": "concede", "pinned": "hold"},
+                    {"key": "save_pct", "label": "SV%", "record": "2-5-0", "all_play": None,
+                     "buys": None, "proposed": "hold", "pinned": None},
+                ],
+            },
+        },
+    )  # fmt: skip
+    out = run_page_and_tap(state.get("jimmy"), "Chase \u00b7 proposed")
+    assert_clean({"fresh": out["fresh"], "app": out["app"]})
+    page = out["app"]
+    assert "Season plan \u00b7 15 weeks left" in page
+    assert "1-6-0 \u00b7 all-play 14%" in page and "buys +5.00 categories" in page
+    assert "Hold \u00b7 yours" in page and "all-play \u2013" in page
+    assert page.count("Chase weighs a category 1.5x") == 1
+    assert "season weight is 0, so a stance changes no move yet" in page
+    assert "Chase Hold Concede Proposal (Chase)" in out["after"]

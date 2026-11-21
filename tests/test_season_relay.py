@@ -490,3 +490,45 @@ def test_the_blob_store_only_writes_over_what_it_read():
         assert store.load() == ({"seq": 2}, second)
     finally:
         server.shutdown()
+
+
+PLAN = {
+    "category_plan": {
+        "weeks_left": 15,
+        "season_weight": 0.0,
+        "categories": [
+            {"key": "saves", "label": "SV", "record": "1-6-0", "all_play": 0.14, "buys": 5.0,
+             "proposed": "chase", "pinned": None},
+        ],
+    }
+}  # fmt: skip
+
+
+def test_a_stance_set_on_the_plan_goes_home_once_and_shows_at_once(relay):
+    _, base = relay
+    call(base, "/push", "KEYJ", {"snapshot": PLAN})
+    assert call(base, "/stance", "KEYJ", {"category": "saves", "stance": "concede"})[0] == 200
+    row = json.loads(call(base, "/state", "KEYJ")[1])["category_plan"]["categories"][0]
+    assert row["pinned"] == "concede"
+    got = json.loads(call(base, "/decisions", "KEYJ")[1])["decisions"]
+    assert [(d["kind"], d["category"], d["stance"]) for d in got] == [
+        ("stance", "saves", "concede")
+    ]
+    assert json.loads(call(base, "/decisions", "KEYJ")[1])["decisions"] == []
+
+
+def test_a_stance_is_refused_for_an_unknown_category_or_stance(relay):
+    state, base = relay
+    call(base, "/push", "KEYJ", {"snapshot": PLAN})
+    for body in ({"category": "pim", "stance": "chase"}, {"category": "saves", "stance": "tank"}):
+        assert call(base, "/stance", "KEYJ", body)[0] == 400, body
+    assert state.drain("jimmy") == []
+    assert call(base, "/stance", "KEYJ", {"category": "saves", "stance": "auto"})[0] == 200
+
+
+def test_the_relay_stances_are_the_engine_stances_and_a_cold_relay_has_no_plan():
+    from puckpilot.season.category_plan import Stance
+    from puckpilot.web.season_relay import AUTO_STANCE, STANCES
+
+    assert tuple(s.value for s in Stance) == STANCES and AUTO_STANCE == "auto"
+    assert SeasonState().get("jimmy")["category_plan"] is None

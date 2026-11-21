@@ -737,6 +737,11 @@ def run_day(
 
     # 5. Publish whatever we managed to work out.
     if manager.page.publishes and page_key:
+        season_plan = _guard(
+            report,
+            "season plan",
+            lambda: _category_plan(conn, manager, runtime, day, roster, models),
+        )
 
         def _push():
             from puckpilot.season import standing
@@ -764,6 +769,7 @@ def run_day(
                 tiers=ctx.tiers,
                 player_stats=ctx.player_stats,
                 standing_on=manager.authority.standing.enabled,
+                category_plan=season_plan,
             )
             publish.push(manager.page.url, page_key, snap)
             # The window of each card it showed for the first time starts now.
@@ -897,6 +903,20 @@ def _protected_keepers(conn, manager_name: str) -> set[str]:
     if not row or not row[0]:
         return set()
     return {k.player_key for k in keeper_value.load(conn, manager_name, row[0]) if k.protected}
+
+
+def _category_plan(conn, manager, runtime, day: str, roster, models) -> dict | None:
+    """The season's category plan for the page (`season.category_plan`)."""
+    from puckpilot.season import category_plan
+
+    week = week_for(runtime, day)
+    if roster is None or models is None or week is None:
+        return None
+    values, goalies = models
+    lines = category_plan.for_roster(
+        conn, runtime, manager.league, manager.name, roster, week, day, values, goalies
+    )
+    return category_plan.payload(lines, manager.authority.transactions.season_weight)
 
 
 def _ledger(conn, manager, league_key: str, runtime, day: str, roster) -> list[dict]:

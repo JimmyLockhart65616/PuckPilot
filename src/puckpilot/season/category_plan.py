@@ -205,6 +205,51 @@ def text(lines: list[CategoryLine], weight: float) -> str:
     return "\n".join(out)
 
 
+def for_roster(conn, runtime, league, manager: str, roster, week, day: str, values, goalies):
+    """The plan's lines for `roster` as of `day`: records, the season outlook
+    against every rival's latest saved roster, and this manager's pins."""
+    from puckpilot.season.outlook import build_outlook, typical_week
+    from puckpilot.season.run import rival_rosters
+    from puckpilot.season.week import expected_starts
+
+    rates = values.rates(league.all_cats, day)
+    rivals = rival_rosters(conn, runtime.league_key, roster.team_key, day)
+    outlook = build_outlook(
+        conn, runtime, league, week, roster, rivals, rates, goalies, values, 1.0
+    )
+    games = expected_starts(
+        conn, runtime, typical_week(runtime, week), roster.players, goalies, values
+    )
+    return build(
+        records(conn, runtime, league, roster.team_key),
+        league,
+        outlook.leverage if outlook else None,
+        starter_weeks(games, rates, [c.key for c in league.all_cats]),
+        outlook.weeks if outlook else 0,
+        pins(conn, manager, runtime.league_key),
+    )
+
+
+def payload(lines: list[CategoryLine], weight: float) -> dict:
+    """The plan as the page draws it (`snapshot` key `category_plan`)."""
+    return {
+        "weeks_left": lines[0].weeks_left if lines else 0,
+        "season_weight": weight,
+        "categories": [
+            {
+                "key": ln.key,
+                "label": ln.label,
+                "record": f"{ln.won}-{ln.lost}-{ln.tied}",
+                "all_play": None if ln.all_play is None else round(ln.all_play, 3),
+                "buys": None if ln.per_spot is None else round(ln.per_spot, 2),
+                "proposed": ln.proposed.value,
+                "pinned": ln.pinned.value if ln.pinned else None,
+            }
+            for ln in lines
+        ],
+    }
+
+
 # -- pins --------------------------------------------------------------------
 
 

@@ -90,6 +90,8 @@ PAGE = """<!doctype html>
   .chip.tier-never { color:var(--bad); }
   .chip.tier-rotation { color:var(--ok); }
   .chip.tier-upgrade { color:var(--accent); }
+  .chip.stance-chase { color:var(--ok); }
+  .chip.stance-concede { color:var(--bad); }
   .tiers { padding:6px 0 2px; }
   .tiers .btns { flex-wrap:wrap; margin-top:6px; }
   .tiers button { flex:1 1 40%; padding:9px; font-size:14px; }
@@ -465,6 +467,98 @@ function renderRoster(root, rows) {
   });
 }
 
+// The season's category plan: per category its record, all-play share and
+// what one starter's worth of it buys over the weeks left - the numbers a
+// stance is set by, in the row. Tapped, the stance opens its choice there; it
+// goes back like an approval. What a stance does is said once, above the list.
+var STANCES = [['chase', 'Chase'], ['hold', 'Hold'], ['concede', 'Concede'], ['auto', 'Proposal']];
+var stanceOpen = {};
+var stanceSaved = {};
+
+function stanceName(v) {
+  var out = v;
+  STANCES.forEach(function (t) { if (t[0] === v) out = t[1]; });
+  return out;
+}
+
+function setStance(c, stance, box) {
+  Array.prototype.forEach.call(box.querySelectorAll('button'), function (b) { b.disabled = true; });
+  fetch(q('/stance'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ category: c.key, stance: stance })
+  }).then(function (resp) { return resp.json(); }).then(function (out) {
+    if (out.error) {
+      box.textContent = '';
+      box.appendChild(el('div', 'sub err', 'Failed: ' + out.error));
+      return;
+    }
+    stanceOpen[c.key] = false;
+    stanceSaved[c.key] = Date.now();
+    c.pinned = stance === 'auto' ? null : stance;
+    if (window.__s) render(window.__s);
+  }).catch(function () {
+    box.textContent = '';
+    box.appendChild(el('div', 'sub err', 'Could not reach the server.'));
+  });
+}
+
+function stanceChoices(c) {
+  var box = el('div', 'tiers');
+  var now = c.pinned || 'auto';
+  var btns = el('div', 'btns');
+  STANCES.forEach(function (t) {
+    var b = el('button', t[0] === now ? 'on' : null, t[0] === 'auto'
+      ? 'Proposal (' + stanceName(c.proposed) + ')' : t[1]);
+    b.onclick = function () { setStance(c, t[0], box); };
+    btns.appendChild(b);
+  });
+  box.appendChild(btns);
+  return box;
+}
+
+function pct(x) {
+  return x === null || x === undefined ? '–' : Math.round(x * 100) + '%';
+}
+
+function renderCategoryPlan(root, plan) {
+  if (!plan || !plan.categories || !plan.categories.length) return;
+  h2(root, 'Season plan · ' + plan.weeks_left + ' weeks left');
+  var c = card(root);
+  var w = plan.season_weight || 0;
+  c.appendChild(el('div', 'sub', 'All-play: of every other team’s week, the share yours ' +
+    'beat. Buys: one more median starter’s worth of it each week, in categories won over ' +
+    'the weeks left. Chase weighs a category 1.5x in a move’s season price, Hold 1x, ' +
+    'Concede not at all' + (w ? ' (season weight ' + w + ').'
+      : ' – the season weight is 0, so a stance changes no move yet.')));
+  var s = window.__s;
+  var pushed = s && s.age_seconds !== null && s.age_seconds !== undefined
+    ? (window.__fetched || Date.now()) - s.age_seconds * 1000 : 0;
+  plan.categories.forEach(function (x) {
+    var row = el('div', 'move');
+    row.appendChild(el('span', 'tag', x.label));
+    var n = el('span', 'name', x.record + ' · all-play ' + pct(x.all_play));
+    if (x.buys !== null && x.buys !== undefined) {
+      n.appendChild(el('div', 'sub', 'a starter’s week buys ' +
+        (x.buys >= 0 ? '+' : '') + x.buys.toFixed(2) + ' categories'));
+    }
+    if (stanceSaved[x.key] && stanceSaved[x.key] > pushed) {
+      n.appendChild(el('div', 'done', 'Saved – PuckPilot uses it from its next run.'));
+    }
+    if (stanceOpen[x.key]) n.appendChild(stanceChoices(x));
+    row.appendChild(n);
+    var now = x.pinned || x.proposed;
+    var chip = el('button', 'chip stance-' + now,
+      stanceName(now) + ' · ' + (x.pinned ? 'yours' : 'proposed'));
+    chip.onclick = function () {
+      stanceOpen[x.key] = !stanceOpen[x.key];
+      if (window.__s) render(window.__s);
+    };
+    row.appendChild(chip);
+    c.appendChild(row);
+  });
+}
+
 function render(s) {
   var fresh = document.getElementById('fresh');
   var next = s.next_local ? ' \\u00b7 next ' + s.next_local : '';
@@ -491,6 +585,7 @@ function render(s) {
   renderProtocol(app, s.protocol);
   renderWeek(app, s.week);
   renderLedger(app, s.ledger);
+  renderCategoryPlan(app, s.category_plan);
   renderRoster(app, s.roster);
 }
 

@@ -67,6 +67,7 @@ def build(
     tiers: dict | None = None,
     standing_on: bool = False,
     player_stats: dict | None = None,
+    category_plan: dict | None = None,
 ) -> dict[str, Any]:
     """Assemble one manager's view. Every part is optional but the shape is not.
 
@@ -119,6 +120,8 @@ def build(
         "blockers": list(blockers or []),
         # The moves made and what each did, against the player let go (ledger.py).
         "ledger": list(ledger or []),
+        # The season's category plan and the manager's stances (category_plan.py).
+        "category_plan": category_plan,
     }
     if next_run is not None:
         from datetime import UTC
@@ -536,6 +539,8 @@ def apply_decisions(
                 out.append(f"protocol #{p.id} (week {p.week}) {verb}")
             elif kind == "tier":
                 out.append(_apply_tier(conn, d, manager))
+            elif kind == "stance":
+                out.append(_apply_stance(conn, d, manager))
             elif kind == "proposal":
                 p = proposals_mod.decide(
                     conn,
@@ -554,6 +559,39 @@ def apply_decisions(
             what = f"{kind} #{ident}" if ident is not None else f"{kind} {d.get('player', '')}"
             out.append(f"could not apply {what}: {e}")
     return out
+
+
+def _apply_stance(conn: sqlite3.Connection, d: dict, manager: str = "") -> str:
+    """One category stance from the page: pin it, or ("auto") take it off.
+
+    The league is the one this manager's latest saved roster is in.
+    """
+    from datetime import UTC, datetime
+
+    from puckpilot.season import category_plan
+
+    manager = manager or str(d.get("manager") or "")
+    key = str(d.get("category") or "")
+    raw = str(d.get("stance") or "")
+    if raw != "auto" and raw not in {s.value for s in category_plan.Stance}:
+        raise ValueError(f"unknown stance {raw!r}")
+    row = conn.execute(
+        "SELECT league_key FROM yahoo_roster_snapshots WHERE manager = ? "
+        "ORDER BY date DESC LIMIT 1",
+        (manager,),
+    ).fetchone()
+    if not manager or not key or row is None:
+        raise ValueError(f"no league to set {key!r} in")
+    when = d.get("at")
+    at = (
+        datetime.fromtimestamp(float(when), UTC).isoformat(timespec="seconds")
+        if when is not None
+        else None
+    )
+    stance = None if raw == "auto" else category_plan.Stance(raw)
+    category_plan.pin(conn, manager, row[0], key, stance, via="page", at=at)
+    label = str(d.get("label") or key)
+    return f"{label}: " + (f"pinned {stance.value}" if stance else "back to the proposal")
 
 
 def _apply_tier(conn: sqlite3.Connection, d: dict, manager: str = "") -> str:
