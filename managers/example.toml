@@ -165,6 +165,11 @@ max_pending = 5
 # in and can walk a roster into categories it already wins.
 # season_weight = 0.0
 
+# Players on waivers searched beside the free agents: the top this many. A
+# claim is priced as made the morning it clears; you put the claim in.
+# 0 = free agents only.
+# waiver_pool = 0
+
 
 [authority.standing]
 # Moves approved in advance: a ROTATION player's drop, each still shown on the

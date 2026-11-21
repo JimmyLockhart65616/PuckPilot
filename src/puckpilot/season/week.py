@@ -1452,6 +1452,27 @@ def _targets(
         else None
     )
     notes: dict[tuple[str, str], str] = {}
+    claim_split: list = []
+
+    def claims():
+        """The split evaluator a claim is priced with, built on first need."""
+        if not claim_split:
+            claim_split.append(
+                split
+                or _split_evaluator(
+                    conn,
+                    runtime,
+                    week,
+                    rates,
+                    cats,
+                    goalie_source,
+                    values,
+                    days,
+                    odds_ctx,
+                    exclude,
+                )  # fmt: skip
+            )
+        return claim_split[0]
 
     base_players = list(ours.players)
     base_starts, first_totals, base_odds = evaluate(base_players)
@@ -1569,6 +1590,9 @@ def _targets(
                 )
                 if not options:
                     continue
+            # A waiver claim is his only after it clears: priced as made on
+            # that morning, the player going out playing the days before.
+            wait = _claim_wait(cand, runtime, days)
             for drop in options:
                 t, after_week = _price(
                     runtime,
@@ -1581,6 +1605,7 @@ def _targets(
                     close_by_key,
                     cand,
                     drop,
+                    **({"split": claims(), "k": wait} if wait else {}),
                 )
                 t = _with_season(t, outlook, conn, runtime, days, rates)
                 priced.append((t, after_week))
@@ -2021,6 +2046,15 @@ def _price(
         gain=gain,
     )
     return t, (after, after_starts, after_odds)
+
+
+def _claim_wait(cand, runtime, days: list[str]) -> int:
+    """Days a waiver claim waits before he is ours: 0 for a free agent, and
+    the league's waiver period (at least one) otherwise - capped at the week
+    left, past which the claim prices as nothing this week."""
+    if not getattr(cand, "on_waivers", False) or len(days) < 2:
+        return 0
+    return min(max(int(getattr(runtime, "waiver_days", 1) or 1), 1), len(days) - 1)
 
 
 def _with_season(t: AddTarget, outlook, conn, runtime, days, rates):

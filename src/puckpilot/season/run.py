@@ -2176,6 +2176,9 @@ def _weekly(
         if theirs is None:
             theirs = fetch_roster(session, opp_key, when, player_map=pmap) if opp_key else ours
         fa = pool.fetch_pool(session, league_key, "FA", limit=150, player_map=pmap)
+        on_waivers = manager.authority.transactions.waiver_pool
+        if on_waivers > 0:
+            fa += pool.fetch_pool(session, league_key, "W", limit=on_waivers, player_map=pmap)
         ahead = None
         if horizon:
             nxt = _following(runtime, week)

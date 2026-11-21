@@ -357,8 +357,16 @@ class TransactionAuthority:
     # only - which buys whatever this week's opponent is close in and walks
     # the roster into categories it already wins. Off until the add gate says.
     season_weight: float = 0.0
+    # Players on waivers searched beside the free agents: the top this many
+    # by Yahoo's own rank. A claim is priced as made the morning it clears,
+    # and the card says to put the claim in (the executor makes none). 0 (as
+    # built): free agents only - so a goalie a rival drops is invisible until
+    # he clears.
+    waiver_pool: int = 0
 
     def __post_init__(self) -> None:
+        if self.waiver_pool < 0:
+            raise AuthorityError("authority.transactions.waiver_pool cannot be negative")
         if self.season_weight < 0:
             raise AuthorityError("authority.transactions.season_weight cannot be negative")
         if self.screen not in SCREENS:

@@ -142,3 +142,21 @@ def replace_gain(t):
     from dataclasses import replace
 
     return replace(t, week_gain=None, season_gain=None)
+
+
+def test_a_waiver_claim_waits_for_the_league_waiver_period_within_the_week():
+    from puckpilot.season.authority import AuthorityError, TransactionAuthority
+    from puckpilot.season.week import _claim_wait
+
+    rt = SimpleNamespace(waiver_days=2)
+    fa = SimpleNamespace(on_waivers=False)
+    claim = SimpleNamespace(on_waivers=True)
+    days = ["d1", "d2", "d3", "d4", "d5"]
+    assert _claim_wait(fa, rt, days) == 0
+    assert _claim_wait(claim, rt, days) == 2
+    assert _claim_wait(claim, SimpleNamespace(waiver_days=0), days) == 1  # never same-day
+    assert _claim_wait(claim, SimpleNamespace(waiver_days=9), days) == 4  # within the week
+    assert _claim_wait(claim, rt, ["d5"]) == 0  # no later morning to make it on
+    assert TransactionAuthority().waiver_pool == 0
+    with pytest.raises(AuthorityError):
+        TransactionAuthority(waiver_pool=-1)
