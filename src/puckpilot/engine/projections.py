@@ -49,6 +49,16 @@ AGE_CLIP = (0.5, 1.5)
 GOALIE_AGE_ON = "volume"
 GOALIE_AGE_MODES = ("volume", "games")
 
+# A goalie's save % shrunk toward the league's (the most recent training
+# season's) by this many pseudo-shots, before saves and goals against are
+# derived. Save % barely repeats (r ~ .13) and the league's falls season on
+# season, so the projected spread between goalies is mostly noise: walk-forward
+# (season.sv_quality, fit 2023-24) 4000 is best, and judged on 2024-25 and
+# 2025-26 the shot-weighted MSE of save % falls 17.2 -> 12.7 and 31.8 -> 17.1
+# (x1e5) against the unshrunk projection. 0 = as built. The in-season engine
+# has its own (`values.IN_SEASON_GOALIE_SV_SHRINK`); this one is the draft's.
+GOALIE_SV_SHRINK = 0.0
+
 GOALIE_COUNT_COLS = ["wins", "shutouts"]
 GOALIE_VOLUME_COLS = ["shots_against", "goals_against", "toi_hours"]
 
@@ -199,6 +209,7 @@ def project_goalies(
     ages: pd.Series | None = None,
     team_win_blend: float = GOALIE_TEAM_WIN_BLEND,
     age_on: str | None = None,
+    sv_shrink: float | None = None,
 ) -> pd.DataFrame:
     """Counting cats blend like skaters; SV%, GAA and SV derive from projected
     volume AFTER any age adjustment, so the rates and the totals can never
@@ -231,6 +242,14 @@ def project_goalies(
         blended = (1 - team_win_blend) * own_wr + team_win_blend * team_wr
         out["wins"] = (blended.fillna(own_wr) * out["proj_gp"]).fillna(0.0)
 
+    shrink = GOALIE_SV_SHRINK if sv_shrink is None else sv_shrink
+    if shrink > 0 and frames and not out.empty:
+        recent = frames[0][0]
+        if not recent.empty and recent["shots_against"].sum() > 0:
+            league = 1.0 - recent["goals_against"].sum() / recent["shots_against"].sum()
+            sa = out["shots_against"]
+            sv = (1.0 - out["goals_against"] / sa.where(sa > 0)).fillna(league)
+            out["goals_against"] = sa * (1.0 - (sv * sa + shrink * league) / (sa + shrink))
     sa, ga = out["shots_against"], out["goals_against"]
     out["save_pct"] = (1.0 - ga / sa.where(sa > 0)).fillna(0.0)
     out["gaa"] = (ga / out["toi_hours"].where(out["toi_hours"] > 0)).fillna(0.0)
@@ -258,6 +277,7 @@ def project(
     as_of: str | None = None,
     target_games: int | None = None,
     goalie_age_on: str | None = None,
+    goalie_sv_shrink: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(skaters, goalies) projected category totals for target_season.
 
@@ -289,7 +309,10 @@ def project(
     )
     ages = player_ages(conn, target_season)
     skaters = _apply_age(project_skaters(sk_frames, target_games, weights), ages)
-    goalies = project_goalies(g_frames, target_games, weights, ages=ages, age_on=goalie_age_on)
+    goalies = project_goalies(
+        g_frames, target_games, weights, ages=ages, age_on=goalie_age_on,
+        sv_shrink=goalie_sv_shrink,
+    )  # fmt: skip
     # Age is consumed by `_apply_age` and then thrown away, so nothing
     # downstream can tell a fading veteran from an unproven youngster. Carry it.
     meta = meta.join(ages.rename("age"), how="left")

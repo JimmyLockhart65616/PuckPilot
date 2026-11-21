@@ -1624,6 +1624,7 @@ def _cmd_season_g3(args: argparse.Namespace) -> int:
         goalie_rates_per=args.goalie_rates,
         goalie_age_on=args.goalie_age,
         start_corr=args.start_corr,
+        goalie_sv_shrink=args.goalie_sv_shrink,
     )
     if not report.cases:
         print("No final week with every team's week-start roster saved - `ppilot season league`.")
@@ -3441,6 +3442,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="how much a goalie's starts in a week move together (odds.START_CORR)",
+    )
+    s_g3.add_argument(
+        "--goalie-sv-shrink",
+        type=float,
+        default=None,
+        help="shrink each goalie's save %% toward the league's by this many shots",
     )
     s_g3.set_defaults(func=_cmd_season_g3)
 

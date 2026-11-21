@@ -228,6 +228,7 @@ def build_universe(
     position_overrides: dict[int, str] | None = None,
     eligibility: dict[int, frozenset[str]] | None = None,
     goalie_age_on: str | None = None,
+    goalie_sv_shrink: float | None = None,
 ) -> Universe:
     """Projection-ranked pool with pseudo-ADP.
 
@@ -252,7 +253,11 @@ def build_universe(
         "eligibility": eligibility,
     }
     proj_sk, proj_g = projections.project(
-        conn, target_season, list(train_seasons), goalie_age_on=goalie_age_on
+        conn,
+        target_season,
+        list(train_seasons),
+        goalie_age_on=goalie_age_on,
+        goalie_sv_shrink=goalie_sv_shrink,
     )
     act_sk, act_g = season_aggregates(conn, train_seasons[0])
     if position_overrides:

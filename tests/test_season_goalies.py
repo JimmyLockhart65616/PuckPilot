@@ -586,3 +586,14 @@ def test_the_default_model_is_the_measured_one():
     from puckpilot.season import goalies
 
     assert goalies.PRIOR_GAMES == 10.0 and goalies.B2B_SAME == 0.07
+
+
+def test_the_recency_and_venue_tokens_parse_and_default_off():
+    from puckpilot.season.goalies import parse_spec
+
+    assert parse_spec("club-h5-v0.5") == {
+        "current_club": True,
+        "half_life": 5.0,
+        "venue_weight": 0.5,
+    }
+    assert "half_life" not in parse_spec("")

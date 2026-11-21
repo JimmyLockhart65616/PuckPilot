@@ -447,6 +447,7 @@ def build(
     goalie_rates_per: str | None = None,
     goalie_age_on: str | None = None,
     start_corr: float | None = None,
+    goalie_sv_shrink: float | None = None,
 ) -> G3Report:
     """Every final team-week projected as of its first morning, against the result.
 
@@ -481,6 +482,7 @@ def build(
         league,
         goalie_age_on=goalie_age_on,
         goalie_rates_per=goalie_rates_per,
+        goalie_sv_shrink=goalie_sv_shrink,
     )
     source = TrailingStartShareSource(conn, season, fallback_season=train[0])
     frame = values.frame

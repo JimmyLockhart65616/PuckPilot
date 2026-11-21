@@ -446,3 +446,21 @@ def test_a_goalie_line_per_start_divides_by_his_starts_and_a_skaters_is_unchange
     assert gp[2] == start[2]
     with pytest.raises(ValueError):
         per_game_rates(frame, cats, "minute")
+
+
+def test_a_goalie_save_pct_can_be_shrunk_toward_the_leagues():
+    from puckpilot.engine.projections import project_goalies
+
+    frame = _frame({
+        1: {"gp": 50, "starts": 50, "wins": 25, "shutouts": 0, "shots_against": 1000,
+            "goals_against": 70, "toi_hours": 50.0},  # .930
+        2: {"gp": 50, "starts": 50, "wins": 25, "shutouts": 0, "shots_against": 1000,
+            "goals_against": 130, "toi_hours": 50.0},  # .870
+    })  # fmt: skip
+    plain = project_goalies([(frame, 82)], 82, (1.0,), team_win_blend=0.0)
+    shrunk = project_goalies([(frame, 82)], 82, (1.0,), team_win_blend=0.0, sv_shrink=1e9)
+    assert plain.loc[1, "save_pct"] == pytest.approx(0.93)
+    assert (
+        shrunk.loc[1, "save_pct"] == pytest.approx(0.90) == pytest.approx(shrunk.loc[2, "save_pct"])
+    )
+    assert shrunk.loc[1, "saves"] == pytest.approx(shrunk.loc[1, "shots_against"] * 0.90)

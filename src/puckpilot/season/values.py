@@ -50,6 +50,10 @@ GOALIE_WORKLOAD = False
 # week, 4 of 8 leagues positive - nothing. None: the draft's setting.
 IN_SEASON_GOALIE_AGE_ON: str | None = None
 
+# A goalie's projected save % shrunk toward the league's by this many
+# pseudo-shots in season (`projections.GOALIE_SV_SHRINK`); None: the draft's.
+IN_SEASON_GOALIE_SV_SHRINK: float | None = None
+
 
 @dataclass
 class ValueModel:
@@ -191,6 +195,7 @@ def build_value_model(
     goalie_workload: bool | None = None,
     goalie_age_on: str | None = None,
     goalie_rates_per: str | None = None,
+    goalie_sv_shrink: float | None = None,
 ) -> ValueModel:
     """Assemble the live value model.
 
@@ -206,7 +211,10 @@ def build_value_model(
     skater_keys = [c.key for c in league.skater_cats]
 
     age_on = goalie_age_on or IN_SEASON_GOALIE_AGE_ON
-    universe = build_universe(conn, season, train_seasons, league, goalie_age_on=age_on)
+    shrink = IN_SEASON_GOALIE_SV_SHRINK if goalie_sv_shrink is None else goalie_sv_shrink
+    universe = build_universe(
+        conn, season, train_seasons, league, goalie_age_on=age_on, goalie_sv_shrink=shrink
+    )
     scale_data = build_replay_data(conn, scale, skater_keys)
     vm = GameValueModel(scale_data, set(universe.ids), league.goalie_cats)
 

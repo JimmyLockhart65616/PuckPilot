@@ -171,7 +171,13 @@ class TrailingStartShareSource:
         healthy: Iterable[int] = (),
         prior_games: float = PRIOR_GAMES,
         b2b_same: float | None = B2B_SAME,
+        half_life: float | None = None,
+        venue_weight: float = 0.0,
     ):
+        if half_life is not None and half_life <= 0:
+            raise ValueError(f"half_life must be positive, got {half_life}")
+        if venue_weight < 0:
+            raise ValueError(f"venue_weight cannot be negative, got {venue_weight}")
         if ahead not in AHEAD_RULES:
             raise ValueError(f"ahead must be one of {AHEAD_RULES}, not {ahead!r}")
         if prior_games < 0:
@@ -188,6 +194,9 @@ class TrailingStartShareSource:
         self.healthy = frozenset(healthy)
         self.prior_games = prior_games
         self.b2b_same = b2b_same
+        self.half_life = half_life
+        self.venue_weight = venue_weight
+        self._home = _home_games(conn, season) if venue_weight else set()
         self._starts = _season_starts(conn, season)
         self._team_dates = _team_dates(self._starts)
         self._fallback = _season_starts(conn, fallback_season) if fallback_season else {}
@@ -236,10 +245,15 @@ class TrailingStartShareSource:
         previous = starts.get((history[-1], team))
 
         counts: dict[int, float] = {}
-        for day in history[-self.trailing_games :]:
+        window = history[-self.trailing_games :]
+        at_home = (date, team) in self._home
+        for back, day in enumerate(reversed(window)):
             pid = starts.get((day, team))
             if pid and self._available(pid, team, cutoff):
-                counts[pid] = counts.get(pid, 0.0) + 1.0
+                w = 1.0 if self.half_life is None else 0.5 ** (back / self.half_life)
+                if self.venue_weight and ((day, team) in self._home) == at_home:
+                    w *= 1.0 + self.venue_weight
+                counts[pid] = counts.get(pid, 0.0) + w
         if current:
             self._pad(counts, team, cutoff, len(history))
         if not any(w > 0 for w in counts.values()):
@@ -372,8 +386,10 @@ def parse_spec(spec: str) -> dict:
     damped/share/chain (games after the next), t<n> (trailing team games),
     x<f> (previous-starter damping), p<f> (prior pseudo-games from last
     season), b<f> (P(same starter) on a back-to-back's second night), boff (no
-    back-to-back rule). 'old' is the model as first measured; '' leaves every
-    knob at its default. The model before 2026-10-11 is club-dw2-chain-p0-boff.
+    back-to-back rule), h<f> (a start counts half as much every f club games
+    back), v<f> (a start at the same venue as the game counts 1 + f times).
+    'old' is the model as first measured; '' leaves every knob at its default.
+    The model before 2026-10-11 is club-dw2-chain-p0-boff.
     """
     kw: dict = {}
     for tok in spec.split("-") if spec else ():
@@ -395,8 +411,14 @@ def parse_spec(spec: str) -> dict:
             kw["ahead"] = tok
         elif tok.startswith("t") and tok[1:].isdigit():
             kw["trailing_games"] = int(tok[1:])
-        elif tok[:1] in ("x", "p", "b") and len(tok) > 1:
-            name = {"x": "previous_damping", "p": "prior_games", "b": "b2b_same"}[tok[0]]
+        elif tok[:1] in ("x", "p", "b", "h", "v") and len(tok) > 1:
+            name = {
+                "x": "previous_damping",
+                "p": "prior_games",
+                "b": "b2b_same",
+                "h": "half_life",
+                "v": "venue_weight",
+            }[tok[0]]
             try:
                 kw[name] = float(tok[1:])
             except ValueError:
@@ -598,6 +620,17 @@ def _start_shares(
     for pid in starts.values():
         made[pid] = made.get(pid, 0) + 1
     return {pid: n / games for pid, n in made.items()}
+
+
+def _home_games(conn: sqlite3.Connection, season: str) -> set[tuple[str, str]]:
+    """(date, club) for every game a club played at home."""
+    return {
+        (d, t)
+        for d, t in conn.execute(
+            "SELECT game_date, home_team FROM nhl_schedule WHERE season = ? AND game_type = 2",
+            (season,),
+        )
+    }
 
 
 def _days_apart(a: str, b: str) -> int:
