@@ -196,6 +196,9 @@ class ArmSpec:
     # -co: no in-season positional caps (`LeagueConfig.in_season_caps = {}`):
     # a drop need not come from a position at its draft cap.
     open_caps: bool = False
+    # -cNN: a swap is priced over the rest of the season too, at NN% of this
+    # week's weight (`season.outlook`); rivals are the league's other rosters.
+    season_weight: float = 0.0
 
 
 def _swap(roster: list[int], target) -> None:
@@ -278,9 +281,11 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.open_caps = True
         elif tok.startswith("o") and tok[1:].isdigit():
             spec.tap = int(tok[1:]) / 100
-        elif len(tok) > 1 and tok[0] in "spqfxknjyzb" and tok[1:].isdigit():
+        elif len(tok) > 1 and tok[0] in "spqfxknjyzbc" and tok[1:].isdigit():
             n = int(tok[1:])
-            if tok[0] == "b":
+            if tok[0] == "c":
+                spec.season_weight = n / 100
+            elif tok[0] == "b":
                 spec.margin = n / 100
             elif tok[0] in "yz":
                 spec.timing = n / 100
@@ -812,6 +817,19 @@ def add_gate_report(
             )
         return boards[month]
 
+    def rivals_on(t: int, i: int, date: str) -> list:
+        """Every other team's roster on day `i`: the season outlook's rivals."""
+        return [
+            TeamRoster(
+                league_key=runtime.league_key,
+                team_key=f"rival{o}",
+                date=date,
+                players=tuple(rp(pid, i) for pid in day_rosters[o][i]),
+            )
+            for o in range(len(day_rosters))
+            if o != t
+        ]
+
     def rp(pid: int, i: int) -> RosterPlayer:
         pos = POS_TO_YAHOO.get(positions.get(pid, "C"), "C")
         return RosterPlayer(
@@ -970,6 +988,8 @@ def add_gate_report(
                                 drop_choice=spec.drops,
                                 goalie_lane=spec.lane,
                                 their_goalie_count=their_goalie_count,
+                                season_rivals=rivals_on(t, i, date) if spec.season_weight else None,
+                                season_weight=spec.season_weight,
                                 goalie_floor=_floor(spec, runtime),
                                 goalie_minimum=(
                                     runtime.min_goalie_games(nw.number) if spec.minimum else 0
@@ -1063,6 +1083,8 @@ def add_gate_report(
                             drop_choice=spec.drops,
                             goalie_lane=spec.lane,
                             their_goalie_count=their_goalie_count,
+                            season_rivals=rivals_on(t, i, date) if spec.season_weight else None,
+                            season_weight=spec.season_weight,
                             goalie_floor=_floor(spec, runtime),
                             goalie_minimum=(
                                 runtime.min_goalie_games(w.number) if spec.minimum else 0
@@ -1114,6 +1136,8 @@ def add_gate_report(
                                 workload=wl,
                                 form_rates=spec.form_rates,
                                 their_goalie_count=their_goalie_count,
+                                season_rivals=rivals_on(t, i, date) if spec.season_weight else None,
+                                season_weight=spec.season_weight,
                                 goalie_minimum=(
                                     runtime.min_goalie_games(weeks[nxt_wi].number)
                                     if spec.minimum

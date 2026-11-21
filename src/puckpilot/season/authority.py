@@ -351,8 +351,16 @@ class TransactionAuthority:
     # not make. Needs the local executor (`local/transact.py`); without it,
     # nothing changes.
     execute_approved: bool = False
+    # How much of a swap's price is the rest of the season (`season.outlook`):
+    # this week's expected categories plus this weight times the season's,
+    # judged against every rival's current roster. 0 (as built): this week
+    # only - which buys whatever this week's opponent is close in and walks
+    # the roster into categories it already wins. Off until the add gate says.
+    season_weight: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.season_weight < 0:
+            raise AuthorityError("authority.transactions.season_weight cannot be negative")
         if self.screen not in SCREENS:
             raise AuthorityError(
                 f"authority.transactions.screen must be one of {', '.join(SCREENS)}; "

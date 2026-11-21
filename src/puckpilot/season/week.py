@@ -226,6 +226,10 @@ class AddTarget:
     # Queued: to be made only after this date's games, because the drop plays
     # that day (`run._recheck_both`). Empty: made as soon as it is approved.
     after_games_of: str = ""
+    # With a season outlook (`season.outlook`): `gain` is this week's gain plus
+    # `season_weight` x the season's; these are the two parts, unweighted.
+    week_gain: float | None = None
+    season_gain: float | None = None
     # The drop's tier when the search chose the swap (`season.tiers`): what
     # the replay's standing-approval arm makes at once.
     drop_tier: str = ""
@@ -887,6 +891,8 @@ def build_week_plan(
     their_goalie_count: str = "top",
     their_stream=None,
     our_stream=None,
+    season_rivals=None,
+    season_weight: float = 0.0,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -940,6 +946,11 @@ def build_week_plan(
     are counted (`GOALIE_COUNTS`). Ours other than "top" is for a projection
     only (`find_targets=False`, as `season g3` asks): the search prices our
     side as the tool's own lineup plays it, by P(start) in the morning.
+
+    `season_rivals` (every other team's roster as it stands) and
+    `season_weight` > 0 price every swap over the rest of the season as well
+    (`season.outlook`): its gain is this week's plus the weight times the
+    season's. 0 or no rivals: this week only, as built.
 
     `their_stream` / `our_stream` (`streams.GoalieStream`) add the goalie
     starts a side will get from adds not yet made this week, as one
@@ -1140,6 +1151,14 @@ def build_week_plan(
         floor = min_expected_gain
     lapsed: tuple[AddTarget, ...] = ()
     near_misses: tuple[AddTarget, ...] = ()
+    season_outlook = None
+    if season_weight > 0 and season_rivals and (find_targets or reprice) and days:
+        from puckpilot.season.outlook import build_outlook
+
+        season_outlook = build_outlook(
+            conn, runtime, league, week, ours, list(season_rivals), rates, goalie_source,
+            values, season_weight, model=odds_model,
+        )  # fmt: skip
     if reprice is not None and days:
         targets, lapsed = _reprice(
             conn,
@@ -1160,6 +1179,7 @@ def build_week_plan(
             horizon=horizon,
             workload=workload,
             switch_after=switch_after,
+            outlook=season_outlook,
         )
     elif find_targets and days and not holding:
         misses: list = []
@@ -1198,6 +1218,7 @@ def build_week_plan(
             time_moves=time_moves if horizon == "this week" else "off",
             wait_hazard=wait_hazard,
             hold=hold,
+            outlook=season_outlook,
         )
         near_misses = _near_misses(misses, targets)
 
@@ -1325,6 +1346,7 @@ def _targets(
     time_moves: str = "off",
     wait_hazard: float = WAIT_HAZARD,
     hold: set[str] | None = None,
+    outlook=None,
 ) -> tuple[AddTarget, ...]:
     """Adds that move a category in play, priced by re-slotting the actual week.
 
@@ -1558,6 +1580,7 @@ def _targets(
                     cand,
                     drop,
                 )
+                t = _with_season(t, outlook, conn, runtime, days, rates)
                 priced.append((t, after_week))
         if split is not None and time_moves == "search":
             # The step's best few, made on a later morning instead.
@@ -1577,8 +1600,9 @@ def _targets(
                     wait_hazard,
                 )
                 if timed is not None:
-                    priced.append(timed[:2])
-                    notes[_pair_key(timed[0])] = timed[2]
+                    tt = _with_season(timed[0], outlook, conn, runtime, days, rates)
+                    priced.append((tt, timed[1]))
+                    notes[_pair_key(tt)] = timed[2]
         for t, after_week in priced:
             if not _pays(t, min_gain, close_by_key):
                 # Against the roster as it is: later steps price swaps
@@ -1608,7 +1632,8 @@ def _targets(
                 wait_hazard,
             )
             if timed is not None:
-                best, best_after = timed[0], timed[1]
+                best = _with_season(timed[0], outlook, conn, runtime, days, rates)
+                best_after = timed[1]
                 notes[_pair_key(best)] = timed[2]
         best = replace(
             best,
@@ -1670,6 +1695,7 @@ def _reprice(
     horizon: str = "this week",
     workload=None,
     switch_after: dict[tuple[str, str], str] | None = None,
+    outlook=None,
 ) -> tuple[tuple[AddTarget, ...], tuple[AddTarget, ...]]:
     """(still pays, no longer pays) for swaps already proposed, priced as the
     search would price them today - or, one queued to be made after a day's
@@ -1721,6 +1747,7 @@ def _reprice(
         )
         if timed:
             t = replace(t, after_games_of=when, timing=f"{t.timing}; {_planned(days[k], drop)}")
+        t = _with_season(t, outlook, conn, runtime, days, rates)
         if not _pays(t, min_gain, close_by_key):
             lapsed.append(t)
             continue
@@ -1841,6 +1868,8 @@ def _best_day(
     is discounted by `wait_hazard`, the chance the free agent is taken first;
     a waiver claim is not timed at all.
     """
+    # Like for like: a timed price is this week's, so is what it must beat.
+    now_week = now.week_gain if now.week_gain is not None else now.score
     from datetime import date as _date
 
     drop, cand = now.drop, now.player
@@ -1866,7 +1895,7 @@ def _best_day(
         survive = (1.0 - wait_hazard) ** k
         raw = t.gain if t.gain is not None else t.score
         score = raw * survive
-        if score <= now.score + 1e-9 or (best is not None and score <= best[0].score):
+        if score <= now_week + 1e-9 or (best is not None and score <= best[0].score):
             continue
         day = _date.fromisoformat(days[k]).strftime("%a %b %d")
         game = _date.fromisoformat(days[k - 1]).strftime("%A")
@@ -1883,7 +1912,7 @@ def _best_day(
         note = (
             f"Best made {day} morning, after {drop.name}'s {game} game: {raw:+.2f} "
             f"categories expected then, {score:+.2f} allowing a {wait_hazard:.0%} a day chance "
-            f"{cand.name} is taken first (made today: {now.score:+.2f})"
+            f"{cand.name} is taken first (made today: {now_week:+.2f})"
         )
         best = (timed, after, note)
     return best
@@ -1988,6 +2017,19 @@ def _price(
         gain=gain,
     )
     return t, (after, after_starts, after_odds)
+
+
+def _with_season(t: AddTarget, outlook, conn, runtime, days, rates):
+    """`t` priced over the rest of the season too (`season.outlook`): its gain
+    is this week's plus `outlook.weight` x the season's. No outlook, or a
+    weight of 0: `t` as it was."""
+    if outlook is None or not outlook.weight or t.gain is None:
+        return t
+    season = outlook.season_gain(t, rates, outlook.week_games(conn, runtime, days))
+    extra = outlook.weight * season
+    return replace(
+        t, week_gain=t.gain, season_gain=season, gain=t.gain + extra, score=t.score + extra
+    )
 
 
 def _near_misses(misses, chosen, limit: int = 5) -> tuple[AddTarget, ...]:

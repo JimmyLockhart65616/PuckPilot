@@ -159,6 +159,12 @@ max_pending = 5
 # the add gate measured.
 # upgrade_margin = 0.0
 
+# How much of a swap's price is the rest of the season: this week's expected
+# categories plus this weight times the season's, against every rival's current
+# roster. 0 = this week only, which buys whatever this week's opponent is close
+# in and can walk a roster into categories it already wins.
+# season_weight = 0.0
+
 
 [authority.standing]
 # Moves approved in advance: a ROTATION player's drop, each still shown on the

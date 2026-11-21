@@ -299,6 +299,42 @@ def timing_terms(terms) -> dict:
     }
 
 
+def season_terms(conn, manager, league_key: str, ours, day: str) -> dict:
+    """The season-horizon arguments for `build_week_plan` (`season.outlook`).
+
+    Off (nothing) unless `season_weight` > 0. The rivals are every other team
+    in the league as last saved by the league feed (week-start rosters).
+    """
+    weight = float(getattr(manager.authority.transactions, "season_weight", 0.0) or 0.0)
+    if weight <= 0 or ours is None:
+        return {}
+    return {
+        "season_rivals": rival_rosters(conn, league_key, ours.team_key, day),
+        "season_weight": weight,
+    }
+
+
+def rival_rosters(conn, league_key: str, our_team: str, day: str) -> list:
+    """Every other team's latest saved roster on or before `day`."""
+    from puckpilot.season.g3 import saved_roster
+
+    out = []
+    teams = conn.execute(
+        "SELECT DISTINCT team_key FROM league_week_stats WHERE league_key = ?", (league_key,)
+    ).fetchall()
+    for (team,) in teams:
+        if team == our_team:
+            continue
+        row = conn.execute(
+            "SELECT MAX(date) FROM yahoo_roster_snapshots WHERE team_key = ? AND date <= ?",
+            (team, day),
+        ).fetchone()
+        roster = saved_roster(conn, league_key, team, row[0]) if row and row[0] else None
+        if roster is not None:
+            out.append(roster)
+    return out
+
+
 def committed_moves(conn, manager_name: str, league_key: str, roster, week) -> list:
     """This week's moves approved and not yet made - one timed for a later
     morning, or one the executor could not make yet.
@@ -1689,6 +1725,7 @@ def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propo
         switch_after=switch_after,
         **live_inputs(conn, runtime, ctx.week, ctx.live, day),
         **goalie_terms(terms, runtime, ctx.week, day, ctx.roster, ctx.theirs),
+        **season_terms(conn, manager, league_key, ctx.roster, day),
     )
     log_week(conn, manager.name, league_key, ctx.roster.team_key, plan, day)
     lines = _recheck(conn, workable, lapsed, plan, terms) if waiting else []
@@ -2185,6 +2222,7 @@ def _weekly(
         **live_inputs(conn, runtime, week, live, day),
         **goalie_terms(terms, runtime, week, day, ours, theirs),
         **timing_terms(terms),
+        **season_terms(conn, manager, league_key, ours, day),
     )
     log_week(conn, manager.name, league_key, ours.team_key, plan, day)
     lines = [ln for ln in explain.week_story(plan, runtime) if ln]
