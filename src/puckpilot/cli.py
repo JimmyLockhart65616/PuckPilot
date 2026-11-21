@@ -1620,6 +1620,7 @@ def _cmd_season_g3(args: argparse.Namespace) -> int:
         our_team=manager.team_key or "",
         weeks=weeks,
         goalie_count=args.goalie_count,
+        streams=args.streams,
     )
     if not report.cases:
         print("No final week with every team's week-start roster saved - `ppilot season league`.")
@@ -3290,6 +3291,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="top",
         choices=("top", "min"),
         help="how both sides' goalie starts are counted (goalie_count.GOALIE_COUNTS)",
+    )
+    s_g3.add_argument(
+        "--streams",
+        default="none",
+        choices=("none", "theirs", "both"),
+        help="add each side's in-week goalie adds, measured on the weeks before (season.streams)",
     )
     s_g3.set_defaults(func=_cmd_season_g3)
 

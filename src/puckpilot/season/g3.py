@@ -432,13 +432,31 @@ def goalie_week(
     )
 
 
+STREAMS = ("none", "theirs", "both")
+
+
 def build(
-    conn, runtime, league, our_team: str = "", weeks=None, progress=None, goalie_count: str = "top"
+    conn,
+    runtime,
+    league,
+    our_team: str = "",
+    weeks=None,
+    progress=None,
+    goalie_count: str = "top",
+    streams: str = "none",
 ) -> G3Report:
     """Every final team-week projected as of its first morning, against the result.
 
     `goalie_count` is how both sides' goalie starts are counted
-    (`goalie_count.GOALIE_COUNTS`)."""
+    (`goalie_count.GOALIE_COUNTS`). `streams` adds the goalie starts a side
+    gets from in-week adds (`season.streams`), measured per team over the
+    weeks before the one projected: to the opponent only ("theirs", as the
+    live search would price it) or to both sides ("both": every team adds, so
+    the forecast is judged against what really happened)."""
+    from puckpilot.season import streams as streams_mod
+
+    if streams not in STREAMS:
+        raise ValueError(f"streams must be one of {STREAMS}, not {streams!r}")
     from puckpilot.draft.sim import build_universe
     from puckpilot.season.add_gate import AsOfValues
     from puckpilot.season.goalies import AsOfGoalieSource, TrailingStartShareSource
@@ -464,6 +482,11 @@ def build(
     }
     wanted = final if weeks is None else final & set(weeks)
     chosen = [w for w in runtime.weeks if w.number in wanted]
+    added = (
+        streams_mod.added_by_week(conn, lk, season, [w for w in runtime.weeks if w.number in final])
+        if streams != "none"
+        else {}
+    )
     cases: list[CatCase] = []
     goalie_weeks: list[GoalieWeek] = []
     unmapped = 0
@@ -484,11 +507,20 @@ def build(
             if ours is None or theirs is None or opp not in rows:
                 continue
             unmapped += sum(1 for p in ours.players if p.nhl_player_id is None)
+            before = sorted(n for n in added if n < w.number)  # played weeks only
+            teams = sorted(rows)
+            their_stream = (
+                streams_mod.measure(added, before, teams, team=opp) if streams != "none" else None
+            )
+            our_stream = (
+                streams_mod.measure(added, before, teams, team=team) if streams == "both" else None
+            )
             plan = build_week_plan(
                 conn, runtime, league, w, rows[opp][1], ours, theirs, [], frame, goalies, vals,
                 find_targets=False, measure_room=False, odds_model=OddsModel(),
                 add_scoring="odds", from_day=w.start,
                 goalie_count=goalie_count, their_goalie_count=goalie_count,
+                their_stream=their_stream, our_stream=our_stream,
             )  # fmt: skip
             opp_stats = rows[opp][2]
             by_label = {label_of.get(int(k), k): v for k, v in stats.items() if k.isdigit()}

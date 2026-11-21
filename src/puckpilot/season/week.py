@@ -867,6 +867,8 @@ def build_week_plan(
     hold: set[str] | None = None,
     goalie_count: str = "top",
     their_goalie_count: str = "top",
+    their_stream=None,
+    our_stream=None,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -920,11 +922,19 @@ def build_week_plan(
     are counted (`GOALIE_COUNTS`). Ours other than "top" is for a projection
     only (`find_targets=False`, as `season g3` asks): the search prices our
     side as the tool's own lineup plays it, by P(start) in the morning.
+
+    `their_stream` / `our_stream` (`streams.GoalieStream`) add the goalie
+    starts a side will get from adds not yet made this week, as one
+    pseudo-goalie (`streams.THEIR_STREAM` / `OUR_STREAM`). Ours is for a
+    projection only: the search is what decides our adds.
     """
     from puckpilot.season.form import FORM_RATES
+    from puckpilot.season.streams import OUR_STREAM, THEIR_STREAM
 
     if find_targets and goalie_count != "top":
         raise ValueError("goalie_count other than 'top' is for a projection (find_targets=False)")
+    if find_targets and our_stream is not None:
+        raise ValueError("our_stream is for a projection (find_targets=False)")
 
     cats = league.all_cats
     if workload is None:
@@ -968,6 +978,15 @@ def build_week_plan(
         goalie_games=their_goalie_games,
         goalie_count=their_goalie_count,
     )
+    for pid, stream, games, goalie_games in (
+        (OUR_STREAM, our_stream, our_games, our_goalie_games),
+        (THEIR_STREAM, their_stream, their_games, their_goalie_games),
+    ):
+        chances = stream.chances(len(days), len(week.dates())) if stream is not None else []
+        if chances:
+            rates = {**rates, pid: stream.rates()}
+            games[pid] = sum(chances)
+            goalie_games[pid] = chances
     our_rest = project_totals(our_games, rates, cats)
     our_totals = project_totals(our_games, rates, cats, base=base_ours)
     their_totals = project_totals(their_games, rates, cats, base=base_theirs)
