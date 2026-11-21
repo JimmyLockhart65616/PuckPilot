@@ -446,6 +446,7 @@ def build(
     streams: str = "none",
     goalie_rates_per: str | None = None,
     goalie_age_on: str | None = None,
+    start_corr: float | None = None,
 ) -> G3Report:
     """Every final team-week projected as of its first morning, against the result.
 
@@ -471,6 +472,7 @@ def build(
 
     lk = runtime.league_key
     season = runtime.nhl_season
+    model = OddsModel() if start_corr is None else OddsModel(start_corr=start_corr)
     train = _train_seasons(season)
     values = build_value_model(
         conn,
@@ -528,7 +530,7 @@ def build(
             )
             plan = build_week_plan(
                 conn, runtime, league, w, rows[opp][1], ours, theirs, [], frame, goalies, vals,
-                find_targets=False, measure_room=False, odds_model=OddsModel(),
+                find_targets=False, measure_room=False, odds_model=model,
                 add_scoring="odds", from_day=w.start,
                 goalie_count=goalie_count, their_goalie_count=goalie_count,
                 their_stream=their_stream, our_stream=our_stream,

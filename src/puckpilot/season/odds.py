@@ -35,6 +35,7 @@ that lasted 69% of the time; a confident wrong number is worse than none.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from statistics import NormalDist
 
@@ -79,6 +80,16 @@ SHOTS_DISPERSION = 1.85
 # by G1 at 1.5.
 SV_PCT_INFLATION = 1.5
 
+# How much one goalie's starts in a week move together. Each game a coin of its
+# own (0, as first built) makes a week of four 60% starts a sure two or three;
+# in fact one lost net or injury takes all four, and one good week keeps them
+# all. A goalie's week is priced as a mixture: with this weight his starts are
+# comonotone (a single draw decides how far down his list of games he starts),
+# otherwise independent. Means are unchanged; the spread of wins, saves and
+# shots grows. GAA's time in net stays independent. Fitted by G1
+# (`calibration.fit(start_corr=True)`), not yet adopted.
+START_CORR = 0.0
+
 # How close two save percentages must be for Yahoo to call it a tie. 0 until a
 # live week's stat_winners shows whether it compares the 3-decimal display.
 RATIO_TIE_WIDTH = 0.0
@@ -99,6 +110,9 @@ class GoalieGame:
     # A real game toward the weekly minimum; the hypothetical extra units
     # `with_extra` prices (leverage) are not appearances.
     appearance: bool = True
+    # Whose game it is: a goalie's games share whether he has the net
+    # (`OddsModel.start_corr`). None: a game on its own.
+    who: int | None = None
 
 
 @dataclass
@@ -117,7 +131,7 @@ class Side:
     min_appearances: int = 0
     appearances: float = 0.0
 
-    def p_reach_minimum(self) -> float:
+    def p_reach_minimum(self, rho: float = 0.0) -> float:
         """P(this side's goalies make the week's minimum appearances).
 
         Each goalie game still to come is a chance at an appearance; a side
@@ -128,7 +142,7 @@ class Side:
         need = self.min_appearances - int(round(self.appearances))
         if self.min_appearances <= 0 or need <= 0:
             return 1.0
-        pmf = trials_pmf([g.p_start for g in self.goalies if g.appearance])
+        pmf = goalie_count_pmf([g for g in self.goalies if g.appearance], lambda _g: 1.0, rho)
         return float(pmf[need:].sum()) if need < len(pmf) else 0.0
 
 
@@ -251,26 +265,103 @@ def normal_odds(mean: float, var: float, integer: bool = False) -> tuple[float, 
 # -- the goalie side ----------------------------------------------------------
 
 
-def _saves_moments(games: list[GoalieGame]) -> tuple[float, float, float, float, float]:
-    """(E saves, Var saves, E shots, Var shots, Cov) over goalie games still to come."""
-    es = vs = ea = va = cov = 0.0
+def _groups(games: list[GoalieGame]) -> list[list[GoalieGame]]:
+    """Games by goalie; a game with no `who` is a group of its own."""
+    by: dict[int, list[GoalieGame]] = {}
+    out: list[list[GoalieGame]] = []
     for g in games:
-        p, a, sv = g.p_start, g.shots, g.save_pct
-        var_a = SHOTS_DISPERSION * a
-        e_s = a * sv
-        var_s = var_a * sv * sv + a * sv * (1.0 - sv)
-        cov_sa = sv * var_a
-        es += p * e_s
-        ea += p * a
-        vs += p * var_s + p * (1.0 - p) * e_s * e_s
-        va += p * var_a + p * (1.0 - p) * a * a
-        cov += p * cov_sa + p * (1.0 - p) * e_s * a
+        if g.who is None:
+            out.append([g])
+        else:
+            by.setdefault(g.who, []).append(g)
+    return out + list(by.values())
+
+
+def _ladder(group: list[GoalieGame]) -> list[tuple[float, list[GoalieGame]]]:
+    """The comonotone week: (P(he starts exactly his k likeliest games), those games).
+
+    One uniform draw U; he starts every game whose P(start) is above U. Each
+    game keeps its own P(start); only the joint draw changes.
+    """
+    order = sorted(group, key=lambda g: -g.p_start)
+    ps = [min(max(g.p_start, 0.0), 1.0) for g in order]
+    out = []
+    for k in range(len(order) + 1):
+        hi = 1.0 if k == 0 else ps[k - 1]
+        lo = ps[k] if k < len(order) else 0.0
+        if hi - lo > 0:
+            out.append((hi - lo, order[:k]))
+    return out
+
+
+def _start_moments(g: GoalieGame) -> tuple[float, float, float, float, float]:
+    """Given he starts: (E saves, E shots, Var saves, Var shots, Cov)."""
+    a, sv = g.shots, g.save_pct
+    var_a = SHOTS_DISPERSION * a
+    return a * sv, a, var_a * sv * sv + a * sv * (1.0 - sv), var_a, sv * var_a
+
+
+def _saves_moments(
+    games: list[GoalieGame], rho: float = 0.0
+) -> tuple[float, float, float, float, float]:
+    """(E saves, Var saves, E shots, Var shots, Cov) over goalie games still to come.
+
+    `rho` (`START_CORR`) weights each goalie's comonotone week against the
+    independent one; the means are the same either way.
+    """
+    es = vs = ea = va = cov = 0.0
+    for group in _groups(games):
+        i_vs = i_va = i_cov = 0.0
+        g_es = g_ea = 0.0
+        for g in group:
+            p = g.p_start
+            e_s, a, var_s, var_a, cov_sa = _start_moments(g)
+            g_es += p * e_s
+            g_ea += p * a
+            i_vs += p * var_s + p * (1.0 - p) * e_s * e_s
+            i_va += p * var_a + p * (1.0 - p) * a * a
+            i_cov += p * cov_sa + p * (1.0 - p) * e_s * a
+        es += g_es
+        ea += g_ea
+        if rho <= 0 or len(group) < 2:
+            vs, va, cov = vs + i_vs, va + i_va, cov + i_cov
+            continue
+        m_ss = m_aa = m_sa = 0.0  # E[S^2], E[A^2], E[SA] for the comonotone week
+        for w, started in _ladder(group):
+            s = [_start_moments(g) for g in started]
+            ms, ma = sum(x[0] for x in s), sum(x[1] for x in s)
+            m_ss += w * (sum(x[2] for x in s) + ms * ms)
+            m_aa += w * (sum(x[3] for x in s) + ma * ma)
+            m_sa += w * (sum(x[4] for x in s) + ms * ma)
+        vs += (1 - rho) * i_vs + rho * (m_ss - g_es * g_es)
+        va += (1 - rho) * i_va + rho * (m_aa - g_ea * g_ea)
+        cov += (1 - rho) * i_cov + rho * (m_sa - g_es * g_ea)
     return es, vs, ea, va, cov
 
 
-def _save_pct(side: Side, inflation: float = SV_PCT_INFLATION) -> tuple[float, float]:
+def goalie_count_pmf(
+    games: list[GoalieGame], chance: Callable[[GoalieGame], float], rho: float = 0.0
+) -> np.ndarray:
+    """PMF of how many goalie games come off with `chance` given he starts
+    (a win, a shutout, 1 for an appearance), each goalie's week a `rho` mixture."""
+    dist = np.array([1.0])
+    for group in _groups(games):
+        ind = trials_pmf([g.p_start * chance(g) for g in group])
+        if rho > 0 and len(group) > 1:
+            com = np.zeros(len(group) + 1)
+            for w, started in _ladder(group):
+                part = trials_pmf([chance(g) for g in started])
+                com[: len(part)] += w * part
+            ind = (1 - rho) * ind + rho * com
+        dist = np.convolve(dist, ind)
+    return dist
+
+
+def _save_pct(
+    side: Side, inflation: float = SV_PCT_INFLATION, rho: float = 0.0
+) -> tuple[float, float]:
     """Mean and variance of the week's final save percentage (delta method)."""
-    es, vs, ea, va, cov = _saves_moments(side.goalies)
+    es, vs, ea, va, cov = _saves_moments(side.goalies, rho)
     num = side.banked.get("saves", 0.0) + es
     den = side.banked.get("shots_against", 0.0) + ea
     if den <= 0:
@@ -325,13 +416,18 @@ class OddsModel:
     pim_sizes: dict[int, float] = field(default_factory=lambda: dict(PIM_SIZES))
     ratio_tie_width: float = RATIO_TIE_WIDTH
     ratio_inflation: float = SV_PCT_INFLATION
+    start_corr: float = START_CORR
 
     def category(self, c: Category, ours: Side, theirs: Side) -> CategoryOdds:
         key = c.key
         if key in ("save_pct", "gaa"):
             ratio = _save_pct if key == "save_pct" else _gaa
-            mo, vo = ratio(ours, self.ratio_inflation)
-            mt, vt = ratio(theirs, self.ratio_inflation)
+            if key == "save_pct":
+                mo, vo = _save_pct(ours, self.ratio_inflation, self.start_corr)
+                mt, vt = _save_pct(theirs, self.ratio_inflation, self.start_corr)
+            else:
+                mo, vo = ratio(ours, self.ratio_inflation)
+                mt, vt = ratio(theirs, self.ratio_inflation)
             if math.isnan(mo) or math.isnan(mt):
                 # No shots faced on one side: the other takes it, or nobody does.
                 p_win = 1.0 if math.isnan(mt) and not math.isnan(mo) else 0.0
@@ -346,8 +442,8 @@ class OddsModel:
             return self._oriented(c, p_win, p_tie, mo, mt)
 
         if key in ("saves", "shots_against"):
-            es_o, vs_o, ea_o, va_o, _ = _saves_moments(ours.goalies)
-            es_t, vs_t, ea_t, va_t, _ = _saves_moments(theirs.goalies)
+            es_o, vs_o, ea_o, va_o, _ = _saves_moments(ours.goalies, self.start_corr)
+            es_t, vs_t, ea_t, va_t, _ = _saves_moments(theirs.goalies, self.start_corr)
             if key == "saves":
                 eo, vo, et, vt = es_o, vs_o, es_t, vs_t
             else:
@@ -360,8 +456,8 @@ class OddsModel:
 
         if key in ("wins", "shutouts"):
             attr = "p_win" if key == "wins" else "p_shutout"
-            po = trials_pmf([g.p_start * getattr(g, attr) for g in ours.goalies])
-            pt = trials_pmf([g.p_start * getattr(g, attr) for g in theirs.goalies])
+            po = goalie_count_pmf(ours.goalies, lambda g: getattr(g, attr), self.start_corr)
+            pt = goalie_count_pmf(theirs.goalies, lambda g: getattr(g, attr), self.start_corr)
             lead = ours.banked.get(key, 0.0) - theirs.banked.get(key, 0.0)
             p_win, p_tie = discrete_odds(po, pt, lead)
             fo = ours.banked.get(key, 0.0) + float(np.dot(np.arange(len(po)), po))
@@ -389,7 +485,8 @@ class OddsModel:
 
     def week(self, cats: tuple[Category, ...], ours: Side, theirs: Side) -> WeekOdds:
         out = tuple(self.category(c, ours, theirs) for c in cats)
-        r_o, r_t = ours.p_reach_minimum(), theirs.p_reach_minimum()
+        r_o = ours.p_reach_minimum(self.start_corr)
+        r_t = theirs.p_reach_minimum(self.start_corr)
         if r_o < 1.0 or r_t < 1.0:
             out = tuple(_minimum(o, r_o, r_t) if o.category.kind == "goalie" else o for o in out)
         return WeekOdds(out)
@@ -421,8 +518,8 @@ def _minimum(o: CategoryOdds, r_o: float, r_t: float) -> CategoryOdds:
 # -- building a side from a roster --------------------------------------------
 
 
-def goalie_game(rates: dict[str, float], p_start: float) -> GoalieGame:
-    """One goalie game from his per-game projection line."""
+def goalie_game(rates: dict[str, float], p_start: float, who: int | None = None) -> GoalieGame:
+    """One goalie game from his per-game projection line; `who` is the goalie."""
     shots = rates.get("shots_against", 0.0)
     saves = rates.get("saves", 0.0)
     return GoalieGame(
@@ -432,6 +529,7 @@ def goalie_game(rates: dict[str, float], p_start: float) -> GoalieGame:
         save_pct=(saves / shots) if shots > 0 else 0.9,
         p_shutout=min(max(rates.get("shutouts", 0.0), 0.0), 1.0),
         hours=rates.get("toi_hours", 0.0) or 1.0,
+        who=who,
     )
 
 
@@ -452,7 +550,7 @@ def side(
         for k, r in (rates.get(pid) or {}).items():
             skaters[k] = skaters.get(k, 0.0) + r * n
     goalies = [
-        goalie_game(rates.get(pid) or {}, p)
+        goalie_game(rates.get(pid) or {}, p, pid)
         for pid, ps in goalie_games.items()
         for p in ps
         if p > 0

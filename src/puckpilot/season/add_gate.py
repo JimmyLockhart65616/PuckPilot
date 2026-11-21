@@ -595,7 +595,7 @@ def add_gate_report(
                 count,
             )
             goalies += [
-                goalie_game(line_rates.get(pid) or {}, ps) for pid, ps in gs.items() if ps > 0
+                goalie_game(line_rates.get(pid) or {}, ps, pid) for pid, ps in gs.items() if ps > 0
             ]
         return Side(
             banked=_components(banked_sk, banked_g, skater_keys), skaters=skaters, goalies=goalies

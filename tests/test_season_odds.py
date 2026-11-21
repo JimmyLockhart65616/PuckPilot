@@ -346,3 +346,23 @@ def test_extra_units_for_leverage_are_not_appearances():
     more = with_extra(s, "wins", 1.0)
     assert more.min_appearances == 3
     assert more.p_reach_minimum() == s.p_reach_minimum() == 0.0
+
+
+def test_correlated_starts_keep_the_mean_and_widen_the_week():
+    import numpy as np
+
+    from puckpilot.season.odds import GoalieGame, _saves_moments, goalie_count_pmf
+
+    games = [GoalieGame(p_start=0.6, p_win=0.5, shots=28.0, save_pct=0.9, who=1)] * 4
+    ind = goalie_count_pmf(games, lambda g: g.p_win, 0.0)
+    com = goalie_count_pmf(games, lambda g: g.p_win, 1.0)
+    k = np.arange(len(ind))
+    assert float(k @ ind) == pytest.approx(float(k @ com)) == pytest.approx(4 * 0.6 * 0.5)
+    var = lambda d: float((k * k) @ d - (k @ d) ** 2)  # noqa: E731
+    assert var(com) > var(ind)
+    e0, v0, *_ = _saves_moments(games, 0.0)
+    e1, v1, *_ = _saves_moments(games, 0.5)
+    assert e0 == pytest.approx(e1) and v1 > v0
+    # games of different goalies stay independent whatever rho is
+    apart = [GoalieGame(0.6, 0.5, 28.0, 0.9, who=i) for i in range(4)]
+    assert np.allclose(goalie_count_pmf(apart, lambda g: g.p_win, 1.0), ind)

@@ -1623,6 +1623,7 @@ def _cmd_season_g3(args: argparse.Namespace) -> int:
         streams=args.streams,
         goalie_rates_per=args.goalie_rates,
         goalie_age_on=args.goalie_age,
+        start_corr=args.start_corr,
     )
     if not report.cases:
         print("No final week with every team's week-start roster saved - `ppilot season league`.")
@@ -2060,6 +2061,7 @@ def _cmd_season_calibrate(args: argparse.Namespace) -> int:
         goalies=args.goalies,
         rates_mode=args.rates,
         goalie_rates_per=args.goalie_rates,
+        fit_start_corr=args.fit_start_corr,
     )
     print()
     print(report.text)
@@ -3157,6 +3159,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("gp", "start"),
         help="a goalie line per game played or per start (week.GOALIE_RATES_PER)",
     )
+    s_cal.add_argument(
+        "--fit-start-corr",
+        action="store_true",
+        help="also fit how much a goalie's starts in a week move together (odds.START_CORR)",
+    )
     s_cal.add_argument("--verbose", action="store_true")
     s_cal.set_defaults(func=_cmd_season_calibrate)
 
@@ -3318,6 +3325,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=("volume", "games"),
         help="where the goalie age curve lands (projections.GOALIE_AGE_MODES)",
+    )
+    s_g3.add_argument(
+        "--start-corr",
+        type=float,
+        default=None,
+        help="how much a goalie's starts in a week move together (odds.START_CORR)",
     )
     s_g3.set_defaults(func=_cmd_season_g3)
 

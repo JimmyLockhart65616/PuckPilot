@@ -47,6 +47,7 @@ from puckpilot.season.odds import OddsModel, Side, goalie_game, normal_odds
 PHI_GRID = (1.0, 1.1, 1.2, 1.35, 1.5, 1.75, 2.0, 2.5, 3.0)
 P_PLAY_GRID = (0.7, 0.74, 0.78, 0.8, 0.82, 0.84, 0.86, 0.88, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0)
 INFLATION_GRID = (1.0, 1.15, 1.3, 1.5, 1.75, 2.0, 2.5)
+START_CORR_GRID = (0.0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0)
 
 # A reliability bin with fewer predictions than this is shown but not judged.
 MIN_BIN = 100
@@ -297,7 +298,7 @@ def build_cases(
             for k, r in (now.get(pid) or {}).items():
                 skaters[k] = skaters.get(k, 0.0) + r * n
         goalies = [
-            goalie_game(now.get(pid) or {}, p) for pid, ps in goalie_games.items() for p in ps
+            goalie_game(now.get(pid) or {}, p, pid) for pid, ps in goalie_games.items() for p in ps
         ]
         return Side(banked=banked, skaters=skaters, goalies=goalies)
 
@@ -431,12 +432,16 @@ def score(
     )
 
 
-def fit(cases: list[Case], cats: tuple[Category, ...], say=None) -> OddsModel:
+def fit(
+    cases: list[Case], cats: tuple[Category, ...], say=None, start_corr: bool = False
+) -> OddsModel:
     """Fit P(play), each count's widening, and the save-percentage spread.
 
     One knob at a time, each against its own categories' log-loss: P(play) on
     the skater counts together (it moves every mean), then phi per count, then
-    the ratio inflation on SV% / GAA.
+    the ratio inflation on SV% / GAA. `start_corr` also fits how much one
+    goalie's starts move together (`odds.START_CORR`) on every goalie
+    category, after the rest.
     """
     say = say or (lambda _m: None)
     model = OddsModel(phi={})
@@ -470,6 +475,13 @@ def fit(cases: list[Case], cats: tuple[Category, ...], say=None) -> OddsModel:
         )
         model = replace(model, ratio_inflation=best_inf)
         say(f"  ratio inflation {best_inf:.2f}")
+    goalie_keys = [c.key for c in cats if c.kind == "goalie"]
+    if start_corr and goalie_keys:
+        best_rho = min(
+            START_CORR_GRID, key=lambda r: total(replace(model, start_corr=r), goalie_keys)
+        )
+        model = replace(model, start_corr=best_rho)
+        say(f"  start correlation {best_rho:.2f}")
     return model
 
 
@@ -500,6 +512,7 @@ def calibration_report(
     goalies: str = "",
     rates_mode: str = "pre",
     goalie_rates_per: str | None = None,
+    fit_start_corr: bool = False,
 ) -> CalibrationReport:
     say = progress or (lambda _m: None)
     cats = league.all_cats
@@ -531,7 +544,7 @@ def calibration_report(
         goalie_rates_per=goalie_rates_per,
     )
     say("fitting")
-    model = fit(fit_cases, cats, say)
+    model = fit(fit_cases, cats, say, start_corr=fit_start_corr)
     s_fit = score(fit_cases, model, cats)
     s_test = score(test_cases, model, cats)
     s_base = score(test_cases, NormalBaseline(p_play=model.p_play), cats)
@@ -541,7 +554,8 @@ def calibration_report(
         f"G1 - calibration: fitted on {fit_season} ({len(fit_cases)} matchup-mornings), "
         f"judged on {test_season} ({len(test_cases)})",
         "",
-        f"fitted: p_play {model.p_play:.2f}, ratio inflation {model.ratio_inflation:.2f}",
+        f"fitted: p_play {model.p_play:.2f}, ratio inflation {model.ratio_inflation:.2f}"
+        + (f", start correlation {model.start_corr:.2f}" if fit_start_corr else ""),
         "        phi " + "  ".join(f"{k} {v:.2f}" for k, v in model.phi.items()),
         "",
         f"{'':26}{'log-loss':>10}{'Brier':>9}",
