@@ -1,0 +1,2529 @@
+"""One command for a day, so nobody has to remember the order.
+
+The pieces were right and the sequence was homework: sync last night, collect
+whatever was decided on the phone, work out tonight's lineup, push it, and on
+the first day of a fantasy week work out the week as well. Getting that wrong
+is quiet - a stale sync just makes the advice slightly worse - which is exactly
+the kind of thing a person should not be holding in their head at 6pm.
+
+Built to be scheduled, which sets the rules:
+
+Nothing raises. A step that fails is reported and the rest still run, because a
+dead Yahoo session must not also cost you the lineup you could have computed
+from data already on disk. The exit code tells a scheduler whether to care.
+
+Everything is logged. An unattended run that leaves no trace is indistinguishable
+from one that never happened.
+
+It is safe to run repeatedly. Every step is idempotent, so running hourly costs
+a little time and changes nothing twice.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import traceback
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+
+from puckpilot.season import proposals as proposals_mod
+from puckpilot.season import protocol as protocol_mod
+from puckpilot.season.moves import MoveKind
+from puckpilot.season.preflight import age_days as _age_days
+
+# The league's own settings carry the week calendar and which week it is now.
+# They change rarely, but a cache that never refreshes goes wrong silently:
+# `current_week` simply stops advancing while everything still looks healthy.
+RUNTIME_REFRESH_DAYS = 3.0
+
+# The player map is the bridge between a Yahoo free agent and a projection, and
+# the players it will be missing are exactly the ones an in-season add comes
+# from: call-ups who did not exist when it was built. Refreshed weekly.
+MAP_REFRESH_DAYS = 7.0
+
+
+@dataclass
+class Step:
+    name: str
+    ok: bool
+    detail: str
+    lines: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RunReport:
+    date: str
+    manager: str
+    steps: list[Step] = field(default_factory=list)
+
+    @property
+    def failed(self) -> bool:
+        return any(not s.ok for s in self.steps)
+
+    def add(self, name: str, ok: bool, detail: str, lines: list[str] | None = None) -> None:
+        self.steps.append(Step(name, ok, detail, lines or []))
+
+    def settle(self, name: str, detail: str, lines: list[str] | None = None) -> bool:
+        """This run's failed `name` step, made good later in the same run: ok
+        now, with what it said kept above what changed. False when no step of
+        that name failed."""
+        for i, s in enumerate(self.steps):
+            if s.name == name and not s.ok:
+                self.steps[i] = Step(
+                    name, True, detail, [f"was: {s.detail}", *s.lines, *(lines or [])]
+                )
+                return True
+        return False
+
+    @property
+    def text(self) -> str:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        out = [f"=== {self.manager} {self.date} (run {stamp}) ==="]
+        for s in self.steps:
+            out.append(f"[{'ok ' if s.ok else 'FAIL'}] {s.name}: {s.detail}")
+            out += [f"       {ln}" for ln in s.lines]
+        out.append("done" if not self.failed else "finished with failures")
+        return "\n".join(out)
+
+
+def _guard(report: RunReport, name: str, fn):
+    """Run a step, and turn any failure into a line rather than an exit."""
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001 - a scheduled run reports, it does not crash
+        tail = traceback.format_exc().splitlines()[-3:]
+        report.add(name, False, f"{type(e).__name__}: {e}", tail)
+        return None
+
+
+def starts_a_week(runtime, day: str) -> bool:
+    """Is `day` the first day of its fantasy week?"""
+    try:
+        return runtime.week(runtime.week_of(day)).start == day
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def preloads(runtime, day: str, last_days: int) -> bool:
+    """Whether `day` is one of its week's last `last_days`, with a week after it.
+
+    Then what is left of this week's acquisitions is better spent on the next
+    week: they expire with this one, and a player added today plays all of the
+    next.
+    """
+    from puckpilot.season.settings import SettingsError
+
+    if last_days <= 0:
+        return False
+    try:
+        w = runtime.week(runtime.week_of(day))
+        runtime.week(w.number + 1)
+    except SettingsError:
+        return False
+    return day in w.dates()[-last_days:]
+
+
+def week_for(runtime, day: str):
+    """The week `day` falls in, or the next one to start.
+
+    Before the season - and between a week's end and the next's start, should
+    the calendar ever have such a gap - "this week" means the one coming.
+    """
+    try:
+        return runtime.week(runtime.week_of(day))
+    except Exception:  # noqa: BLE001 - outside every known week
+        later = [w for w in runtime.weeks if w.start > day]
+        return min(later, key=lambda w: w.start) if later else None
+
+
+@dataclass
+class WeekContext:
+    """What one run learned about the week, shared by every step after the read."""
+
+    week: object | None = None
+    roster: object | None = None
+    theirs: object | None = None
+    live: object | None = None
+    raw: dict | None = None
+    error: str = ""
+    # Roster legality as of this run (`legality.Resolution`), and the roster as
+    # it will stand once its make-room moves are made - what adds are priced on.
+    resolution: object | None = None
+    resolved: object | None = None
+    # Every player's drop tier as of this run (`tiers.board`), for the page;
+    # the rest-of-season values it placed them by; and the roster's numbers
+    # for the page (`roster_stats.describe`).
+    tiers: dict | None = None
+    keep: dict | None = None
+    player_stats: dict | None = None
+
+
+def _priced(ctx):
+    """The roster the week is priced on: legal, as it will stand."""
+    resolved = getattr(ctx, "resolved", None)
+    return resolved if resolved is not None else ctx.roster
+
+
+def started_clubs(conn, season: str, day: str, now=None) -> set[str]:
+    """Clubs whose game on `day` has already begun.
+
+    Their stats are already in Yahoo's banked totals, so projecting the game
+    as well would count it twice.
+    """
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    now = now or _dt.now(UTC)
+    out: set[str] = set()
+    for r in conn.execute(
+        "SELECT start_time_utc, home_team, away_team FROM nhl_schedule "
+        "WHERE season = ? AND game_type = 2 AND game_date = ? AND start_time_utc IS NOT NULL",
+        (season, day),
+    ):
+        try:
+            begins = _dt.fromisoformat(r["start_time_utc"].replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if begins <= now:
+            out.update((r["home_team"], r["away_team"]))
+    return out
+
+
+def live_inputs(conn, runtime, week, live, day: str, now=None) -> dict:
+    """The banked-plus-remaining arguments for `build_week_plan`.
+
+    Before the week starts (or with no labels to read Yahoo's stats by) nothing
+    is banked and the whole week, or what is left of it, is projected.
+    """
+    from_day = max(day, week.start)
+    started = started_clubs(conn, runtime.nhl_season, day, now) if from_day == day else set()
+    out: dict = {"from_day": from_day, "started": started or None}
+    out["status"] = live.status if live is not None else ""
+    labels = runtime.stat_labels()
+    if live is not None and live.started and labels:
+        out["banked_ours"] = live.banked(labels, "ours")
+        out["banked_theirs"] = live.banked(labels, "theirs")
+    return out
+
+
+def goalie_terms(terms, runtime, week, day: str | None = None, ours=None, theirs=None) -> dict:
+    """The goalie-move arguments for `build_week_plan`, from a manager's terms.
+
+    The weekly minimum is priced only from a count we can trust: nothing
+    banked before the week starts, Yahoo's own count once it has (an unknown
+    count leaves the minimum unpriced rather than guessing it at zero). The
+    opponent's count is used when Yahoo shows it; unknown, they are taken to
+    reach it.
+    """
+    from puckpilot.season.today import yahoo_goalie_games
+
+    out: dict = {
+        "drop_choice": getattr(terms, "drop_choice", "cheapest"),
+        "goalie_lane": getattr(terms, "goalie_lane", 0),
+    }
+    floor = goalie_floor(getattr(terms, "min_goalies", None), runtime)
+    if floor:
+        out["goalie_floor"] = floor
+    if not getattr(terms, "price_goalie_minimum", False) or week is None:
+        return out
+    need = runtime.min_goalie_games(week.number)
+    if day is None or day <= week.start:
+        out.update(goalie_minimum=need, goalie_appearances=0.0, their_goalie_appearances=None)
+        return out
+    mine = yahoo_goalie_games(ours, runtime, day) if ours is not None else None
+    if mine is None:
+        return out
+    got = yahoo_goalie_games(theirs, runtime, day) if theirs is not None else None
+    out.update(
+        goalie_minimum=need,
+        goalie_appearances=float(mine),
+        their_goalie_appearances=None if got is None else float(got),
+    )
+    return out
+
+
+def goalie_floor(setting, runtime) -> int:
+    """`authority.transactions.min_goalies` as a count: off (0), a number, or
+    "auto" - the league's G slots plus one, from the league's own settings."""
+    if setting is None:
+        return 0
+    if setting == "auto":
+        return sum(s.count for s in runtime.slots if s.position == "G") + 1
+    return int(setting)
+
+
+def timing_terms(terms) -> dict:
+    """The swap-timing arguments for `build_week_plan`, from a manager's terms."""
+    return {
+        "time_moves": str(getattr(terms, "time_moves", "off")),
+        "wait_hazard": float(getattr(terms, "wait_hazard", 0.10)),
+    }
+
+
+def committed_moves(conn, manager_name: str, league_key: str, roster, week) -> list:
+    """This week's moves approved and not yet made - one timed for a later
+    morning, or one the executor could not make yet.
+
+    Each already holds its drop - and an add/drop its acquisition and its add -
+    so a search plans around them rather than over them. An add is unmade
+    while the add is not on the roster; a make-room move while its drop still
+    is (the returning player was on the roster all along).
+    """
+    if week is None or roster is None:
+        return []
+    mine = {p.player_key for p in roster.players}
+    out = []
+    for p in proposals_mod.approved_unmade(conn, manager_name, league_key, week.number):
+        if p.move_kind.spends_acquisition:
+            if p.add_player_key not in mine:
+                out.append(p)
+        elif p.drop_player_key in mine:
+            out.append(p)
+    return out
+
+
+def _swaps(proposals) -> list:
+    """Only the add search's own proposals - the ones it re-prices and withdraws."""
+    return [p for p in proposals if p.move_kind.is_search_result]
+
+
+def _label(p) -> str:
+    """A queued move in a log line."""
+    if p.move_kind is MoveKind.ACTIVATE:
+        return f"#{p.id} (make room for {p.add_name})"
+    return f"#{p.id} {p.add_name}"
+
+
+def adds_used(roster, week) -> tuple[int, int]:
+    """(this week, this season) - Yahoo's own counters, zero only when unknown."""
+    wk = roster.adds_this_week if roster is not None else None
+    if wk is not None and roster.adds_week not in (None, getattr(week, "number", None)):
+        wk = 0  # a count for another week
+    season = roster.moves_season if roster is not None else None
+    return wk or 0, season or 0
+
+
+def run_day(
+    conn: sqlite3.Connection,
+    manager,
+    league_key: str,
+    runtime,
+    day: str,
+    *,
+    weekly: bool | None = None,
+    do_sync: bool = True,
+    propose: bool = True,
+    reschedule: bool = True,
+    say=print,
+) -> RunReport:
+    """Everything a day needs, in the order it needs it."""
+    from puckpilot.season import cli_support, explain, publish, snapshot
+    from puckpilot.season.fetch import discover_team_key, fetch_live, fetch_roster, save_roster
+    from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
+    from puckpilot.season.legality import open_roster_spots
+    from puckpilot.season.today import build_plan, yahoo_goalie_games
+    from puckpilot.season.values import build_value_model
+    from puckpilot.yahoo import playermap
+
+    report = RunReport(date=day, manager=manager.name)
+    page_key = manager.page.owner_key or _env_key()
+    # In the proposals table's own format, to find what this run queued.
+    started = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+    # 0. Keep the league's own rules current. Cheap, and the alternative is a
+    # week calendar that quietly stops advancing.
+    refreshed = _guard(
+        report, "settings", lambda: _refresh_runtime(conn, manager, league_key, runtime, report)
+    )
+    runtime = refreshed or runtime
+    season = runtime.nhl_season
+
+    # 1. Last night's games, so recent form and the goalie model are current.
+    if do_sync:
+
+        def _sync():
+            from puckpilot.data.nhl import NhlClient
+            from puckpilot.data.sync import sync_day
+
+            out = sync_day(conn, NhlClient(), season, progress=lambda _m: None)
+            report.add(
+                "sync",
+                True,
+                f"{out['boxscores']} boxscore(s), {out['players_synced']} player log(s)",
+                [f"{out['still_behind']} still behind"] if out["still_behind"] else [],
+            )
+
+        _guard(report, "sync", _sync)
+
+    # 2. Anything decided on the phone, before anything is proposed again.
+    if manager.page.publishes and page_key:
+
+        def _collect():
+            got = publish.collect(manager.page.url, page_key)
+            lines = snapshot.apply_decisions(conn, got, manager=manager.name)
+            report.add("decisions", True, f"{len(got)} from your phone", lines)
+
+        _guard(report, "decisions", _collect)
+
+    # 2a. Moves approved in advance whose time has come (season/standing.py) -
+    # after the phone's decisions, so a Stop or a tier change made there counts.
+    _guard(report, "standing", lambda: _standing_due(conn, manager, league_key, report))
+
+    # 2b. Moves approved to be made, made - before the roster is read, so the
+    # lineup below already has the new player in it.
+    pmap = playermap.load_map(conn, league_key)
+    if manager.authority.transactions.execute_approved:
+        _guard(
+            report,
+            "transactions",
+            lambda: _carry_out(conn, manager, league_key, runtime, day, report, pmap),
+        )
+
+    # 3. Tonight - and the week's live score and the opponent's roster, read in
+    # the same browser session. Intra-week state cannot be fetched afterwards,
+    # so every run logs it.
+    week = week_for(runtime, day)
+    ctx = WeekContext(week=week)
+
+    def _read(session):
+        key = manager.team_key or discover_team_key(session, league_key)
+        roster = fetch_roster(session, key, day, player_map=pmap)
+        if week is not None:
+            try:
+                ctx.live, ctx.raw = fetch_live(session, key, week.number)
+                opp = ctx.live.theirs.team_key if ctx.live is not None else ""
+                if opp:
+                    when = day if week.contains(day) else week.start
+                    ctx.theirs = fetch_roster(session, opp, when, player_map=pmap)
+            except Exception as e:  # noqa: BLE001 - the lineup must not die with the score
+                ctx.error = f"{type(e).__name__}: {e}"
+        return roster
+
+    roster = _guard(report, "roster", lambda: cli_support.run_session(manager, _read))
+    keepers = None
+    if roster is not None:
+        got = _guard(
+            report, "keepers", lambda: _keepers(conn, manager, runtime, roster, day, report)
+        )
+        if got is not None:
+            roster, keepers = got
+        roster = _with_pins(conn, manager, league_key, roster)
+    ctx.roster = roster
+    _guard(report, "score", lambda: _log_week(conn, manager, league_key, ctx, report))
+    train = _train_seasons(season)
+    models = _guard(
+        report,
+        "model",
+        lambda: (
+            build_value_model(conn, season, train, manager.league),
+            ChainedGoalieSource(
+                TrailingStartShareSource(
+                    conn,
+                    season,
+                    fallback_season=train[0],
+                    unavailable=_out_goalies(roster, ctx.theirs),
+                    healthy=_healthy_goalies(roster, ctx.theirs),
+                )
+            ),
+        ),
+    )
+    if models is not None and keepers is not None:
+        models[0].keepers = keepers  # read by the add cards
+    plan = None
+    acted = None
+    if roster is not None:
+        save_roster(conn, manager.name, roster)
+        report.add("roster", True, f"{len(roster)} players", list(roster.unmapped))
+        _guard(report, "statuses", lambda: _statuses(conn, roster, report, "yours"))
+        # 3a. Roster legality, on every run that has the roster: a player
+        # cleared to play on a Wednesday must not wait for Monday's search, and
+        # nothing an add search proposes can be made while the roster is illegal.
+        if models is not None:
+            _guard(
+                report,
+                "legality",
+                lambda: _legality(conn, manager, league_key, runtime, day, roster, ctx,
+                                  models, report, propose),
+            )  # fmt: skip
+
+        def _plan():
+            values, goalies = models
+            steer = _guard(
+                report, "steer", lambda: _steer(conn, manager, runtime, ctx, roster, models, day)
+            )
+            got = build_plan(
+                conn,
+                runtime,
+                roster,
+                values,
+                goalies,
+                day,
+                manager=manager.name,
+                authority=manager.authority.lineup,
+                goalie_starts_so_far=yahoo_goalie_games(roster, runtime, day),
+                weights=protocol_mod.lineup_weights(conn, manager, league_key, runtime, day),
+                steer=steer,
+            )
+            reasons = explain.move_reasons(conn, runtime, got)
+            report.add(
+                "lineup",
+                True,
+                f"{len(got.moves)} change(s), {got.gain:+.2f}"
+                + (f", {len(got.ir_moves)} roster move(s)" if got.ir_moves else "")
+                + (f", locks {got.deadline()}" if got.lock_utc else ""),
+                [f"!! {a}" for a in got.ir_alerts]
+                + [
+                    f"{m.describe()} - {reasons.get(m.player.player_key, '')}"
+                    for m in (*got.ir_moves, *got.moves)
+                ],
+            )
+            proposals_mod.record_action(
+                conn,
+                manager.name,
+                league_key,
+                roster.team_key,
+                day,
+                "lineup",
+                {
+                    "moves": [m.describe() for m in got.moves],
+                    "gain": round(got.gain, 3),
+                    "reasons": reasons,
+                },
+                outcome="planned",
+            )
+            return got, reasons
+
+        got = _guard(report, "lineup", _plan) if models else None
+        plan, reasons = got if got else (None, {})
+        if plan is not None:
+            acted = _guard(
+                report, "act", lambda: act(conn, manager, league_key, roster, plan, report)
+            )
+            roster = _after_act(conn, manager, league_key, runtime, day, roster, ctx, models,
+                                report, propose, plan, acted, pmap)  # fmt: skip
+
+        # 3b. The rest of the week, set in Yahoo, so a run that never happens
+        # leaves a planned day rather than a copy of the last one set.
+        if plan is not None and week is not None:
+            ir_done = bool(ir_made(plan, acted))
+            _guard(
+                report,
+                "ahead",
+                lambda: _set_ahead(
+                    conn, manager, league_key, runtime, day, week, roster, models, report,
+                    pmap, moved_today=ir_done,
+                ),
+            )  # fmt: skip
+
+    # 4. The week: the full plan, with adds, on the day it turns over; where it
+    # stands - banked plus what is left - on every other run.
+    week_plan = None
+    if weekly is None:
+        weekly = starts_a_week(runtime, day)
+    terms = manager.authority.transactions
+
+    def last_days(n: int) -> bool:
+        return not weekly and week is not None and preloads(runtime, day, n)
+
+    # The week's last days look at the next one: waiting adds are judged over
+    # the rest of this week and the next together (`look_ahead_days`), and -
+    # only if a manager turns it on - the search itself prices against next
+    # week (`preload_days`; measured worse, so off by default).
+    ahead_search = last_days(terms.preload_days)
+    ahead_check = last_days(terms.look_ahead_days)
+    ahead = ahead_search or ahead_check
+    # A morning search on the days between: Monday has its weekly search and
+    # the week's last days the look-ahead rules (`mid_week_floor`).
+    mid_week = terms.mid_week_floor is not None and not ahead
+    if weekly and models:
+        week_plan = _guard(
+            report,
+            "week",
+            lambda: _weekly(conn, manager, league_key, runtime, day, propose, report, ctx, models),
+        )
+    elif (
+        models
+        and not ahead_search
+        and week is not None
+        and roster is not None
+        and not pool_read_on(conn, league_key, day)
+        and (mid_week or open_roster_spots(runtime, roster) > 0)
+    ):
+        # Mid-week the search runs again on the morning's first run when
+        # `mid_week_floor` is set - a swap there must clear that bar, and
+        # (`mid_week_horizon`) pay over next week too - and otherwise only when
+        # a roster spot has opened (an add that costs no drop should not wait
+        # for Monday; judgement - the replay never frees a spot mid-week). A
+        # plain daily search at the usual floor churned too much to beat once a
+        # week (gate G2: -0.06 +/- 0.06 and -0.06 +/- 0.08 categories a week).
+        week_plan = _guard(
+            report,
+            "week",
+            lambda: _weekly(
+                conn,
+                manager,
+                league_key,
+                runtime,
+                day,
+                propose,
+                report,
+                ctx,
+                models,
+                start_of_week=False,
+                floor=terms.mid_week_floor if mid_week else None,
+                horizon=mid_week and terms.mid_week_horizon,
+            ),
+        )
+    elif models and ctx.roster is not None and ctx.theirs is not None and week is not None:
+        week_plan = _guard(
+            report,
+            "week",
+            lambda: _outlook(
+                conn,
+                manager,
+                league_key,
+                runtime,
+                day,
+                report,
+                ctx,
+                models,
+                # On the week's last days the queue is judged with next week in.
+                propose=propose and not ahead_check,
+            ),
+        )
+    if ahead and models and ctx.roster is not None:
+        _guard(
+            report,
+            "next week",
+            lambda: _next_week(
+                conn,
+                manager,
+                league_key,
+                runtime,
+                day,
+                propose,
+                report,
+                ctx,
+                models,
+                search_ahead=ahead_search,
+                check_ahead=ahead_check,
+            ),
+        )
+
+    # 4a. The whole league, once a day: every team's moves, standings, the
+    # week's scores and week-start rosters (season/league_feed.py) - what the
+    # live calibration and the replay's rivals are measured against.
+    if not _league_read_on(conn, manager, day):
+        _guard(report, "league", lambda: _league(conn, manager, league_key, runtime, day, report))
+
+    # 4a'. Every player's drop tier, as the searches above placed them - for
+    # the page, and for which waiting moves count as rotation drops.
+    if ctx.roster is not None and models is not None:
+        _guard(
+            report,
+            "tiers",
+            lambda: _tiers(conn, manager, league_key, runtime, ctx, models, day, report),
+        )
+    # ...with the numbers a tier is decided by, on the page's roster.
+    if ctx.keep is not None:
+        _guard(report, "stats", lambda: _roster_stats(conn, manager, runtime, ctx, day))
+    # ...and which waiting cards a standing approval covers: a rotation
+    # player's drop, made after the window unless stopped (season/standing.py).
+    # Only where a page shows them: the window is the manager's to stop it.
+    offered = []
+    showable = manager.page.publishes and page_key
+    if ctx.tiers is not None and manager.authority.standing.enabled and showable:
+        offered = (
+            _guard(
+                report, "standing", lambda: _standing_offer(conn, manager, league_key, ctx, report)
+            )
+            or []
+        )
+
+    # 4b. What stops the tool working - said on the page, in the log as a FAIL,
+    # and on the phone - never left as a line under an "ok" step.
+    blocked = _guard(report, "blockers", lambda: _blockers(conn, manager, league_key, ctx, report))
+
+    # 5. Publish whatever we managed to work out.
+    if manager.page.publishes and page_key:
+
+        def _push():
+            from puckpilot.season import standing
+
+            standing.stamp(conn, manager.name, league_key, datetime.now(UTC))
+            snap = snapshot.build(
+                conn,
+                manager.name,
+                league_key,
+                team_name=getattr(roster, "team_name", "") or manager.name,
+                plan=plan,
+                week_plan=week_plan,
+                roster=roster,
+                reasons=reasons if plan else None,
+                week_no=week.number if week is not None else None,
+                next_run=_next_run(conn, manager, runtime, day, roster),
+                acted=acted,
+                show_protocol=manager.authority.lineup.follow_protocol,
+                lineup_by=lineup_by(manager),
+                executes_moves=_executes(manager),
+                executable_kinds=_executable_kinds(),
+                today=day,
+                blockers=[b.payload() for b in blocked or ()],
+                ledger=_ledger(conn, manager, league_key, runtime, day, roster),
+                tiers=ctx.tiers,
+                player_stats=ctx.player_stats,
+                standing_on=manager.authority.standing.enabled,
+            )
+            publish.push(manager.page.url, page_key, snap)
+            # The window of each card it showed for the first time starts now.
+            standing.shown(conn, manager.name, league_key, datetime.now(UTC))
+            report.add("page", True, manager.page.url)
+
+        _guard(report, "page", _push)
+
+    # 5b. With no window (`veto_minutes = 0`) a card shown just now is due now:
+    # made on this run, the push having told the phone first.
+    grant = manager.authority.standing
+    if (
+        offered
+        and grant.enabled
+        and grant.veto_minutes == 0
+        and _guard(report, "standing", lambda: _standing_due(conn, manager, league_key, report))
+        and manager.authority.transactions.execute_approved
+    ):
+        _guard(
+            report,
+            "transactions",
+            lambda: _carry_out(conn, manager, league_key, runtime, day, report, pmap),
+        )
+
+    # 6. Line up the rest of today against the real game times.
+    if reschedule:
+        own = manager.team_key or getattr(roster, "team_key", "")
+        _guard(
+            report,
+            "schedule",
+            lambda: _plan_rest_of_day(conn, manager, runtime, day, report, own),
+        )
+
+    # 7. Tell the phone about anything that needs the manager.
+    _guard(
+        report,
+        "notify",
+        lambda: _notify(conn, manager, league_key, report, started, blocked or (), offered),
+    )
+    from puckpilot.season import blockers as blockers_mod
+
+    blockers_mod.mark_run(conn, manager.name)
+
+    say(report.text)
+    return report
+
+
+def _executes(manager) -> bool:
+    """Whether Approve makes the move: the manager turned it on and an executor
+    is installed. The page words its cards by this - and an approval is only
+    ever carried out if the card it was given on said so."""
+    from puckpilot.season.transactions import executor
+
+    return bool(manager.authority.transactions.execute_approved) and executor() is not None
+
+
+def _executable_kinds() -> frozenset[str]:
+    """The move kinds the installed executor makes - a card of another kind
+    says to make it yourself, because nothing here would."""
+    from puckpilot.season.transactions import executor
+
+    ex = executor()
+    return frozenset(ex.kinds) if ex is not None else frozenset()
+
+
+def _carry_out(conn, manager, league_key, runtime, day, report, pmap) -> int:
+    """Make the approved moves (season/transactions.py), reading the roster
+    before and after each one in its own session - the executor needs the
+    profile to itself in between."""
+    from puckpilot.season import calendar, cli_support
+    from puckpilot.season import pool as pool_mod
+    from puckpilot.season.fetch import discover_team_key, fetch_roster
+    from puckpilot.season.transactions import carry_out
+
+    team_key = manager.team_key
+    if not team_key:
+        team_key = cli_support.run_session(manager, lambda s: discover_team_key(s, league_key))
+
+    def read_roster():
+        return cli_support.run_session(
+            manager, lambda s: fetch_roster(s, team_key, day, player_map=pmap)
+        )
+
+    def read_adds(keys):
+        # The adds as they stand now: an approval is not carried out for a
+        # player taken, put on waivers or listed out since it was given.
+        found = cli_support.run_session(
+            manager, lambda s: pool_mod.fetch_players(s, league_key, keys, player_map=pmap)
+        )
+        return {a.player_key: a for a in found}
+
+    from puckpilot.season import tiers
+
+    pins = tiers.pins(conn, manager.name, league_key)
+    protected = (
+        _protected_keepers(conn, manager.name)
+        if manager.authority.transactions.protect_keepers
+        else set()
+    )
+    # A keeper pinned to another tier is the manager's to let go.
+    protected -= {k for k, t in pins.items() if t is not tiers.Tier.NEVER}
+    never = {k for k, t in pins.items() if t is tiers.Tier.NEVER}
+    playing = calendar.teams_playing(conn, day, runtime.nhl_season)
+    url = manager.page.url if manager.page.publishes else ""
+    return carry_out(
+        conn,
+        manager,
+        league_key,
+        team_key,
+        report,
+        read_roster,
+        playing_today=playing,
+        started_today=started_clubs(conn, runtime.nhl_season, day),
+        today=day,
+        page_url=url,
+        read_adds=read_adds,
+        protected=protected,
+        never=never,
+        runtime=runtime,
+    )
+
+
+def _protected_keepers(conn, manager_name: str) -> set[str]:
+    """Player keys protected for next season by the latest weekly ranking
+    (season/keeper_value.py) - the moves run before this week's is decided."""
+    from puckpilot.season import keeper_value
+
+    row = conn.execute(
+        "SELECT MAX(week_start) FROM keeper_ranks WHERE manager = ?", (manager_name,)
+    ).fetchone()
+    if not row or not row[0]:
+        return set()
+    return {k.player_key for k in keeper_value.load(conn, manager_name, row[0]) if k.protected}
+
+
+def _ledger(conn, manager, league_key: str, runtime, day: str, roster) -> list[dict]:
+    """The last few moves made, and what each did - for the page (ledger.py)."""
+    from puckpilot.season import ledger
+
+    team_key = manager.team_key or getattr(roster, "team_key", "")
+    if not team_key:
+        return []
+    lines = ledger.build(conn, manager.name, league_key, team_key, runtime.nhl_season, day)
+    return [ledger.summary(x, manager.league.all_cats) for x in lines[-LEDGER_SHOWN:]][::-1]
+
+
+# Moves the page lists, newest first.
+LEDGER_SHOWN = 6
+
+
+def _league_read_on(conn, manager, day: str) -> bool:
+    from puckpilot.data import store
+
+    return store.get_meta(conn, f"league:{manager.name}:{day}") is not None
+
+
+def _league(conn, manager, league_key: str, runtime, day: str, report: RunReport) -> None:
+    from puckpilot.data import store
+    from puckpilot.season import cli_support
+    from puckpilot.season import league_feed as lf
+    from puckpilot.yahoo import playermap
+
+    pmap = playermap.load_map(conn, league_key)
+    got = cli_support.run_session(
+        manager,
+        lambda s: lf.sync(conn, lf.YahooLeagueSource(s), league_key, runtime, manager.name,
+                          day, pmap),
+    )  # fmt: skip
+    store.set_meta(conn, f"league:{manager.name}:{day}", "read")
+    conn.commit()
+    report.add(
+        "league",
+        True,
+        f"{got['transactions']} transaction rows, {got['weeks']} week(s) of scores, "
+        f"{got['rosters']} week-start roster(s)",
+    )
+
+
+def _blockers(conn, manager, league_key: str, ctx, report: RunReport) -> list:
+    """This run's blockers (`season/blockers.py`), recorded, as a step that
+    FAILs while any stands."""
+    from puckpilot.season import blockers as blockers_mod
+    from puckpilot.season.transactions import executor
+
+    read = next((s for s in report.steps if s.name == "roster"), None)
+    approved = [
+        p
+        for p in proposals_mod.listing(conn, manager.name, league_key,
+                                       status=proposals_mod.APPROVED, limit=200)
+        if p.reason.get("approved_to_execute") and not p.reason.get("submitted_at")
+    ]  # fmt: skip
+    pending_fixes = [
+        p for p in proposals_mod.pending(conn, manager.name, league_key)
+        if p.move_kind is MoveKind.ACTIVATE
+    ]  # fmt: skip
+    found, failures = blockers_mod.detect(
+        resolution=getattr(ctx, "resolution", None),
+        pending_fixes=pending_fixes,
+        execute_approved=bool(manager.authority.transactions.execute_approved),
+        executor=executor(),
+        approved=approved,
+        read_failed=read is not None and not read.ok,
+        read_error=read.detail if read is not None and not read.ok else "",
+        previous_failures=blockers_mod.read_failures(conn, manager.name),
+        last_run_at=blockers_mod.last_run(conn, manager.name),
+    )
+    blockers_mod.set_read_failures(conn, manager.name, failures)
+    recorded = blockers_mod.record(conn, manager.name, found)
+    if recorded:
+        report.add(
+            "blockers",
+            False,
+            "; ".join(b.title for b in recorded),
+            [f"{b.title} (since {b.since}): {b.message}" for b in recorded],
+        )
+    return recorded
+
+
+def ir_made(plan, acted) -> tuple:
+    """The moves between IR and the active roster the actuator made tonight.
+
+    The plan's IR moves, and an activation straight into tonight's lineup:
+    `today.build_plan` files that one with the lineup moves, in place of his
+    move to the bench. Read off `ir_moves` alone, a run kept the roster as it
+    was read before them - on 2026-11-01 a player brought back from IR+ into
+    a free D slot at 07:02 left the run saying the roster was illegal, and the
+    phone was told so.
+    """
+    if not (acted and acted.get("ok")):
+        return ()
+    made = list(plan.ir_moves) if plan.ir_within_authority else []
+    if plan.within_authority:
+        made += [m for m in plan.moves if m.is_activation]
+    return tuple(made)
+
+
+def _after_act(conn, manager, league_key, runtime, day, roster, ctx, models, report, propose,
+               plan, acted, pmap=None):  # fmt: skip
+    """The roster once tonight's moves between IR and the active roster are
+    made, and what follows from them: legality checked again, and approved
+    adds Yahoo refused until the player was back made now."""
+    made = ir_made(plan, acted)
+    if not made:
+        return roster
+    # The actuator re-read every slot before saying ok, so the moves stand;
+    # the week below and the page work from the roster as it is now, not as
+    # it was read before them.
+    roster = _after_ir(roster, made)
+    ctx.roster = roster
+    _guard(
+        report,
+        "legality",
+        lambda: _legality(conn, manager, league_key, runtime, day, roster, ctx, models, report,
+                          propose, made=made),
+    )  # fmt: skip
+    if manager.authority.transactions.execute_approved and _waiting_swaps(
+        conn, manager, league_key
+    ):
+        # A make-room move made at 2b leaves approved adds that Yahoo refused
+        # until the player was back: make them now.
+        _guard(
+            report,
+            "transactions",
+            lambda: _carry_out(conn, manager, league_key, runtime, day, report, pmap),
+        )
+    return roster
+
+
+def _after_ir(roster, moves):
+    """`roster` with tonight's IR moves made (the actuator verified them)."""
+    to = {m.player.player_key: m.to_slot for m in moves}
+    return replace(
+        roster,
+        players=tuple(
+            replace(p, selected_slot=to[p.player_key]) if p.player_key in to else p
+            for p in roster.players
+        ),
+    )
+
+
+def _waiting_swaps(conn, manager, league_key: str) -> bool:
+    """Approved adds the executor is to make that are not made yet."""
+    return any(
+        p.reason.get("approved_to_execute") and not p.reason.get("submitted_at")
+        for p in _swaps(proposals_mod.listing(conn, manager.name, league_key,
+                                              status=proposals_mod.APPROVED, limit=200))
+    )  # fmt: skip
+
+
+def _resolution(conn, manager, runtime, roster, values, day, hold=(), ctx=None):
+    """`legality.resolve` for this manager's roster: drops chosen by rest-of-
+    season value, keepers and approved moves' drops held, an approved
+    make-room drop kept."""
+    from puckpilot.season import legality
+    from puckpilot.season import week as weekmod
+
+    if not legality.check(runtime, roster):
+        return legality.Resolution((), ())
+    promised = {
+        p.add_player_key: p.drop_player_key
+        for p in proposals_mod.listing(conn, manager.name, roster.league_key or "",
+                                       status=proposals_mod.APPROVED, limit=200)
+        if p.move_kind is MoveKind.ACTIVATE
+    }  # fmt: skip
+    keep = weekmod.keep_values(
+        conn, runtime, roster.players, values, day, getattr(values, "workload", None)
+    )
+    terms = manager.authority.transactions
+    return legality.resolve(
+        runtime,
+        roster,
+        keep,
+        manager.league.draft_rules(),
+        hold=hold,
+        promised=promised,
+        stream_spots=terms.stream_spots,
+        upgrade_margin=terms.upgrade_margin,
+    )
+
+
+def _legality(conn, manager, league_key, runtime, day, roster, ctx, models, report, propose,
+              made=()):  # fmt: skip
+    """Roster legality: what Yahoo refuses today, and the make-room moves that fix it.
+
+    A violation is a FAIL on the run, not a note: on 2026-10-19 one sat as a
+    line under an "ok" lineup for twelve days while nothing could be added.
+    Each fix that needs a drop is proposed (`MoveKind.ACTIVATE`) - required,
+    so never weighed against the add bar - and one no longer needed is
+    withdrawn. A fix the lineup can make (a free spot) needs no proposal.
+    `made`: the IR moves this run made since the roster was read - the check
+    after them settles this run's earlier FAIL when they made it legal.
+    """
+    values, _ = models
+    hold = {
+        p.drop_player_key
+        for p in committed_moves(conn, manager.name, league_key, roster, ctx.week)
+        if p.move_kind.spends_acquisition and p.drop_player_key
+    }
+    res = _resolution(conn, manager, runtime, roster, values, day, hold, ctx)
+    from puckpilot.season import legality
+
+    ctx.resolution = res
+    ctx.resolved = legality.as_resolved(roster, res) if not res.legal else None
+    stuck = {f.player.player_key for f in res.fixes if f.player is not None}
+    stuck |= {p.player_key for p in roster.illegal_ir()}
+    lines = []
+    if propose:
+        gone = proposals_mod.retire_fixes(conn, manager.name, league_key, stuck)
+        lines += [f"#{p.id} withdrawn: {p.reason.get('withdrawn', '')}" for p in gone]
+    if res.legal:
+        if made and report.settle(
+            "legality",
+            "the roster is legal again - tonight's lineup made the fix",
+            [*lines, *(f"made: {m.describe()}" for m in made)],
+        ):
+            return res
+        if lines:
+            report.add("legality", True, "the roster is legal", lines)
+        return res
+    lines += [v.message for v in res.violations]
+    week_no = ctx.week.number if ctx.week is not None else 0
+    for f in res.fixes:
+        if not f.needs_transaction:
+            lines.append(
+                f"{f.player.name} comes back from {f.slot} into a free spot - a lineup move"
+            )
+            continue
+        head = MoveKind.ACTIVATE.head(f.player.name if f.player else "", f.drop.name, f.slot)
+        if f.player is None:
+            lines.append(f"{head} - over the roster limit; drop {f.drop.name} by hand")
+            continue
+        if not propose:
+            lines.append(f"would propose: {head}")
+            continue
+        p, new = proposals_mod.propose_fix(
+            conn, manager.name, league_key, roster.team_key, f, week_no,
+            {"detail": {"room": _room_lines(f, roster, values, day, conn, runtime,
+                                            manager.league.draft_rules(),
+                                            manager.authority.transactions)}},
+        )  # fmt: skip
+        state = "proposed" if new else p.status
+        lines.append(f"{state}: #{p.id} {head} ({f.reason})")
+    lines += list(res.unresolved)
+    head = "the roster is illegal - Yahoo refuses every add until it is fixed"
+    report.add("legality", False, head, lines)
+    return res
+
+
+def _room_lines(fix, roster, values, day, conn, runtime, rules=None, terms=None) -> list[str]:
+    """Why this drop, for the card: the rule, the cheapest few it was chosen
+    from with each one's tier, and anyone cheaper who was kept and why - the
+    roster's minimums, or his tier - so "why not him?" is answered on the card."""
+    from puckpilot.season import legality, tiers
+    from puckpilot.season import week as weekmod
+
+    keep = weekmod.keep_values(
+        conn, runtime, roster.players, values, day, getattr(values, "workload", None)
+    )
+    able = legality.droppable(roster)
+    placed = tiers.board(
+        roster.players,
+        keep,
+        terms.stream_spots if terms is not None else 2,
+        droppable=able,
+        upgrade_margin=terms.upgrade_margin if terms is not None else 0.0,
+    )
+    ranked = sorted(able, key=lambda q: keep.get(q.player_key, 0.0))
+    counts = legality.position_counts(roster)
+    pool = [q for q in ranked if legality.legal_drop(fix.player.position, q, counts, rules)]
+    floor = keep.get(fix.drop.player_key, 0.0) if fix.drop is not None else 0.0
+    gone = fix.drop.player_key if fix.drop is not None else ""
+    cheaper = [q for q in ranked if keep.get(q.player_key, 0.0) < floor and q.player_key != gone]
+    short = [q for q in cheaper if q not in pool]
+    by_tier = [q for q in cheaper if q in pool]
+    out = [
+        f"{fix.player.name} is cleared to play, but still in {fix.slot}: until he is back on the "
+        f"active roster Yahoo refuses every add (Error #845), and all active spots are full.",
+        "The drop is the player worth least over the rest of the season among those your drop "
+        "tiers let go - a Rotation player, or an Upgrade only one he is a clear upgrade on - "
+        "never a player set to Never (protected keepers among them), one listed out or NA, or "
+        "one an approved move already drops.",
+    ]
+    if fix.releases:
+        out.append(f"{fix.player.name} himself is worth least, so he is the one released.")
+    line = ", ".join(
+        f"{q.name} {keep.get(q.player_key, 0.0):.0f} ({placed[q.player_key].tier.label})"
+        for q in pool[:4]
+    )
+    if line:
+        back = keep.get(fix.player.player_key, 0.0)
+        out.append(
+            f"Rest-of-season value of those who may go, lowest first: {line}; "
+            f"{fix.player.name} {back:.0f}."
+        )
+    if short:
+        names = ", ".join(q.name for q in short)
+        pos = "/".join(sorted({q.position for q in short}))
+        out.append(
+            f"Worth less but kept: {names} - dropping {'him' if len(short) == 1 else 'them'} "
+            f"would leave the roster under its minimum at {pos}."
+        )
+    if by_tier:
+        names = ", ".join(f"{q.name} ({placed[q.player_key].tier.label})" for q in by_tier)
+        out.append(f"Worth less but kept by tier: {names}.")
+    nevers = [
+        q.name
+        for q in roster.players
+        if tiers.is_never(q) and q.player_key != fix.player.player_key and not q.on_ir
+    ]
+    if nevers:
+        out.append(f"Never dropped: {', '.join(nevers)}.")
+    return out
+
+
+def _price_fixes(
+    conn, manager, league_key, runtime, ctx, plan, models, day, frame=None, unpriced=None
+):
+    """What each open make-room move is worth this week, written onto its card.
+
+    The week as priced (`plan`, on the roster with the move made) against the
+    same week on the roster as it stands - where the returning player cannot
+    play and no add can be made.
+    """
+    from puckpilot.season import week as weekmod
+
+    res = getattr(ctx, "resolution", None)
+    if res is None or not res.transactions or plan is None:
+        return []
+    mine = [
+        p
+        for p in proposals_mod.listing(conn, manager.name, league_key, limit=200)
+        if p.move_kind is MoveKind.ACTIVATE and (p.is_live or p.status == proposals_mod.APPROVED)
+    ]
+    if not mine or getattr(plan, "expected", None) is None:
+        return []
+    values, goalies = models
+    terms = manager.authority.transactions
+    base = weekmod.build_week_plan(
+        conn,
+        runtime,
+        manager.league,
+        ctx.week,
+        ctx.live.theirs.name if ctx.live is not None else "",
+        unpriced if unpriced is not None else ctx.roster,
+        ctx.theirs,
+        [],
+        frame,
+        goalies,
+        values,
+        find_targets=False,
+        measure_room=False,
+        odds_model=_odds_model(),
+        min_gain=terms.min_weekly_gain,
+        add_scoring=terms.add_scoring,
+        min_expected_gain=terms.min_expected_gain,
+        **live_inputs(conn, runtime, ctx.week, ctx.live, day),
+        **goalie_terms(terms, runtime, ctx.week, day, ctx.roster, ctx.theirs),
+    )
+    if getattr(base, "expected", None) is None:
+        return []
+    gain = round(float(plan.expected) - float(base.expected), 3)
+    for p in mine:
+        if p.is_live:
+            proposals_mod.annotate(conn, p.id, expected_gain=gain)
+    return [f"make room: +{gain:.2f} categories expected this week with the move made"]
+
+
+def _temporary_spots(conn, runtime, ours, values, day, targets) -> None:
+    """Say on an add that fills a spot an injured player freed that the spot is
+    on loan: when he is cleared one player has to go, and which one that would
+    be today. The 2026-10-07 add into such a spot is how the roster came to be
+    illegal on 10-19. Wording only - pricing the return needs injury returns in
+    the replay first.
+    """
+    from puckpilot.season import legality
+    from puckpilot.season import week as weekmod
+
+    away = [p for p in ours.players if p.on_ir and p.selected_slot in p.yahoo_eligible]
+    fills = [t for t in targets if t.drop is None and isinstance(getattr(t, "detail", None), dict)]
+    if not away or not fills:
+        return
+    keep = weekmod.keep_values(conn, runtime, ours.players, values, day)
+    pool = sorted(legality.droppable(ours), key=lambda q: keep.get(q.player_key, 0.0))
+    who = ", ".join(p.name for p in away)
+    then = pool[0].name if pool else "nobody (every player is protected or out)"
+    for t in fills:
+        t.detail.setdefault("room", []).append(
+            f"This spot is free because {who} {'is' if len(away) == 1 else 'are'} on IR. "
+            f"When cleared, one player has to be dropped to bring him back - today that "
+            f"would be {then}, the lowest rest-of-season value who may go."
+        )
+
+
+def _odds_model():
+    from puckpilot.season.odds import OddsModel
+
+    return OddsModel()
+
+
+def _notify(
+    conn, manager, league_key: str, report: RunReport, since: str, blocked=(), offered=()
+) -> None:
+    """New pickups this run queued, tonight's lineup if it was not made, and
+    each blocker once a day while it stands.
+
+    Quiet unless `PUCKPILOT_NOTIFY_URL` is set (season/notify.py). A lineup
+    switched off on purpose (the kill switch) is not news. A make-room card
+    pushed this run already says the roster is illegal, so that blocker waits
+    for tomorrow's push rather than doubling today's. A card this run offered
+    under a standing approval (`offered`) is told on its own, with the time it
+    will be made - once the page shows it, which is when its window starts.
+    """
+    from puckpilot.season import notify, standing
+
+    url = manager.page.url if manager.page.publishes else ""
+    ahead = [proposals_mod.get(conn, p.id) for p in offered]
+    ahead = [p for p in ahead if p.is_live and standing.due_at(p) is not None]
+    mine = {p.id for p in offered}
+    new = [
+        p
+        for p in proposals_mod.listing(conn, manager.name, league_key, status=proposals_mod.PENDING)
+        if p.created_at >= since and not p.superseded_at and p.id not in mine
+    ]
+    sent = []
+    if ahead and notify.standing_offers([(p, standing.due_local(p)) for p in ahead], url):
+        sent.append(f"{len(ahead)} move(s) made unless you stop them")
+    if new and notify.new_pickups(new, url):
+        sent.append(f"{len(new)} new pickup(s)")
+    for s in report.steps:
+        lineup_missed = s.name == "act" and not s.ok and "switched off" not in s.detail
+        if lineup_missed and notify.failed("tonight's lineup", s.detail, url):
+            sent.append("lineup not made")
+    from puckpilot.season import blockers as blockers_mod
+
+    told = {blockers_mod.ROSTER_ILLEGAL} if any(not p.move_kind.spends_acquisition
+                                                for p in [*new, *ahead]) else set()  # fmt: skip
+    for b in blockers_mod.due(conn, manager.name, [b for b in blocked if b.kind not in told]):
+        if notify.blocked(b.title, b.message, url):
+            sent.append(b.title.lower())
+    if sent:
+        report.add("notify", True, "sent to your phone: " + ", ".join(sent))
+
+
+def act(conn, manager, league_key, roster, plan, report, apply=None) -> dict | None:
+    """Make tonight's changes in Yahoo, where standing authority covers them.
+
+    The published tool stops at the plan: making a change needs an actuator,
+    and none ships with it. Without one this says so - on the page too, so
+    "will act automatically" never stands in for a change nobody made. With
+    one, every attempt lands in `season_actions` with what happened, because
+    criteria granted in advance can only be argued with from a record.
+
+    IR moves go first, as their own phase: tonight's lineup was planned on the
+    roster they leave, so the lineup is not attempted if they do not finish.
+    """
+    phases = []
+    if plan.ir_within_authority and plan.ir_moves:
+        phases.append(list(plan.ir_moves))
+    if plan.within_authority and plan.moves:
+        phases.append(list(plan.moves))
+    if not phases:
+        return None
+    if apply is None:
+        try:  # Optional local actuator; a clone without one gets recommendations.
+            from puckpilot.local.act import apply_lineup as apply
+        except ImportError:
+            report.add("act", True, "not made - no actuator installed")
+            return {"ok": False, "message": "Not made automatically - make these in Yahoo."}
+    result = apply(manager, roster.team_key, plan.date, phases)
+    moves = [m.describe() for phase in phases for m in phase]
+    proposals_mod.record_action(
+        conn,
+        manager.name,
+        league_key,
+        roster.team_key,
+        plan.date,
+        "lineup",
+        {"moves": moves, "steps": list(result.lines)},
+        outcome="executed" if result.ok else "failed",
+        message=result.message,
+    )
+    report.add("act", result.ok, result.message, list(result.lines))
+    return {"ok": bool(result.ok), "message": result.message, "at": datetime.now(UTC)}
+
+
+def _set_ahead(
+    conn,
+    manager,
+    league_key: str,
+    runtime,
+    day: str,
+    week,
+    roster,
+    models,
+    report,
+    pmap=None,
+    moved_today: bool = False,
+    read_rosters=None,
+    plan_for=None,
+    apply=None,
+) -> None:
+    """Set each remaining day of the week's lineup in Yahoo, planned like tonight's.
+
+    Yahoo fills a day nobody set from the last day set before it - checked
+    live on 2026-10-16: a change made for the 16th showed on every day to the
+    22nd. So a run that does not happen leaves the last lineup in place,
+    players without a game in active slots and players with one on the bench.
+    From 09:30 on 2026-10-15 an update restart stopped every run for 35
+    hours; that evening the next six days of carried-over lineup would have
+    cost about 33 against the planner's own plan for each day (lineup value,
+    about four player-games). A day set on its own is kept when an earlier
+    day changes - checked the same evening: 10-19 set, then 10-17, and 10-19
+    stood - so each day can be set ahead and still be re-planned by its own
+    run, with what is known then.
+
+    Done on the week's first run, and again when the roster has changed since
+    (an add, a drop - a day set before it has a hole where the dropped player
+    stood) or an IR move was made today. Each day is planned with today's
+    values and statuses, under the same authority as tonight, without the
+    weekly goalie minimum (Yahoo's count for a later day is not known yet).
+    `read_rosters(days)`, `plan_for(roster, day)` and `apply` are for tests.
+    """
+    import json
+
+    from puckpilot.data.store import get_meta, set_meta
+
+    auth = manager.authority.lineup
+    if not (auth.enabled and auth.set_ahead):
+        return
+    days = [d for d in week.dates() if d > day]
+    if not days:
+        return
+    if apply is None:
+        try:  # Optional local actuator; without one there is nothing to set.
+            from puckpilot.local.act import apply_lineup as apply
+        except ImportError:
+            return
+    key = f"ahead:{manager.name}:{week.start}"
+    members = ",".join(sorted(p.player_key for p in roster.players))
+    done = json.loads(get_meta(conn, key) or "{}")
+    if done and done.get("roster") == members and not moved_today:
+        return
+    why = "the week's first run" if not done else "the roster changed"
+    if read_rosters is None:
+        from puckpilot.season import cli_support
+        from puckpilot.season.fetch import fetch_roster
+
+        def read_rosters(ds):
+            return cli_support.run_session(
+                manager,
+                lambda s: {d: fetch_roster(s, roster.team_key, d, player_map=pmap) for d in ds},
+            )
+
+    if plan_for is None:
+        from puckpilot.season.today import build_plan
+
+        values, goalies = models
+
+        def plan_for(r, d):
+            return build_plan(
+                conn, runtime, r, values, goalies, d, manager=manager.name, authority=auth
+            )
+
+    from datetime import date as _date
+
+    rosters = read_rosters(days)
+    lines, failed = [], 0
+    for d in days:
+        label = _date.fromisoformat(d).strftime("%a %d")
+        planned = plan_for(rosters[d], d)
+        if not (planned.moves or planned.ir_moves):
+            lines.append(f"{label}: already as planned")
+            continue
+        scratch = RunReport(date=d, manager=manager.name)
+        got = act(conn, manager, league_key, rosters[d], planned, scratch, apply)
+        if got is None:
+            lines.append(f"{label}: nothing within authority to change")
+            continue
+        failed += 0 if got["ok"] else 1
+        lines.append(f"{label}: {got['message']}")
+    if not failed:
+        set_meta(conn, key, json.dumps({"on": day, "roster": members}))
+    report.add(
+        "ahead",
+        not failed,
+        f"rest of the week set in Yahoo ({why})"
+        if not failed
+        else f"{failed} day(s) not set - tried again next run",
+        lines,
+    )
+
+
+def _next_run(conn, manager, runtime, day, roster):
+    """When the scheduler will next run, for the page's freshness line."""
+    from puckpilot.season import locks, schedule, standing
+
+    try:
+        own = manager.team_key or getattr(roster, "team_key", "")
+        nxt = locks.next_run(
+            conn, manager.name, runtime.nhl_season, day, own, anchor=schedule.ANCHOR_TIMES[0]
+        )
+        due = standing.next_due(conn, manager.name)
+        return min(nxt, due) if due is not None and nxt is not None else nxt or due
+    except Exception:  # noqa: BLE001 - freshness is advisory; never fail the push
+        return None
+
+
+def _plan_rest_of_day(conn, manager, runtime, day, report, team_key: str = ""):
+    """Register a run shortly before each lock still to come today.
+
+    Done on every run rather than once in the morning, so a game that moves, a
+    roster that changes, or a missed run all self-correct at the next one.
+    """
+    from datetime import date as _date
+
+    from puckpilot.config import REPO_ROOT
+    from puckpilot.season import locks, schedule
+
+    if day != _date.today().isoformat():
+        report.add("schedule", True, f"not planning {day}; only today is schedulable")
+        return
+    from puckpilot.season import standing
+
+    teams = locks.roster_teams(conn, manager.name, team_key, day)
+    if not teams:
+        report.add("schedule", True, "no roster snapshot yet, so nothing to plan against")
+        return
+    todays = locks.locks_for(conn, runtime.nhl_season, day, teams)
+    ahead = locks.upcoming(todays)
+    # A card made after its window is made at its time, not the next lock's.
+    due = standing.due_times(conn, manager.name, day)
+    times = sorted(set(locks.run_times(ahead)) | set(due))
+    lines = schedule.plan_day(manager.name, REPO_ROOT, times)
+    detail = (
+        f"{len(ahead)} lock(s) left today: " + ", ".join(x.pretty for x in ahead)
+        if ahead
+        else "no locks left today"
+    )
+    if due:
+        detail += f"; moves due at {', '.join(due)} unless stopped"
+    report.add("schedule", True, detail, lines)
+
+
+def _upkeep(conn, manager, league_key, season, report):
+    """Weekly housekeeping, in the order each step makes the next one useful.
+
+    A call-up has to cross three gaps before the tool can value him: onto an
+    NHL roster, into our player table, and into the Yahoo map. Doing them in
+    that order means one week's lag rather than three.
+    """
+    from puckpilot.data.nhl import NhlClient
+    from puckpilot.data.sync import sync_current_rosters
+    from puckpilot.season import cli_support
+    from puckpilot.yahoo import playermap
+
+    lines = []
+    rosters = sync_current_rosters(conn, NhlClient(), season, progress=lambda _m: None)
+    lines.append(
+        f"NHL rosters: {rosters.get('new', 0)} new player(s), {rosters.get('changed', 0)} re-teamed"
+    )
+
+    again = playermap.reresolve_unmatched(conn)
+    lines.append(f"re-resolved {again.matched}/{again.total} previously unmapped")
+
+    age = _map_age(conn, league_key)
+    if age is None or age >= MAP_REFRESH_DAYS:
+        built = cli_support.run_session(
+            manager, lambda s: playermap.build_map(conn, s, league_key, limit=900)
+        )
+        lines.append(f"player map rebuilt: {built.matched}/{built.total} matched")
+    else:
+        lines.append(f"player map {age:.1f} days old, still fresh")
+    report.add("upkeep", True, "player map and rosters", lines)
+
+
+def _map_age(conn, league_key: str) -> float | None:
+    row = conn.execute(
+        "SELECT MAX(updated_at) FROM yahoo_player_map WHERE league_key = ?", (league_key,)
+    ).fetchone()
+    return _age_days(row[0]) if row and row[0] else None
+
+
+def _refresh_runtime(conn, manager, league_key, runtime, report):
+    """Re-read the league settings when the cache has aged."""
+    from puckpilot.season import cli_support
+    from puckpilot.season.fetch import fetch_runtime, save_runtime
+
+    age = _age_days(runtime.fetched_at)
+    # A cache written before the scored categories were read has none, and
+    # without them Yahoo's live category totals cannot be labelled.
+    if age is not None and age < RUNTIME_REFRESH_DAYS and runtime.stat_categories:
+        report.add("settings", True, f"cached {age:.1f} days ago, still fresh")
+        return runtime
+    got = cli_support.run_session(manager, lambda s: fetch_runtime(s, league_key, manager.team_key))
+    save_runtime(conn, got)
+    report.add(
+        "settings",
+        True,
+        f"refreshed - week {got.current_week}, {len(got.weeks)} week(s) known",
+    )
+    return got
+
+
+def _log_week(conn, manager, league_key, ctx, report):
+    """Record this run's reading of the live score, and the opponent's roster."""
+    from puckpilot.season.fetch import save_live, save_roster
+
+    if ctx.error:
+        report.add("score", False, f"live score not read: {ctx.error}")
+        return
+    if ctx.live is None:
+        if ctx.week is not None:
+            report.add("score", True, f"week {ctx.week.number}: no live score in the response")
+        return
+    save_live(conn, manager.name, league_key, ctx.live, ctx.raw)
+    if ctx.theirs is not None:
+        save_roster(conn, manager.name, ctx.theirs)
+        _statuses(conn, ctx.theirs, report, "theirs")
+    t = ctx.live
+    left = ""
+    if t.ours.remaining_games is not None:
+        left = f", Yahoo counts {t.ours.remaining_games} games left vs {t.theirs.remaining_games}"
+    report.add("score", True, f"week {t.week} vs {t.theirs.name} ({t.status}){left}")
+
+
+def _statuses(conn, roster, report, whose: str) -> None:
+    """Log injury and availability tags as this run saw them (season/status_log.py)."""
+    from puckpilot.season import status_log
+
+    changes = status_log.record(conn, roster)
+    if changes:
+        report.add(
+            f"tags ({whose})",
+            True,
+            f"{len(changes)} change(s)",
+            [c.describe() for c in changes],
+        )
+
+
+def _outlook(conn, manager, league_key, runtime, day, report, ctx, models, propose=True):
+    """Where the week stands on a run that is not the week's first - and
+    whether what is waiting for a decision still pays.
+
+    Banked plus what is left, both sides, from the rosters just read - no add
+    search, which is the weekly job's, and no new protocol, which Monday's.
+
+    The queue is re-checked, though. A proposal is priced once, by the search,
+    and midweek the search runs again only when a roster spot opens; on
+    2026-09-30 the cards still argued from Tuesday morning - before J.T.
+    Miller's NA cleared and before a night was banked - with "Tue 29: fills an
+    empty C" on a day already played. So every such run re-prices each pending
+    swap as the search would today, in the order proposed, and withdraws, with
+    the reason, any whose player is gone, whose drop is no longer droppable, or
+    that no longer clears the floor. Nothing new is searched for.
+
+    The week is priced with this week's approved moves not yet made as well,
+    ahead of the pending ones: approved is decided, not done, and on
+    2026-10-06 a plan that counted only pending cards told the manager no
+    pickup cleared the bar while the best one sat approved and unmade. An
+    approval is never withdrawn here - only pending cards are re-checked.
+    """
+    from puckpilot.draft.sim import build_universe
+    from puckpilot.season import pool as pool_mod
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.odds import OddsModel, log_week
+
+    values, goalies = models
+    season = runtime.nhl_season
+    universe = build_universe(conn, season, _train_seasons(season), manager.league)
+    used_week, used_season = adds_used(ctx.roster, ctx.week)
+    waiting = (
+        _swaps(sorted(proposals_mod.pending(conn, manager.name, league_key), key=lambda p: p.id))
+        if propose
+        else []
+    )
+    mine = {p.player_key for p in ctx.roster.players}
+    approved = [
+        p
+        for p in _swaps(
+            proposals_mod.approved_unmade(conn, manager.name, league_key, ctx.week.number)
+        )
+        if p.add_player_key not in mine
+    ]
+    workable, lapsed = (
+        _workable(conn, manager, league_key, ctx, approved + waiting)
+        if approved or waiting
+        else ([], {})
+    )
+    switch_after = {
+        (p.add_player_key, p.drop_player_key or ""): str(p.reason["after_games_of"])
+        for p, _, _ in workable
+        if p.reason.get("after_games_of")
+    }
+    decided = {p.id for p in approved}
+    reprice = [(add, drop) for p, add, drop in workable if p.id in decided]
+    workable = [w for w in workable if w[0].id not in decided]
+    lapsed = {pid: why for pid, why in lapsed.items() if pid not in decided}
+    reprice += [(add, drop) for _, add, drop in workable]
+    terms = manager.authority.transactions
+    plan = weekmod.build_week_plan(
+        conn,
+        runtime,
+        manager.league,
+        ctx.week,
+        ctx.live.theirs.name if ctx.live is not None else "",
+        _priced(ctx),
+        ctx.theirs,
+        pool_mod.load_pool(conn, league_key, day),
+        universe.frame,
+        goalies,
+        values,
+        adds_used_week=used_week,
+        adds_used_season=used_season,
+        find_targets=False,
+        odds_model=OddsModel(),
+        min_gain=terms.min_weekly_gain,
+        add_scoring=terms.add_scoring,
+        min_expected_gain=terms.min_expected_gain,
+        playoff_reserve=terms.playoff_reserve,
+        stream_spots=terms.stream_spots,
+        upgrade_margin=terms.upgrade_margin,
+        reprice=reprice if approved or waiting else None,
+        switch_after=switch_after,
+        **live_inputs(conn, runtime, ctx.week, ctx.live, day),
+        **goalie_terms(terms, runtime, ctx.week, day, ctx.roster, ctx.theirs),
+    )
+    log_week(conn, manager.name, league_key, ctx.roster.team_key, plan, day)
+    lines = _recheck(conn, workable, lapsed, plan, terms) if waiting else []
+    lines += _price_fixes(conn, manager, league_key, runtime, ctx, plan, models, day,
+                          frame=universe.frame)  # fmt: skip
+    report.add("week", True, _week_line(plan), lines)
+    return plan
+
+
+def _next_week(
+    conn,
+    manager,
+    league_key,
+    runtime,
+    day,
+    propose,
+    report,
+    ctx,
+    models,
+    search_ahead=False,
+    check_ahead=True,
+):
+    """The week's last days: judge adds with the week to come in view.
+
+    A player added late in a week plays all of the next one. On 2026-10-03
+    and 04 two adds were chosen - and approved - for the last two days of a
+    lost week; against the next week both cost categories (-0.32 and -0.12),
+    because Gibson and Malkin each had more games coming than the players
+    replacing them.
+
+    `check_ahead` (the default; `look_ahead_days`): anything still waiting
+    must pay over what is left of this week AND next week together - today's
+    games still count, and so does everything after. It only ever withdraws.
+
+    `search_ahead` (`preload_days`, off by default): the first run of the day
+    also searches against next week, spending this week's leftover
+    acquisitions. Measured in the add gate (12 teams x 22 weeks): +0.05 +/-
+    0.07 (2024-25) and -0.33 +/- 0.07 (2025-26) categories a week against the
+    plain weekly search, with ~20% more adds - it drops players who still play
+    on the week's last day, and Monday's search churns the new ones straight
+    back out. Kept for a manager who wants it, not on by default.
+    """
+    from puckpilot.draft.sim import build_universe
+    from puckpilot.season import cli_support, pool
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.fetch import fetch_matchups, fetch_roster
+    from puckpilot.season.matchups import current_or_next
+    from puckpilot.season.odds import OddsModel
+    from puckpilot.yahoo import playermap
+
+    nxt = runtime.week(ctx.week.number + 1)
+    terms = manager.authority.transactions
+    used_week, used_season = adds_used(ctx.roster, ctx.week)
+    left = None if runtime.max_weekly_adds is None else runtime.max_weekly_adds - used_week
+    search = (
+        search_ahead
+        and propose
+        and not pool_read_on(conn, league_key, day)
+        and (left is None or left > 0)
+    )
+    waiting = (
+        _swaps(sorted(proposals_mod.pending(conn, manager.name, league_key), key=lambda p: p.id))
+        if check_ahead and propose and not search and ctx.theirs is not None
+        else []
+    )
+    if not search and not waiting:
+        return None
+    pmap = playermap.load_map(conn, league_key)
+    team_key = ctx.roster.team_key
+
+    def _read(session):
+        m = current_or_next(fetch_matchups(session, team_key), nxt.start)
+        if m is None:
+            return None
+        theirs = fetch_roster(session, m.opponent_key, nxt.start, player_map=pmap)
+        fa = (
+            pool.fetch_pool(session, league_key, "FA", limit=150, player_map=pmap) if search else []
+        )
+        return m, theirs, fa
+
+    got = cli_support.run_session(manager, _read)
+    if got is None:
+        report.add("next week", False, f"no matchup for week {nxt.number}")
+        return None
+    m, theirs, fa = got
+    if search:
+        pool.save_pool(conn, league_key, day, fa)
+    workable, lapsed = _workable(conn, manager, league_key, ctx, waiting) if waiting else ([], {})
+    values, goalies = models
+    universe = build_universe(
+        conn, runtime.nhl_season, _train_seasons(runtime.nhl_season), manager.league
+    )
+    common = dict(
+        adds_used_week=used_week,
+        adds_used_season=used_season,
+        odds_model=OddsModel(),
+        add_scoring=terms.add_scoring,
+        playoff_reserve=terms.playoff_reserve,
+        stream_spots=terms.stream_spots,
+        upgrade_margin=terms.upgrade_margin,
+        screen_by=terms.screen,
+        **goalie_terms(terms, runtime, nxt),
+    )
+    pairs = [(add, drop) for _, add, drop in workable]
+    # Re-checks price every pair whatever it is worth (no floor); the
+    # combined total is judged afterwards, in `_recheck_both`.
+    no_floor = dict(min_gain=-1e9, min_expected_gain=-1e9, measure_room=False)
+    plan = weekmod.build_week_plan(
+        conn,
+        runtime,
+        manager.league,
+        nxt,
+        m.opponent_name,
+        ctx.roster,
+        theirs,
+        fa,
+        universe.frame,
+        goalies,
+        values,
+        find_targets=search,
+        reprice=pairs if waiting else None,
+        horizon="next week",
+        **common,
+        **(
+            no_floor
+            if waiting
+            else dict(min_gain=terms.min_weekly_gain, min_expected_gain=terms.min_expected_gain)
+        ),
+    )
+    expect = f" - expect {plan.expected:.1f} of {len(plan.outlook)}" if plan.expected else ""
+    head = f"week {nxt.number} vs {m.opponent_name}{expect} as the roster stands"
+    lines: list[str] = []
+    if search:
+        made = proposals_mod.propose(
+            conn,
+            manager.name,
+            league_key,
+            team_key,
+            plan.targets,
+            nxt.number,
+            max_pending=terms.max_pending,
+            supersede=True,
+            horizon="next week",
+        )
+        spare = "" if left is None else f" with this week's {left} leftover acquisition(s)"
+        if made:
+            lines += [p.describe() for p in made]
+        elif plan.targets:
+            lines.append("nothing new to propose")
+        else:
+            lines.append(f"nothing worth making{spare} - Monday's search starts fresh")
+    else:
+        now_plan = weekmod.build_week_plan(
+            conn,
+            runtime,
+            manager.league,
+            ctx.week,
+            ctx.live.theirs.name if ctx.live is not None else "",
+            ctx.roster,
+            ctx.theirs,
+            [],
+            universe.frame,
+            goalies,
+            values,
+            find_targets=False,
+            reprice=pairs,
+            **common,
+            **no_floor,
+            **live_inputs(conn, runtime, ctx.week, ctx.live, day),
+        )
+        from puckpilot.season import calendar
+
+        lines += _recheck_both(
+            conn,
+            workable,
+            lapsed,
+            now_plan,
+            plan,
+            terms,
+            playing_today=calendar.teams_playing(conn, day, runtime.nhl_season),
+            day=day,
+        )
+    report.add("next week", True, head, lines)
+    return plan
+
+
+def _workable(conn, manager, league_key, ctx, waiting):
+    """(proposal, add, drop) for those still possible, and {id: why} for the rest.
+
+    One read of the pending players' ownership - a pool read is several pages
+    and might not reach a player proposed days ago.
+    """
+    from dataclasses import replace
+
+    from puckpilot.season import cli_support, tiers
+    from puckpilot.season import pool as pool_mod
+    from puckpilot.yahoo import playermap
+
+    pmap = playermap.load_map(conn, league_key)
+    keys = [p.add_player_key for p in waiting]
+    found = cli_support.run_session(
+        manager, lambda s: pool_mod.fetch_players(s, league_key, keys, player_map=pmap)
+    )
+    now = {a.player_key: a for a in found}
+    mine = {p.player_key: p for p in ctx.roster.players}
+    workable, lapsed = [], {}
+    for p in waiting:
+        add = now.get(p.add_player_key)
+        drop = mine.get(p.drop_player_key) if p.drop_player_key else None
+        if add is None or not add.is_available:
+            lapsed[p.id] = f"{p.add_name} is no longer available"
+        elif add.is_out:
+            lapsed[p.id] = f"{p.add_name} is now listed {add.status}"
+        elif p.drop_player_key and drop is None:
+            lapsed[p.id] = f"{p.drop_name} is no longer on your roster"
+        elif drop is not None and (drop.is_out or drop.on_ir):
+            lapsed[p.id] = (
+                f"{p.drop_name} is now {drop.status or drop.selected_slot} - "
+                f"not a player to drop on that"
+            )
+        elif drop is not None and tiers.pinned(drop) is tiers.Tier.NEVER:
+            lapsed[p.id] = f"you set {p.drop_name} to Never"
+        elif drop is not None and drop.is_undroppable:
+            lapsed[p.id] = f"Yahoo does not let {p.drop_name} be dropped"
+        elif drop is not None and tiers.is_never(drop):
+            lapsed[p.id] = (
+                f"{p.drop_name} ranks {drop.keeper_rank} of your keepers for next season - "
+                f"not one to give away"
+            )
+        else:
+            if add.nhl_player_id is None:
+                add = replace(add, nhl_player_id=p.add_pid)
+            workable.append((p, add, drop))
+    return workable, lapsed
+
+
+def _recheck(conn, workable, lapsed, plan, terms) -> list[str]:
+    """Write a re-check back to the queue, and say what it did."""
+    by_pair = {(t.player.player_key, t.drop.player_key if t.drop else ""): t for t in plan.targets}
+    low = {(t.player.player_key, t.drop.player_key if t.drop else ""): t for t in plan.lapsed}
+    odds = terms.add_scoring == "odds"
+    floor = terms.min_expected_gain if odds else terms.min_weekly_gain
+    kept: dict[int, object] = {}
+    lapsed = dict(lapsed)
+    if plan.adds_left_week == 0:
+        lapsed.update({p.id: "no acquisitions left this week" for p, _, _ in workable})
+        workable = []
+    lines = []
+    for p, _, _ in workable:
+        pair = (p.add_player_key, p.drop_player_key)
+        t = by_pair.get(pair)
+        was = p.reason.get("expected_gain") if odds else p.reason.get("gain")
+        if t is not None:
+            kept[p.id] = t
+            now = t.gain if odds and t.gain is not None else t.score
+            before = f" (was {float(was):+.2f})" if was is not None else ""
+            lines.append(f"#{p.id} {_swap(p)}: still {now:+.2f}{before}")
+            continue
+        t = low.get(pair)
+        now = (t.gain if odds and t.gain is not None else t.score) if t is not None else 0.0
+        unit = " categories expected" if odds else ""
+        lapsed[p.id] = f"now worth {now:+.2f}{unit}, below the {floor:.2f} floor"
+    proposals_mod.refresh(conn, kept, lapsed)
+    lines += [f"#{pid} withdrawn: {why}" for pid, why in lapsed.items()]
+    return lines
+
+
+def _swap(p) -> str:
+    """A proposal's move in words: "Marco Rossi for Evgeni Malkin", or "Anton
+    Frondell added" when it drops nobody."""
+    return f"{p.add_name} for {p.drop_name}" if p.drop_player_key else f"{p.add_name} added"
+
+
+def _recheck_both(
+    conn, workable, lapsed, now_plan, next_plan, terms, playing_today=frozenset(), day: str = ""
+) -> list[str]:
+    """A waiting add, late in a week: worth it over the rest of this week and
+    the next one together, or withdrawn with both numbers.
+
+    On 2026-10-04 at 11:02 #10 (Beniers for Gibson) was +0.25 for the day
+    that was left and -0.32 for the week after: kept by a this-week check,
+    withdrawn by this one.
+
+    A move whose drop plays today is queued until the rosters unlock: Yahoo
+    refuses to drop a player who has played that day ("A player has already
+    played and is no longer editable for today", Error #174), and dropping him
+    before his game gives the game away. So it changes nothing this week - it
+    is worth next week alone, and counts against next week's acquisitions.
+    It is marked with `day` (`after_games_of`), so an approval is made after
+    that day's games and not before.
+    """
+    from dataclasses import replace
+
+    odds = terms.add_scoring == "odds"
+    floor = terms.min_expected_gain if odds else terms.min_weekly_gain
+
+    def key(t):
+        return (t.player.player_key, t.drop.player_key if t.drop else "")
+
+    def worth(t) -> float:
+        if t is None:
+            return 0.0
+        return t.gain if odds and t.gain is not None else t.score
+
+    now = {key(t): t for t in (*now_plan.targets, *now_plan.lapsed)}
+    nxt = {key(t): t for t in (*next_plan.targets, *next_plan.lapsed)}
+    kept: dict[int, object] = {}
+    lapsed = dict(lapsed)
+    if now_plan.adds_left_week == 0:
+        lapsed.update({p.id: "no acquisitions left this week" for p, _, _ in workable})
+        workable = []
+    lines = []
+    for p, _, drop in workable:
+        pair = (p.add_player_key, p.drop_player_key)
+        t_now, t_next = now.get(pair), nxt.get(pair)
+        queued = drop is not None and drop.team in playing_today
+        a, b = (0.0 if queued else worth(t_now)), worth(t_next)
+        both = (
+            f"{b:+.2f} next week (queued - {p.drop_name} plays today)"
+            if queued
+            else f"{a:+.2f} for the rest of this week, {b:+.2f} next week"
+        )
+        if a + b >= floor and queued and t_next is not None:
+            # Its reasons are next week's, and so is its timing.
+            kept[p.id] = replace(
+                t_next,
+                timing=f"{t_next.timing}; queued - make it after tonight's games, once rosters "
+                f"unlock ({p.drop_name} plays today, and Yahoo locks a player for the day "
+                f"once he has played)",
+                after_games_of=day,
+            )
+            lines.append(f"#{p.id} {_swap(p)}: {both} - kept")
+            continue
+        if a + b >= floor and not queued and (t_now or t_next) is not None:
+            t = t_now or t_next
+            ahead = (
+                f"Next week too: {b:+.2f} categories expected - {p.add_name} "
+                f"{t_next.starts:g} starts, {p.drop_name} {t_next.drop_starts:g}"
+                if t_next is not None and p.drop_player_key
+                else f"Next week too: {b:+.2f} categories expected"
+            )
+            detail = dict(t.detail)
+            detail["week"] = [ahead, *detail.get("week", [])]
+            kept[p.id] = replace(t, detail=detail)
+            lines.append(f"#{p.id} {_swap(p)}: {both} - kept")
+            continue
+        lapsed[p.id] = f"{both} - {a + b:+.2f} together, below the {floor:.2f} floor"
+    proposals_mod.refresh(conn, kept, lapsed)
+    lines += [f"#{pid} withdrawn: {why}" for pid, why in lapsed.items()]
+    return lines
+
+
+def _week_line(plan) -> str:
+    bands: dict[str, list[str]] = {}
+    for o in plan.outlook:
+        bands.setdefault(o.band, []).append(o.category.label)
+    bits = [f"{k}: {' '.join(v)}" for k, v in sorted(bands.items())]
+    exp = f" - expect {plan.expected:.1f} of {len(plan.outlook)}" if plan.expected else ""
+    return (
+        f"week {plan.week} vs {plan.opponent or '?'} - starts left {plan.our_games} v "
+        f"{plan.their_games}{exp} - " + "; ".join(bits)
+    )
+
+
+def pool_read_on(conn, league_key: str, day: str) -> bool:
+    """Has today's free-agent pool been read - i.e. has today's add search run?"""
+    row = conn.execute(
+        "SELECT 1 FROM yahoo_fa_snapshots WHERE league_key = ? AND date = ? LIMIT 1",
+        (league_key, day),
+    ).fetchone()
+    return row is not None
+
+
+def _weekly(
+    conn,
+    manager,
+    league_key,
+    runtime,
+    day,
+    propose,
+    report,
+    ctx,
+    models,
+    start_of_week=True,
+    floor=None,
+    horizon=False,
+):
+    """The full plan with the add search - daily - and on a week's first day,
+    the weekly upkeep and the protocol too.
+
+    Reuses what this run already read - our roster, theirs, the live score -
+    and falls back to reading the matchups itself when the score read failed.
+
+    Mid-week (`mid_week_floor`), a swap must clear `floor` expected
+    categories, and with `horizon` it is also priced against the next week,
+    the two together clearing the floor.
+    """
+    from puckpilot.draft.sim import build_universe
+    from puckpilot.season import cli_support, explain, pool
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.fetch import fetch_matchups, fetch_roster
+    from puckpilot.season.matchups import current_or_next
+    from puckpilot.season.odds import OddsModel, log_week
+    from puckpilot.yahoo import playermap
+
+    season = runtime.nhl_season
+    pmap = playermap.load_map(conn, league_key)
+
+    def _read(session):
+        team_key = manager.team_key or (ctx.roster.team_key if ctx.roster else "")
+        week = ctx.week
+        opp_key = ctx.live.theirs.team_key if ctx.live is not None else ""
+        opp_name = ctx.live.theirs.name if ctx.live is not None else ""
+        if week is None or not opp_key:
+            m = current_or_next(fetch_matchups(session, team_key), day)
+            if m is None:
+                return None
+            week, opp_key, opp_name = m.as_week(), m.opponent_key, m.opponent_name
+        when = day if week.contains(day) else week.start
+        ours = ctx.roster
+        if ours is None or ours.date != when:
+            ours = fetch_roster(session, team_key, when, player_map=pmap)
+        theirs = ctx.theirs
+        if theirs is None:
+            theirs = fetch_roster(session, opp_key, when, player_map=pmap) if opp_key else ours
+        fa = pool.fetch_pool(session, league_key, "FA", limit=150, player_map=pmap)
+        ahead = None
+        if horizon:
+            nxt = _following(runtime, week)
+            mn = current_or_next(fetch_matchups(session, team_key), nxt.start) if nxt else None
+            if mn is not None:
+                ahead = (
+                    nxt,
+                    mn.opponent_name,
+                    fetch_roster(session, mn.opponent_key, nxt.start, player_map=pmap),
+                )
+        return week, opp_name, ours, theirs, fa, ahead
+
+    if start_of_week:
+        _guard(report, "upkeep", lambda: _upkeep(conn, manager, league_key, season, report))
+
+    got = cli_support.run_session(manager, _read)
+    if got is None:
+        report.add("week", False, f"no matchup covering {day} and none after it")
+        return None
+    week, opp_name, ours, theirs, fa, ahead = got
+    pool.save_pool(conn, league_key, day, fa)
+    terms = manager.authority.transactions
+    bar = terms.min_expected_gain if floor is None else max(floor, terms.min_expected_gain)
+
+    values, goalies = models
+    universe = build_universe(conn, season, _train_seasons(season), manager.league)
+    used_week, used_season = adds_used(ours, week)
+    committed = committed_moves(conn, manager.name, league_key, ours, week)
+    spends = [p for p in committed if p.move_kind.spends_acquisition]
+    if spends:
+        used_week += len(spends)
+        used_season += len(spends)
+        taken = {p.add_player_key for p in spends}
+        fa = [c for c in fa if c.player_key not in taken]
+    hold = {p.drop_player_key for p in committed if p.drop_player_key}
+    # Priced on the roster as it will stand once any make-room move is made,
+    # so the adds proposed below are ones Yahoo will take.
+    unpriced = ours
+    resolution = _resolution(conn, manager, runtime, ours, values, day, hold, ctx)
+    if resolution is not None and not resolution.legal:
+        from puckpilot.season import legality
+
+        ours = legality.as_resolved(ours, resolution)
+    live = ctx.live if ctx.week is not None and ctx.week.number == week.number else None
+    plan = weekmod.build_week_plan(
+        conn,
+        runtime,
+        manager.league,
+        week,
+        opp_name,
+        ours,
+        theirs,
+        fa,
+        universe.frame,
+        goalies,
+        values,
+        adds_used_week=used_week,
+        adds_used_season=used_season,
+        min_gain=terms.min_weekly_gain,
+        odds_model=OddsModel(),
+        add_scoring=terms.add_scoring,
+        min_expected_gain=bar,
+        playoff_reserve=terms.playoff_reserve,
+        stream_spots=terms.stream_spots,
+        upgrade_margin=terms.upgrade_margin,
+        screen_by=terms.screen,
+        hold=hold,
+        **live_inputs(conn, runtime, week, live, day),
+        **goalie_terms(terms, runtime, week, day, ours, theirs),
+        **timing_terms(terms),
+    )
+    log_week(conn, manager.name, league_key, ours.team_key, plan, day)
+    lines = [ln for ln in explain.week_story(plan, runtime) if ln]
+    if committed:
+        labels = ", ".join(_label(p) for p in committed)
+        lines.append(f"planned around {labels} - approved, not made yet")
+    lines += near_miss_lines(plan)
+    targets = list(plan.targets)
+    _temporary_spots(conn, runtime, ours, values, day, targets)
+    if horizon and ahead is not None and targets:
+        targets, notes = _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models)
+        lines += notes
+        if len(targets) < len(plan.targets):
+            # The odds with every move made were priced on the chain as
+            # searched; with a link gone that chain no longer exists. The next
+            # run re-prices exactly the queue and restores them.
+            plan = replace(plan, planned=None)
+
+    if start_of_week and manager.authority.lineup.follow_protocol:
+        stance = protocol_mod.derive(
+            plan.outlook, manager.name, league_key, ours.team_key, plan.week, opp_name
+        )
+        existing = protocol_mod.load(conn, manager.name, league_key, plan.week)
+        if not (existing and existing.status == protocol_mod.APPROVED):
+            stance = protocol_mod.save(conn, stance)
+            lines.append(f"protocol #{stance.id} proposed - approve it on the page")
+
+    unfixable = list(resolution.unresolved) if resolution is not None else []
+    if propose and targets and unfixable:
+        lines.append(
+            "no proposals: the roster is illegal and nothing on it can be dropped to fix it - "
+            + "; ".join(unfixable)
+        )
+    elif propose and targets:
+        made = proposals_mod.propose(
+            conn,
+            manager.name,
+            league_key,
+            ours.team_key,
+            targets,
+            plan.week,
+            max_pending=terms.max_pending,
+            supersede=True,
+        )
+        lines += [p.describe() for p in made] or ["nothing new to propose"]
+        if resolution is not None and resolution.transactions:
+            lines.append("these assume the make-room move above is made first")
+    if resolution is not None and not resolution.legal:
+        priced = ctx.resolved
+        ctx.resolved = ours
+        lines += _price_fixes(conn, manager, league_key, runtime, ctx, plan, models, day,
+                              frame=universe.frame, unpriced=unpriced)  # fmt: skip
+        ctx.resolved = priced
+    head = _week_line(plan) if not start_of_week else f"week {plan.week} vs {opp_name}"
+    report.add("week", True, head, lines)
+    return plan
+
+
+def _steer(conn, manager, runtime, ctx, roster, models, day):
+    """This week's odds as they stand on this run, for tonight's bench calls.
+
+    Rebuilt every run from Yahoo's live score - the 07:00 run and each lock run
+    see the week as it stands then - so a decision at 5pm is made on the score
+    at 5pm. None (the plain lineup) when the setting is off; an error, which
+    the report shows and the lineup survives, when the odds cannot be read.
+    """
+    if getattr(manager.authority.lineup, "steer", "off") != "odds":
+        return None
+    week = ctx.week
+    if week is None or ctx.theirs is None or roster is None or not week.contains(day):
+        raise RuntimeError("no matchup or opponent roster to read the odds from - plain lineup")
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.odds import OddsModel
+
+    values, goalies = models
+    live = live_inputs(conn, runtime, week, ctx.live, day)
+    return weekmod.tonight_odds(
+        conn,
+        runtime,
+        manager.league,
+        week,
+        roster,
+        ctx.theirs,
+        goalies,
+        values,
+        OddsModel(),
+        day,
+        banked_ours=live.get("banked_ours"),
+        banked_theirs=live.get("banked_theirs"),
+        started=live.get("started"),
+    )
+
+
+def lineup_by(manager) -> str:
+    """How the week's bench calls are being decided, in the plan card's words."""
+    lineup = manager.authority.lineup
+    if getattr(lineup, "steer", "off") == "odds":
+        return "this week's odds"
+    if lineup.follow_protocol:
+        return "season value, tilted by an approved protocol"
+    return "season value"
+
+
+def _following(runtime, week):
+    """The fantasy week after `week`, or None at the end of the calendar."""
+    from puckpilot.season.settings import SettingsError
+
+    try:
+        return runtime.week(week.number + 1)
+    except SettingsError:
+        return None
+
+
+def near_miss_lines(plan, limit: int = 3) -> list[str]:
+    """The best few swaps the search priced and turned down, for the log.
+
+    So a week with nothing proposed shows what was weighed: "considered" tells
+    "no goalie was ever looked at" from "looked at, and short of the bar".
+    """
+    out = []
+    for t in plan.near_misses[:limit]:
+        what = t.player.name + (f" for {t.drop.name}" if t.drop else "")
+        worth = t.gain if t.gain is not None else t.score
+        out.append(f"considered, below the bar: {what} ({worth:+.2f})")
+    return out
+
+
+def _pays_both(conn, runtime, manager, ours, ahead, targets, bar, models):
+    """Keep the swaps that pay over the rest of this week and next week together.
+
+    The search priced each over the days left this week; here each is priced
+    over the next week too (no floor - the total is judged here), and kept only
+    if the two clear `bar`. A pickup who helps until Sunday and costs the week
+    after is not one to make on a Wednesday.
+    """
+    from dataclasses import replace
+
+    from puckpilot.draft.sim import build_universe
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.odds import OddsModel
+
+    nxt, opp_name, theirs = ahead
+    terms = manager.authority.transactions
+    values, goalies = models
+    universe = build_universe(
+        conn, runtime.nhl_season, _train_seasons(runtime.nhl_season), manager.league
+    )
+    later = weekmod.build_week_plan(
+        conn,
+        runtime,
+        manager.league,
+        nxt,
+        opp_name,
+        ours,
+        theirs,
+        [],
+        universe.frame,
+        goalies,
+        values,
+        find_targets=False,
+        reprice=[(t.player, t.drop) for t in targets],
+        odds_model=OddsModel(),
+        add_scoring=terms.add_scoring,
+        min_gain=-1e9,
+        min_expected_gain=-1e9,
+        playoff_reserve=terms.playoff_reserve,
+        stream_spots=terms.stream_spots,
+        upgrade_margin=terms.upgrade_margin,
+        measure_room=False,
+        horizon="next week",
+        **goalie_terms(terms, runtime, nxt),
+    )
+
+    def key(t):
+        return (t.player.player_key, t.drop.player_key if t.drop else "")
+
+    def worth(t) -> float:
+        return t.gain if t.gain is not None else t.score
+
+    next_of = {key(t): t for t in (*later.targets, *later.lapsed)}
+    kept, notes = [], []
+    for t in targets:
+        n = next_of.get(key(t))
+        b = worth(n) if n is not None else 0.0
+        a = worth(t)
+        what = f"{t.player.name}" + (f" for {t.drop.name}" if t.drop else "")
+        if a + b < bar:
+            notes.append(
+                f"not proposed: {what} - {a:+.2f} this week but {b:+.2f} next week, "
+                f"{a + b:+.2f} together, below {bar:.2f}"
+            )
+            continue
+        line = f"Next week too: {b:+.2f} categories expected" + (
+            f" - {t.player.name} {n.starts:g} starts, {t.drop.name} {n.drop_starts:g}"
+            if n is not None and t.drop is not None
+            else ""
+        )
+        detail = dict(t.detail)
+        detail["week"] = [line, *detail.get("week", [])]
+        kept.append(replace(t, detail=detail))
+    return kept, notes
+
+
+def _standing_due(conn, manager, league_key: str, report) -> int:
+    """Approve every card a standing approval covers whose time has come; put
+    back any the manager has said otherwise about since. Returns how many."""
+    from puckpilot.season import standing
+
+    grant = manager.authority.standing
+    approved, back = standing.approve_due(conn, manager.name, league_key, grant)
+    if approved or back:
+        report.add(
+            "standing",
+            True,
+            f"{len(approved)} made unless stopped - none was"
+            if approved and not back
+            else f"{len(approved)} approved in advance, {len(back)} back to wait for a tap",
+            [f"{_label(p)}: approved in advance - its window passed" for p in approved]
+            + [f"{_label(p)}: needs a tap - {why}" for p, why in back],
+        )
+    return len(approved)
+
+
+def _standing_offer(conn, manager, league_key: str, ctx, report) -> list:
+    """Offer the waiting cards a standing approval covers (season/standing.py)."""
+    from puckpilot.season import standing
+
+    offered = standing.offer(
+        conn,
+        manager.name,
+        league_key,
+        manager.authority.standing,
+        ctx.tiers,
+        ctx.roster,
+        _executes(manager),
+        _executable_kinds(),
+        ctx.week.number if ctx.week is not None else 0,
+    )
+    if offered:
+        window = manager.authority.standing.veto_minutes
+        report.add(
+            "standing",
+            True,
+            f"{len(offered)} card(s) made {window} min after the page shows them, unless stopped",
+            [f"{_label(p)}" for p in offered],
+        )
+    return offered
+
+
+def _roster_stats(conn, manager, runtime, ctx, day: str) -> dict:
+    """This season's rank and VORP, and the rest-of-season value the tiers were
+    placed by, for every rostered player (season/roster_stats.py)."""
+    from puckpilot.season import roster_stats
+
+    ranks = roster_stats.season_ranks(conn, manager.league, runtime.nhl_season, day)
+    ctx.player_stats = roster_stats.describe(ctx.roster, ctx.keep, ranks)
+    return ctx.player_stats
+
+
+def _with_pins(conn, manager, league_key: str, roster):
+    """The roster with the manager's drop tiers on it (`tiers.annotate`)."""
+    from puckpilot.season import tiers
+
+    return tiers.annotate(roster, tiers.pins(conn, manager.name, league_key))
+
+
+def _tiers(conn, manager, league_key: str, runtime, ctx, models, day: str, report) -> dict:
+    """Every player's drop tier this run - the board the searches use, on the
+    same values and the same players who may be dropped today."""
+    from puckpilot.season import legality, tiers
+    from puckpilot.season import week as weekmod
+
+    roster = ctx.roster
+    values, _ = models
+    terms = manager.authority.transactions
+    hold = {
+        p.drop_player_key
+        for p in committed_moves(conn, manager.name, league_key, roster, ctx.week)
+        if p.drop_player_key
+    }
+    to_ir = {m.player.player_key for m in legality.ir_changes(runtime, roster)[0] if m.is_ir}
+    keep = weekmod.keep_values(
+        conn, runtime, roster.players, values, day, getattr(values, "workload", None)
+    )
+    placed = tiers.board(
+        roster.players,
+        keep,
+        terms.stream_spots,
+        droppable=legality.droppable(roster, hold, to_ir),
+        upgrade_margin=terms.upgrade_margin,
+    )
+    ctx.tiers = placed
+    ctx.keep = keep
+    names = {p.player_key: p.name for p in roster.players}
+
+    def who(tier, source=None) -> list[str]:
+        return [
+            names[k]
+            for k, pl in placed.items()
+            if pl.tier is tier and (source is None or pl.source == source)
+        ]
+
+    rot = who(tiers.Tier.ROTATION)
+    mine = who(tiers.Tier.ROTATION, tiers.YOU) + who(tiers.Tier.UPGRADE, tiers.YOU)
+    mine += who(tiers.Tier.NEVER, tiers.YOU)
+    report.add(
+        "tiers",
+        True,
+        f"rotation: {', '.join(rot) or 'nobody'}; never: {len(who(tiers.Tier.NEVER))}; "
+        f"upgrade only: {len(who(tiers.Tier.UPGRADE))}",
+        [f"set by you: {', '.join(sorted(mine))}"] if mine else [],
+    )
+    return placed
+
+
+def _keepers(conn, manager, runtime, roster, day, report):
+    """(roster with next season's keepers ranked, the board), or None when off.
+
+    The ranks - and so the protection - are decided on the week's first run and
+    kept for the week: a player who moved from fourth to fifth on a Wednesday
+    would otherwise become droppable under a proposal already on the phone.
+    The board itself is rebuilt every run, for the cards.
+    """
+    from pathlib import Path
+
+    from puckpilot.config import Settings
+    from puckpilot.season import keeper_value as kv
+
+    terms = manager.authority.transactions
+    if not terms.protect_keepers or manager.league.n_keepers <= 0:
+        return None
+    season = runtime.nhl_season
+    path = Settings()._resolve(Path("data")) / f"keepers-{season}.json"
+    board = kv.board(conn, manager.league, season, day, path)
+    week = week_for(runtime, day)
+    week_start = week.start if week is not None else day
+    ranks = kv.load(conn, manager.name, week_start)
+    if not ranks:
+        ranks = board.rank(roster.players, margin=terms.keeper_margin)
+        kv.save(conn, manager.name, week_start, day, ranks)
+    safe = [k.name for k in ranks if k.protected]
+    notes = []
+    if board.times_kept is None:
+        notes.append(
+            f"no saved contracts ({path.name}) - every player taken as eligible; "
+            f"`ppilot yahoo keepers --season {season}` saves them"
+        )
+    report.add("keepers", True, f"protected for next season: {', '.join(safe) or 'nobody'}", notes)
+    return kv.annotate(roster, ranks), board
+
+
+def _out_goalies(*rosters) -> set[int]:
+    """Goalies on the rosters read this run whose tag rules them out.
+
+    The start model learns a goalie is out only once he has missed two games
+    he would have dressed for; an injury tag says so the day it appears, and
+    his partner's share should rise that day, not two games later.
+    """
+    return {
+        p.nhl_player_id
+        for roster in rosters
+        if roster is not None
+        for p in roster.players
+        if p.position == "G" and p.nhl_player_id is not None and p.is_out
+    }
+
+
+def _healthy_goalies(*rosters) -> set[int]:
+    """Goalies on the rosters read this run with no tag at all.
+
+    A goalie who has not dressed for two games is taken to be out, which is
+    right for an injury and wrong on the night he comes back from one. A clean
+    tag on a roster read this morning says which, and only for the goalies we
+    can see - the ones whose starts we are actually deciding.
+    """
+    return {
+        p.nhl_player_id
+        for roster in rosters
+        if roster is not None
+        for p in roster.players
+        if p.position == "G" and p.nhl_player_id is not None and not p.status
+    }
+
+
+def _train_seasons(season: str) -> tuple[str, ...]:
+    y = int(season[:4])
+    return tuple(f"{y - i}{y - i + 1}" for i in range(1, 4))
+
+
+def _env_key() -> str:
+    import os
+
+    return os.environ.get("PUCKPILOT_MANAGER_KEY", "")

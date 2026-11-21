@@ -20,8 +20,10 @@ token.json
 # Local data. `data/` is ignored wholesale and the tracked exceptions are named,
 # so a new subdirectory of recordings is private by default rather than by
 # someone remembering to add a rule. Draft-room recordings in particular hold
-# live session cookies and personal league data.
-data/
+# live session cookies and personal league data. Anchored to the root: a bare
+# `data/` also matched the source package `src/puckpilot/data/`, so a new
+# module there was silently left out of a commit.
+/data/
 
 # League configs are PRIVATE: they carry a live Yahoo league id, the league
 # name, and named keeper rosters for every team in it. Ignore the directory and
@@ -30,6 +32,12 @@ data/
 # the built-in default path in config.py, publishable.
 leagues/*
 !leagues/example.toml
+
+# Same rule as leagues/: a manager config names a real team, a real league and
+# the path to a logged-in browser profile. Private by default; only the
+# documented template is tracked.
+managers/*
+!managers/example.toml
 
 # Local, unpublished helpers - research tools, not part of the product.
 # Directory-wide for the same reason as data/ and leagues/: private by default,

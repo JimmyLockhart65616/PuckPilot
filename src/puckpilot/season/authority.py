@@ -1,0 +1,613 @@
+"""What the tool may do on its own, and what it must ask about first.
+
+The split is deliberate and it is not symmetric.
+
+A lineup change is reversible, expires in a day, costs nothing to get wrong
+beyond one night of one player, and has to happen ~185 times a season at an
+hour when a person is usually busy. So it runs under *standing authority*: a
+written, versioned set of criteria, and anything inside them is done without
+asking. The criteria live in config precisely so they can be argued with after
+the fact against the audit log rather than debated in advance.
+
+A transaction is none of those things. It spends one of a fixed number of
+weekly acquisitions, it drops a player who may not come back, and in a rolling
+waiver league it can be won by somebody else while you sleep. So it is
+*approval-gated*, and that is enforced structurally rather than by a setting:
+`TransactionAuthority` has no `enabled` flag, and the executor takes an
+approved `waiver_proposals` id it cannot mint itself. Turning transactions
+autonomous is not a config change; it would require deleting the mechanism.
+
+Approval comes one of two ways, and both are per move. A tap on the card; or,
+for a move whose drop is one of the manager's rotation players
+(`season.tiers`), given in advance - `StandingApproval`, written down here
+like the lineup's criteria. A card under it is still shown first, says when
+the move will be made, and is made only if nobody stopped it by then
+(`season.standing`, `proposals.approve_standing`). Neither is a way round the
+queue: the executor still takes only an approved row, and a standing approval
+can only be given to a card that was shown with its time.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+# How to treat a player Yahoo flags but does not rule out (DTD and friends).
+QUESTIONABLE_MODES = ("never", "only_if_needed", "always")
+# How an add is priced (see TransactionAuthority.add_scoring).
+ADD_SCORING = ("share", "odds")
+# Mirrors `week.DROP_CHOICES`, kept here so reading a config imports no engine.
+DROP_CHOICES = ("cheapest", "goalies", "all")
+# Mirrors `week.TIME_MODES`.
+TIME_MODES = ("off", "shift", "search")
+# How the add search shortlists candidates (TransactionAuthority.screen).
+SCREENS = ("value", "union")
+# How a night with more players than slots is decided (LineupAuthority.steer).
+STEER_MODES = ("off", "odds")
+
+
+class AuthorityError(ValueError):
+    """The authority config is not a thing the tool can act on."""
+
+
+@dataclass(frozen=True)
+class LineupAuthority:
+    """Standing permission to change today's lineup, and its bounds."""
+
+    enabled: bool = False
+    # Leave a lineup alone unless the swap is worth this much, in the same
+    # z-like per-day units `GameValueModel` produces. Measured over a real
+    # season this knob barely matters in either direction - raising it to 1.0
+    # changes 530 lineup moves instead of 536 and costs 0.13% of season value -
+    # because daily churn comes from who has a game, not from marginal swaps.
+    # Kept as a small floor against a pointless swap between near-equals.
+    min_gain: float = 0.15
+    # Never start a goalie less likely than this to actually start. A goalie who
+    # does not play scores zero in every goalie category.
+    min_goalie_p_start: float = 0.5
+    # ...except when a G slot would otherwise sit empty: a goalie who does not
+    # start then scores nothing, the same as the empty slot, so the floor costs
+    # something and protects nothing. The floor still decides between goalies
+    # competing for a slot - a 45% goalie never takes one from a 60% one here.
+    fill_empty_goalie_slot: bool = False
+    # "never" benches anyone carrying a status; "always" ignores the flag;
+    # "only_if_needed" starts him when the alternative is an empty slot.
+    start_questionable: str = "only_if_needed"
+    # Yahoo's own per-week minimum (min_games_played) is a rule, not a
+    # preference - falling short forfeits the category.
+    enforce_min_games: bool = True
+    # There is deliberately no cap on the number of changes. Lineup moves are
+    # free and unlimited until a player's own game starts, so a busy night is a
+    # busy schedule, not a malfunction - an earlier version capped them and
+    # would have refused to act on 17.6% of days for no reason. What actually
+    # bounds the day is the lock, which is a clock, not a count.
+    # Names, because a person thinks in names. Config, never code.
+    never_bench: tuple[str, ...] = ()
+    # Move a player Yahoo lists as out, and eligible for a free IR slot, into
+    # it. That frees an active roster spot, which is worth something only once
+    # an add fills it - and the add is still a proposal. Off unless agreed:
+    # it is a roster move a person may want to make themselves.
+    manage_ir: bool = False
+    # Set the rest of the week's lineups in Yahoo too - on the week's first run,
+    # and again whenever the roster has changed since - so a run that never
+    # happens leaves that day planned, not a copy of the last day set
+    # (`run._set_ahead`). Each day's own run still plans it again.
+    set_ahead: bool = True
+    # Whether an approved week protocol also re-weights the daily lineup.
+    #
+    # OFF, on measurement. Scored by categories won per week - the only metric
+    # that can judge a mechanism whose whole purpose is trading value for
+    # category wins - it came out positive in 3 of 6 runs across two seasons
+    # and three seeds, with every effect inside +-0.08 categories of ~5.8.
+    # That is noise, and it agrees with why: lineup headroom is zero most
+    # weeks, because a roster of seventeen into thirteen slots has no choice
+    # to make on a night when nine players have games. A weight cannot change
+    # a decision that was never open.
+    #
+    # The protocol is analysis, not a switch: it says which categories are gone
+    # and which are live, from the same odds the add search prices by. Gate G2
+    # also found no gain in choosing goalies by those odds, so nothing in the
+    # daily lineup acts on it. This flag only governs the lineup.
+    follow_protocol: bool = False
+    # How a night with more players than slots is decided. "off": by each
+    # player's per-game value, as always. "odds": by what his game adds to
+    # this week's expected categories won - from the odds rebuilt on that run,
+    # Yahoo's banked score plus the days left - and tonight's goalies by
+    # `odds.choose_goalies`.
+    #
+    # OFF, on measurement (add gate `odds-daily-h-f25-x1-k1-r-t` against the
+    # same arm unsteered, 12 teams x 22 weeks, 4 drafts x 2 seasons): ahead in
+    # 6 of 8 leagues, pooled +0.015 +/- 0.009 categories a week - inside noise,
+    # and short of the rule set before running it (clear of 2 SE in both
+    # seasons of the first draft: +0.081 +/- 0.026, +0.006 +/- 0.024). It
+    # changes 14-20 nights a team-season; there are not enough bench calls for
+    # the odds to matter. The fixed-weight protocol measured the same way.
+    steer: str = "off"
+
+    def __post_init__(self) -> None:
+        if self.steer not in STEER_MODES:
+            raise AuthorityError(
+                f"authority.lineup.steer must be one of {', '.join(STEER_MODES)}; "
+                f"got {self.steer!r}"
+            )
+        if self.start_questionable not in QUESTIONABLE_MODES:
+            raise AuthorityError(
+                f"authority.lineup.start_questionable must be one of "
+                f"{', '.join(QUESTIONABLE_MODES)}; got {self.start_questionable!r}"
+            )
+        if not 0.0 <= self.min_goalie_p_start <= 1.0:
+            raise AuthorityError("authority.lineup.min_goalie_p_start must be between 0 and 1")
+
+    def describe(self) -> list[str]:
+        """The criteria in words, for printing before acting under them."""
+        if not self.enabled:
+            return ["Lineup changes: RECOMMEND ONLY (no standing authority granted)."]
+        return [
+            "Lineup changes: AUTONOMOUS within these criteria -",
+            f"  swap only when it gains at least {self.min_gain:.2f} for the day",
+            f"  never start a goalie below {self.min_goalie_p_start:.0%} to start"
+            + (
+                " - unless a G slot would otherwise be empty" if self.fill_empty_goalie_slot else ""
+            ),
+            f"  players flagged day-to-day: {self.start_questionable.replace('_', ' ')}",
+            f"  weekly goalie minimum enforced: {'yes' if self.enforce_min_games else 'no'}",
+            "  out players moved to a free IR slot: "
+            + ("yes" if self.manage_ir else "no (recommended, not made)"),
+            "  the rest of the week set ahead (week's first run, and after a roster change): "
+            + ("yes" if self.set_ahead else "no"),
+            "  changes are unlimited until each player's game starts",
+            "  week protocol steers the lineup: "
+            + ("yes" if self.follow_protocol else "no (measured inert)"),
+            "  bench calls decided by: "
+            + ("this week's odds" if self.steer == "odds" else "season value"),
+            *([f"  never benched: {', '.join(self.never_bench)}"] if self.never_bench else []),
+        ]
+
+
+@dataclass(frozen=True)
+class TransactionAuthority:
+    """Bounds on what may be *proposed*. There is deliberately no `enabled`.
+
+    Adds, drops and claims are never executed without an approved proposal row,
+    so this class tunes what reaches a person, not what happens without one.
+    """
+
+    # How much of a live category gap a swap must close to be worth raising.
+    # 0.25 is a quarter of it. A proposal the person will reject is a
+    # notification that trains them to ignore the next one.
+    #
+    # This is a SHARE, not a score. It used to be an abstract value number, and
+    # when adds started being priced by re-slotting the week the same 0.5 quietly
+    # became "must close half a gap" and cut five proposals to one.
+    min_weekly_gain: float = 0.25
+    # More pending proposals than this means the tool is guessing, not advising.
+    max_pending: int = 5
+    # How an add is priced: "share" of each live gap it closes (the original),
+    # or "odds" - the change in expected categories won this week, from the
+    # calibrated model. Gate G2 (`ppilot season add-gate`, 12 teams x 22 weeks,
+    # rivals frozen): odds-weekly against share-weekly +0.15 +/- 0.09 (2025-26)
+    # and +0.02 +/- 0.11 (2024-25) categories a week - never worse, not clear of
+    # noise in either season, which was the bar set before running it - while
+    # making about 30% fewer adds (504 v 727, 539 v 744). So "share" stays the
+    # default and "odds" is a manager's choice, with that on the record.
+    # Replicated afterwards on three more drafts (seeds 7, 42, 99) x both
+    # seasons: all eight leagues favour odds, pooled +0.22 +/- 0.03 categories
+    # a week (4 of 8 clear 2 SE alone), ~28% fewer adds in every one. The
+    # default waits on the manager; the evidence says switch.
+    add_scoring: str = "share"
+    # Under "odds", the least an add must raise expected categories won.
+    min_expected_gain: float = 0.1
+    # Acquisitions kept back for the playoffs: once the season's remaining
+    # count falls to this, the regular season stops proposing.
+    playoff_reserve: int = 6
+    # Roster spots that rotate: only the players worth least over the rest of
+    # the season may be dropped for a streamer (an upgrade can replace anyone).
+    # Measured 2 v 3 v 4 after week 1 (add gate, both seasons): neither 3 nor 4
+    # was positive in both and clear of noise, so it stays 2. These are the
+    # automatic rotation tier (`season.tiers`); a manager's own rotation pins
+    # take them first.
+    stream_spots: int = 2
+    # How clear an upgrade must be to let an upgrade-only player go (the
+    # tiers' middle one): the player coming in worth at least this share more
+    # over the rest of the season. 0 = worth more by anything, the rule the add
+    # gate measured; the default moves only on the gate (`-b<nn>` arms).
+    upgrade_margin: float = 0.0
+    # The last days of a week on which an add still waiting for a decision must
+    # pay over the rest of this week AND the next week together, or it is
+    # withdrawn (it never adds a move). 1 = Sunday, 0 = never. Asked for on
+    # 2026-10-04, after two adds approved for a lost week's last two days
+    # turned out to cost categories the week after (-0.32, -0.12). Judgement,
+    # not measurement: the add gate replays no waiting proposals to test it on.
+    look_ahead_days: int = 1
+    # The last days of a week on which the SEARCH also prices against the next
+    # week, spending this week's leftover acquisitions. Measured in the add
+    # gate (12 teams x 22 weeks) against the plain weekly search: +0.05 +/-
+    # 0.07 (2024-25) and -0.33 +/- 0.07 (2025-26) categories a week, with ~20%
+    # more adds. Queued until the rosters unlock (a drop who plays that day
+    # keeps his game) it was still -0.04 +/- 0.09 and -0.28 +/- 0.08: the cost
+    # is the churn, not the lost Sunday game. Off by default.
+    preload_days: int = 0
+    # A search on every morning of the week but its first (Monday's weekly
+    # search) and the look-ahead days: a swap that gets more of the rest of
+    # the week's empty slots filled, made mid-week rather than waiting for
+    # Monday - asked for after week 1. None = off: mid-week, the search runs
+    # only when a roster spot opens. A mid-week move must clear this many
+    # expected categories, not `min_expected_gain` - a plain daily search
+    # churned too much to beat once a week. Measured at 0.25 with the horizon
+    # and no search on the look-ahead day (add gate `odds-daily-h-f25-x1`, 4
+    # drafts x 2 seasons, against the weekly search alone): ahead in 6 of 8
+    # leagues, clearly in 4, none clearly behind (worst -0.13 +/- 0.07);
+    # pooled +0.12 +/- 0.02 categories a week, ~6 more adds a season. Not
+    # positive in both seasons for any one draft, so the default waits on the
+    # manager; the evidence says turn it on.
+    mid_week_floor: float | None = None
+    # A mid-week move must also pay over the next week, the two together
+    # clearing `mid_week_floor` - a pickup that only lasts until Sunday costs
+    # the roster spot a week later.
+    mid_week_horizon: bool = True
+    # Never propose dropping one of next season's best keepers: the top
+    # n_keepers + keeper_margin eligible players by projected value next
+    # season, less what keeping costs (`season.keeper_value`). Decided once a
+    # week, so the line does not move under a waiting proposal. A league
+    # without keepers protects nobody.
+    #
+    # Measured twice. Which keepers it picks (`ppilot season keeper-check`,
+    # 48 drafted rosters, 2023-24 and 2024-25): from January on, those it would
+    # keep did better the next season than the preseason projection's picks
+    # and far better than the per-game value drops were judged by. What it
+    # costs now (add gate `odds-daily-h-f25-x1-k1`, 12 teams x 22 weeks):
+    # +0.04 +/- 0.05 and +0.14 +/- 0.05 categories a week - nothing; the
+    # players it shields are the rising ones the per-game value cut too soon.
+    protect_keepers: bool = True
+    keeper_margin: int = 1
+    # How the search shortlists free agents before pricing them properly.
+    # "value": the 20 worth most per game times the empty slots they would
+    # fill. "union": those, plus the 20 whose games move this week's close
+    # categories most (`odds.leverage`) - a hitter when HIT is level, which a
+    # general value can rank out of the 20.
+    #
+    # "value", on measurement (add gate `-e` against the live arm, 4 drafts x
+    # 2 seasons): behind in 7 of 8 leagues, pooled -0.044 +/- 0.023
+    # categories a week, with 25-70 more adds a league-season. A value-only
+    # list of 40 (`-n40`, the control) did the same: a longer list finds more
+    # moves that clear the floor on paper and do not pay.
+    screen: str = "value"
+    # Which drops each free agent is priced against. "cheapest": the player
+    # with the least rest-of-season value - with a goalie minimum, only ever
+    # one goalie, however few of his starts this roster can use. "goalies":
+    # also every other goalie he may replace; "all": every legal drop. An
+    # upgrade is then judged on one scale (a skater does not out-value a
+    # goalie by being a skater). Audit 2026-10-11: a third goalie whose club
+    # plays on nights the other two fill both G slots was never priced as a
+    # drop. "cheapest" on measurement (add gate `-dg` v the live arm, 12 teams
+    # x 22 weeks): 4 drafts x 2 seasons +0.030 +/- 0.019 categories a week (6
+    # of 8 leagues ahead), then on 8 fresh leagues +0.013 +/- 0.019 (6 of 8) -
+    # small, never clear of noise. A manager's choice; "goalies" costs ~3x the
+    # pricing time on rosters with goalies to spare.
+    drop_choice: str = "cheapest"
+    # Free-agent goalies always priced, the most expected starts' worth first.
+    # The screen counts a goalie's games only into an empty G slot and ignores
+    # whether he starts, so on a roster with goalies to spare it almost never
+    # shortlisted one. 0 = off, on measurement: three in the lane (add gate
+    # `-j3` v the live arm, 4 drafts x 2 seasons) lost -0.069 +/- 0.025
+    # categories a week (2 of 8 leagues positive) with ~6% more adds - the
+    # longer-list lesson of `screen` again: more moves that pay on paper only.
+    goalie_lane: int = 0
+    # Price the league's weekly goalie minimum into the odds: a side short of
+    # it wins no goalie category (Yahoo, help.yahoo.com/kb/SLN6878), so a drop
+    # that leaves too few goalie games pays for the risk. Off on measurement
+    # (add gate `-w`, 12 teams x 22 weeks): +0.044 +/- 0.023 categories a week
+    # over 4 drafts x 2 seasons, then +0.011 +/- 0.025 (3 of 8 ahead) on 8
+    # fresh leagues; with `drop_choice = "goalies"`, +0.024 +/- 0.026. The
+    # gate itself now scores the minimum, so this is what pricing it buys.
+    price_goalie_minimum: bool = False
+    # Goalies kept on the roster: no drop for a skater takes it below this,
+    # and while it is below, the free agents with the most expected starts are
+    # priced against the cheapest legal skater. None = off; an integer; or
+    # "auto" = the league's G slots + 1 (read from Yahoo, never a literal).
+    # Asked for by the 2026-10-31 review: a 10-12 drop left a roster two
+    # goalies, one lost his net, and goalie categories went 1 for 4 weeks.
+    # Off until the pre-registered add-gate arms (`-gf<N>` / `-gfa`) say.
+    min_goalies: int | str | None = None
+    # Make a swap on its best day of the week, not the day it is found: after
+    # the games the player going out still has, on days the one coming in
+    # does not play ("make it Wednesday morning"). The card says when and the
+    # move waits for that morning's run. Each day waited is discounted by
+    # `wait_hazard`, the chance the free agent is taken first; a waiver claim
+    # is never timed. "shift": the moves the search would make anyway, on their
+    # best day; "search": also moves that pay only when timed. Both measured
+    # (add gate v the live arm, 4 drafts x 2 seasons, 2026-10-12): "search"
+    # -0.075 +/- 0.028 categories a week at 10% a day (~8% more adds),
+    # "shift" +0.003 +/- 0.014 at 10% and -0.035 +/- 0.014 at 5%. The games a
+    # drop still has are worth about what a pickup lost while waiting costs:
+    # "off" - make a move as soon as it is decided.
+    time_moves: str = "off"
+    wait_hazard: float = 0.10
+    # Make an approved add and drop in Yahoo, rather than leave it to the
+    # manager. It changes who makes the move, not who decides: every move
+    # still needs its own approval (`proposals.take_for_execution`), and only
+    # an approval given while the page said Approve would make the move is
+    # carried out. One given on "make it in Yahoo yourself" is put back on the
+    # page to be asked again - a manager who turned this on does not make
+    # pickups by hand - and no waiver claim is offered, the one move it does
+    # not make. Needs the local executor (`local/transact.py`); without it,
+    # nothing changes.
+    execute_approved: bool = False
+
+    def __post_init__(self) -> None:
+        if self.screen not in SCREENS:
+            raise AuthorityError(
+                f"authority.transactions.screen must be one of {', '.join(SCREENS)}; "
+                f"got {self.screen!r}"
+            )
+        if self.add_scoring not in ADD_SCORING:
+            raise AuthorityError(
+                f"authority.transactions.add_scoring must be one of {', '.join(ADD_SCORING)}; "
+                f"got {self.add_scoring!r}"
+            )
+        if self.playoff_reserve < 0:
+            raise AuthorityError("authority.transactions.playoff_reserve cannot be negative")
+        for name in ("preload_days", "look_ahead_days"):
+            if not 0 <= getattr(self, name) <= 6:
+                raise AuthorityError(f"authority.transactions.{name} must be between 0 and 6")
+        if self.mid_week_floor is not None and self.mid_week_floor < 0:
+            raise AuthorityError("authority.transactions.mid_week_floor cannot be negative")
+        if self.keeper_margin < 0:
+            raise AuthorityError("authority.transactions.keeper_margin cannot be negative")
+        if self.stream_spots < 0:
+            raise AuthorityError("authority.transactions.stream_spots cannot be negative")
+        if not 0.0 <= self.upgrade_margin <= 10.0:
+            raise AuthorityError(
+                "authority.transactions.upgrade_margin is a share of a player's value, "
+                f"from 0 (worth more by anything) up to 10; got {self.upgrade_margin!r}"
+            )
+        if self.drop_choice not in DROP_CHOICES:
+            raise AuthorityError(
+                f"authority.transactions.drop_choice must be one of {', '.join(DROP_CHOICES)}; "
+                f"got {self.drop_choice!r}"
+            )
+        if self.goalie_lane < 0:
+            raise AuthorityError("authority.transactions.goalie_lane cannot be negative")
+        if (
+            self.min_goalies is not None
+            and self.min_goalies != "auto"
+            and (
+                not isinstance(self.min_goalies, int)
+                or isinstance(self.min_goalies, bool)
+                or self.min_goalies < 1
+            )
+        ):
+            raise AuthorityError(
+                "authority.transactions.min_goalies must be a whole number of goalies or "
+                f'"auto"; got {self.min_goalies!r}'
+            )
+        if self.time_moves not in TIME_MODES:
+            raise AuthorityError(
+                f"authority.transactions.time_moves must be one of {', '.join(TIME_MODES)}; "
+                f"got {self.time_moves!r}"
+            )
+        if not 0.0 <= self.wait_hazard < 1.0:
+            raise AuthorityError(
+                "authority.transactions.wait_hazard is a daily chance, from 0 up to (not) 1"
+            )
+
+    @property
+    def requires_approval(self) -> bool:
+        """Always true. A property rather than a field so it cannot be set."""
+        return True
+
+    def describe(self) -> list[str]:
+        return [
+            "Transactions (add / drop / claim): APPROVAL REQUIRED, always - by a tap, or in "
+            "advance (below).",
+            (
+                f"  proposed only when it adds {self.min_expected_gain:.2f} expected categories"
+                if self.add_scoring == "odds"
+                else f"  proposed only when it closes {self.min_weekly_gain:.0%} of a live gap"
+            ),
+            f"  at most {self.max_pending} awaiting your decision at once",
+            f"  {self.playoff_reserve} acquisition(s) held back for the playoffs",
+            (
+                f"  on the week's last {self.look_ahead_days} day(s), a waiting add must pay "
+                f"over the rest of the week and the next one together"
+                if self.look_ahead_days
+                else "  a waiting add is judged on the current week alone"
+            ),
+            (
+                f"  on the week's last {self.preload_days} day(s), the search also prices "
+                f"against next week (measured worse - off by default)"
+                if self.preload_days
+                else "  the search prices against the current week"
+            ),
+            (
+                f"  mid-week: a search every morning; a swap must add "
+                f"{self.mid_week_floor:.2f} expected categories"
+                + (" over the rest of this week and next together" if self.mid_week_horizon else "")
+                if self.mid_week_floor is not None
+                else "  mid-week: a search only when a roster spot opens"
+            ),
+            (
+                f"  next season's best keepers, and {self.keeper_margin} more, are never "
+                f"proposed as a drop"
+                if self.protect_keepers
+                else "  next season's keepers are not protected from a drop"
+            ),
+            f"  rotation: your rotation picks, then the cheapest, fill {self.stream_spots} "
+            f"spot(s) - any move that pays may drop one",
+            (
+                f"  upgrade only: dropped only for a player worth {self.upgrade_margin:.0%} "
+                f"more over the rest of the season"
+                if self.upgrade_margin > 0
+                else "  upgrade only: dropped only for a player worth more over the rest of "
+                "the season"
+            ),
+            (
+                "  each free agent is priced against the cheapest legal drop"
+                if self.drop_choice == "cheapest"
+                else "  each free agent is priced against the cheapest legal drop and every "
+                + ("goalie he may replace" if self.drop_choice == "goalies" else "legal drop")
+            ),
+            *(
+                [f"  the {self.goalie_lane} free-agent goalie(s) with most expected starts priced"]
+                if self.goalie_lane
+                else []
+            ),
+            *(
+                ["  the weekly goalie minimum is priced: a short week forfeits goalie categories"]
+                if self.price_goalie_minimum
+                else []
+            ),
+            (
+                f"  a swap is proposed for its best day of the week (waiting discounted "
+                f"{self.wait_hazard:.0%} a day; {self.time_moves})"
+                if self.time_moves != "off"
+                else "  a swap is proposed to be made as soon as it is approved"
+            ),
+            (
+                "  an approved move is made in Yahoo on the next run (where the executor is "
+                "installed) - approval still required for each"
+                if self.execute_approved
+                else "  an approved move is recorded; the manager makes it in Yahoo"
+            ),
+        ]
+
+
+@dataclass(frozen=True)
+class StandingApproval:
+    """Moves approved in advance: a rotation player's drop, shown first with a
+    window to stop it (season/standing.py).
+
+    It changes what saying yes takes - a tap, or letting the window pass - not
+    whether a move is shown and decided one at a time. Off unless agreed:
+    asked for on 2026-10-31, when 4 of 5 cards had each waited 11-12 hours
+    for a tap, so a move found in the morning was made after that night's
+    games.
+    """
+
+    enabled: bool = False
+    # How long a card is shown before it is made, unless stopped. 0 = made on
+    # the run that shows it - still shown and pushed first, with no window.
+    veto_minutes: int = 120
+    # Which moves it covers, each only when its drop is a rotation player:
+    # dropping one so a player back from IR can play (no acquisition spent),
+    # a free agent for one of the same kind (goalie for goalie, skater for
+    # skater), and one of the other kind.
+    make_room: bool = True
+    same_kind: bool = True
+    cross_kind: bool = False
+    # Moves made without a tap in a week. None: the league's own weekly cap
+    # and the playoff reserve are the only bound, as for a tapped move.
+    max_per_week: int | None = None
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.veto_minutes <= 24 * 60:
+            raise AuthorityError(
+                "authority.standing.veto_minutes is minutes a card is shown before it is made, "
+                f"from 0 to a day; got {self.veto_minutes!r}"
+            )
+        if self.max_per_week is not None and (
+            not isinstance(self.max_per_week, int)
+            or isinstance(self.max_per_week, bool)
+            or self.max_per_week < 0
+        ):
+            raise AuthorityError(
+                "authority.standing.max_per_week is a whole number of moves, or left out"
+            )
+
+    def covers(self, what: str) -> bool:
+        """Whether `what` ("make_room", "same_kind", "cross_kind") is covered."""
+        return what in COVERS and bool(getattr(self, what))
+
+    def describe(self) -> list[str]:
+        if not self.enabled:
+            return ["Moves without a tap: NONE (no standing approval given)."]
+        kinds = [label for key, label in COVERS.items() if getattr(self, key)]
+        window = (
+            f"shown {self.veto_minutes} min before it is made, to stop it"
+            if self.veto_minutes
+            else "made on the run that shows it - no window to stop it"
+        )
+        return [
+            "Moves without a tap: a ROTATION player's drop, approved in advance -",
+            f"  covers: {', '.join(kinds) or 'nothing'}",
+            f"  each one {window}",
+            (
+                f"  at most {self.max_per_week} a week"
+                if self.max_per_week is not None
+                else "  no weekly limit beyond the league's own"
+            ),
+            "  a drop set to Never or Upgrade only, or a Stop on the card, is never made this way",
+        ]
+
+
+# What a standing approval can cover, and how it is said.
+COVERS = {
+    "make_room": "make-room drops",
+    "same_kind": "same-kind swaps",
+    "cross_kind": "skater-for-goalie swaps",
+}
+
+
+@dataclass(frozen=True)
+class Authority:
+    lineup: LineupAuthority = field(default_factory=LineupAuthority)
+    transactions: TransactionAuthority = field(default_factory=TransactionAuthority)
+    standing: StandingApproval = field(default_factory=StandingApproval)
+
+    def describe(self) -> str:
+        parts = [self.lineup.describe(), self.transactions.describe(), self.standing.describe()]
+        return "\n\n".join("\n".join(x) for x in parts)
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> Authority:
+        """Parse an `[authority]` table. Unknown keys are refused, not ignored.
+
+        A misspelled bound that silently keeps the default is how a tool ends up
+        acting under criteria nobody agreed to.
+        """
+        lineup_cfg = dict(cfg.get("lineup", {}) or {})
+        tx_cfg = dict(cfg.get("transactions", {}) or {})
+        standing_cfg = dict(cfg.get("standing", {}) or {})
+
+        if "enabled" in tx_cfg:
+            raise AuthorityError(
+                "authority.transactions.enabled is not a setting: transactions always "
+                "require an approved proposal. Remove it."
+            )
+        _refuse_removed("authority.lineup", lineup_cfg)
+        _refuse_unknown("authority.lineup", lineup_cfg, LineupAuthority)
+        _refuse_unknown("authority.transactions", tx_cfg, TransactionAuthority)
+        _refuse_unknown("authority.standing", standing_cfg, StandingApproval)
+
+        if "never_bench" in lineup_cfg:
+            lineup_cfg["never_bench"] = tuple(str(n) for n in lineup_cfg["never_bench"])
+        return cls(
+            lineup=LineupAuthority(**lineup_cfg),
+            transactions=TransactionAuthority(**tx_cfg),
+            standing=StandingApproval(**standing_cfg),
+        )
+
+
+# Settings that existed and should not be silently ignored if someone still
+# has them in a config: say why they went rather than "unknown setting".
+REMOVED = {
+    "max_swaps_per_day": (
+        "lineup changes are free and unlimited until each player's game starts, "
+        "so capping them per day modelled a constraint that does not exist. "
+        "The real bound is the lock time, which is reported instead."
+    ),
+}
+
+
+def _refuse_removed(where: str, cfg: dict) -> None:
+    for key, why in REMOVED.items():
+        if key in cfg:
+            raise AuthorityError(f"{where}.{key} has been removed: {why}")
+
+
+def _refuse_unknown(where: str, cfg: dict, cls: type) -> None:
+    known = set(cls.__dataclass_fields__)
+    unknown = sorted(set(cfg) - known)
+    if unknown:
+        raise AuthorityError(
+            f"{where}: unknown setting(s) {', '.join(unknown)}. Known: {', '.join(sorted(known))}"
+        )

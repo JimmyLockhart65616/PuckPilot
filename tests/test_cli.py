@@ -59,3 +59,35 @@ def test_farm_help_does_not_promise_a_human_will_click():
 
         src = inspect.getsource(cli)
         assert "waiting for you to join" not in src.lower()
+
+
+# ---- pre-draft commands ------------------------------------------------------
+
+
+def test_preflight_requires_a_seat_and_fails_on_a_league_that_will_not_load(
+    monkeypatch, tmp_path, capsys
+):
+    """No silent seat-0 default, and a league file that does not load is a
+    non-zero exit - not the generic fallback every other command accepts."""
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["draft", "preflight"])
+
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pre.db"))
+    cli.main(["data", "init"])
+    rc = cli.main(
+        ["--league", str(tmp_path / "nope.toml"), "draft", "preflight", "--seat", "3", "--offline"]
+    )
+    assert rc == 1
+    assert "[FAIL] league file" in capsys.readouterr().out
+
+
+def test_live_draft_accepts_an_adp_league_key():
+    args = cli.build_parser().parse_args(
+        ["draft", "live", "--seat", "3", "--adp-league-key", "477.l.1"]
+    )
+    assert args.adp_league_key == "477.l.1"
+
+
+def test_yahoo_keepers_parses_a_draft_order():
+    args = cli.build_parser().parse_args(["yahoo", "keepers", "--order", "a,b,c"])
+    assert args.order == "a,b,c" and args.func is cli._cmd_yahoo_keepers

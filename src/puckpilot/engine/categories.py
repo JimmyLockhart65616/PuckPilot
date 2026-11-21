@@ -31,8 +31,10 @@ CATALOG: dict[str, Category] = {
         Category("blocks", "BLK", "skater"),
         Category("wins", "W", "goalie"),
         Category("saves", "SV", "goalie"),
-        # Yahoo scores SA as higher-is-better (stat_id 24, sort_order=1): as a
-        # counting stat it rewards workload, not weak goaltending.
+        # Higher-is-better when a league scores it (stat_id 24, sort_order=1):
+        # as a counting stat it rewards workload, not weak goaltending. Yahoo
+        # often lists it display-only beside SV% instead - its denominator, not
+        # a category - so check `is_only_display_stat` before valuing it.
         Category("shots_against", "SA", "goalie"),
         Category("shutouts", "SHO", "goalie"),
         Category("save_pct", "SV%", "goalie", rate=True),

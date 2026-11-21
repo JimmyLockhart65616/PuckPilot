@@ -21,7 +21,10 @@ validation, not gut feel.
 - **Waiver & free-agent engine** — ranked pickup and drop proposals, scored
   against a weekly backtest. Proposals are recorded for you to review; executing
   them through the Yahoo Fantasy API is designed but not built, and is gated on
-  API approval.
+  API approval. Every player carries a drop tier — never, upgrade only, or
+  rotation — that decides who a proposal may let go; a manager can approve
+  rotation drops in advance, each still shown first with the time it would be
+  made and a way to stop it.
 
 ## Why PuckPilot
 
@@ -130,6 +133,26 @@ browser on the drafter's machine, so the board is always computed there; the
 relay (`deploy/relay/`) holds nothing but the last snapshot pushed to it and
 imports no part of the engine. That also means the drafter's machine is a single
 point of failure — hosting buys a stable URL, not resilience.
+
+## How it's built
+
+PuckPilot is written to be run by managers in leagues other than the one it was
+tested in, for the long term, so it holds itself to a few rules:
+
+- **General mechanisms, not special cases.** A behaviour is built for every
+  league shape, category set and roster - never for one team. League settings
+  are configuration (`leagues/*.toml`, read from the platform at run time), not
+  code.
+- **Seams at the platform boundary.** Reading the league
+  (`season/league_feed.py`) and making an approved move (`season/executors.py`)
+  are interfaces, and lineup changes go through a single actuator hook, so a
+  platform's official API drops in without touching anything that decides.
+- **Measured defaults.** A tuning knob ships with a default, and that default
+  changes only when a pre-registered replay gate or live calibration says so -
+  failures recorded alongside passes.
+- **Nothing important is silent.** A state that stops the tool working (an
+  illegal roster, a signed-out session, missed runs) fails the run, leads the
+  page and is pushed to the manager until it is fixed (`season/blockers.py`).
 
 ## Testing
 

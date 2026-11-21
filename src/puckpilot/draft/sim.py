@@ -105,31 +105,54 @@ def keepers_for(
     the config lists none. Keepers outside the universe are reported, never
     dropped quietly — a missing keeper leaves an elite player wrongly available.
     """
-    from puckpilot.keepers import keeper_seats, resolve_keeper_ids
+    from puckpilot.keepers import keeper_seats, resolve_keepers
 
     n_teams = league.shape.n_teams
     names = league.keepers_for_season(season)
     if not names:
         return simulate_keepers(u, n_teams, league.n_keepers, rng)
-    resolved, unmatched = resolve_keeper_ids(conn, names)
+    res = resolve_keepers(conn, names)
+    resolved = res.resolved
     known = set(u.ids.tolist())
     missing = [n for n, pid in resolved.items() if pid not in known]
-    if warn and (unmatched or missing):
-        if unmatched:
-            warn(f"  keepers not found in nhl_players: {', '.join(unmatched)}")
+    if warn and (res.unmatched or res.ambiguous or missing):
+        if res.unmatched:
+            warn(f"  keepers not found in nhl_players: {', '.join(res.unmatched)}")
+        for entry, cands in res.ambiguous.items():
+            warn(
+                f"  keeper {entry!r} matches {len(cands)} players ({'; '.join(cands)}) - "
+                'NOT placed; qualify it in the league file, e.g. "Name (TEAM)"'
+            )
         if missing:
             warn(f"  keepers outside the ranked universe: {', '.join(missing)}")
 
     # Where the league records WHO keeps whom, honour it. Availability is the
     # same either way, but which seat holds a keeper decides whose roster the
     # engine reasons about - and on a live board one of those seats is ours.
+    #
+    # Owner names are resolved to ids on their own, not looked up by the exact
+    # spelling used in `by_season`: "JT Miller" under an owner and "J.T. Miller"
+    # in the pool are one player, and a string lookup sent him to a random seat.
+    kept_ids = set(resolved.values())
     owned: dict[int, list[int]] = {}
     for seat, owner_names in league.keeper_owners_for_season(season).items():
-        ids = [resolved.get(n) for n in owner_names]
-        unknown = [n for n in owner_names if resolved.get(n) not in known]
-        if warn and unknown:
-            warn(f"  seat {seat} keepers not on the board: {', '.join(unknown)}")
-        owned[seat] = [pid for pid in ids if pid is not None and pid in known]
+        mine = resolve_keepers(conn, tuple(owner_names))
+        bad = mine.unmatched + list(mine.ambiguous)
+        # An owner may only claim someone the pool lists as kept: placing a
+        # player the pool omits would take a draftable player off the board on
+        # the strength of a second, contradictory list.
+        outside = [n for n, pid in mine.resolved.items() if pid not in kept_ids]
+        off_board = [n for n, pid in mine.resolved.items() if pid in kept_ids and pid not in known]
+        if warn and bad:
+            warn(f"  seat {seat} keepers not resolvable: {', '.join(bad)}")
+        if warn and outside:
+            warn(
+                f"  seat {seat} keepers missing from keepers.by_season.{season} "
+                f"(not placed): {', '.join(outside)}"
+            )
+        if warn and off_board:
+            warn(f"  seat {seat} keepers not on the board: {', '.join(off_board)}")
+        owned[seat] = [pid for pid in mine.resolved.values() if pid in kept_ids and pid in known]
 
     return keeper_seats(
         [pid for pid in resolved.values() if pid in known], n_teams, rng, owned=owned
@@ -181,7 +204,12 @@ def run_draft(
         next_pick[picks[-1]] = None
 
     for i, seat in enumerate(order):
-        ctx = {"pick_no": i, "next_pick_no": next_pick[i], "avail": avail}
+        ctx = {
+            "pick_no": i,
+            "next_pick_no": next_pick[i],
+            "avail": avail,
+            "roster_rows": rosters[seat],
+        }
         idx = bots[seat].pick(u, avail, counts[seat], rules, remaining[seat], rng, ctx)
         avail[idx] = False
         rosters[seat].append(idx)
@@ -197,20 +225,42 @@ def build_universe(
     train_seasons: tuple[str, ...],
     league: LeagueConfig = DEFAULT_LEAGUE,
     market_ids: set[int] | None = None,
+    position_overrides: dict[int, str] | None = None,
+    eligibility: dict[int, frozenset[str]] | None = None,
+    goalie_age_on: str | None = None,
 ) -> Universe:
     """Projection-ranked pool with pseudo-ADP.
 
     Pseudo-ADP = prior-season ACTUAL value order (what casual drafters chase);
     swaps for real Yahoo ADP when API access lands.
+
+    `position_overrides` (player id -> position) re-labels skaters before
+    ranking, so their VORP is taken against the league's position rather than
+    the NHL's - see `playermap.position_corrections`.
+
+    `eligibility` (player id -> Yahoo positions) values multi-position skaters
+    at their best allowed position - see `valuation.replacement_adjust`. It
+    changes VORP only; attach it to the universe separately for accounting.
+
+    `goalie_age_on`: where the age curve lands for goalies
+    (`projections.GOALIE_AGE_ON` when None).
     """
     kw = {
         "shape": league.shape,
         "skater_cats": league.skater_cats,
         "goalie_cats": league.goalie_cats,
+        "eligibility": eligibility,
     }
-    proj_sk, proj_g = projections.project(conn, target_season, list(train_seasons))
-    ranked = rank_players(proj_sk, proj_g, **kw)
+    proj_sk, proj_g = projections.project(
+        conn, target_season, list(train_seasons), goalie_age_on=goalie_age_on
+    )
     act_sk, act_g = season_aggregates(conn, train_seasons[0])
+    if position_overrides:
+        for frame in (proj_sk, act_sk):
+            hit = [pid for pid in frame.index if int(pid) in position_overrides]
+            if hit:
+                frame.loc[hit, "position"] = [position_overrides[int(p)] for p in hit]
+    ranked = rank_players(proj_sk, proj_g, **kw)
     adp_ranked = rank_players(act_sk, act_g, **kw)
     adp = pd.Series(
         np.arange(1, len(adp_ranked) + 1, dtype=float), index=adp_ranked.index, name="adp_rank"
@@ -298,6 +348,8 @@ def run_sims(
     league: LeagueConfig = DEFAULT_LEAGUE,
     scoring: str = "h2h",
     progress: Callable[[str], None] | None = None,
+    eligibility: dict[int, frozenset[str]] | None = None,
+    position_overrides: dict[int, str] | None = None,
 ) -> SimReport:
     """Monte Carlo snake drafts vs bot field, each roster replayed over the
     REAL target season (walk-forward: projections never see target data).
@@ -313,7 +365,14 @@ def run_sims(
     rng = np.random.default_rng(seed)
 
     skater_keys = [c.key for c in league.skater_cats]
-    u = build_universe(conn, target_season, train_seasons, league)
+    u = build_universe(
+        conn, target_season, train_seasons, league, position_overrides=position_overrides
+    )
+    if eligibility is not None:
+        # Every team's lineups are then filled over eligibility, not only the
+        # engine's - an engine aware of it must not be scored as if it were not.
+        u = u.with_eligibility(eligibility)
+        eligibility = {int(pid): s for pid, s in zip(u.ids, u.elig_sets, strict=True)}
     data = build_replay_data(conn, target_season, skater_keys)
     positions = dict(zip(u.ids.tolist(), u.pos.tolist(), strict=True))
     scalar = dict(zip(u.ids.tolist(), u.z_total.tolist(), strict=True))
@@ -342,7 +401,7 @@ def run_sims(
         g = np.zeros((shape.n_teams, n_weeks, G_WIDTH))
         for t, ridx in enumerate(rosters):
             ids = [int(u.ids[i]) for i in ridx]
-            sk[t], g[t] = replay_roster(ids, positions, scalar, data, shape)
+            sk[t], g[t] = replay_roster(ids, positions, scalar, data, shape, eligibility)
 
         if scoring == "h2h":
             finish = run_h2h_season(

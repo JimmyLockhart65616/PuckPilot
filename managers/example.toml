@@ -1,0 +1,173 @@
+# Who PuckPilot is acting for. Copy to managers/<name>.toml and edit; the rest
+# of managers/ is git-ignored because this file names a real team and the path
+# to a logged-in browser profile.
+#
+# Everything here is about one person's chair in one league. The league's own
+# rules - categories, roster slots, the week calendar, waiver rules,
+# acquisition caps - are NOT here: they are read from Yahoo at run time, so
+# they cannot go stale and a different league needs no edits.
+#
+# Two managers in the same league each get their own file. They are rivals, so
+# nothing is shared between them: separate rows, separate browser profiles,
+# separate page keys.
+
+name = "example"
+
+# The league file (categories, keepers, roster shape). Relative to the repo
+# root. Omit to use LEAGUE_FILE from .env.
+league_file = "leagues/example.toml"
+
+# Yahoo keys. Both are optional: the league key is taken from the player map
+# when there is only one, and the team key is discovered from Yahoo by asking
+# which team the logged-in user owns. Set them to be explicit, and set them if
+# you own teams in more than one league.
+# league_key = "465.l.12345"
+# team_key   = "465.l.12345.t.5"
+
+# A logged-in Chrome profile, only needed to ACT. Leave it out to decide and
+# view without a write path - which is the whole setup for someone on a machine
+# they cannot install a browser driver on.
+# profile_dir = "secrets/chrome-profile-example"
+
+# Defaults to DB_PATH from .env. Set it when two managers share a machine but
+# should not share rows.
+# db_path = "data/puckpilot-example.db"
+
+
+# Where this manager's view is published. Keys are per-manager: a guest key
+# shows one chair, and one manager must never be handed another's.
+[page]
+# url       = "https://<your-relay-host>"
+# owner_key = ""   # prefer the environment over a file on disk
+# guest_key = ""
+
+
+# ---------------------------------------------------------------------------
+# STANDING AUTHORITY
+#
+# The asymmetry here is the point, and it is enforced in code, not by these
+# values. A lineup change is reversible, expires in a day, and has to happen
+# ~185 times a season at an hour when you are usually busy - so you can grant
+# it in advance, bounded by criteria you wrote down. A transaction spends one
+# of a fixed number of weekly acquisitions and drops a player who may not come
+# back - so it is always proposed and never executed until you approve it.
+# ---------------------------------------------------------------------------
+
+[authority.lineup]
+# false = recommend only. Set true to grant standing authority to make these
+# changes for you, within every bound below.
+enabled = false
+
+# Leave the lineup alone unless the swap is worth this much for the day, in the
+# same units the value model uses. Measured over a real season this barely
+# matters either way - at 1.0 it saves 6 of 536 moves and costs 0.13% -
+# because daily churn comes from who has a game, not from marginal swaps.
+min_gain = 0.15
+
+# Never start a goalie less likely than this to actually start. A goalie who
+# does not play scores zero in every goalie category that night.
+min_goalie_p_start = 0.5
+
+# Players Yahoo flags but does not rule out (day-to-day and similar):
+#   "never"          - bench them
+#   "only_if_needed" - start them when the alternative is an empty slot
+#   "always"         - ignore the flag
+start_questionable = "only_if_needed"
+
+# Yahoo's per-week minimum games is a rule, not a preference: falling short
+# forfeits the category.
+enforce_min_games = true
+
+# NOTE: there is no cap on changes per day. Lineup moves are free and
+# unlimited until each player's own game starts, so a busy night is a busy
+# schedule rather than a malfunction. What bounds the day is the lock, and
+# the daily plan reports it ("First lock: 7:00 PM").
+
+# Never bench these, whatever the numbers say. Names, because you think in
+# names. Config, never code.
+never_bench = []
+
+# Whether an approved week protocol also re-weights the daily lineup.
+# OFF on measurement: scored by categories won per week it was positive in
+# 3 of 6 runs across two seasons and three seeds, every effect inside 0.08
+# categories of ~5.8 - noise. The reason is the headroom finding: most weeks
+# everyone with a game fits in a slot, so there is no lineup decision for a
+# weight to change. The protocol still steers the ADDS, where the lever is.
+follow_protocol = false
+
+
+[authority.transactions]
+# NOTE: there is no `enabled` here, and adding one is an error rather than a
+# setting. Adds, drops and claims are only ever executed from a proposal you
+# approved; the executor takes an approved proposal id and has no way to create
+# one itself. Making transactions autonomous is not a config change - it would
+# mean deleting that mechanism.
+
+# How much of a live category gap a swap must close to be worth raising -
+# 0.25 is a quarter of it. A SHARE, not a score: adds are priced by
+# re-slotting the actual week and subtracting, so this is in gap units.
+min_weekly_gain = 0.25
+
+# More than this awaiting your decision means the tool is guessing, not advising.
+max_pending = 5
+
+# Goalie moves (measured 2026-10-11; see season/authority.py for the numbers).
+# Which drops a free agent is priced against: "cheapest" (the player with the
+# least rest-of-season value), "goalies" (also every goalie he may replace -
+# with a goalie minimum the cheapest rule can only ever offer one), or "all".
+# drop_choice = "cheapest"
+# Price the weekly goalie minimum into the odds: a week short of it wins no
+# goalie category, so a drop that leaves too few goalie games pays for that.
+# price_goalie_minimum = false
+# Free-agent goalies always priced by expected starts. Measured worse: 0.
+# goalie_lane = 0
+# Goalies to keep on the roster: no drop for a skater takes it below this, and
+# while it is below, the free agents with the most expected starts are priced
+# against the cheapest skater. A number, or "auto" (the league's G slots + 1).
+# Off until the add gate measures it (arms -gf<N> / -gfa).
+# min_goalies = "auto"
+# Make a swap on its best day of the week ("Wednesday morning, after Tuesday's
+# games") instead of as soon as it is approved: "off", "shift" (the same moves,
+# a later day) or "search" (also moves that only pay when timed). Measured: no
+# gain - the drop's last games are worth about what a pickup lost while
+# waiting costs. wait_hazard is the chance a day that the free agent is taken.
+# time_moves = "off"
+# wait_hazard = 0.10
+
+# Drop tiers: who a move may let go. Every player is one of
+#   Never         never dropped (Yahoo's own lock, your pin, or a protected keeper)
+#   Upgrade only  dropped only for a player worth more over the rest of the season
+#   Rotation      dropped for any move that pays this week (a streamer spot)
+# Set a player's tier from the page's roster (tap his tier) or with
+# `ppilot season tiers --set "Name=rotation"`; unset players follow the rule:
+# your Rotation picks fill `stream_spots` first, then the cheapest players,
+# and everyone else is Upgrade only.
+# stream_spots = 2
+# How much more an Upgrade only player's replacement must be worth over the
+# rest of the season: 0.25 = at least 25% more. 0 = more by anything, the rule
+# the add gate measured.
+# upgrade_margin = 0.0
+
+
+[authority.standing]
+# Moves approved in advance: a ROTATION player's drop, each still shown on the
+# page first with the time it will be made ("PuckPilot makes this at 9:05 PM
+# unless you stop it"), pushed to your phone, and made by the run at that time
+# only if you did not tap Stop. A Stop, setting the drop to another tier, or
+# turning this off sends a card back to wait for your tap. Waiver claims and
+# adds that drop nobody always wait for a tap. Needs a page (it is where you
+# stop one) and PuckPilot making your approved moves (execute_approved).
+# Emergency stop without editing this file: PUCKPILOT_STANDING_OFF=1.
+enabled = false
+
+# Minutes a card is shown before it is made. 0 = made on the run that shows
+# it (still pushed to you first, with no time to stop it).
+veto_minutes = 120
+
+# Which moves it covers, each only when the drop is a Rotation player:
+make_room = true     # drop one so a player back from IR can play (no acquisition spent)
+same_kind = true     # a free agent for one of the same kind: goalie for goalie, skater for skater
+cross_kind = false   # a skater for a goalie, or the reverse
+
+# Moves made without a tap in a week; leave out for only the league's own cap.
+# max_per_week = 2

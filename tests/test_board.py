@@ -95,13 +95,108 @@ def test_next_pick_no_indexes_the_live_sequence_not_the_full_snake():
     assert later is None or (later > b.made and b.slots[later][1] == 0)
 
 
-def test_explicit_keeper_rounds_override_the_default_assumption():
-    default = _board(keepers={0: [1, 2]})
-    override = _board(keepers={0: [1, 2]}, keeper_rounds={0: [5, 6]})
-    assert default.picks_left(0) == override.picks_left(0) == 5
-    # the default consumes seat 0's earliest rounds; the override its last two
-    assert default.slots[0][1] != 0
+def test_explicit_keeper_rounds_override_the_placement():
+    first = _board(keepers={0: [1, 2]}, keeper_placement="first")
+    override = _board(keepers={0: [1, 2]}, keeper_rounds={0: [5, 6]}, keeper_placement="first")
+    assert first.picks_left(0) == override.picks_left(0) == 5
+    # "first" consumes seat 0's earliest rounds; the override its last two
+    assert first.slots[0][1] != 0
     assert override.slots[0][1] == 0
+
+
+def test_last_placement_keeps_the_opening_rounds_a_plain_snake():
+    """The real-league bug: keepers in the LAST rounds, modelled in the first,
+    put seat 5 on the clock at pick 1 and our seat-3 first pick at #16 instead
+    of #4. Every survival probability reads off that number."""
+    keepers = {0: [1, 2], 1: [11], 2: [21, 22], 3: [31, 32]}
+    b = _board(keepers=keepers, keeper_placement="last")
+    assert [seat for _, seat in b.slots[:8]] == [0, 1, 2, 3, 3, 2, 1, 0]
+    assert b.slot_numbers[:8] == list(range(1, 9))
+    assert b.next_pick_no(3) == 3
+    # the uneven keeper counts show up only in the final rounds: seat 1 kept
+    # one player, so he alone still picks in round 6
+    assert [seat for rnd, seat in b.slots if rnd == 5] == [1]
+    assert [seat for rnd, seat in b.slots if rnd == 6] == []
+    assert b.picks_left(1) == 6 and b.picks_left(2) == 5
+
+
+def test_first_placement_with_uniform_keepers_reverses_the_snake():
+    """Why "first" is not the default: an odd number of keepers each shifts the
+    live draft onto a reverse round, so the LAST seat picks first."""
+    b = _board(keepers={s: [1 + 10 * s] for s in range(4)}, keeper_placement="first")
+    assert b.on_the_clock() == 3
+
+
+def test_an_unknown_placement_is_refused():
+    with pytest.raises(DraftBoardError, match="keeper_placement"):
+        _board(keeper_placement="middle")
+
+
+# ---- reconciling with the room --------------------------------------------
+
+
+def test_room_pick_numbers_map_onto_live_slots_around_keeper_rounds():
+    b = _board(keepers={0: [1]}, keeper_placement="last")
+    # 4 teams x 7 rounds = 28 room picks; round 7 runs forward, so seat 0's
+    # round-7 pick is room #25 - and that is his keeper
+    assert b.slot_for_room_pick(25) is None
+    assert b.slot_for_room_pick(26) == 24
+    assert b.slot_for_room_pick(1) == 0
+    assert b.live_picks_through(24) == 24
+    assert b.live_picks_through(25) == 24
+    assert b.live_picks_through(28) == 27
+
+
+def test_drift_is_how_far_the_board_trails_the_room():
+    b = _board()
+    assert b.drift(0) == 0
+    assert b.drift(3) == 3  # room made three picks, board recorded none
+    b.record(int(b.u.ids[0]))
+    assert b.drift(3) == 2
+    b.record_unknown()
+    b.record_unknown()
+    b.record_unknown()
+    assert b.drift(3) == -1  # entered by hand ahead of a lagging feed
+
+
+def test_a_late_keeper_comes_off_without_consuming_a_pick():
+    """Found on draft night: a keeper nobody declared. Recording him as a pick
+    would advance the clock past a pick that has not happened."""
+    b = _board(keeper_placement="last")
+    b.record(int(b.u.ids[0]))
+    pid = int(b.u.ids[5])
+    made, before = b.made, len(b.slots)
+    pick = b.add_keeper(pid, seat=2)
+    assert pick.source == "keeper" and pick.seat == 2
+    assert not b.avail[b._row_of[pid]]
+    assert b.made == made
+    assert len(b.slots) == before - 1
+    assert b.picks_left(2) == 6
+    assert [p.player_id for p in b.roster(2)] == [pid]
+
+
+def test_a_late_keeper_can_be_taken_back():
+    b = _board()
+    pid = int(b.u.ids[5])
+    before = list(b.slots)
+    b.add_keeper(pid, seat=2)
+    assert b.remove_keeper(pid).player_id == pid
+    assert b.avail[b._row_of[pid]]
+    assert b.slots == before
+    assert b.roster(2) == []
+    assert b.remove_keeper(pid) is None
+
+
+def test_a_placeholder_is_named_later_without_counting_the_slot_twice():
+    b = _board()
+    b.record_unknown(label="?")
+    pid = int(b.u.ids[3])
+    pick = b.fill_placeholder(0, pid, source="feed")
+    assert b.made == 1
+    assert pick.player_id == pid and pick.overall == 0
+    assert not b.avail[b._row_of[pid]]
+    with pytest.raises(DraftBoardError, match="not an unknown placeholder"):
+        b.fill_placeholder(0, int(b.u.ids[4]))
 
 
 # ---- keepers --------------------------------------------------------------
@@ -206,8 +301,25 @@ def test_the_board_owns_the_pick_context():
     b = _board()
     ctx = b.pick_context(0)
     assert ctx["pick_no"] == b.made
-    assert ctx["next_pick_no"] == b.next_pick_no(0)
+    assert ctx["next_pick_no"] == b.survival_pick_no(0)
     assert ctx["avail"] is b.avail
+
+
+def test_survival_is_scored_against_the_following_turn_as_the_sim_does():
+    """On the clock, `sim.run_draft` gives a seat its FOLLOWING pick: will this
+    player still be there if we pass now? The board used to hand over the pick
+    being made, so every "lasts %" on the clock asked the wrong question and
+    the shortlist was ranked on a discount the sim never tuned."""
+    b = _board()
+    while b.on_the_clock() != 2:
+        b.record(int(b.u.ids[np.flatnonzero(b.avail)[0]]))
+    on_clock = b.made
+    following = b.next_pick_no(2, after=on_clock)
+    assert b.slots[following][1] == 2 and following > on_clock
+    assert b.pick_context(2)["next_pick_no"] == following
+    # off the clock it previews that same question for the upcoming turn
+    upcoming = b.next_pick_no(3)
+    assert b.pick_context(3)["next_pick_no"] == b.next_pick_no(3, after=upcoming)
 
 
 def test_recommend_never_offers_a_drafted_player():
@@ -242,7 +354,9 @@ def test_last_pick_of_the_draft_discounts_nobody():
     b = _board()
     b.slots = b.slots[:1]
     assert b.next_pick_no(0) == 0
+    assert b.pick_context(0)["next_pick_no"] is None
     cands = recommend(b, n=3)
+    assert all(c.p_survive == 0.0 for c in cands)
     b.record(cands[0].player_id)
     assert b.complete
     assert b.next_pick_no(0) is None
@@ -385,3 +499,85 @@ def test_a_real_shortlist_puts_survival_first():
         timing = [r for r in reasons if r.weight == TIMING]
         if timing:
             assert reasons[0].weight == TIMING, "a timing fact exists but is not first"
+
+
+# ---- terminal hand entry and feed health ------------------------------------
+
+
+def test_console_taken_unknown_and_kept_commands():
+    from puckpilot.draft.live import handle_command
+
+    b = _board()
+    assert "taken by seat 0" in handle_command(b, "t Player CA")
+    assert b.made == 1 and b.picks[0].name == "Player CA"
+    assert "taken by seat 2" in handle_command(b, "taken Player DA @2")
+    assert b.picks[1].seat == 2
+    assert "recorded as unknown" in handle_command(b, "x")
+    assert b.made == 3
+    assert "no pick used" in handle_command(b, "k Player LA @1")
+    assert b.made == 3 and [p.name for p in b.roster(1)] == ["Player LA"]
+    assert "back on the board" in handle_command(b, "unk Player LA")
+    assert handle_command(b, "Player RA") is None, "a bare name is not a command"
+
+
+def test_console_commands_refuse_bad_input_with_a_sentence():
+    from puckpilot.draft.live import handle_command
+
+    b = _board()
+    handle_command(b, "t Player CA")
+    assert "already off the board" in handle_command(b, "t Player CA")
+    assert "outside" in handle_command(b, "x @9")
+    assert "must be a number" in handle_command(b, "t Player DA @two")
+    assert "give the seat" in handle_command(b, "k Player DB")
+    assert b.made == 1
+
+
+def test_console_health_says_when_the_board_is_behind_the_room():
+    from puckpilot.draft.live import feed_health
+
+    class Quiet:
+        name = "websocket"
+
+        def status(self):
+            return {"room_picks": 4, "gaps": [], "unmapped_names": ["Ivan Demidov"]}
+
+    b = _board()
+    b.warnings = ["no Yahoo ADP"]
+    lines = feed_health(b, Quiet())
+    assert lines[0] == "no Yahoo ADP"
+    assert any("4 PICKS BEHIND THE ROOM" in line for line in lines)
+    assert any("Ivan Demidov" in line for line in lines)
+    for _ in range(4):
+        b.record_unknown()
+    assert not any("BEHIND" in line for line in feed_health(b, Quiet()))
+
+
+# ---- traded picks and the room's clock ------------------------------------------
+
+
+def test_a_traded_pick_moves_one_slot_and_keepers_still_take_the_last_picks():
+    """The real case: seat 3 owns seat 1's round-3 pick; seat 1 owns seat 3's
+    round-5 pick. Keepers must still come off each seat's LAST picks."""
+    trades = {(2, 1): 3, (4, 3): 1}  # 0-based (round, pick in round) -> seat
+    keepers = {s: [1 + 10 * s] for s in range(4)}
+    b = _board(keepers=keepers, keeper_placement="last", pick_owners=trades)
+    assert b.slots[9][1] == 3 and b.slot_numbers[9] == 10  # round 3, 2nd pick
+    assert b.slots[19][1] == 1 and b.slot_numbers[19] == 20  # round 5, 4th pick
+    assert b.picks_left(3) == b.picks_left(1) == 6  # 7 picks each, one kept
+    # everyone's keeper came off their last pick: the final round is empty
+    assert all(rnd < 6 for rnd, _ in b.slots)
+
+
+def test_no_trades_is_the_old_sequence_exactly():
+    for placement in ("first", "last"):
+        keepers = {0: [1, 2], 1: [11], 2: [], 3: [31, 32]}
+        a = _board(keepers=keepers, keeper_placement=placement)
+        b = _board(keepers=keepers, keeper_placement=placement, pick_owners={})
+        assert a.slots == b.slots and a.slot_numbers == b.slot_numbers
+
+
+def test_the_room_clock_disagreeing_with_the_board_is_named():
+    b = _board()
+    assert b.clock_disagreement(1, 0) is None
+    msg = b.clock_disagreement(2, 3)
+    assert msg and "seat 3" in msg and "expects seat 1" in msg

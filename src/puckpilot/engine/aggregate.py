@@ -34,13 +34,18 @@ def toi_seconds(toi: str) -> int:
     return int(m) * 60 + int(s)
 
 
-def season_aggregates(conn: sqlite3.Connection, season: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def season_aggregates(
+    conn: sqlite3.Connection, season: str, before: str | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(skaters, goalies) per-player season totals from nhl_game_logs.
 
     Skaters: gp + summed counting stats (SKATER_COLS).
     Goalies: gp, starts, wins, shutouts, shots_against, goals_against, toi_hours,
     plus derived save_pct and gaa (per 60). Split by nhl_players.position == 'G'.
     Both frames are indexed by player_id and carry name/team/position.
+
+    `before` (YYYY-MM-DD) keeps only games played before that date: the season
+    so far, as it stood that morning.
     """
     players = pd.read_sql_query(
         "SELECT player_id, full_name AS name, team_abbrev AS team, position FROM nhl_players",
@@ -56,8 +61,8 @@ def season_aggregates(conn: sqlite3.Connection, season: str) -> tuple[pd.DataFra
         "SELECT l.player_id, l.stats_json, b.stats_json FROM nhl_game_logs l"
         " LEFT JOIN nhl_boxscore_stats b"
         "   ON b.game_id = l.game_id AND b.player_id = l.player_id"
-        " WHERE l.season = ?",
-        (season,),
+        " WHERE l.season = ?" + (" AND l.game_date < ?" if before else ""),
+        (season, before) if before else (season,),
     )
     for pid, stats_json, box_json in cur:
         s = json.loads(stats_json)
@@ -105,18 +110,27 @@ def season_aggregates(conn: sqlite3.Connection, season: str) -> tuple[pd.DataFra
     return skaters, goalies
 
 
-def season_games(conn: sqlite3.Connection, season: str, default: int = 82) -> int:
-    """Games each team plays that season (82, or 84 from 2026-27) from the schedule."""
+def season_games(
+    conn: sqlite3.Connection, season: str, default: int = 82, before: str | None = None
+) -> int:
+    """Games each team plays that season (82, or 84 from 2026-27) from the schedule.
+
+    `before` counts only games dated before it - the most any club had played
+    that morning, which is a partial season's availability denominator.
+    """
+    cut = " AND game_date < ?" if before else ""
     row = conn.execute(
-        """
+        f"""
         SELECT MAX(n) FROM (
             SELECT team, COUNT(*) n FROM (
-                SELECT home_team team FROM nhl_schedule WHERE season = ? AND game_type = 2
+                SELECT home_team team FROM nhl_schedule
+                    WHERE season = ? AND game_type = 2{cut}
                 UNION ALL
-                SELECT away_team FROM nhl_schedule WHERE season = ? AND game_type = 2
+                SELECT away_team FROM nhl_schedule
+                    WHERE season = ? AND game_type = 2{cut}
             ) GROUP BY team
         )
         """,
-        (season, season),
+        (season, before, season, before) if before else (season, season),
     ).fetchone()
     return row[0] or default

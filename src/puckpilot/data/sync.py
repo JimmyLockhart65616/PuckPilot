@@ -209,7 +209,8 @@ def sync_current_rosters(
     delay: float = POLITE_DELAY_S,
     progress: Progress = _noop,
 ) -> dict[str, int]:
-    """Point `nhl_players.team_abbrev` at who each player actually plays for.
+    """Point `nhl_players.team_abbrev` at who each player actually plays for,
+    and give a name to anyone on a roster who has never been synced at all.
 
     MoneyPuck is the player-discovery mechanism and it is synced per season with
     INSERT OR REPLACE, so whichever season ran last decided every player's team.
@@ -221,10 +222,22 @@ def sync_current_rosters(
     Re-projected with correct teams the mean absolute change was 2.24 wins and
     the largest was 13.19.
 
+    The roster response also lists pre-debut players - drafted, camp-invited,
+    not yet in a boxscore - with name, position and birth date. MoneyPuck
+    never sees them (it discovers players from game stats, so zero games means
+    zero rows), and until now neither did we: `update_player_team` is a pure
+    UPDATE, so a rookie with no `nhl_players` row matched nothing and every
+    field of him beyond a bare Yahoo ADP was silently dropped - unnameable and
+    unmappable, not just unprojectable. `insert_player_if_missing` gives him a
+    row without touching anyone who already has one - that guard is load
+    bearing, see `update_player_team`. He still cannot be projected (no game
+    logs to blend), but `playermap._resolve` can now find him by name and
+    `draft.market` can price him against the market instead of dropping him.
+
     32 requests, one per club, same shape as `sync_player_bios`.
     """
     teams = current_team_abbrevs(nhl)
-    seen = changed = 0
+    seen = changed = new = renamed = 0
     for team in teams:
         try:
             data = nhl.roster(team, season)
@@ -237,11 +250,57 @@ def sync_current_rosters(
                 if pid is None:
                     continue
                 seen += 1
-                changed += store.update_player_team(conn, int(pid), team)
+                if store.insert_player_if_missing(
+                    conn, int(pid), _roster_name(p), p.get("positionCode"), team
+                ):
+                    new += 1
+                    changed += 1
+                    # The same payload carries birth date - free once we are
+                    # already reading it, and it is what lets a market-priced
+                    # rookie get an age instead of a permanent "unknown".
+                    if p.get("birthDate"):
+                        store.upsert_player_bio(
+                            conn,
+                            player_id=int(pid),
+                            birth_date=p.get("birthDate"),
+                            height_in=p.get("heightInInches"),
+                            weight_lb=p.get("weightInPounds"),
+                            shoots=p.get("shootsCatches"),
+                        )
+                else:
+                    changed += store.update_player_team(conn, int(pid), team)
+                    # The roster spells names properly; MoneyPuck deletes
+                    # accented letters. See store.is_lossy_copy.
+                    renamed += store.repair_player_name(conn, int(pid), _roster_name(p))
         time.sleep(delay)
+    # Recorded so `draft preflight` can say whether this has run for the season
+    # being drafted. It is a separate command, easy to forget, and its absence
+    # once corrupted goalie win projections by up to 13 wins - silently.
+    if seen:
+        store.set_meta(conn, ROSTERS_META.format(season=season), f"{len(teams)} teams, {seen}")
     conn.commit()
-    progress(f"  {len(teams)} rosters, {seen} players, {changed} team(s) corrected")
-    return {"teams": len(teams), "players": seen, "changed": changed}
+    progress(
+        f"  {len(teams)} rosters, {seen} players, {changed} corrected ({new} newly seen), "
+        f"{renamed} names repaired"
+    )
+    return {
+        "teams": len(teams),
+        "players": seen,
+        "changed": changed,
+        "new": new,
+        "renamed": renamed,
+    }
+
+
+ROSTERS_META = "rosters:{season}"
+
+
+def _roster_name(p: dict) -> str:
+    """`{"firstName": {"default": "Gavin"}, "lastName": {"default": "McKenna"}}`
+    -> "Gavin McKenna", same nested-locale shape the NHL API uses everywhere."""
+    first = (p.get("firstName") or {}).get("default", "")
+    last = (p.get("lastName") or {}).get("default", "")
+    return f"{first} {last}".strip() or f"Player {p.get('id')}"
 
 
 def sync_players_and_logs(
@@ -333,3 +392,179 @@ def sync_players_and_logs(
             "logs_skipped": skipped,
         }
     return report
+
+
+def players_behind_their_boxscores(
+    conn: sqlite3.Connection, season: str, limit: int | None = None
+) -> list[int]:
+    """Players with a boxscore row for a game their game log does not have.
+
+    This is the whole incremental rule for an in-season sync, and it is a
+    question rather than a watermark on purpose: it answers itself from the
+    data, it self-heals after an interrupted run, and it cannot drift out of
+    step with what was actually stored.
+
+    The game log is still needed despite the boxscore carrying most of a stat
+    line, because it does NOT carry power-play points - one of this league's
+    twelve categories - nor short-handed points or game-winning goals.
+
+    Players who dressed without playing are excluded, and that is what makes
+    this converge rather than chase itself. A backup goalie gets a boxscore row
+    every night he is on the bench and a game-log entry only when he appears,
+    so without the ice-time filter every backup in the league reads as
+    permanently behind - 122 of them on a fully synced season, refetched every
+    run, forever.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT b.player_id FROM nhl_boxscore_stats b "
+        "LEFT JOIN nhl_game_logs l ON l.player_id = b.player_id AND l.game_id = b.game_id "
+        "WHERE b.season = ? AND l.player_id IS NULL "
+        "  AND COALESCE(json_extract(b.stats_json, '$.toi'), '00:00') "
+        "      NOT IN ('00:00', '0:00', '') "
+        "ORDER BY b.player_id" + (" LIMIT ?" if limit else ""),
+        (season, limit) if limit else (season,),
+    ).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def _seconds(v) -> int | None:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def sync_skater_toi(
+    conn: sqlite3.Connection,
+    stats,
+    seasons: list[str],
+    *,
+    delay: float = POLITE_DELAY_S,
+    today: date | None = None,
+    progress: Progress = _noop,
+) -> dict[str, dict[str, int]]:
+    """Ice time by situation for every regular-season game date already played.
+
+    One request per date (`NhlStatsClient.skater_toi`), incremental via sync_meta
+    key 'toi:{date}'. A date that comes back empty is left unmarked, so a run
+    before the stats are published picks it up on the next one.
+    """
+    cutoff = (today or date.today()).isoformat()
+    report: dict[str, dict[str, int]] = {}
+    for season in seasons:
+        dates = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT game_date FROM nhl_schedule"
+                " WHERE season = ? AND game_type = ? AND game_date < ? ORDER BY game_date",
+                (season, REGULAR_SEASON, cutoff),
+            )
+        ]
+        synced = skipped = empty = rows_written = 0
+        for d in dates:
+            key = f"toi:{d}"
+            if store.get_meta(conn, key) == "done":
+                skipped += 1
+                continue
+            got = stats.skater_toi(d)
+            rows = [
+                (
+                    int(r["gameId"]),
+                    int(r["playerId"]),
+                    season,
+                    d,
+                    _seconds(r.get("timeOnIce")),
+                    _seconds(r.get("ppTimeOnIce")),
+                    _seconds(r.get("shTimeOnIce")),
+                    _seconds(r.get("evTimeOnIce")),
+                )
+                for r in got
+                if r.get("gameId") is not None and r.get("playerId") is not None
+            ]
+            if not rows:
+                empty += 1
+                continue
+            store.upsert_skater_toi(conn, rows)
+            store.set_meta(conn, key, "done")
+            synced += 1
+            rows_written += len(rows)
+            if synced % 25 == 0:
+                conn.commit()
+                progress(f"    {season}: {synced} dates")
+            time.sleep(delay)
+        conn.commit()
+        progress(
+            f"  {season}: ice time for {synced} date(s), {skipped} already done, "
+            f"{empty} empty, {rows_written} rows"
+        )
+        report[season] = {"dates": synced, "skipped": skipped, "empty": empty, "rows": rows_written}
+    return report
+
+
+def sync_day(
+    conn: sqlite3.Connection,
+    nhl: NhlClient,
+    season: str,
+    *,
+    delay: float = POLITE_DELAY_S,
+    today: date | None = None,
+    max_players: int | None = None,
+    progress: Progress = _noop,
+) -> dict[str, int]:
+    """Bring one season up to date: last night's boxscores, then the logs behind them.
+
+    Built for a daily job rather than a rebuild. `sync_players_and_logs` never
+    marks an incomplete season done, so running it in-season refetches every
+    player's log every time - about a thousand requests to learn what a handful
+    of games changed. This fetches one boxscore per newly played game, then a
+    log only for players those games moved.
+
+    A player's log endpoint returns his whole season, so one request catches him
+    up however many games he is behind.
+    """
+    boxes = sync_boxscores(conn, nhl, [season], delay=delay, today=today, progress=progress)
+    # sync_boxscores calls it "synced"; reading a key it never sets reported 0
+    # boxscores on a run that fetched three, in the log a person is meant to trust.
+    fetched = boxes.get(season, {}).get("synced", 0)
+
+    behind = players_behind_their_boxscores(conn, season, limit=max_players)
+    progress(f"  {season}: {len(behind)} player(s) with logs behind their boxscores")
+    synced = 0
+    for i, pid in enumerate(behind, start=1):
+        try:
+            log = nhl.player_game_log(pid, season)
+        except NhlApiError as e:  # a single missing player must not end the run
+            progress(f"    {pid}: {e}")
+            continue
+        for entry in log.get("gameLog", []):
+            store.upsert_game_log(
+                conn,
+                player_id=pid,
+                game_id=entry["gameId"],
+                season=season,
+                game_type=REGULAR_SEASON,
+                game_date=entry["gameDate"],
+                team_abbrev=entry.get("teamAbbrev"),
+                opponent_abbrev=entry.get("opponentAbbrev"),
+                is_home=1 if entry.get("homeRoadFlag") == "H" else 0,
+                stats_json=json.dumps(entry),
+            )
+        conn.commit()
+        synced += 1
+        if i % 50 == 0:
+            progress(f"    {i}/{len(behind)} players caught up")
+        time.sleep(delay)
+
+    still = len(players_behind_their_boxscores(conn, season))
+    progress(f"  {season}: {synced} player log(s) updated, {still} still behind")
+    # Ice time by situation, from a second, unofficial API: its failure costs a
+    # day of power-play time, never the morning's lineup.
+    toi = 0
+    try:
+        from puckpilot.data.nhlstats import NhlStatsClient
+
+        got = sync_skater_toi(conn, NhlStatsClient(), [season], delay=delay, today=today)
+        toi = got.get(season, {}).get("dates", 0)
+    except Exception as e:  # noqa: BLE001
+        progress(f"  {season}: ice time not synced - {type(e).__name__}: {e}")
+    return {"boxscores": fetched, "players_synced": synced, "still_behind": still, "toi": toi}

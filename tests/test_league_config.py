@@ -107,3 +107,24 @@ def test_default_config_needs_no_file():
     lg = LeagueConfig()
     assert lg.shape.n_teams == 12
     assert lg.all_cats
+
+
+def test_traded_picks_round_trip_and_bad_ones_are_refused(tmp_path):
+    from puckpilot.league import LeagueConfigError, load_league
+
+    base = '[roster]\nteams = 4\nslots = [{ pos = "C", count = 1 }]\n'
+    ok = tmp_path / "ok.toml"
+    ok.write_text(
+        base + '[draft.traded_picks]\n"20262027" = [{ round = 7, pick = 2, seat = 3 }]\n',
+        encoding="utf-8",
+    )
+    league = load_league(ok)
+    assert league.pick_owners_for_season("20262027") == {(6, 1): 3}
+    assert league.pick_owners_for_season("20272028") == {}
+    bad = tmp_path / "bad.toml"
+    bad.write_text(
+        base + '[draft.traded_picks]\n"20262027" = [{ round = 7, pick = 5, seat = 3 }]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(LeagueConfigError, match="outside a 4-team draft"):
+        load_league(bad)

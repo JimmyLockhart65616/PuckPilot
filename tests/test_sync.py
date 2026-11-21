@@ -247,6 +247,67 @@ def test_updating_a_team_does_not_clobber_name_or_position(db):
     assert row == ("Moved Winger", "R", "DAL")
 
 
+class RosterWithRookie(RosterNhl):
+    """The same two clubs, plus one player DAL's roster lists who has never
+    been synced before - no `nhl_players` row, the shape a pre-debut rookie
+    takes: MoneyPuck only discovers players from game stats, and he has none."""
+
+    def roster(self, team_abbrev, season):
+        data = super().roster(team_abbrev, season)
+        if team_abbrev == "DAL":
+            data = {
+                **data,
+                "forwards": [
+                    *data["forwards"],
+                    {
+                        "id": 99,
+                        "firstName": {"default": "Rookie"},
+                        "lastName": {"default": "Prospect"},
+                        "positionCode": "L",
+                        "birthDate": "2007-01-01",
+                    },
+                ],
+            }
+        return data
+
+
+def test_sync_current_rosters_adds_a_player_never_seen_before(db):
+    """`update_player_team` is a pure UPDATE, so a rookie who matches no row
+    used to vanish - unnameable, unmappable, not merely unprojectable."""
+    store.upsert_player(db, 1, "Moved Winger", "R", "COL")
+    store.upsert_player(db, 2, "Stayed Centre", "C", "COL")
+    store.upsert_player(db, 3, "Moved Goalie", "G", "ANA")
+
+    result = sync.sync_current_rosters(db, RosterWithRookie(), "20262027", delay=0)
+
+    row = db.execute(
+        "SELECT full_name, position, team_abbrev FROM nhl_players WHERE player_id = 99"
+    ).fetchone()
+    assert tuple(row) == ("Rookie Prospect", "L", "DAL")
+    assert result["new"] == 1
+    # Free from the same payload, and it is what lets a market-priced rookie
+    # carry an age instead of a permanent "unknown".
+    bio = db.execute("SELECT birth_date FROM nhl_player_bio WHERE player_id = 99").fetchone()
+    assert tuple(bio) == ("2007-01-01",)
+
+
+def test_an_existing_player_is_never_reinserted_by_roster_sync(db):
+    """`insert_player_if_missing` must not touch a row that already exists -
+    that whole-row-replace mistake is what made `team_abbrev` stale in the
+    first place, see `update_player_team`."""
+    store.upsert_player(db, 1, "Moved Winger", "R", "COL")
+    store.upsert_player(db, 2, "Stayed Centre", "C", "COL")
+    store.upsert_player(db, 3, "Moved Goalie", "G", "ANA")
+
+    result = sync.sync_current_rosters(db, RosterWithRookie(), "20262027", delay=0)
+
+    row = db.execute(
+        "SELECT full_name, position, team_abbrev FROM nhl_players WHERE player_id = 1"
+    ).fetchone()
+    assert tuple(row) == ("Moved Winger", "R", "DAL"), "name and position survive; only team moves"
+    assert result["new"] == 1, "only the genuinely new player (99) counts as new"
+
+
 def test_a_club_with_no_roster_for_that_season_is_skipped(db):
     """Defunct franchises and expansion clubs must not abort the sync."""
     from puckpilot.data.nhl import NhlApiError
@@ -259,4 +320,86 @@ def test_a_club_with_no_roster_for_that_season_is_skipped(db):
 
     store.upsert_player(db, 1, "Moved Winger", "R", "COL")
     result = sync.sync_current_rosters(db, Missing(), "20262027", delay=0)
-    assert result["teams"] == 2 and result["changed"] == 1
+    # id 1 moves (COL -> DAL) and id 3 (DAL's goalie) is new, never upserted
+    # above - both count as "changed" now that a rookie is inserted rather
+    # than silently dropped by a pure UPDATE matching no row.
+    assert result["teams"] == 2 and result["changed"] == 2 and result["new"] == 1
+
+
+# ---- names MoneyPuck mangled ------------------------------------------------------
+#
+# MoneyPuck's CSVs delete accented letters rather than folding them: Tim Stützle
+# is "Tim Sttzle", Alexis Lafrenière "Alexis Lafrenire". The draft board showed
+# those spellings and `DraftBoard.find("stutzle")` matched nobody, which is the
+# path manual pick entry depends on.
+
+
+class NamedRoster(RosterNhl):
+    def roster(self, team_abbrev, season):
+        if team_abbrev == "DAL":
+            return {
+                "forwards": [
+                    {"id": 1, "firstName": {"default": "Tim"}, "lastName": {"default": "Stützle"}},
+                    {
+                        "id": 2,
+                        "firstName": {"default": "Mitchell"},
+                        "lastName": {"default": "Marner"},
+                    },
+                ],
+                "defensemen": [],
+                "goalies": [],
+            }
+        return {"forwards": [], "defensemen": [], "goalies": []}
+
+
+def test_a_name_moneypuck_mangled_is_repaired_from_the_roster(db):
+    store.upsert_player(db, 1, "Tim Sttzle", "L", "DAL")
+    result = sync.sync_current_rosters(db, NamedRoster(), "20262027", delay=0)
+    name = db.execute("SELECT full_name FROM nhl_players WHERE player_id = 1").fetchone()[0]
+    assert name == "Tim Stützle"
+    assert result["renamed"] == 1
+
+
+def test_a_spelling_choice_is_not_damage_and_is_left_alone(db):
+    """Only a deleted-letter copy is repaired. "Mitch" vs "Mitchell" is a
+    preference, and churning it would break every match made on the old one."""
+    store.upsert_player(db, 2, "Mitch Marner", "R", "DAL")
+    result = sync.sync_current_rosters(db, NamedRoster(), "20262027", delay=0)
+    name = db.execute("SELECT full_name FROM nhl_players WHERE player_id = 2").fetchone()[0]
+    assert name == "Mitch Marner"
+    assert result["renamed"] == 0
+
+
+def test_the_next_moneypuck_sync_does_not_undo_a_repair(db):
+    store.upsert_player(db, 1, "Tim Sttzle", "L", "OTT")
+    sync.sync_current_rosters(db, NamedRoster(), "20262027", delay=0)
+    store.upsert_player(db, 1, "Tim Sttzle", "C", "OTT")  # MoneyPuck again, next season
+    row = db.execute("SELECT full_name, position FROM nhl_players WHERE player_id = 1").fetchone()
+    assert tuple(row) == ("Tim Stützle", "C"), "name kept, everything else still updates"
+
+
+def test_a_genuinely_new_name_from_moneypuck_still_replaces_the_old_one(db):
+    store.upsert_player(db, 1, "Old Name", "L", "OTT")
+    store.upsert_player(db, 1, "New Name", "L", "OTT")
+    assert db.execute("SELECT full_name FROM nhl_players").fetchone()[0] == "New Name"
+
+
+def test_a_repaired_name_is_findable_the_way_a_drafter_types_it():
+    import pandas as pd
+
+    from puckpilot.draft.board import DraftBoard
+    from puckpilot.draft.engine import DraftRules, Universe
+    from puckpilot.engine.valuation import LeagueShape
+
+    def board_named(name):
+        df = pd.DataFrame(
+            {"name": [name, "Brady Tkachuk"], "position": ["C", "L"], "team": ["OTT", "OTT"],
+             "vorp": [9.0, 8.0], "z_total": [9.0, 8.0], "adp_rank": [1.0, 2.0]},
+            index=pd.Index([8482116, 8480801], name="player_id"),
+        )  # fmt: skip
+        shape = LeagueShape(n_teams=2, slots=(("C", 1), ("L", 1)), util_slots=0, bench_slots=0)
+        return DraftBoard(Universe(df), DraftRules(shape, 2), my_seat=0)
+
+    assert board_named("Tim Sttzle").find("stutzle") == []  # the bug, as it was
+    for typed in ("stutzle", "Stützle", "tim stutzle"):
+        assert board_named("Tim Stützle").find(typed) == [0], typed

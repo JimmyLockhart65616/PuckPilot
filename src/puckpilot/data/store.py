@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS mp_season_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_mp_season_stats_season ON mp_season_stats (season, kind);
 
+-- A transaction can only be executed from an approved row here. That is the
+-- whole mechanism behind "lineups are pre-authorised, transactions are not":
+-- the executor takes a proposal id and has no path that creates one itself.
 CREATE TABLE IF NOT EXISTS waiver_proposals (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -51,7 +54,15 @@ CREATE TABLE IF NOT EXISTS waiver_proposals (
     drop_pid    INTEGER,
     reason_json TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'approved', 'rejected', 'executed'))
+        CHECK (status IN ('pending', 'approved', 'rejected', 'executed')),
+    manager         TEXT NOT NULL DEFAULT '',
+    league_key      TEXT NOT NULL DEFAULT '',
+    team_key        TEXT NOT NULL DEFAULT '',
+    kind            TEXT NOT NULL DEFAULT 'add_drop',
+    add_player_key  TEXT,
+    drop_player_key TEXT,
+    decided_at      TEXT,
+    executed_at     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS nhl_game_logs (
@@ -80,6 +91,22 @@ CREATE TABLE IF NOT EXISTS nhl_boxscore_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_nhl_boxscore_player ON nhl_boxscore_stats (player_id, season);
 
+-- Ice time by situation per skater-game, from the NHL stats API
+-- (data/nhlstats.py), in seconds. The game log carries only the total; the
+-- power-play share is the earliest sign of a power-play role.
+CREATE TABLE IF NOT EXISTS nhl_skater_toi (
+    game_id     INTEGER NOT NULL,
+    player_id   INTEGER NOT NULL,
+    season      TEXT NOT NULL,
+    game_date   TEXT NOT NULL,
+    toi_s       INTEGER,
+    pp_toi_s    INTEGER,
+    sh_toi_s    INTEGER,
+    ev_toi_s    INTEGER,
+    PRIMARY KEY (game_id, player_id)
+);
+CREATE INDEX IF NOT EXISTS idx_nhl_skater_toi_player ON nhl_skater_toi (player_id, season);
+
 -- Biographical data (birth date drives age curves). Kept in its own table so
 -- adding it needs no migration of nhl_players.
 CREATE TABLE IF NOT EXISTS nhl_player_bio (
@@ -106,7 +133,260 @@ CREATE TABLE IF NOT EXISTS yahoo_player_map (
     updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS ix_yahoo_map_nhl ON yahoo_player_map(nhl_player_id);
+
+-- In-season. Everything below is keyed by `manager` as well as league, because
+-- two people in the same league may run this against the same database and the
+-- draft board already taught us what happens when "my team" is implicit.
+
+-- Yahoo's own description of the league: the week calendar, lock mode, waiver
+-- rules and caps. Cached whole rather than shredded into columns so a setting
+-- we have not thought about yet is still there when we want it.
+CREATE TABLE IF NOT EXISTS yahoo_league_runtime (
+    league_key   TEXT PRIMARY KEY,
+    settings_json TEXT NOT NULL,
+    weeks_json   TEXT NOT NULL DEFAULT '[]',
+    fetched_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- One row per player per day: what Yahoo had slotted, and what it knew about
+-- his health. Kept as history so "what did we actually start" is answerable
+-- after the fact, which is the only way an autonomous lineup change can be
+-- audited.
+CREATE TABLE IF NOT EXISTS yahoo_roster_snapshots (
+    manager       TEXT NOT NULL,
+    league_key    TEXT NOT NULL,
+    team_key      TEXT NOT NULL,
+    date          TEXT NOT NULL,
+    player_key    TEXT NOT NULL,
+    nhl_player_id INTEGER,
+    name          TEXT NOT NULL,
+    team_abbrev   TEXT,
+    selected_slot TEXT,
+    eligible      TEXT,
+    status        TEXT,
+    injury_note   TEXT,
+    is_editable   INTEGER NOT NULL DEFAULT 1,
+    fetched_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (manager, team_key, date, player_key)
+);
+CREATE INDEX IF NOT EXISTS ix_roster_snap_date ON yahoo_roster_snapshots (date);
+
+-- The free-agent and waiver pool, sampled daily. Differencing percent_owned
+-- between two days is the trending-adds signal, and it is this league's own
+-- ownership rather than a site-wide average.
+CREATE TABLE IF NOT EXISTS yahoo_fa_snapshots (
+    league_key     TEXT NOT NULL,
+    date           TEXT NOT NULL,
+    player_key     TEXT NOT NULL,
+    nhl_player_id  INTEGER,
+    name           TEXT NOT NULL,
+    team_abbrev    TEXT,
+    positions      TEXT,
+    ownership      TEXT,
+    percent_owned  REAL,
+    status         TEXT,
+    PRIMARY KEY (league_key, date, player_key)
+);
+CREATE INDEX IF NOT EXISTS ix_fa_snap_date ON yahoo_fa_snapshots (league_key, date);
+
+-- The audit log. Every lineup change made under standing authority and every
+-- transaction executed after approval lands here, with the reasoning that
+-- produced it, so the criteria can be argued with from evidence.
+CREATE TABLE IF NOT EXISTS season_actions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    manager      TEXT NOT NULL,
+    league_key   TEXT NOT NULL,
+    team_key     TEXT NOT NULL,
+    date         TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    detail_json  TEXT NOT NULL,
+    outcome      TEXT NOT NULL DEFAULT 'planned'
+        CHECK (outcome IN ('planned', 'dry-run', 'executed', 'failed', 'skipped')),
+    message      TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_season_actions_date ON season_actions (manager, date);
+
+-- A stance for the week, agreed before it starts: which categories are out of
+-- reach and which are live. Approving one is what licenses the daily lineup to
+-- weigh players by it, so the status here is load-bearing, not a label.
+CREATE TABLE IF NOT EXISTS week_protocols (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    manager      TEXT NOT NULL,
+    league_key   TEXT NOT NULL,
+    team_key     TEXT NOT NULL,
+    week         INTEGER NOT NULL,
+    opponent     TEXT,
+    stances_json TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'proposed'
+        CHECK (status IN ('proposed', 'approved', 'rejected')),
+    decided_at   TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_week_protocols ON week_protocols (manager, league_key, week);
+
+-- The live score of a week, as Yahoo reported it at each run. Intra-week state
+-- cannot be fetched after the fact - Yahoo only ever says "now" - so this log is
+-- the only record of how a week unfolded, and the only live data the win
+-- probabilities can ever be checked against. The raw payload is kept because
+-- the parser was written before a live week existed to test it on.
+CREATE TABLE IF NOT EXISTS matchup_snapshots (
+    manager      TEXT NOT NULL,
+    league_key   TEXT NOT NULL,
+    team_key     TEXT NOT NULL,
+    week         INTEGER NOT NULL,
+    fetched_at   TEXT NOT NULL,
+    status       TEXT,
+    opponent_key TEXT,
+    ours_json    TEXT NOT NULL,
+    theirs_json  TEXT NOT NULL,
+    winners_json TEXT,
+    raw_json     TEXT,
+    PRIMARY KEY (manager, team_key, week, fetched_at)
+);
+
+-- What the odds said at each run, so live weeks can be scored against how they
+-- ended (gate G3) - the same test the replay passed, on the real league.
+CREATE TABLE IF NOT EXISTS week_odds_log (
+    manager    TEXT NOT NULL,
+    league_key TEXT NOT NULL,
+    team_key   TEXT NOT NULL,
+    week       INTEGER NOT NULL,
+    logged_at  TEXT NOT NULL,
+    day        TEXT NOT NULL,
+    days_left  INTEGER,
+    expected   REAL,
+    cats_json  TEXT NOT NULL,
+    PRIMARY KEY (manager, team_key, week, logged_at)
+);
+
+-- The tag each rostered player was last seen with (season/status_log.py);
+-- '' is healthy. Kept because roster snapshots are overwritten every run.
+CREATE TABLE IF NOT EXISTS player_status (
+    league_key   TEXT NOT NULL,
+    player_key   TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    since_at     TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (league_key, player_key)
+);
+
+-- Next season's keepers among a manager's players, decided once a fantasy week
+-- (season/keeper_value.py) so protection does not move under a waiting
+-- proposal. rank NULL: not eligible, or no projection for next season.
+CREATE TABLE IF NOT EXISTS keeper_ranks (
+    manager       TEXT NOT NULL,
+    week_start    TEXT NOT NULL,
+    player_key    TEXT NOT NULL,
+    nhl_player_id INTEGER,
+    name          TEXT,
+    vorp_next     REAL,
+    value         REAL,
+    times_kept    INTEGER NOT NULL,
+    eligible      INTEGER NOT NULL,
+    rank          INTEGER,
+    protected     INTEGER NOT NULL,
+    as_of         TEXT NOT NULL,
+    PRIMARY KEY (manager, week_start, player_key)
+);
+
+-- A manager's drop tier for a player (season/tiers.py): never, upgrade or
+-- rotation. No row is the automatic rule. Kept when he leaves the roster - it
+-- is the manager's view of the player - and applied if he comes back.
+CREATE TABLE IF NOT EXISTS player_tiers (
+    manager       TEXT NOT NULL,
+    league_key    TEXT NOT NULL,
+    player_key    TEXT NOT NULL,
+    tier          TEXT NOT NULL,
+    name          TEXT,
+    nhl_player_id INTEGER,
+    set_at        TEXT NOT NULL,
+    set_via       TEXT NOT NULL,
+    PRIMARY KEY (manager, league_key, player_key)
+);
+
+-- Every change of tag, between the last run that saw the old one and the first
+-- that saw the new. old_status NULL: the player's first sighting, already tagged.
+CREATE TABLE IF NOT EXISTS player_status_changes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    league_key    TEXT NOT NULL,
+    team_key      TEXT NOT NULL,
+    player_key    TEXT NOT NULL,
+    nhl_player_id INTEGER,
+    name          TEXT,
+    team_abbrev   TEXT,
+    old_status    TEXT,
+    new_status    TEXT NOT NULL,
+    injury_note   TEXT,
+    old_seen_at   TEXT,
+    new_seen_at   TEXT NOT NULL
+);
+
+-- The whole league, not only our matchup (season/league_feed.py): every
+-- transaction, the standings by day, and every team's weekly totals.
+CREATE TABLE IF NOT EXISTS league_transactions (
+    league_key   TEXT NOT NULL,
+    txn_key      TEXT NOT NULL,
+    at           TEXT NOT NULL,          -- UTC ISO
+    type         TEXT NOT NULL,          -- add | drop | add/drop | trade
+    status       TEXT,
+    team_key     TEXT NOT NULL,          -- the team the player moved to or from
+    action       TEXT NOT NULL,          -- add | drop
+    player_key   TEXT NOT NULL,
+    nhl_player_id INTEGER,
+    name         TEXT,
+    nhl_team     TEXT,
+    positions    TEXT,
+    source_type  TEXT,                   -- freeagents | waivers | team
+    PRIMARY KEY (league_key, txn_key, player_key, action)
+);
+CREATE TABLE IF NOT EXISTS league_standings (
+    league_key TEXT NOT NULL,
+    date       TEXT NOT NULL,
+    team_key   TEXT NOT NULL,
+    name       TEXT,
+    rank       INTEGER,
+    wins       INTEGER,
+    losses     INTEGER,
+    ties       INTEGER,
+    moves      INTEGER,
+    trades     INTEGER,
+    PRIMARY KEY (league_key, date, team_key)
+);
+CREATE TABLE IF NOT EXISTS league_week_stats (
+    league_key      TEXT NOT NULL,
+    week            INTEGER NOT NULL,
+    team_key        TEXT NOT NULL,
+    name            TEXT,
+    opponent_key    TEXT,
+    status          TEXT,                -- preevent | midevent | postevent
+    cats_won        REAL,
+    completed_games INTEGER,
+    stats_json      TEXT NOT NULL,       -- {stat_id: value}
+    fetched_at      TEXT NOT NULL,
+    PRIMARY KEY (league_key, week, team_key)
+);
 """
+
+# `waiver_proposals` predates the in-season work and shipped without a manager,
+# a league or Yahoo's own player keys. There is no migration framework here and
+# `CREATE TABLE IF NOT EXISTS` will not alter an existing table, so this is the
+# narrow version of one: additive columns only, idempotent, no rewrites.
+ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "waiver_proposals": {
+        "manager": "TEXT NOT NULL DEFAULT ''",
+        "league_key": "TEXT NOT NULL DEFAULT ''",
+        "team_key": "TEXT NOT NULL DEFAULT ''",
+        "kind": "TEXT NOT NULL DEFAULT 'add_drop'",
+        "add_player_key": "TEXT",
+        "drop_player_key": "TEXT",
+        "decided_at": "TEXT",
+        "executed_at": "TEXT",
+        # Withdrawn by a newer search. A column rather than a status, because
+        # the status CHECK cannot change without rewriting the table.
+        "superseded_at": "TEXT",
+    },
+}
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -120,7 +400,27 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _add_missing_columns(conn)
     conn.commit()
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> list[str]:
+    """Bring pre-existing tables up to the current column set.
+
+    Only ever adds, and only columns with a default, so it cannot lose data and
+    cannot fail halfway into an inconsistent shape. Returns what it added, so a
+    caller can say so rather than changing a database silently.
+    """
+    added = []
+    for table, columns in ADDED_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not have:  # table does not exist yet; the schema above just made it
+            continue
+        for name, decl in columns.items():
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                added.append(f"{table}.{name}")
+    return added
 
 
 def table_names(conn: sqlite3.Connection) -> set[str]:
@@ -141,6 +441,22 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def _ascii_only(name: str) -> str:
+    return "".join(ch for ch in name if ord(ch) < 128)
+
+
+def is_lossy_copy(lossy: str, proper: str) -> bool:
+    """`lossy` is `proper` with its non-ASCII letters deleted - not folded.
+
+    MoneyPuck's CSVs spell Tim Stützle "Tim Sttzle" and Alexis Lafrenière
+    "Alexis Lafrenire". A folded "Stutzle" still matches what a drafter types;
+    a deleted letter does not, so `DraftBoard.find("stutzle")` found nobody.
+    The test is deliberately that narrow: a name that differs any other way
+    ("Mitch" vs "Mitchell") is a spelling choice, not damage, and is left alone.
+    """
+    return lossy != proper and _ascii_only(proper) == lossy
+
+
 def upsert_player(
     conn: sqlite3.Connection,
     player_id: int,
@@ -148,11 +464,30 @@ def upsert_player(
     position: str | None,
     team_abbrev: str | None,
 ) -> None:
+    # Never overwrite a repaired name with MoneyPuck's lossy copy of it, or every
+    # `data sync` would undo `repair_player_name`.
+    row = conn.execute(
+        "SELECT full_name FROM nhl_players WHERE player_id = ?", (player_id,)
+    ).fetchone()
+    if row and is_lossy_copy(full_name, row[0]):
+        full_name = row[0]
     conn.execute(
         "INSERT OR REPLACE INTO nhl_players (player_id, full_name, position, team_abbrev)"
         " VALUES (?, ?, ?, ?)",
         (player_id, full_name, position, team_abbrev),
     )
+
+
+def repair_player_name(conn: sqlite3.Connection, player_id: int, proper: str) -> int:
+    """Replace a stored name only when it is a lossy copy of `proper`."""
+    row = conn.execute(
+        "SELECT full_name FROM nhl_players WHERE player_id = ?", (player_id,)
+    ).fetchone()
+    if not row or not is_lossy_copy(row[0], proper):
+        return 0
+    return conn.execute(
+        "UPDATE nhl_players SET full_name = ? WHERE player_id = ?", (proper, player_id)
+    ).rowcount
 
 
 def update_player_team(conn: sqlite3.Connection, player_id: int, team_abbrev: str) -> int:
@@ -169,6 +504,30 @@ def update_player_team(conn: sqlite3.Connection, player_id: int, team_abbrev: st
         (team_abbrev, player_id, team_abbrev),
     )
     return cur.rowcount
+
+
+def insert_player_if_missing(
+    conn: sqlite3.Connection,
+    player_id: int,
+    full_name: str,
+    position: str | None,
+    team_abbrev: str | None,
+) -> bool:
+    """Add a player `nhl_players` has never heard of, without touching a row
+    that already exists there - `INSERT OR IGNORE`, not `upsert_player`'s
+    whole-row replace, for the same reason `update_player_team` exists.
+
+    This is what makes a pre-debut roster player nameable: MoneyPuck is the
+    normal discovery mechanism but only lists players with >=1 NHL game, so a
+    rookie who has not played yet has no row until something else creates one.
+    Returns whether a row was actually inserted.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO nhl_players (player_id, full_name, position, team_abbrev)"
+        " VALUES (?, ?, ?, ?)",
+        (player_id, full_name, position, team_abbrev),
+    )
+    return cur.rowcount > 0
 
 
 def upsert_schedule_game(
@@ -249,6 +608,19 @@ def upsert_player_bio(
         " (player_id, birth_date, height_in, weight_lb, shoots)"
         " VALUES (?, ?, ?, ?, ?)",
         (player_id, birth_date, height_in, weight_lb, shoots),
+    )
+
+
+def upsert_skater_toi(
+    conn: sqlite3.Connection,
+    rows: list[tuple[int, int, str, str, int | None, int | None, int | None, int | None]],
+) -> None:
+    """Bulk upsert of (game_id, player_id, season, game_date, toi, pp, sh, ev) seconds."""
+    conn.executemany(
+        "INSERT OR REPLACE INTO nhl_skater_toi"
+        " (game_id, player_id, season, game_date, toi_s, pp_toi_s, sh_toi_s, ev_toi_s)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
     )
 
 

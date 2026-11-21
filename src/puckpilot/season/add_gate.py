@@ -1,0 +1,1215 @@
+"""Gate G2 for adds: which way of choosing pickups takes more categories?
+
+Replays a season with the live add search itself - `week.build_week_plan`, the
+same function the scheduled run calls - fed through roster adapters, and
+scores each way of choosing adds by what it exists to raise: categories won
+per week against the real schedule of opponents.
+
+    none           keep the drafted roster all season
+    share-weekly   search once a week, priced by the share of each gap closed
+    share-daily    the same pricing, searched every morning
+    odds-weekly    searched once a week, priced by expected categories won
+    odds-daily     searched every morning, priced by expected categories won
+    goalie-odds    no adds; tonight's goalies chosen by expected categories
+                   (`odds.choose_goalies`) instead of starting whoever plays
+
+Asked for when the weekly plan was rebuilt around what it targets and gives up
+(2026-10-05), and tested the same way:
+
+    -e       the search's shortlist also takes the players whose games move
+             this week's close categories most (`screen_by="union"`), not
+             only the 20 worth most per game
+    -n<N>    a value-only shortlist of N - the control for -e, so a gain from
+             a longer list is not read as one from leverage
+    -t       the daily lineup steered by this week's odds, rebuilt each
+             morning from the banked score: skaters by what their game adds to
+             expected categories won, goalies by `odds.choose_goalies`
+
+Any search arm takes a `-s<n>` suffix - `odds-weekly-s3` - to let the bottom
+`n` players by rest-of-season value rotate for a streamer instead of the run's
+`stream_spots`. Asked after week 1 of 2026-27, when 30-46 empty slot-games went
+with two adds proposed and the third acquisition unused.
+
+And a `-p<n>` suffix - `odds-weekly-p1` - searches on each week's last `n` days
+against the NEXT week (its opponent, its schedule), spending what is left of
+this week's acquisitions: the live run's `preload_days`.
+
+Asked for after week 1, and tested the same way:
+
+    -q<n>    the same search, but a move whose drop plays that day waits for the
+             rosters to unlock after the day's games (and so counts against
+             the next week's acquisitions); one whose drop is idle is made at
+             once from what is left of this week's
+    -h       a MID-WEEK move must pay over the rest of this week and the next
+             one together (daily arms; Monday's search is unchanged)
+    -f<nn>   a mid-week move must clear nn hundredths of a category, not the
+             usual floor (daily arms)
+    -x<n>    no search on the week's last n days (daily arms) - the live run,
+             where Sunday follows the queue rule instead
+
+Asked for after the goalie audit (2026-10-11), and tested the same way:
+
+    -dg      each candidate is also priced against every goalie he may
+             replace, not only the cheapest legal drop (`drop_choice`)
+    -da      ... against every legal drop
+    -j<n>    the n free agent goalies with the most expected starts' worth
+             are always priced (`goalie_lane`)
+    -w       the odds price the weekly goalie minimum: a side short of it
+             wins no goalie category (`goalie_minimum`)
+    -gf<n>   keep n goalies (`goalie_floor`): no drop for a skater below it,
+             and under it the free agents with most expected starts priced
+             against the cheapest skater; -gfa is the league's G slots + 1
+    -a       the tested team's in-season pricing uses goalie projections
+             aged on games played, not per-start volume
+             (`projections.GOALIE_AGE_ON`); the draft is the same in every arm
+    -y<n>    swaps are timed to their best day (`time_moves="search"`), waiting
+             priced at n% a day; a timed swap is held, its acquisition
+             reserved, and made that morning unless the free agent was taken
+             first - which the replay draws at n% a day waited, since its
+             rivals are frozen and would otherwise never take anyone
+    -z<n>    the same, `time_moves="shift"`: only the swaps chosen on today's
+             price are moved to their best day - never an extra move
+
+Asked for with the drop tiers (2026-10-31):
+
+    -b<nn>   an upgrade-only player is dropped only for one worth nn% more over
+             the rest of the season (`upgrade_margin`); rotation players as before
+    -o<pct>  a tap: each swap is approved with pct% chance on the day it is
+             found and made after that day's games - the live pattern since
+             PuckPilot began making approved moves (4 of 5 approved, each 11-12
+             hours later); one not approved is found again the next morning
+             if it still pays, and spends no acquisition
+    -ow      with -o, a swap whose drop is a rotation player is made at once,
+             as a standing approval's window would make it before the games
+
+`versus` compares every arm with one named arm - the live baseline.
+
+A week is scored as Yahoo scores it, including the weekly goalie minimum: a
+team whose goalies made fewer than `min_goalie_appearances` appearances
+(any game a goalie played, relief included) wins none of the goalie
+categories - "you won't win any stat categories or get any points for their
+performance" (help.yahoo.com/kb/SLN6878). Both short is scored a tie. Before
+2026-10-11 the gate had no minimum at all, which rewards cutting goalies;
+`goalie_minimum=False` reproduces those numbers.
+
+Every input is as-of the morning it is used: the value model and the goalie
+start model are clamped to that date (`AsOfValues`, `AsOfGoalieSource`), a
+player who has missed two straight team games is out until he plays again,
+and the banked part of a week is the real production of whoever the lineup
+policy started. By default the other eleven teams are frozen - nobody else
+picks anyone up - so every arm's gain is an upper bound, shared alike, and the
+arms are compared with each other rather than with zero. The weekly cap is the
+league's; nothing is held back for playoffs (this is the regular season).
+
+`rivals="stream"` (2026-10-31) has every other team add as real ones do: at
+`rival_rate` adds a week (`rival_goalie_share` of them goalies; both measured
+from a live league's transactions, `league_feed`), each the free agent a
+manager can see is best - a skater's value a game times his club's games that
+week, a goalie's value a start times his expected starts - for that team's
+least valuable like-for-like player from the bottom half of its roster, and
+only when he is worth more that week. Their production, their rosters in the
+odds and the free agents left for the tested team all follow. A separate
+random stream, so rate 0 reproduces the frozen league exactly. Caveat: a
+player a rival drops stays off the tested team's pool (as every drafted player
+does here).
+"""
+
+from __future__ import annotations
+
+import math
+import sqlite3
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+
+import numpy as np
+
+from puckpilot.engine.categories import CATALOG
+from puckpilot.league import LeagueConfig
+from puckpilot.season.calibration import _components, _result, drop_known_absences
+
+ARMS = ("none", "share-weekly", "share-daily", "odds-weekly", "odds-daily", "goalie-odds")
+# How the other teams behave in the replay (`add_gate_report(rivals=...)`).
+RIVALS = ("frozen", "stream")
+
+
+@dataclass
+class ArmSpec:
+    """One arm: a base policy, and what its suffixes change about it."""
+
+    kind: str
+    spots: int = 2  # -sN: the bottom N by rest-of-season value may be dropped
+    preload: int = 0  # -pN: last N days search next week; moves made at once
+    # -qN: last N days search next week; a move whose drop plays that day waits
+    # for the rosters to unlock after the day's games (and counts next week).
+    queue: int = 0
+    horizon: bool = False  # -h: a mid-week move must pay over this week's rest + next week
+    mid_floor: float | None = None  # -fNN: mid-week bar, in hundredths of a category
+    skip_last: int = 0  # -xN: no search on the week's last N days (the live run's Sunday)
+    # -g: the tested team's lineups and plans use the `goalies_alt` start model
+    # while every other team keeps the base one, so the gain is ours alone.
+    goalies: bool = False
+    # -l: a goalie's rest-of-season games are his club's times his share of
+    # its starts (`goalies.GoalieWorkload`), not all of his club's.
+    workload: bool = False
+    # -r: plans price with per-category rates that have seen this season
+    # (`season.form`), not the preseason projection's.
+    form_rates: bool = False
+    # -v: plans value players per game from those rates (`form.FORM_VALUE`),
+    # not the 14-day blend.
+    form_value: bool = False
+    # -u: those rates scaled by recent ice time and power-play time
+    # (`form.Usage`).
+    usage: bool = False
+    # -m: a hot player's rates moved by his streak's measured next-week effect
+    # (`season.streaks`), from a table the other seasons measured.
+    momentum: bool = False
+    # -kN: next season's best n_keepers + N are never dropped, ranked each
+    # Monday by `keeper_value` as of the latest month's start (no contracts:
+    # every player eligible). None: no protection.
+    keepers: int | None = None
+    # -e: the shortlist adds the players whose games move this week's close
+    # categories most; -nN: a value-only shortlist of N (the control).
+    screen_by: str = "value"
+    screen: int = 20
+    # -t: the lineup steered by this week's odds each morning.
+    steer: bool = False
+    # -dg / -da: which drops a candidate is priced against (`week.DROP_CHOICES`).
+    drops: str = "cheapest"
+    # -jN: free-agent goalies always priced, most expected starts first.
+    lane: int = 0
+    # -w: the weekly goalie minimum priced into the odds.
+    minimum: bool = False
+    # -gfN / -gfa: goalies kept (`goalie_floor`); "auto" = G slots + 1.
+    floor: int | str | None = None
+    # -a: in-season rates and values from the goalie projection aged on games.
+    age_games: bool = False
+    # -yN / -zN: swaps timed to their best day ("search" / "shift"), waiting
+    # priced (and lost) at N% a day.
+    timing: float | None = None
+    timing_mode: str = "off"
+    # -bNN: an upgrade-only player's replacement must be worth NN% more.
+    margin: float = 0.0
+    # -oPCT: a swap waits for a tap - approved with this chance, made after
+    # the day's games; -ow: one dropping a rotation player is made at once.
+    tap: float | None = None
+    standing: bool = False
+
+
+def _swap(roster: list[int], target) -> None:
+    if target.drop is not None:
+        roster.remove(int(target.drop.player_key))
+    roster.append(int(target.player.player_key))
+
+
+def _pair(target) -> tuple[str, str]:
+    return (target.player.player_key, target.drop.player_key if target.drop else "")
+
+
+def _worth(target) -> float:
+    return target.gain if target.gain is not None else target.score
+
+
+def _floor(spec: ArmSpec, runtime) -> int:
+    """The arm's goalie floor as a count (`run.goalie_floor`)."""
+    from puckpilot.season.run import goalie_floor
+
+    return goalie_floor(spec.floor, runtime)
+
+
+def week_result(cats, ours, theirs, our_short: bool = False, their_short: bool = False) -> float:
+    """Categories won in a week, the goalie minimum applied as Yahoo applies it.
+
+    A side short of the minimum wins none of the goalie categories; both short
+    is scored a tie in each.
+    """
+    total = 0.0
+    for c in cats:
+        if c.kind == "goalie" and (our_short or their_short):
+            total += 0.5 if (our_short and their_short) else (0.0 if our_short else 1.0)
+        else:
+            total += _result(c, ours, theirs)
+    return total
+
+
+def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
+    """ "odds-daily-h-f25" -> odds-daily, horizon on, mid-week floor 0.25."""
+    base = next(
+        (b for b in sorted(ARMS, key=len, reverse=True) if arm == b or arm.startswith(b + "-")),
+        None,
+    )
+    if base is None:
+        raise ValueError(f"unknown arm {arm!r}")
+    spec = ArmSpec(kind=base, spots=stream_spots)
+    for tok in arm[len(base) :].split("-")[1:]:
+        if tok == "h":
+            spec.horizon = True
+        elif tok == "g":
+            spec.goalies = True
+        elif tok == "l":
+            spec.workload = True
+        elif tok == "r":
+            spec.form_rates = True
+        elif tok == "v":
+            spec.form_value = True
+        elif tok == "u":
+            spec.usage = True
+        elif tok == "m":
+            spec.momentum = True
+        elif tok == "e":
+            spec.screen_by = "union"
+        elif tok == "t":
+            spec.steer = True
+        elif tok in ("dg", "da"):
+            spec.drops = "goalies" if tok == "dg" else "all"
+        elif tok == "w":
+            spec.minimum = True
+        elif tok == "gfa":
+            spec.floor = "auto"
+        elif tok.startswith("gf") and tok[2:].isdigit():
+            spec.floor = int(tok[2:])
+        elif tok == "a":
+            spec.age_games = True
+        elif tok == "ow":
+            spec.standing = True
+        elif tok.startswith("o") and tok[1:].isdigit():
+            spec.tap = int(tok[1:]) / 100
+        elif len(tok) > 1 and tok[0] in "spqfxknjyzb" and tok[1:].isdigit():
+            n = int(tok[1:])
+            if tok[0] == "b":
+                spec.margin = n / 100
+            elif tok[0] in "yz":
+                spec.timing = n / 100
+                spec.timing_mode = "search" if tok[0] == "y" else "shift"
+            elif tok[0] == "j":
+                spec.lane = n
+            elif tok[0] == "n":
+                spec.screen = n
+            elif tok[0] == "k":
+                spec.keepers = n
+            elif tok[0] == "s":
+                spec.spots = n
+            elif tok[0] == "p":
+                spec.preload = n
+            elif tok[0] == "q":
+                spec.queue = n
+            elif tok[0] == "x":
+                spec.skip_last = n
+            else:
+                spec.mid_floor = n / 100
+        else:
+            raise ValueError(f"unknown option {tok!r} in arm {arm!r}")
+    if spec.standing and spec.tap is None:
+        raise ValueError(f"-ow needs -o<pct> (a tap to make the rest) in arm {arm!r}")
+    return spec
+
+
+# The start model `-g` arms give the tested team: current club only, a goalie
+# out after two games not dressed, later games walked forward a game at a
+# time - the variant `season goalie-check` found best (STATUS.md).
+GOALIES_ALT = "club-dw2-chain"
+
+# Free agents offered to the search each morning, best projections first - the
+# live run reads Yahoo's top 150 by the same measure.
+POOL_SIZE = 150
+
+
+class AsOfValues:
+    """A value model that cannot see past `cutoff`.
+
+    Live, a later date's form window cannot contain games not yet played. In a
+    replay it can: asked about Saturday on Wednesday, it would blend in
+    Thursday's and Friday's games. Every question is answered as of the cutoff.
+    """
+
+    def __init__(self, values, cutoff: str):
+        self.values = values
+        self.cutoff = cutoff
+
+    def per_game(self, pid: int, date: str) -> float:
+        return self.values.per_game(pid, min(date, self.cutoff))
+
+    def per_game_tilted(self, pid: int, date: str, weights) -> float:
+        return self.values.per_game_tilted(pid, min(date, self.cutoff), weights)
+
+    def rates(self, cats, date: str):
+        return self.values.rates(cats, min(date, self.cutoff))
+
+    def knows(self, pid: int) -> bool:
+        return self.values.knows(pid)
+
+    def projected(self, pid: int) -> float:
+        return self.values.projected(pid)
+
+
+def as_labels(comp: dict[str, float]) -> dict[str, float]:
+    """Component totals as the Yahoo labels `build_week_plan` takes banked."""
+    by_key = {c.key: c.label for c in CATALOG.values()}
+    out = {by_key[k]: v for k, v in comp.items() if k in by_key}
+    if "goals_against" in comp:
+        out["GA"] = comp["goals_against"]
+        hours = comp.get("toi_hours", 0.0)
+        if hours > 0:
+            out["GAA"] = comp["goals_against"] / hours
+    return out
+
+
+@dataclass
+class AddGateReport:
+    season: str
+    arms: dict[str, list[float]]  # arm -> categories won, per tested team-week
+    adds: dict[str, int]  # arm -> acquisitions made
+    text: str
+
+    def mean(self, arm: str) -> float:
+        v = self.arms[arm]
+        return sum(v) / len(v) if v else float("nan")
+
+    def paired(self, a: str, b: str) -> tuple[float, float]:
+        """Mean and standard error of (a - b) over the same team-weeks."""
+        d = np.array(self.arms[a]) - np.array(self.arms[b])
+        if len(d) < 2:
+            return float(d.mean()) if len(d) else float("nan"), float("nan")
+        return float(d.mean()), float(d.std(ddof=1) / math.sqrt(len(d)))
+
+
+def add_gate_report(
+    conn: sqlite3.Connection,
+    league: LeagueConfig,
+    season: str = "20252026",
+    train_seasons: tuple[str, ...] | None = None,
+    n_tested: int = 6,
+    seed: int = 20261,
+    arms: tuple[str, ...] = ARMS,
+    min_gain: float = 0.25,
+    min_expected_gain: float = 0.1,
+    stream_spots: int = 2,
+    progress: Callable[[str], None] | None = None,
+    versus: str = "",
+    goalies: str = "",
+    goalies_alt: str = GOALIES_ALT,
+    goalie_minimum: bool = True,
+    rivals: str = "frozen",
+    rival_rate: float = 0.0,
+    rival_goalie_share: float = 0.0,
+) -> AddGateReport:
+    from puckpilot.draft.engine import RosterValuePolicy
+    from puckpilot.draft.h2h import round_robin_schedule
+    from puckpilot.draft.replay import G_WIDTH, build_replay_data
+    from puckpilot.draft.sim import _default_opponents, build_universe, keepers_for, run_draft
+    from puckpilot.engine.aggregate import season_games
+    from puckpilot.engine.lineup import optimize_lineup
+    from puckpilot.engine.lineup_replay import (
+        GameValueModel,
+        projected_pg_values,
+        skater_availability,
+    )
+    from puckpilot.season.form import FormRates, Usage
+    from puckpilot.season.goalies import (
+        AsOfGoalieSource,
+        GoalieWorkload,
+        projected_shares,
+        trailing_model,
+    )
+    from puckpilot.season.odds import (
+        OddsModel,
+        Side,
+        choose_goalies,
+        game_worth,
+        goalie_game,
+        leverage,
+    )
+    from puckpilot.season.pool import PoolPlayer
+    from puckpilot.season.replay import POS_TO_YAHOO, runtime_for_replay, team_by_day
+    from puckpilot.season.roster import RosterPlayer, TeamRoster
+    from puckpilot.season.today import STEER_TIE
+    from puckpilot.season.values import ValueModel
+    from puckpilot.season.week import build_week_plan, per_game_rates
+
+    say = progress or (lambda _m: None)
+    if rivals not in RIVALS:
+        raise ValueError(f"rivals must be one of {RIVALS}, not {rivals!r}")
+    if train_seasons is None:
+        y = int(season[:4])
+        train_seasons = tuple(f"{y - i}{y - i + 1}" for i in range(1, 4))
+    rules = league.draft_rules()
+    shape = rules.shape
+    rng = np.random.default_rng(seed)
+    skater_keys = [c.key for c in league.skater_cats]
+    cats = league.all_cats
+
+    u = build_universe(conn, season, train_seasons, league)
+    data = build_replay_data(conn, season, skater_keys)
+    vm = GameValueModel(data, set(u.ids.tolist()), league.goalie_cats)
+    pg_value = projected_pg_values(u.frame, vm, skater_keys)
+    positions = dict(zip(u.ids.tolist(), u.pos.tolist(), strict=True))
+    skaters = {int(p) for p, pos in u.frame["position"].items() if pos != "G"}
+    form = FormRates(data, per_game_rates(u.frame, cats), skaters=skaters)
+    values = ValueModel(
+        vm=vm,
+        data=data,
+        proj_pg=pg_value,
+        season=season,
+        scale_season=season,
+        frame=u.frame,
+        form=form,
+        form_value=False,
+    )
+    wanted = [parse_arm(a, stream_spots) for a in arms]
+    usage = Usage(conn, season, data.dates) if any(x.usage or x.momentum for x in wanted) else None
+    finder = None
+    if any(x.momentum for x in wanted):
+        from puckpilot.season.streak_gate import SEASONS as STREAK_SEASONS
+        from puckpilot.season.streak_gate import momentum_table
+        from puckpilot.season.streaks import StreakFinder
+
+        others = tuple(x for x in STREAK_SEASONS if x != season)
+        table = momentum_table(conn, league, others)
+        say(f"{season}: streak momentum from {', '.join(others)}: {table}")
+        finder = StreakFinder(data, per_game_rates(u.frame, cats), usage=usage, momentum=table)
+    by_kind: dict[tuple[bool, bool, bool], ValueModel] = {(False, False, False): values}
+
+    aged = None  # -a arms: (frame, ValueModel) from the games-aged goalie projection
+    if any(x.age_games for x in wanted):
+        if any(x.age_games and (x.form_value or x.usage or x.momentum) for x in wanted):
+            raise ValueError("-a does not combine with -v, -u or -m")
+        ua = build_universe(conn, season, train_seasons, league, goalie_age_on="games")
+        rates_a = per_game_rates(ua.frame, cats)
+        aged = (
+            ua.frame,
+            ValueModel(
+                vm=vm,
+                data=data,
+                proj_pg=projected_pg_values(ua.frame, vm, skater_keys),
+                season=season,
+                scale_season=season,
+                frame=ua.frame,
+                form=FormRates(data, rates_a, skaters=skaters),
+                form_value=False,
+            ),
+        )
+
+    def values_for(spec: ArmSpec) -> ValueModel:
+        if spec.age_games and aged is not None:
+            return aged[1]
+        key = (spec.form_value, spec.usage, spec.momentum)
+        if key not in by_kind:
+            rates_now = FormRates(
+                data,
+                per_game_rates(u.frame, cats),
+                skaters=skaters,
+                usage=usage if spec.usage else None,
+                streaks=finder,
+                momentum=spec.momentum,
+            )
+            by_kind[key] = replace(values, form=rates_now, form_value=spec.form_value, _tilts={})
+        return by_kind[key]
+
+    opponents = _default_opponents(rng, league)
+    order = rng.permutation(len(opponents))
+    bots, oi = [], 0
+    for seat in range(shape.n_teams):
+        bots.append(RosterValuePolicy() if seat == 0 else opponents[order[oi]])
+        oi += 0 if seat == 0 else 1
+    keepers = keepers_for(conn, u, season, league, rng)
+    rosters = [[int(u.ids[i]) for i in r] for r in run_draft(u, bots, rules, rng, keepers)]
+    say(f"{season}: drafted {len(rosters)} teams")
+
+    everyone = set(int(x) for x in u.ids.tolist())
+    played = {
+        pid: set(data.skater.get(pid, {})) | set(data.goalie.get(pid, {})) for pid in everyone
+    }
+    avail = drop_known_absences(skater_availability(conn, season, data, everyone), played)
+    teams = team_by_day(conn, season, data, everyone)
+    policy = trailing_model(conn, season, train_seasons[0], goalies)
+    specs = [parse_arm(a, stream_spots) for a in arms]
+    policy_alt = (
+        trailing_model(conn, season, train_seasons[0], goalies_alt)
+        if any(x.goalies for x in specs)
+        else policy
+    )
+    workload = (
+        GoalieWorkload(conn, season, priors=projected_shares(u.frame, season_games(conn, season)))
+        if any(x.workload for x in specs)
+        else None
+    )
+    runtime = runtime_for_replay(league, season, data.dates)
+    index = {d: i for i, d in enumerate(data.dates)}
+
+    def lineup(roster: list[int], i: int, pol=None) -> dict[int, str]:
+        """The morning lineup: schedule, projections, P(start). No forcing."""
+        p = (pol or policy).starts(data.dates[i])
+        cands = []
+        for pid in roster:
+            if positions.get(pid) == "G":
+                if p.get(pid, 0.0) > 0:
+                    cands.append((pid, "G", p[pid] * pg_value.get(pid, 0.0)))
+            elif i in avail.get(pid, ()):
+                cands.append((pid, positions.get(pid, "C"), pg_value.get(pid, 0.0)))
+        return optimize_lineup(cands, shape)
+
+    rates = per_game_rates(u.frame, cats)
+    g_slots = sum(n for pos, n in shape.slots if pos == "G")
+    model = OddsModel()
+
+    def projected_side(
+        roster, banked_sk, banked_g, rest, cutoff, tonight_too=True, line_rates=None, pol=None
+    ):
+        """Banked totals plus the as-of projection of `rest` (date indices)."""
+        line_rates = line_rates if line_rates is not None else rates
+        frozen = AsOfGoalieSource(pol or policy, cutoff)
+        skaters: dict[str, float] = {}
+        goalies = []
+        for j in rest:
+            for pid in lineup_skaters(roster, j):
+                for key, r in (line_rates.get(pid) or {}).items():
+                    skaters[key] = skaters.get(key, 0.0) + r
+            if not tonight_too and j == rest[0]:
+                continue
+            p = frozen.starts(data.dates[j])
+            gs = sorted(
+                (
+                    (p.get(pid, 0.0) * pg_value.get(pid, 0.0), p.get(pid, 0.0), pid)
+                    for pid in roster
+                    if positions.get(pid) == "G" and p.get(pid, 0.0) > 0
+                ),
+                reverse=True,
+            )[:g_slots]
+            goalies += [goalie_game(line_rates.get(pid) or {}, ps) for _, ps, pid in gs]
+        return Side(
+            banked=_components(banked_sk, banked_g, skater_keys), skaters=skaters, goalies=goalies
+        )
+
+    def lineup_skaters(roster, i):
+        cands = [
+            (pid, positions.get(pid, "C"), pg_value.get(pid, 0.0))
+            for pid in roster
+            if positions.get(pid) != "G" and i in avail.get(pid, ())
+        ]
+        return optimize_lineup(cands, shape)
+
+    changed = [0]  # goalie nights the chooser departed from starting everyone
+
+    def lineup_goalie_odds(roster, i, rest, sk, g, opp, opp_done):
+        """Skaters as usual; tonight's goalies by expected categories won."""
+        date = data.dates[i]
+        ours = projected_side(roster, sk, g, rest, date, tonight_too=False)
+        zero_sk = np.zeros(len(skater_keys))
+        zero_g = np.zeros(G_WIDTH)
+        theirs = projected_side(
+            list(day_rosters[opp][i]),
+            sk_day[opp, opp_done].sum(0) if opp_done else zero_sk,
+            g_day[opp, opp_done].sum(0) if opp_done else zero_g,
+            rest,
+            date,
+        )
+        p = policy.starts(date)
+        tonight = {
+            pid: goalie_game(rates.get(pid) or {}, p[pid])
+            for pid in roster
+            if positions.get(pid) == "G" and p.get(pid, 0.0) > 0
+        }
+        choice = choose_goalies(model, cats, ours, tonight, theirs, slots=g_slots)
+        plain = frozenset(pid for pid, slot in lineup(roster, i).items() if slot == "G")
+        if choice.start != plain:
+            changed[0] += 1
+        assigned = dict(lineup_skaters(roster, i))
+        for pid in choice.start:
+            assigned[pid] = "G"
+        return assigned
+
+    steered: dict[str, int] = {}  # -t arms: nights the lineup left the plain one
+
+    def lineup_steered(arm, roster, i, rest, sk, g, opp, opp_done, pol, line_rates):
+        """Tonight by this week's odds, as of this morning: banked plus the
+        days left, both sides. Skaters by what their game adds to expected
+        categories won (ties to the plain value); goalies by choose_goalies."""
+        date = data.dates[i]
+        ours = projected_side(
+            roster, sk, g, rest, date, tonight_too=False, line_rates=line_rates, pol=pol
+        )
+        theirs = projected_side(
+            list(day_rosters[opp][i]),
+            sk_day[opp, opp_done].sum(0) if opp_done else np.zeros(len(skater_keys)),
+            g_day[opp, opp_done].sum(0) if opp_done else np.zeros(G_WIDTH),
+            rest,
+            date,
+            line_rates=line_rates,
+            pol=pol,
+        )
+        lev = leverage(model, cats, ours, theirs)
+        cands = [
+            (
+                pid,
+                positions.get(pid, "C"),
+                game_worth(lev, line_rates.get(pid) or {}) + STEER_TIE * pg_value.get(pid, 0.0),
+            )
+            for pid in roster
+            if positions.get(pid) != "G" and i in avail.get(pid, ())
+        ]
+        assigned = dict(optimize_lineup(cands, shape))
+        p = (pol or policy).starts(date)
+        tonight = {
+            pid: goalie_game(line_rates.get(pid) or {}, p[pid])
+            for pid in roster
+            if positions.get(pid) == "G" and p.get(pid, 0.0) > 0
+        }
+        for pid in choose_goalies(model, cats, ours, tonight, theirs, slots=g_slots).start:
+            assigned[pid] = "G"
+        if set(assigned) != set(lineup(roster, i, pol)):
+            steered[arm] = steered.get(arm, 0) + 1
+        return assigned
+
+    def realise(assigned, i, sk, g) -> int:
+        """Add the day's lines; return the goalie appearances (Yahoo's count)."""
+        apps = 0
+        for pid in assigned:
+            line = data.skater.get(pid, {}).get(i)
+            if line is not None:
+                sk += line
+                continue
+            line = data.goalie.get(pid, {}).get(i)
+            if line is not None:
+                g += line
+                apps += 1
+        return apps
+
+    n_days = len(data.dates)
+
+    weeks = [w for w in runtime.weeks if any(d in index for d in w.dates())][: league.regular_weeks]
+    week_days = {w.number: [index[d] for d in w.dates() if d in index] for w in weeks}
+    schedule = round_robin_schedule(len(rosters), len(weeks))
+
+    plays_on: dict[int, set[str]] = {}
+    for r in conn.execute(
+        "SELECT game_date, home_team, away_team FROM nhl_schedule "
+        "WHERE season = ? AND game_type = 2",
+        (season,),
+    ):
+        if r[0] in index:
+            plays_on.setdefault(index[r[0]], set()).update((r[1], r[2]))
+
+    rival_adds = [0]  # adds the streaming rivals made, all season
+
+    def streamed() -> list[list[tuple[int, ...]]]:
+        """Every team's roster on every day: the drafted one, changed by the
+        streaming rivals' adds (`rivals="stream"`), made each week's first morning."""
+        cur = [list(r) for r in rosters]
+        out: list[list[tuple[int, ...]]] = [[()] * n_days for _ in rosters]
+        firsts = {week_days[w.number][0]: w for w in weeks if week_days.get(w.number)}
+        srng = np.random.default_rng([seed, 4099])
+        cap = runtime.max_weekly_adds or 99
+        live = rivals == "stream" and rival_rate > 0
+        for i in range(n_days):
+            if live and i in firsts:
+                days = week_days[firsts[i].number]
+                held = {pid for r in cur for pid in r}
+                pool = {pid for pid in everyone if pid not in held}
+                p_by_day = {j: AsOfGoalieSource(policy, data.dates[i]).starts(data.dates[j])
+                            for j in days}  # fmt: skip
+
+                def worth(pid: int, days=days, p_by_day=p_by_day) -> float:
+                    if positions.get(pid) == "G":
+                        starts = sum(p_by_day[j].get(pid, 0.0) for j in days)
+                        return pg_value.get(pid, 0.0) * starts
+                    club = teams.get(pid, [""] * n_days)
+                    return pg_value.get(pid, 0.0) * sum(
+                        1 for j in days if club[j] in plays_on.get(j, set())
+                    )
+
+                for t in range(len(cur)):
+                    for _ in range(min(int(srng.poisson(rival_rate)), cap)):
+                        goalie = bool(srng.random() < rival_goalie_share)
+                        same = [q for q in pool if (positions.get(q) == "G") == goalie]
+                        mine = sorted(
+                            (q for q in cur[t] if (positions.get(q) == "G") == goalie),
+                            key=lambda q: pg_value.get(q, 0.0),
+                        )
+                        bottom = mine[: max(1, len(mine) // 2)]
+                        if not same or not bottom:
+                            continue
+                        best = max(same, key=worth)
+                        drop = min(bottom, key=worth)
+                        if worth(best) <= worth(drop):
+                            continue
+                        cur[t][cur[t].index(drop)] = best
+                        pool.discard(best)
+                        pool.add(drop)
+                        rival_adds[0] += 1
+            for t in range(len(cur)):
+                out[t][i] = tuple(cur[t])
+        return out
+
+    day_rosters = streamed()
+    held_on = [frozenset(pid for r in day_rosters for pid in r[i]) for i in range(n_days)]
+
+    # The league: every team's realised production, day by day, on the
+    # roster it had that day (frozen unless the rivals stream).
+    sk_day = np.zeros((len(rosters), n_days, len(skater_keys)))
+    g_day = np.zeros((len(rosters), n_days, G_WIDTH))
+    apps_day = np.zeros((len(rosters), n_days))
+    for t in range(len(rosters)):
+        for i in range(n_days):
+            day = list(day_rosters[t][i])
+            apps_day[t, i] = realise(lineup(day, i), i, sk_day[t, i], g_day[t, i])
+    per = rival_adds[0] / max(len(rosters) * len(weeks), 1)
+    say(
+        f"{season}: league played ({rivals}"
+        + (f", {rival_adds[0]} rival adds, {per:.2f} a team-week" if rivals == "stream" else "")
+        + ")"
+    )
+
+    def out_on(pid: int, i: int) -> bool:
+        """Known to be out that morning: his club plays and he is not available."""
+        team = teams.get(pid, [""] * n_days)[i]
+        return (
+            positions.get(pid) != "G"
+            and i not in avail.get(pid, ())
+            and team in plays_on.get(i, set())
+        )
+
+    # The tested team's protected keepers this week (-k arms); empty otherwise.
+    shield: set[int] = set()
+    boards: dict[str, object] = {}
+
+    def keeper_board(date: str):
+        """Next season's values as of the first of the month: no later games."""
+        from puckpilot.season.keeper_value import KeeperBoard, keeper_cost, project_next
+
+        month = date[:8] + "01"
+        if month not in boards:
+            vorp = project_next(conn, league, season, month)
+            boards[month] = KeeperBoard(
+                league=league,
+                season=season,
+                as_of=month,
+                vorp_next=vorp,
+                cost=keeper_cost(league, vorp),
+                times_kept=None,
+            )
+        return boards[month]
+
+    def rp(pid: int, i: int) -> RosterPlayer:
+        pos = POS_TO_YAHOO.get(positions.get(pid, "C"), "C")
+        return RosterPlayer(
+            player_key=str(pid),
+            yahoo_id=str(pid),
+            name=str(pid),
+            team=teams.get(pid, [""] * n_days)[i],
+            primary_position=pos,
+            yahoo_eligible=frozenset({pos}),
+            selected_slot="BN",
+            nhl_player_id=pid,
+            status="O" if out_on(pid, i) else "",
+            keeper_protected=pid in shield,
+        )
+
+    def fa(pid: int, i: int) -> PoolPlayer:
+        pos = POS_TO_YAHOO.get(positions.get(pid, "C"), "C")
+        return PoolPlayer(
+            player_key=str(pid),
+            name=str(pid),
+            team=teams.get(pid, [""] * n_days)[i],
+            primary_position=pos,
+            yahoo_eligible=frozenset({pos}),
+            nhl_player_id=pid,
+            status="O" if out_on(pid, i) else "",
+            ownership_type="freeagents",
+        )
+
+    frozen_pids = {pid for r in rosters for pid in r}
+    by_value = sorted(everyone, key=lambda pid: -pg_value.get(pid, 0.0))
+
+    results: dict[str, list[float]] = {a: [] for a in arms}
+    made: dict[str, int] = dict.fromkeys(arms, 0)
+    timed_made: dict[str, int] = {}  # -y arms: swaps put off to a later morning
+    timed_lost: dict[str, int] = {}  # ... and of those, the free agent taken first
+    tapped: dict[str, list[int]] = {}  # -o arms: [after the games, never approved, at once]
+    tested = list(range(min(n_tested, len(rosters))))
+    for t in tested:
+        for arm in arms:
+            spec = parse_arm(arm, stream_spots)
+            kind, spots = spec.kind, spec.spots
+            pol = policy_alt if spec.goalies else policy
+            wl = workload if spec.workload else None
+            vals = values_for(spec)
+            frame_now = aged[0] if spec.age_games and aged is not None else u.frame
+            last_n = max(spec.preload, spec.queue)
+            roster = list(rosters[t])
+            adds_season = 0
+            shield.clear()
+            # -y arms: (date index to make it on, index it was found on, target)
+            waiting: list = []
+            lost = np.random.default_rng([seed, t, arms.index(arm)])
+            # -o arms: a draw of their own, so the other arms' streams are untouched.
+            taps = np.random.default_rng([seed, t, arms.index(arm), 7919])
+            # Moves queued at the end of a week for the rosters' unlock are made
+            # the next morning, so they count against the week that starts then.
+            carry = 0
+            for wi, w in enumerate(weeks):
+                days = week_days[w.number]
+                opp = next((b if a == t else a for a, b in schedule[wi] if t in (a, b)), None)
+                if opp is None or not days:
+                    continue
+                adds_week, carry = carry, 0
+                sk = np.zeros(len(skater_keys))
+                g = np.zeros(G_WIDTH)
+                apps = 0
+                if spec.keepers is not None and league.n_keepers > 0:
+                    board = keeper_board(data.dates[days[0]])
+                    ranks = board.rank([rp(pid, days[0]) for pid in roster], margin=spec.keepers)
+                    shield.clear()
+                    shield.update(k.nhl_player_id for k in ranks if k.protected)
+                for k, i in enumerate(days):
+                    date = data.dates[i]
+                    for when, found, target in [x for x in waiting if x[0] <= i]:
+                        waiting.remove((when, found, target))
+                        kept = (1.0 - (spec.timing or 0.0)) ** (when - found)
+                        if lost.random() < kept:
+                            _swap(roster, target)
+                            made[arm] += 1
+                        else:  # taken by someone else: the acquisition was never spent
+                            adds_week -= 1
+                            adds_season -= 1
+                            timed_lost[arm] = timed_lost.get(arm, 0) + 1
+                    search = (
+                        kind not in ("none", "goalie-odds")
+                        and (kind.endswith("daily") or k == 0)
+                        and not (spec.skip_last and k > 0 and k >= len(days) - spec.skip_last)
+                    )
+                    cap_w = runtime.max_weekly_adds or 99
+                    # The week's last days: prepare for the next one.
+                    nxt_wi = wi + 1
+                    queued: list = []
+                    ahead = (
+                        last_n > 0
+                        and k >= len(days) - last_n
+                        and k > 0
+                        and nxt_wi < len(weeks)
+                        and kind not in ("none", "goalie-odds")
+                        and (adds_week < cap_w or (spec.queue > 0 and carry < cap_w))
+                    )
+                    if ahead:
+                        nw = weeks[nxt_wi]
+                        nopp = next(
+                            (b if a == t else a for a, b in schedule[nxt_wi] if t in (a, b)), None
+                        )
+                        if nopp is not None and week_days.get(nw.number):
+                            ours = TeamRoster(
+                                league_key=runtime.league_key,
+                                team_key="us",
+                                date=date,
+                                players=tuple(rp(pid, i) for pid in roster),
+                            )
+                            theirs = TeamRoster(
+                                league_key=runtime.league_key,
+                                team_key="them",
+                                date=date,
+                                players=tuple(rp(pid, i) for pid in day_rosters[nopp][i]),
+                            )
+                            taken = frozen_pids | held_on[i] | set(roster)
+                            pool = [
+                                fa(pid, i)
+                                for pid in by_value
+                                if pid not in taken and not out_on(pid, i)
+                            ][:POOL_SIZE]
+                            odds_arm = kind.startswith("odds")
+                            plan = build_week_plan(
+                                conn,
+                                runtime,
+                                league,
+                                nw,
+                                "opp",
+                                ours,
+                                theirs,
+                                pool,
+                                frame_now,
+                                AsOfGoalieSource(pol, date),
+                                AsOfValues(vals, date),
+                                # Queued moves are paid for next week, not now.
+                                adds_used_week=0 if spec.queue else adds_week,
+                                adds_used_season=adds_season,
+                                min_gain=min_gain,
+                                max_targets=cap_w,
+                                find_targets=True,
+                                odds_model=OddsModel() if odds_arm else None,
+                                add_scoring="odds" if odds_arm else "share",
+                                min_expected_gain=min_expected_gain,
+                                playoff_reserve=0,
+                                stream_spots=spots,
+                                upgrade_margin=spec.margin,
+                                measure_room=False,
+                                workload=wl,
+                                form_rates=spec.form_rates,
+                                screen_by=spec.screen_by,
+                                screen=spec.screen,
+                                drop_choice=spec.drops,
+                                goalie_lane=spec.lane,
+                                goalie_floor=_floor(spec, runtime),
+                                goalie_minimum=(
+                                    runtime.min_goalie_games(nw.number) if spec.minimum else 0
+                                ),
+                            )
+                            for target in plan.targets:
+                                drop = target.drop
+                                plays = drop is not None and teams.get(
+                                    int(drop.player_key), [""] * n_days
+                                )[i] in plays_on.get(i, set())
+                                if spec.queue and (plays or adds_week >= cap_w):
+                                    # His last game of the week comes first.
+                                    if carry >= cap_w:
+                                        continue
+                                    queued.append(target)
+                                    carry += 1
+                                else:
+                                    if adds_week >= cap_w:
+                                        break
+                                    _swap(roster, target)
+                                    adds_week += 1
+                                adds_season += 1
+                                made[arm] += 1
+                        search = False
+                    if search and adds_week < cap_w:
+                        opp_done = days[:k]
+                        ours = TeamRoster(
+                            league_key=runtime.league_key,
+                            team_key="us",
+                            date=date,
+                            players=tuple(rp(pid, i) for pid in roster),
+                        )
+                        theirs = TeamRoster(
+                            league_key=runtime.league_key,
+                            team_key="them",
+                            date=date,
+                            players=tuple(rp(pid, i) for pid in day_rosters[opp][i]),
+                        )
+                        pending = {int(x[2].player.player_key) for x in waiting}
+                        taken = frozen_pids | held_on[i] | set(roster) | pending
+                        pool = [
+                            fa(pid, i)
+                            for pid in by_value
+                            if pid not in taken and not out_on(pid, i)
+                        ][:POOL_SIZE]
+                        opp_comp = _components(
+                            sk_day[opp, opp_done].sum(0)
+                            if opp_done
+                            else np.zeros(len(skater_keys)),
+                            g_day[opp, opp_done].sum(0) if opp_done else np.zeros(G_WIDTH),
+                            skater_keys,
+                        )
+                        odds_arm = kind.startswith("odds")
+                        mid = k > 0
+                        floor_now = (
+                            spec.mid_floor
+                            if mid and spec.mid_floor is not None
+                            else min_expected_gain
+                        )
+                        plan = build_week_plan(
+                            conn,
+                            runtime,
+                            league,
+                            w,
+                            "opp",
+                            ours,
+                            theirs,
+                            pool,
+                            frame_now,
+                            AsOfGoalieSource(pol, date),
+                            AsOfValues(vals, date),
+                            adds_used_week=adds_week,
+                            adds_used_season=adds_season,
+                            min_gain=min_gain,
+                            max_targets=cap_w,
+                            banked_ours=as_labels(_components(sk, g, skater_keys)),
+                            banked_theirs=as_labels(opp_comp),
+                            from_day=date,
+                            find_targets=True,
+                            odds_model=OddsModel() if odds_arm else None,
+                            add_scoring="odds" if odds_arm else "share",
+                            min_expected_gain=floor_now,
+                            playoff_reserve=0,
+                            stream_spots=spots,
+                            upgrade_margin=spec.margin,
+                            measure_room=False,
+                            workload=wl,
+                            form_rates=spec.form_rates,
+                            screen_by=spec.screen_by,
+                            screen=spec.screen,
+                            drop_choice=spec.drops,
+                            goalie_lane=spec.lane,
+                            goalie_floor=_floor(spec, runtime),
+                            goalie_minimum=(
+                                runtime.min_goalie_games(w.number) if spec.minimum else 0
+                            ),
+                            goalie_appearances=apps,
+                            time_moves=spec.timing_mode,
+                            wait_hazard=spec.timing or 0.0,
+                            hold={x[2].drop.player_key for x in waiting if x[2].drop is not None},
+                        )
+                        targets = list(plan.targets)
+                        nopp = (
+                            next(
+                                (b if a == t else a for a, b in schedule[nxt_wi] if t in (a, b)),
+                                None,
+                            )
+                            if nxt_wi < len(weeks)
+                            else None
+                        )
+                        if mid and spec.horizon and targets and nopp is not None:
+                            # A mid-week move must pay over the rest of this
+                            # week and the next one together.
+                            nplan = build_week_plan(
+                                conn,
+                                runtime,
+                                league,
+                                weeks[nxt_wi],
+                                "opp",
+                                ours,
+                                TeamRoster(
+                                    league_key=runtime.league_key,
+                                    team_key="them",
+                                    date=date,
+                                    players=tuple(rp(pid, i) for pid in day_rosters[nopp][i]),
+                                ),
+                                [],
+                                frame_now,
+                                AsOfGoalieSource(pol, date),
+                                AsOfValues(vals, date),
+                                find_targets=False,
+                                reprice=[(x.player, x.drop) for x in targets],
+                                odds_model=OddsModel() if odds_arm else None,
+                                add_scoring="odds" if odds_arm else "share",
+                                min_gain=-1e9,
+                                min_expected_gain=-1e9,
+                                playoff_reserve=0,
+                                stream_spots=spots,
+                                upgrade_margin=spec.margin,
+                                measure_room=False,
+                                workload=wl,
+                                form_rates=spec.form_rates,
+                                goalie_minimum=(
+                                    runtime.min_goalie_games(weeks[nxt_wi].number)
+                                    if spec.minimum
+                                    else 0
+                                ),
+                            )
+                            later = {_pair(x): _worth(x) for x in (*nplan.targets, *nplan.lapsed)}
+                            targets = [
+                                x
+                                for x in targets
+                                if _worth(x) + later.get(_pair(x), 0.0) >= floor_now
+                            ]
+                        for target in targets:
+                            if adds_week >= cap_w:
+                                break
+                            on_days = [
+                                j
+                                for j in days[k + 1 :]
+                                if target.after_games_of and data.dates[j] > target.after_games_of
+                            ]
+                            if spec.tap is not None and not (
+                                spec.standing and target.drop_tier == "rotation"
+                            ):
+                                # Waiting for a tap: made after tonight's
+                                # games if one comes today; if not, found again
+                                # tomorrow - no acquisition spent on it.
+                                counts = tapped.setdefault(arm, [0, 0, 0])
+                                if taps.random() >= spec.tap:
+                                    counts[1] += 1
+                                    continue
+                                adds_week += 1
+                                adds_season += 1
+                                queued.append(target)
+                                counts[0] += 1
+                                made[arm] += 1
+                                continue
+                            if spec.tap is not None:
+                                tapped.setdefault(arm, [0, 0, 0])[2] += 1
+                            adds_week += 1
+                            adds_season += 1
+                            if spec.timing is not None and on_days:
+                                waiting.append((on_days[0], i, target))
+                                timed_made[arm] = timed_made.get(arm, 0) + 1
+                                continue
+                            _swap(roster, target)
+                            made[arm] += 1
+                    if arm == "goalie-odds":
+                        assigned = lineup_goalie_odds(roster, i, days[k:], sk, g, opp, days[:k])
+                    elif spec.steer:
+                        line_rates = vals.rates(cats, date) if spec.form_rates else rates
+                        assigned = lineup_steered(
+                            arm, roster, i, days[k:], sk, g, opp, days[:k], pol, line_rates
+                        )
+                    else:
+                        assigned = lineup(roster, i, pol)
+                    apps += realise(assigned, i, sk, g)
+                    # After the day's games the rosters unlock: queued moves are made.
+                    for target in queued:
+                        _swap(roster, target)
+                ours_final = _components(sk, g, skater_keys)
+                theirs_final = _components(
+                    sk_day[opp, days].sum(0), g_day[opp, days].sum(0), skater_keys
+                )
+                need = runtime.min_goalie_games(w.number) if goalie_minimum else 0
+                results[arm].append(
+                    week_result(
+                        cats,
+                        ours_final,
+                        theirs_final,
+                        our_short=apps < need,
+                        their_short=float(apps_day[opp, days].sum()) < need,
+                    )
+                )
+            if arm == "goalie-odds":
+                made[arm] = changed[0]
+            say(f"{season}: team {t + 1}/{len(tested)} {arm}: {made[arm]} adds so far")
+
+    report = AddGateReport(season=season, arms=results, adds=made, text="")
+    lines = [
+        f"G2 (adds) - {season}: {len(tested)} teams tested x {len(weeks)} weeks, rivals "
+        + (
+            f"stream ({rival_rate:g} adds/week, {rival_goalie_share:.0%} goalies)"
+            if rivals == "stream"
+            else "frozen"
+        ),
+        "",
+        f"{'arm':14}{'cats/week':>11}{'adds':>7}   (goalie-odds: nights changed)",
+    ]
+    for arm in arms:
+        line = f"{arm:14}{report.mean(arm):>11.3f}{made[arm]:>7}"
+        if arm in steered:
+            line += f"   steered lineups: {steered[arm]} nights changed"
+        if arm in timed_made:
+            line += f"   timed: {timed_made[arm]} put off, {timed_lost.get(arm, 0)} lost waiting"
+        if arm in tapped:
+            late, never, now = tapped[arm]
+            line += f"   taps: {late} after the games, {never} not approved that day"
+            if now:
+                line += f", {now} rotation drops at once"
+        lines.append(line)
+    lines.append("")
+    pairs = [(a, "none") for a in arms if a != "none" and "none" in arms]
+    if "odds-daily" in arms and "share-daily" in arms:
+        pairs.append(("odds-daily", "share-daily"))
+    if "share-daily" in arms and "share-weekly" in arms:
+        pairs.append(("share-daily", "share-weekly"))
+    if "odds-daily" in arms and "odds-weekly" in arms:
+        pairs.append(("odds-daily", "odds-weekly"))
+    if "odds-weekly" in arms and "share-weekly" in arms:
+        pairs.append(("odds-weekly", "share-weekly"))
+    pairs += [(a, parse_arm(a, stream_spots).kind) for a in arms]
+    if versus:
+        pairs += [(a, versus) for a in arms]
+    pairs = [(a, b) for a, b in dict.fromkeys(pairs) if b in arms and a != b]
+    for a, b in pairs:
+        m, se = report.paired(a, b)
+        # Both ways: a loss clear of noise is a finding too - 2025-26's -0.33
+        # +/- 0.07 for the Sunday search was once labelled "within noise".
+        if se == se and m > 2 * se:
+            verdict = "clears 2 SE"
+        elif se == se and m < -2 * se:
+            verdict = "WORSE by more than 2 SE"
+        else:
+            verdict = "within noise"
+        lines.append(f"{a} - {b}: {m:+.3f} +/- {se:.3f}  ({verdict})")
+    report.text = "\n".join(lines)
+    return report

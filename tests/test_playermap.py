@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from puckpilot.data import store
-from puckpilot.yahoo.playermap import _nhl_index, _resolve, _team
+from puckpilot.yahoo.playermap import _nhl_index, _resolve, _team, reresolve_unmatched
 
 
 @pytest.fixture
@@ -98,3 +98,202 @@ def test_team_aliases_normalize_yahoo_abbreviations():
     assert _team("TB") == "TBL"
     assert _team("EDM") == "EDM"
     assert _team(None) == ""
+
+
+# ---- re-resolving previously-unmatched rows, without asking Yahoo again ----
+
+
+def _map_row(db, key, name, team, nhl_id=None, adp=100):
+    db.execute(
+        "INSERT INTO yahoo_player_map"
+        " (player_key, league_key, full_name, team_abbrev, positions, nhl_player_id, adp_rank)"
+        " VALUES (?, 'L.1', ?, ?, 'C', ?, ?)",
+        (key, name, team, nhl_id, adp),
+    )
+
+
+def test_a_rookie_synced_after_the_fact_resolves_on_reresolve(db):
+    """The exact bug this exists to fix: McKenna failed to match when the
+    Yahoo pool was first fetched because `nhl_players` had no row for him yet.
+    A roster sync since then gave him one; re-resolving must pick it up
+    without going back to Yahoo."""
+    _map_row(db, "477.p.1", "Gavin McKenna", "TOR")
+    db.commit()
+
+    before = reresolve_unmatched(db)
+    assert before.matched == 0 and before.unmatched == ["Gavin McKenna"]
+
+    store.upsert_player(db, 999, "Gavin McKenna", "L", "TOR")
+    after = reresolve_unmatched(db)
+    assert after.matched == 1
+    row = db.execute(
+        "SELECT nhl_player_id FROM yahoo_player_map WHERE player_key = '477.p.1'"
+    ).fetchone()
+    assert row[0] == 999
+
+
+def test_reresolve_never_touches_adp_or_positions(db):
+    """Only `nhl_player_id` may change here - `adp_rank` and `positions` were
+    not re-fetched, so nothing here may act as if they were."""
+    _map_row(db, "477.p.1", "Connor McDavid", "EDM", adp=1)
+    store.upsert_player(db, 1, "Connor McDavid", "C", "EDM")
+
+    reresolve_unmatched(db)
+
+    row = db.execute(
+        "SELECT positions, adp_rank FROM yahoo_player_map WHERE player_key = '477.p.1'"
+    ).fetchone()
+    assert tuple(row) == ("C", 1)
+
+
+def test_reresolve_does_not_double_assign_an_nhl_id(db):
+    """An id another Yahoo row already claims - in this league or any other -
+    must not be handed out a second time."""
+    _map_row(db, "477.p.1", "Sebastian Aho", "CAR", nhl_id=7)
+    _map_row(db, "477.p.2", "Sebastian Aho", "CAR")  # unresolved twin, same name+team
+    store.upsert_player(db, 7, "Sebastian Aho", "C", "CAR")
+
+    report = reresolve_unmatched(db)
+
+    assert report.matched == 0
+    row = db.execute(
+        "SELECT nhl_player_id FROM yahoo_player_map WHERE player_key = '477.p.2'"
+    ).fetchone()
+    assert row[0] is None
+
+
+# ---- which league's ADP the live board uses ---------------------------------
+#
+# Without ADP the board silently ran on a proxy. Every way of not getting it is
+# now named, with the keys that do exist listed - a typo is the likeliest cause.
+
+
+def _adp_row(db, key, league, nhl_id, rank):
+    db.execute(
+        "INSERT INTO yahoo_player_map (player_key, league_key, full_name, nhl_player_id,"
+        " adp_rank) VALUES (?, ?, ?, ?, ?)",
+        (key, league, f"Player {key}", nhl_id, rank),
+    )
+
+
+def test_an_explicit_adp_key_wins(db):
+    from puckpilot.yahoo.playermap import resolve_adp_key
+
+    _adp_row(db, "477.p.1", "477.l.1", 1, 1)
+    _adp_row(db, "477.p.2", "477.l.2", 2, 1)
+    key, notes = resolve_adp_key(db, "477.l.2", None)
+    assert key == "477.l.2" and notes == []
+
+
+def test_a_bare_yahoo_flag_uses_the_only_mapped_league_and_says_so(db):
+    from puckpilot.yahoo.playermap import resolve_adp_key
+
+    _adp_row(db, "477.p.1", "477.l.1", 1, 1)
+    key, notes = resolve_adp_key(db, None, "auto")
+    assert key == "477.l.1"
+    assert "only mapped league" in notes[0]
+
+
+def test_a_mistyped_key_warns_and_lists_the_real_ones(db):
+    from puckpilot.yahoo.playermap import resolve_adp_key
+
+    _adp_row(db, "477.p.1", "477.l.1", 1, 1)
+    key, notes = resolve_adp_key(db, "477.l.9", None)
+    assert key is None
+    assert notes[0].startswith("WARNING") and "477.l.1" in notes[0]
+
+
+def test_several_leagues_and_no_key_is_a_warning_not_a_guess(db):
+    from puckpilot.yahoo.playermap import resolve_adp_key
+
+    _adp_row(db, "477.p.1", "477.l.1", 1, 1)
+    _adp_row(db, "477.p.2", "477.l.2", 2, 1)
+    key, notes = resolve_adp_key(db, None, "auto")
+    assert key is None and notes[0].startswith("WARNING")
+
+
+def test_position_corrections_only_touch_skaters_yahoo_will_not_play_there(db):
+    from puckpilot.yahoo.playermap import load_eligibility, position_corrections
+
+    for pid, name, pos in [(1, "Martin Necas", "C"), (2, "Leon Draisaitl", "C"), (3, "G One", "G")]:
+        store.upsert_player(db, pid, name, pos, "AAA")
+    for key, pid, raw in [
+        ("477.p.1", 1, "RW,Util"),
+        ("477.p.2", 2, "C,LW,Util"),
+        ("477.p.3", 3, "G"),
+    ]:
+        db.execute(
+            "INSERT INTO yahoo_player_map (player_key, league_key, full_name, positions,"
+            " nhl_player_id, adp_rank) VALUES (?, '477.l.1', 'x', ?, ?, 1)",
+            (key, raw, pid),
+        )
+    assert position_corrections(db) == {1: "R"}
+    assert load_eligibility(db) == {
+        1: frozenset({"R"}),
+        2: frozenset({"C", "L"}),
+        3: frozenset({"G"}),
+    }
+
+
+# -- the 2026-10-05 recheck: name alone was too little ----------------------------
+
+
+@pytest.fixture
+def idx2(db):
+    for pid, name, pos, team in [
+        (21, "Elias Pettersson", "C", "VAN"),  # two players, one name, one club
+        (22, "Elias Pettersson", "D", "VAN"),
+        (23, "Konnor Smith", "D", "ANA"),
+        (24, "John Moore", "D", "BOS"),
+        (25, "Benoit-Olivier Groulx", "C", "TOR"),
+        (26, "Anthony (AJ) Spellacy", "R", "CHI"),
+    ]:
+        store.upsert_player(db, pid, name, pos, team)
+    return _nhl_index(db)
+
+
+def test_one_name_on_one_club_is_told_apart_by_position(idx2):
+    assert _resolve(idx2, "Elias Pettersson", "VAN", "C,Util") == (21, "exact+position")
+    assert _resolve(idx2, "Elias Pettersson", "VAN", "D,Util") == (22, "exact+position")
+    assert _resolve(idx2, "Elias Pettersson", "VAN")[0] is None  # no position: refuse
+
+
+def test_a_surname_and_a_club_are_not_enough(idx2):
+    """Tarin Smith was matched to Konnor Smith, and a centre named William Moore
+    to a defenceman named John - each the only one of his surname on the club."""
+    assert _resolve(idx2, "Tarin Smith", "ANA", "D,Util")[0] is None
+    assert _resolve(idx2, "William Moore", "BOS", "C,Util")[0] is None
+
+
+def test_nicknames_still_find_their_player(idx2):
+    assert _resolve(idx2, "Bo Groulx", "TOR", "C,Util")[0] == 25
+    assert _resolve(idx2, "AJ Spellacy", "CHI", "RW,Util")[0] == 26
+
+
+def test_given_names_and_positions_compare_as_people_would():
+    from puckpilot.yahoo.playermap import position_class, same_given
+
+    assert same_given("Bob Smith", "Robert Smith")  # a nickname
+    assert same_given("Egor Chinakhov", "Yegor Chinakhov")  # a transliteration
+    assert not same_given("Tarin Smith", "Konnor Smith")
+    assert position_class("C,LW,Util") == "F" and position_class("D,Util") == "D"
+    assert position_class("G") == "G" and position_class("") == ""
+
+
+def test_a_recheck_corrects_a_stored_match_without_asking_yahoo(db, idx2):
+    from puckpilot.yahoo.playermap import recheck_map
+
+    db.executemany(
+        "INSERT INTO yahoo_player_map (player_key, league_key, full_name, team_abbrev,"
+        " positions, nhl_player_id, adp_rank) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("k1", "L", "Elias Pettersson", "VAN", "C,Util", 21, 1),
+            ("k2", "L", "Elias Pettersson", "VAN", "D,Util", None, 109),
+            ("k3", "L", "Tarin Smith", "ANA", "D,Util", 23, 300),  # the old wrong match
+        ],
+    )
+    db.commit()
+    changes = recheck_map(db)
+    got = dict(db.execute("SELECT player_key, nhl_player_id FROM yahoo_player_map"))
+    assert got == {"k1": 21, "k2": 22, "k3": None}
+    assert len(changes) == 2 and any("Konnor Smith -> nobody" in c for c in changes)

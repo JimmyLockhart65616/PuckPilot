@@ -163,12 +163,19 @@ def replay_roster(
     scalar: dict[int, float],
     data: ReplayData,
     shape: LeagueShape,
+    eligibility: dict[int, frozenset[str]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Replay one roster over the season with daily greedy lineup fill.
 
     Players are prioritized by `scalar` (draft-time projected value — no
     hindsight leaks into who gets the slot). Single-position eligibility makes
     greedy fill optimal: position slots first, then util for skaters.
+
+    With `eligibility` (player id -> positions he may fill) the daily lineup is
+    a matching instead, still taken in the same priority order - see
+    `eligibility.starts_in_order`. Pass it for EVERY team in a comparison, or
+    the teams drafted with eligibility in mind are scored as if it did not
+    exist.
 
     Returns per-week (weeks, n_skater_cats) and (weeks, G_WIDTH) accumulators;
     sum over axis 0 for season totals.
@@ -183,6 +190,29 @@ def replay_roster(
     n_weeks = max(data.n_weeks, 1)
     sk_total = np.zeros((n_weeks, len(data.skater_keys)))
     g_total = np.zeros((n_weeks, G_WIDTH))
+    if eligibility is not None:
+        from puckpilot.draft.eligibility import slot_units, starts_in_order
+
+        units = slot_units(shape.slots, shape.util_slots)
+        sets = {
+            pid: (
+                frozenset({positions.get(pid)})
+                if positions.get(pid) == "G" or not eligibility.get(pid)
+                else eligibility[pid]
+            )
+            for pid in roster
+        }
+        for i, pids in by_date.items():
+            w = int(data.weeks[i])
+            starts = starts_in_order(tuple(sets[pid] for pid in pids), units)
+            for pid, starting in zip(pids, starts, strict=True):
+                if not starting:
+                    continue
+                if positions.get(pid) == "G":
+                    g_total[w] += data.goalie[pid][i]
+                else:
+                    sk_total[w] += data.skater[pid][i]
+        return sk_total, g_total
     for i, pids in by_date.items():
         w = int(data.weeks[i])
         slots = slot_base.copy()

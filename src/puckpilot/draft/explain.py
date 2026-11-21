@@ -93,6 +93,20 @@ def explain(
     roster-fit reason below is answered against this seat.
     """
     labels = labels or {}
+    if candidate.source == "market":
+        # Everything below reasons from a real VORP and real per-category z -
+        # neither exists for a market-implied row (see `draft.market`), so
+        # every one of those reasons would either read as zero or, worse, read
+        # as an opinion we do not actually hold. Say what this number is
+        # instead of pretending it belongs to the same machinery.
+        return [
+            Reason(
+                "con",
+                "No NHL projection - this is the market's price, not ours "
+                f"(consensus pick {candidate.adp_rank:.0f})",
+                GENERIC,
+            )
+        ]
     pros: list[Reason] = []
     cons: list[Reason] = []
     seat = board.my_seat if seat is None else seat

@@ -1,0 +1,326 @@
+"""What the league itself says its rules are, read from Yahoo rather than typed.
+
+`leagues/*.toml` describes the league as a human transcribed it. That is right
+for things Yahoo does not know - this league tracks keepers by hand, so nothing
+else can - and wrong for everything Yahoo does know, because a transcription is
+a copy that silently goes stale.
+
+Everything here is Yahoo's own answer: the week calendar, the lineup lock mode,
+the waiver rules, the acquisition caps, the roster slots. A league with twelve
+categories and a 22-week season configures itself, and so does one with none of
+that, which is the point.
+
+The week calendar is fetched, never computed. Yahoo says this season runs
+2026-09-29 to 2027-03-28 across 25 weeks; Monday-Sunday arithmetic from the
+start date lands on 2027-03-21, a week short, because at least one week is
+longer than seven days. Deriving week boundaries would therefore have put every
+"games this week" count into the wrong bucket for the back half of the season -
+the same failure mode as assuming keepers filled a seat's earliest rounds.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, timedelta
+
+from puckpilot.engine.valuation import LeagueShape
+
+# Yahoo's slot names vs the single-letter positions the engines use. Util is
+# handled separately (LeagueShape carries it as a count), and the rest are not
+# startable.
+YAHOO_TO_POS = {"C": "C", "LW": "L", "RW": "R", "D": "D", "G": "G"}
+BENCH_SLOTS = {"BN"}
+IR_SLOTS = {"IR", "IR+", "IR-LT", "NA"}
+UTIL_SLOTS = {"Util", "UTIL", "W", "F"}
+
+# Statuses that mean the player cannot play tonight no matter what the schedule
+# says. DTD is deliberately absent: day-to-day players play most nights, and
+# treating them as out would bench half a roster every February.
+OUT_STATUSES = {"IR", "IR-LT", "IR-R", "IR-NR", "O", "NA", "SUSP"}
+
+
+def is_out_status(status: str) -> bool:
+    """Whether a Yahoo status rules a player out tonight.
+
+    Every IR designation does, including ones not listed: IR-NR (non-roster)
+    reached a real roster on opening day unlisted, which would have let the add
+    search read an injured free agent as available.
+    """
+    return status in OUT_STATUSES or status.startswith("IR")
+
+
+class SettingsError(RuntimeError):
+    """The league's settings cannot answer the question asked of them."""
+
+
+@dataclass(frozen=True)
+class RosterSlot:
+    position: str
+    count: int
+    starting: bool
+
+
+@dataclass(frozen=True)
+class StatCategory:
+    """One stat in the league's stat list, and whether it actually scores.
+
+    Yahoo lists display-only stats beside the scored ones - this league shows
+    shots against next to save percentage without scoring it - and only the
+    `is_only_display_stat` flag tells them apart. Counting one as a category
+    values players for a contest that is not being played.
+    """
+
+    stat_id: int
+    label: str
+    scored: bool
+    higher_is_better: bool = True
+
+
+@dataclass(frozen=True)
+class Week:
+    number: int
+    start: str
+    end: str
+
+    def dates(self) -> list[str]:
+        a, b = date.fromisoformat(self.start), date.fromisoformat(self.end)
+        return [(a + timedelta(days=i)).isoformat() for i in range((b - a).days + 1)]
+
+    def contains(self, day: str) -> bool:
+        return self.start <= day <= self.end
+
+
+@dataclass(frozen=True)
+class LeagueRuntime:
+    """Yahoo's own description of the league, as of when it was fetched."""
+
+    league_key: str
+    name: str
+    num_teams: int
+    scoring_type: str
+    yahoo_season: str
+    start_date: str
+    end_date: str
+    start_week: int
+    end_week: int
+    current_week: int
+    current_date: str
+    playoff_start_week: int
+    num_playoff_teams: int
+    weekly_deadline: str
+    roster_type: str
+    waiver_type: str
+    waiver_rule: str
+    waiver_days: int
+    uses_faab: bool
+    max_adds: int | None
+    max_weekly_adds: int | None
+    min_games_played: int
+    trade_end_date: str
+    slots: tuple[RosterSlot, ...]
+    weeks: tuple[Week, ...] = ()
+    fetched_at: str = ""
+    # Empty on a cache written before these were read; `season run` refreshes it.
+    stat_categories: tuple[StatCategory, ...] = ()
+    # Weeks Yahoo says have too few days to hold anyone to the goalie minimum.
+    min_games_waived: tuple[int, ...] = ()
+
+    # -- calendar ----------------------------------------------------------
+
+    @property
+    def nhl_season(self) -> str:
+        """Yahoo's "2026" as the eight-digit form the rest of the codebase uses."""
+        y = int(self.yahoo_season)
+        return f"{y}{y + 1}"
+
+    @property
+    def regular_weeks(self) -> int:
+        return self.playoff_start_week - self.start_week
+
+    def week_of(self, day: str) -> int:
+        """The fantasy week containing `day`.
+
+        Raises rather than guessing when the calendar was never fetched: a wrong
+        week silently mis-counts every "games remaining" number downstream.
+        """
+        if not self.weeks:
+            raise SettingsError(
+                "week calendar not loaded - run `ppilot season settings --refresh`. "
+                "Week boundaries are not uniform and must not be computed."
+            )
+        for w in self.weeks:
+            if w.contains(day):
+                return w.number
+        raise SettingsError(f"{day} falls outside weeks {self.start_week}-{self.end_week}")
+
+    def week(self, number: int) -> Week:
+        for w in self.weeks:
+            if w.number == number:
+                return w
+        raise SettingsError(f"week {number} not in the loaded calendar")
+
+    def min_goalie_games(self, week: int) -> int:
+        """The goalie minimum Yahoo will actually enforce in `week`."""
+        return 0 if week in self.min_games_waived else self.min_games_played
+
+    # -- scoring -----------------------------------------------------------
+
+    @property
+    def scored_labels(self) -> tuple[str, ...]:
+        """The categories the league scores, as Yahoo labels them."""
+        return tuple(s.label for s in self.stat_categories if s.scored)
+
+    def stat_labels(self) -> dict[int, str]:
+        """stat_id -> label for every stat Yahoo reports, scored or not.
+
+        Display-only stats are kept: a team's shots against is not a category
+        here, but it is the denominator of one.
+        """
+        return {s.stat_id: s.label for s in self.stat_categories}
+
+    # -- roster ------------------------------------------------------------
+
+    @property
+    def is_daily_lineup(self) -> bool:
+        """True when lineups lock per game rather than once a week."""
+        return self.weekly_deadline == "intraday" or self.roster_type == "date"
+
+    @property
+    def bench_slots(self) -> int:
+        return sum(s.count for s in self.slots if s.position in BENCH_SLOTS)
+
+    @property
+    def ir_slots(self) -> int:
+        return sum(s.count for s in self.slots if s.position in IR_SLOTS)
+
+    @property
+    def util_slots(self) -> int:
+        return sum(s.count for s in self.slots if s.position in UTIL_SLOTS)
+
+    def shape(self) -> LeagueShape:
+        """The `LeagueShape` the valuation and lineup engines already take."""
+        starting = [
+            (YAHOO_TO_POS[s.position], s.count)
+            for s in self.slots
+            if s.starting and s.position in YAHOO_TO_POS
+        ]
+        if not starting:
+            raise SettingsError(f"no startable roster slots in {self.league_key}")
+        return LeagueShape(
+            n_teams=self.num_teams,
+            slots=tuple(starting),
+            util_slots=self.util_slots,
+            bench_slots=self.bench_slots,
+        )
+
+    # -- construction ------------------------------------------------------
+
+    @classmethod
+    def from_payload(
+        cls, flat: dict, weeks: tuple[Week, ...] = (), fetched_at: str = ""
+    ) -> LeagueRuntime:
+        """Build from a `flatten()`ed `/league/{key}/settings` response."""
+
+        def need(key: str) -> str:
+            v = flat.get(key)
+            if v in (None, ""):
+                raise SettingsError(f"Yahoo settings are missing {key!r}")
+            return str(v)
+
+        def num(key: str, default: int | None = None) -> int:
+            v = flat.get(key)
+            if v in (None, ""):
+                if default is None:
+                    raise SettingsError(f"Yahoo settings are missing {key!r}")
+                return default
+            return int(v)
+
+        slots = tuple(
+            RosterSlot(
+                position=str(rp["position"]),
+                count=int(rp.get("count", 0)),
+                starting=bool(int(rp.get("is_starting_position", 0))),
+            )
+            for entry in flat.get("roster_positions", [])
+            if (rp := entry.get("roster_position") if isinstance(entry, dict) else None)
+        )
+        if not slots:
+            raise SettingsError("Yahoo settings carried no roster_positions")
+
+        stats = _stat_categories(flat.get("stat_categories"))
+        waived = _waived_weeks(flat.get("week_has_enough_qualifying_days"))
+
+        # max_adds is absent in leagues that do not cap acquisitions; that is a
+        # real setting ("unlimited"), not a missing field, so it stays None and
+        # waivers.budget_threshold already treats None that way.
+        return cls(
+            league_key=need("league_key"),
+            name=need("name"),
+            num_teams=num("num_teams"),
+            scoring_type=need("scoring_type"),
+            yahoo_season=need("season"),
+            start_date=need("start_date"),
+            end_date=need("end_date"),
+            start_week=num("start_week"),
+            end_week=num("end_week"),
+            current_week=num("current_week"),
+            current_date=need("current_date"),
+            playoff_start_week=num("playoff_start_week"),
+            num_playoff_teams=num("num_playoff_teams", 0),
+            weekly_deadline=str(flat.get("weekly_deadline", "")),
+            roster_type=str(flat.get("roster_type", "")),
+            waiver_type=str(flat.get("waiver_type", "")),
+            waiver_rule=str(flat.get("waiver_rule", "")),
+            waiver_days=num("waiver_time", 0),
+            uses_faab=bool(int(flat.get("uses_faab", 0) or 0)),
+            max_adds=int(flat["max_adds"]) if flat.get("max_adds") else None,
+            max_weekly_adds=int(flat["max_weekly_adds"]) if flat.get("max_weekly_adds") else None,
+            min_games_played=num("min_games_played", 0),
+            trade_end_date=str(flat.get("trade_end_date", "")),
+            slots=slots,
+            weeks=weeks,
+            fetched_at=fetched_at,
+            stat_categories=stats,
+            min_games_waived=waived,
+        )
+
+
+def _stat_categories(node) -> tuple[StatCategory, ...]:
+    """Yahoo's `stat_categories` block, kept whole by `flatten`.
+
+    `sort_order` "1" means a higher value wins the category; "0" means lower
+    does (goals against average).
+    """
+    if not isinstance(node, dict):
+        return ()
+    out: list[StatCategory] = []
+    for entry in node.get("stats", []) or []:
+        st = entry.get("stat") if isinstance(entry, dict) else None
+        if not isinstance(st, dict) or "stat_id" not in st:
+            continue
+        label = str(st.get("display_name") or st.get("abbr") or st.get("name") or "")
+        enabled = str(st.get("enabled", "1")) == "1"
+        display_only = str(st.get("is_only_display_stat", "0")) == "1"
+        out.append(
+            StatCategory(
+                stat_id=int(st["stat_id"]),
+                label=label,
+                scored=enabled and not display_only,
+                higher_is_better=str(st.get("sort_order", "1")) == "1",
+            )
+        )
+    return tuple(out)
+
+
+def _waived_weeks(node) -> tuple[int, ...]:
+    """Weeks flagged as not having enough qualifying days for the minimum."""
+    if not isinstance(node, dict):
+        return ()
+    out = []
+    for week, ok in node.items():
+        try:
+            if int(ok) == 0:
+                out.append(int(week))
+        except (TypeError, ValueError):
+            continue
+    return tuple(sorted(out))

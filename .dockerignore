@@ -11,7 +11,10 @@
 *
 !src
 
-# Nothing under src/ is sensitive (it is the public package), but keep the
-# image clean anyway.
+# What is tracked under src/ is the public package. What is not tracked is not:
+# `src/puckpilot/local/` is git-ignored, machine-only tooling, and it rode along
+# in the uploaded context until this line - never into the image, but into the
+# registry's build step all the same.
+src/puckpilot/local
 **/__pycache__
 **/*.pyc

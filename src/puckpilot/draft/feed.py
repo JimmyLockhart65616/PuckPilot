@@ -30,9 +30,17 @@ from puckpilot.keepers import _norm
 class PickEvent:
     """A pick observed from outside, before the board has accepted it."""
 
-    player_id: int
+    # None -> the room took someone we cannot identify. The pick still
+    # happened, so it still consumes a slot; see `apply`.
+    player_id: int | None
     seat: int | None = None  # None -> whoever is on the clock
     source: str = "feed"
+    # What to call an unidentified pick on screen ("Ivan Demidov (unmapped)").
+    label: str = ""
+    # The room's own 1-based pick number, when the source knows it. Lets a
+    # recovered feed name a pick that was advanced by hand instead of counting
+    # the same slot twice.
+    pick_no: int | None = None
 
 
 class PickFeed(Protocol):
@@ -133,7 +141,7 @@ class SimFeed:
             # An exhausted board would otherwise have _pick_best return an
             # already-taken row forever; say nothing instead of looping.
             return []
-        ctx = {"pick_no": board.made, "next_pick_no": board.next_pick_no(seat)}
+        ctx = {"pick_no": board.made, "next_pick_no": board.survival_pick_no(seat)}
         row = self.bots[seat].pick(
             board.u,
             board.avail,
@@ -162,10 +170,26 @@ class YahooDraftFeed:
 
     name = "yahoo"
 
-    def __init__(self, session, league_key: str, key_to_nhl: dict[str, int]):
+    def __init__(
+        self,
+        session,
+        league_key: str,
+        key_to_nhl: dict[str, int],
+        key_names: dict[str, str] | None = None,
+        min_interval: float = 0.0,
+        clock=time.monotonic,
+    ):
         self.session = session
         self.league_key = league_key
         self.key_to_nhl = key_to_nhl
+        self.key_names = key_names or {}
+        # The console polls every second; the draft results endpoint does not
+        # need asking that often, and it is someone else's server.
+        self.min_interval = min_interval
+        self._clock = clock
+        self._last_poll: float | None = None
+        self.highest_pick = 0
+        self._filled: set[int] = set()
         self.seen: set[str] = set()
         self.unmapped: list[str] = []
         self.last_error: str | None = None
@@ -180,6 +204,10 @@ class YahooDraftFeed:
         self.seat_of_team = {k: i for i, k in enumerate(team_keys)}
 
     def poll(self, board: DraftBoard) -> list[PickEvent]:
+        now = self._clock()
+        if self._last_poll is not None and now - self._last_poll < self.min_interval:
+            return []
+        self._last_poll = now
         try:
             results = self.session.draft_results(self.league_key)
             self.last_error = None
@@ -188,21 +216,115 @@ class YahooDraftFeed:
             return []
 
         events: list[PickEvent] = []
+        results = sorted(results, key=lambda e: _int_or_none(e.get("pick")) or 0)
         for entry in results:
+            pick = _int_or_none(entry.get("pick")) or 0
+            if entry.get("player_key"):
+                self._filled.add(pick)
+        # How far the room has got: the unbroken run of filled picks from #1.
+        # Keeper picks sit in the results from the start (#157-192 here), so
+        # the highest filled number read "192" and showed 127 picks behind.
+        n = 0
+        while n + 1 in self._filled:
+            n += 1
+        self.highest_pick = n
+        for entry in results:
+            pick = _int_or_none(entry.get("pick")) or 0
             player_key = entry.get("player_key")
             if not player_key or player_key in self.seen:
                 continue
             self.seen.add(player_key)
             nhl_id = self.key_to_nhl.get(player_key)
+            seat = self.seat_of_team.get(entry.get("team_key", ""))
+            pick_no = _int_or_none(entry.get("pick"))
             if nhl_id is None:
-                # A prospect outside our NHL data. Recorded so the console can
-                # say "Yahoo took someone we cannot rank" instead of desyncing.
+                # A prospect outside our NHL data. The pick still happened, so
+                # it is emitted unidentified and consumes the slot, rather than
+                # being dropped and leaving the clock a pick behind the room.
                 self.unmapped.append(player_key)
+                name = self.key_names.get(player_key)
+                label = f"{name} (not on our board)" if name else f"{player_key} (unmapped)"
+                events.append(PickEvent(None, seat, self.name, label=label, pick_no=pick_no))
                 continue
-            events.append(
-                PickEvent(nhl_id, self.seat_of_team.get(entry.get("team_key", "")), self.name)
-            )
+            events.append(PickEvent(nhl_id, seat, self.name, pick_no=pick_no))
         return events
+
+    def status(self) -> dict:
+        return {
+            "chosen": "draftresults",
+            "frames": len(self.seen),
+            "picks_detected": len(self.seen),
+            "highest_pick": self.highest_pick,
+            "room_picks": self.highest_pick,
+            "gaps": [],
+            "unmapped": len(self.unmapped),
+            "unmapped_names": [
+                f"{self.key_names[k]} (not on our board)" if k in self.key_names else k
+                for k in self.unmapped[-10:]
+            ],
+            "on_the_clock": None,
+            "error": self.last_error,
+        }
+
+
+class CombinedFeed:
+    """Several pick sources on one board, each catching what the others miss.
+
+    Draft night showed why: the websocket delivered some picks and silently
+    ignored the rest, while the room's own draft results list every pick.
+    Duplicates are harmless - `apply` rejects a player already off the board
+    without consuming a slot - so every source is simply polled and merged in
+    pick order.
+    """
+
+    name = "combined"
+
+    def __init__(self, feeds: list):
+        self.feeds = [f for f in feeds if f is not None]
+
+    @property
+    def last_error(self) -> str | None:
+        errors = [e for f in self.feeds if (e := getattr(f, "last_error", None))]
+        return "; ".join(errors) or None
+
+    def poll(self, board: DraftBoard) -> list[PickEvent]:
+        events: list[PickEvent] = []
+        for feed in self.feeds:
+            try:
+                events += feed.poll(board)
+            except Exception:  # one broken source must not silence the others
+                continue
+        return sorted(events, key=lambda e: e.pick_no if e.pick_no is not None else 10**6)
+
+    def status(self) -> dict:
+        parts = [f.status() for f in self.feeds if hasattr(f, "status")]
+        if not parts:
+            return {}
+        names: list[str] = []
+        for p in parts:
+            names += list(p.get("unmapped_names") or [])
+        clocks = [p["on_the_clock"] for p in parts if p.get("on_the_clock")]
+        return {
+            "chosen": "+".join(str(p.get("chosen")) for p in parts),
+            "frames": sum(int(p.get("frames") or 0) for p in parts),
+            "picks_detected": max(int(p.get("picks_detected") or 0) for p in parts),
+            "highest_pick": max(int(p.get("highest_pick") or 0) for p in parts),
+            "room_picks": max(int(p.get("room_picks") or 0) for p in parts),
+            # A gap one source shows is usually a pick another source has; the
+            # drift count is the honest measure once they are merged.
+            "gaps": [],
+            "unmapped": sum(int(p.get("unmapped") or 0) for p in parts),
+            "unmapped_names": list(dict.fromkeys(names))[-10:],
+            "on_the_clock": clocks[0] if clocks else None,
+            "error": self.last_error,
+        }
+
+
+def _int_or_none(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def apply(board: DraftBoard, events: list[PickEvent]) -> tuple[list, list[str]]:
@@ -214,14 +336,55 @@ def apply(board: DraftBoard, events: list[PickEvent]) -> tuple[list, list[str]]:
     """
     accepted, rejected = [], []
     for event in events:
+        slot = None if event.pick_no is None else board.slot_for_room_pick(event.pick_no)
+        if slot is not None and slot < len(board.slots):
+            # The board's own order says who owns this pick number, and it is
+            # checked against the room's order before the draft. A feed's seat
+            # is not trusted over it: Yahoo's websocket numbers teams by team
+            # id, not draft slot, and on draft night that sent every pick to
+            # the wrong roster.
+            event = PickEvent(
+                event.player_id,
+                board.slots[slot][1],
+                event.source,
+                label=event.label,
+                pick_no=event.pick_no,
+            )
+        if event.pick_no is not None and slot is None and event.player_id is None:
+            # A keeper round on this board. A known player is already off it
+            # (a keeper); an unknown one must not consume a live slot that the
+            # room has not reached.
+            rejected.append(f"pick {event.pick_no} is a keeper slot (not consumed)")
+            continue
         try:
+            if (
+                event.player_id is not None
+                and slot is not None
+                and slot < board.made
+                and board.picks[slot].row < 0
+            ):
+                # The feed has recovered and is naming a pick that was advanced
+                # by hand as "unknown". Fill it in; recording it fresh would
+                # count one slot twice.
+                accepted.append(board.fill_placeholder(slot, event.player_id, event.source))
+                continue
+            if event.player_id is None:
+                if slot is not None and slot < board.made:
+                    rejected.append(f"pick {event.pick_no} is already on the board")
+                    continue
+                board.record_unknown(event.seat, event.label)
+                rejected.append(f"{event.label or 'unidentified player'} (slot consumed)")
+                continue
             accepted.append(board.record(event.player_id, event.seat, event.source))
         except UnknownPlayerError as e:
             # The pick really happened - the room took someone off a board that
             # does not contain them. Consume the slot so our clock stays with
             # the room's; `next_pick_no` drives every survival probability on
             # screen. Still reported, so the console can say how blind it is.
-            board.record_unknown(event.seat)
+            if slot is not None and slot < board.made:
+                rejected.append(f"{e} (pick {event.pick_no} already on the board)")
+                continue
+            board.record_unknown(event.seat, event.label)
             rejected.append(f"{e} (slot consumed)")
         except DraftBoardError as e:
             rejected.append(str(e))
@@ -254,6 +417,8 @@ class ReplayFeed:
         interval: float = 0.0,
         clock=time.monotonic,
         n_teams: int | None = None,
+        yahoo_names: dict[str, str] | None = None,
+        drop: tuple[int, int] | None = None,
     ):
         # Rooms are whatever the lobby hands out - the harvested ones are
         # 14-team while this league is 12. Seat numbers from a differently
@@ -262,6 +427,18 @@ class ReplayFeed:
         # makes a replay useful; the seat attribution is not transferable.
         self.source_teams = n_teams
         self.yahoo_to_nhl = yahoo_to_nhl
+        self.yahoo_names = yahoo_names or {}
+        # The failure drill: while paused, poll() delivers nothing, exactly as
+        # a dead socket would, while the room keeps drafting. `drop=(start,
+        # count)` pauses after `start` room picks for the next `count`.
+        self.paused = False
+        self.missed = 0
+        self.drop = drop
+        # Room picks that are live on OUR board. A harvested mock has no
+        # keepers, so its pick of a player our league keeps never happened in
+        # our room and must not count toward how far the room has got.
+        self.room_picks = 0
+        self.skipped_keepers = 0
         self.interval = interval
         self._clock = clock
         self._picks = sorted(picks, key=lambda p: int(p.get("pick", 0)))
@@ -286,24 +463,59 @@ class ReplayFeed:
         self._next += 1
         yahoo_id = str(row.get("yahoo_id"))
         nhl_id = self.yahoo_to_nhl.get(yahoo_id)
-        if nhl_id is None:
-            # Recorded rather than silently dropped: the console shows how far
-            # the board is behind the room, and that has to stay honest here.
-            self.unmapped.append(yahoo_id)
+        kept = {p.player_id for p in getattr(board, "keeper_picks", [])}
+        if nhl_id is not None and nhl_id in kept:
+            self.skipped_keepers += 1
+            return []
+        self.room_picks += 1
+        if self.drop is not None:
+            start, count = self.drop
+            self.paused = start < self.room_picks <= start + count
+        if self.paused:
+            # The room keeps drafting while the socket is dead: the pick
+            # happens (`room_picks` moves) but this feed never delivers it,
+            # which is exactly what the drill has to recover from by hand.
+            self.missed += 1
             return []
         seat = int(row.get("seat", 0))
-        if self.source_teams and self.source_teams != board.n_teams:
-            return [PickEvent(nhl_id, None, self.name)]
-        return [PickEvent(nhl_id, max(0, seat - 1), self.name)]
+        # Seat numbers from a differently shaped room mean nothing here, and
+        # nor do its pick numbers, which count no keeper slots.
+        same_shape = not self.source_teams or self.source_teams == board.n_teams
+        board_seat = max(0, seat - 1) if same_shape else None
+        if nhl_id is None:
+            # Consumes the slot, exactly as live: dropping it here used to let
+            # a replay drift one pick further behind the room with every
+            # prospect, which is the failure the replay exists to expose.
+            self.unmapped.append(yahoo_id)
+            label = self.yahoo_names.get(yahoo_id)
+            return [
+                PickEvent(
+                    None,
+                    board_seat,
+                    self.name,
+                    label=f"{label} (not on our board)" if label else f"Yahoo player {yahoo_id}",
+                )
+            ]
+        return [PickEvent(nhl_id, board_seat, self.name)]
 
     def status(self) -> dict:
         return {
             "chosen": "replay",
             "frames": len(self._picks),
-            "picks_detected": self._next,
-            "highest_pick": self._next,
+            "picks_detected": self.room_picks - self.missed,
+            "highest_pick": self.room_picks,
+            "room_picks": self.room_picks,
+            "missed": self.missed,
+            "skipped_keepers": self.skipped_keepers,
             "gaps": [],
             "unmapped": len(self.unmapped),
+            "unmapped_names": [
+                f"{self.yahoo_names[i]} (not on our board)"
+                if i in self.yahoo_names
+                else f"Yahoo player {i}"
+                for i in self.unmapped[-10:]
+            ],
             "on_the_clock": None,
             "error": self.last_error,
+            "paused": self.paused,
         }

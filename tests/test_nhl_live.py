@@ -55,3 +55,13 @@ def test_boxscore_carries_hits_and_blocks(nhl):
 def test_standings_has_32_teams(nhl):
     data = nhl.standings_now()
     assert len(data["standings"]) == 32
+
+
+def test_stats_api_ice_time_by_situation_schema():
+    """The power-play split comes from a second unofficial API (data/nhlstats.py)."""
+    from puckpilot.data.nhlstats import NhlStatsClient
+
+    rows = NhlStatsClient().skater_toi("2025-11-01")
+    assert len(rows) > 100  # every skater who played that night
+    assert {"playerId", "gameId", "timeOnIce", "ppTimeOnIce", "shTimeOnIce"} <= set(rows[0])
+    assert all(isinstance(r["ppTimeOnIce"], int) for r in rows[:20])

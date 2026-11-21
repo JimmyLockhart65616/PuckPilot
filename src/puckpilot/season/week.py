@@ -1,0 +1,2207 @@
+"""The week ahead: which categories are in play, and what to do about it.
+
+`engine/waivers.py` ranks an add by how much season value it adds. That is the
+right question in a roto league and the wrong one here. Head to head, a week
+is won category by category, and value banked in a category you were going to
+win by miles is value wasted.
+
+So the order of business is the opposite way round. First work out where this
+week is actually decided - project both rosters over the week's real games and
+see which categories are close. Then look for adds that move those, and only
+those. A 4-game week against a 2-game week is double the counting stats, and
+the schedule says which is which, so most of the edge here is arithmetic
+rather than opinion.
+
+Two deliberate limits, stated rather than papered over:
+
+Margins are reported, not probabilities. Saying "68% to win HIT" would need a
+fitted variance model per category, which does not exist yet; saying "you
+project +14 hits, which is close" is true and is enough to decide an add.
+
+A transaction is never executed from here. This produces proposals, and
+`waiver_proposals` is the only route to acting on one.
+"""
+
+from __future__ import annotations
+
+import math
+import sqlite3
+from dataclasses import dataclass, field, replace
+from statistics import NormalDist
+
+from puckpilot.engine.categories import CATALOG, Category
+from puckpilot.engine.lineup import optimize_lineup
+from puckpilot.league import LeagueConfig
+from puckpilot.season import calendar, legality, tiers
+from puckpilot.season.add_story import SECTIONS, SeasonLeft, games_left, share_of
+from puckpilot.season.pool import PoolPlayer
+from puckpilot.season.roster import RosterPlayer, TeamRoster
+from puckpilot.season.settings import LeagueRuntime, Week
+
+# A category inside this share of the combined projected total is close enough
+# that a single add can plausibly swing it. Judgement, not a fit - and the
+# reason the output says "close", never "68%".
+CLOSE_BAND = 0.06
+
+# Rate categories are not summed; they are derived from their components.
+DERIVED = {"save_pct": ("saves", "shots_against"), "gaa": ("goals_against", "toi_hours")}
+
+# A contribution smaller than this share of the gap is not why you would make
+# the move, so listing it makes every candidate look identical.
+MATERIAL = 0.25
+
+# A gap smaller than this is a coin flip; treat it as this wide so a near-tie
+# does not divide by nothing.
+MIN_GAP = 0.5
+
+# Stances by odds rather than by share of the total: "likely" from 85%, "long
+# shot" below 15%. The relative band compared margins across categories whose
+# weekly noise differs tenfold - it called a +12% lead in wins "safe" when two
+# goalie starts either way make it a coin flip. These are labels, not claims:
+# no percentage is shown until the odds are calibrated against real weeks.
+LIKELY = 0.85
+Z_BAND = NormalDist().inv_cdf(LIKELY)
+
+# Per-game variance as a multiple of the per-game mean, measured within player
+# on 2025-26 game lines: 0.96-1.11 for goals, assists, points, PPP, shots, hits
+# and blocks (Poisson), 3.84 for penalty minutes (majors and misconducts come
+# in lumps). Saves and shots against run about 2. Wins and shutouts are
+# yes/no per start and handled as such.
+DISPERSION = {"pim": 3.84, "saves": 2.0, "shots_against": 2.0, "goals_against": 1.5}
+BERNOULLI = {"wins", "shutouts"}
+# Save percentage varies more than shots alone explain - shot quality, and who
+# is in net - so its binomial spread is widened by this much.
+SV_PCT_INFLATION = 1.3
+
+# A goalie left out of the G slots counts as a bench call only if he was more
+# likely than not to start: a backup who sits sits whoever else is rostered.
+BENCH_START = 0.5
+
+# A swap is worth most made on its best day: after the games the player going
+# out still has, when the one coming in does not play them ("make it Wednesday
+# morning"). `time_moves`: "off" makes every swap at once; "shift" moves a swap
+# the search chose on today's price to its best morning - the same moves, a
+# better day; "search" also lets a swap that pays only when timed be chosen.
+# Waiting is discounted by `WAIT_HAZARD` a day for the chance the free agent is
+# taken first (a claim on waivers is never timed). Measured (add gate, 8
+# leagues): "search" -0.075 +/- 0.028 at 10% a day - more moves that pay on
+# paper only; "shift" +0.003 +/- 0.014 at 10%, -0.035 +/- 0.014 at 5%. Off.
+TIME_MODES = ("off", "shift", "search")
+WAIT_HAZARD = 0.10
+# How many of a step's best swaps are priced on later days as well.
+TIMING_TOP = 5
+
+
+@dataclass(frozen=True)
+class CategoryOutlook:
+    category: Category
+    ours: float
+    theirs: float
+    # How much the lineup and the best available add could each still move this
+    # category. None means it was never measured, which is different from zero -
+    # zero is the common and informative answer.
+    lineup_room: float | None = None
+    add_room: float | None = None
+    # Spread of the final margin from what is still to play; None when not
+    # modelled. It shrinks to nothing as the week is banked.
+    sd: float | None = None
+    # Yahoo's own totals so far, when the week has started.
+    banked_ours: float | None = None
+    banked_theirs: float | None = None
+    # Calibrated odds (season/odds.py, gate G1), when computed.
+    p_win: float | None = None
+    p_tie: float | None = None
+
+    @property
+    def expected(self) -> float | None:
+        """This category's expected score: P(win) + half P(tie)."""
+        if self.p_win is None:
+            return None
+        return self.p_win + 0.5 * (self.p_tie or 0.0)
+
+    @property
+    def room(self) -> float:
+        return (self.lineup_room or 0.0) + (self.add_room or 0.0)
+
+    @property
+    def measured(self) -> bool:
+        return self.lineup_room is not None
+
+    @property
+    def edge(self) -> float:
+        """The margin in our favour: positive is winning, whichever way the
+        category is scored. `margin` alone reads a GAA lead backwards."""
+        return self.margin if self.category.higher_is_better else -self.margin
+
+    @property
+    def z(self) -> float | None:
+        if self.sd is None:
+            return None
+        if self.sd <= 1e-9:
+            return float("inf") if self.edge > 0 else float("-inf") if self.edge < 0 else 0.0
+        return self.edge / self.sd
+
+    @property
+    def band(self) -> str:
+        """likely / in play / long shot, by the odds; by the relative margin
+        only where no spread was modelled."""
+        e = self.expected
+        if e is not None:
+            if e >= LIKELY:
+                return "likely"
+            if e <= 1.0 - LIKELY:
+                return "long shot"
+            return "in play"
+        z = self.z
+        if z is None:
+            if abs(self.relative) <= CLOSE_BAND:
+                return "in play"
+            return "likely" if self.edge > 0 else "long shot"
+        if z >= Z_BAND:
+            return "likely"
+        if z <= -Z_BAND:
+            return "long shot"
+        return "in play"
+
+    @property
+    def reachable(self) -> bool:
+        """Whether any lever left could still close this gap.
+
+        A category we lead is trivially reachable. One we trail is reachable
+        only if re-slotting plus the best add available could make it more
+        than a long shot - with no spread modelled, only if they cover the gap.
+        """
+        if self.edge >= 0:
+            return True
+        if not self.measured:
+            return True
+        if self.sd is not None and self.sd > 1e-9:
+            return (self.edge + self.room) / self.sd > -Z_BAND
+        return abs(self.margin) <= self.room
+
+    @property
+    def margin(self) -> float:
+        return self.ours - self.theirs
+
+    @property
+    def relative(self) -> float:
+        total = abs(self.ours) + abs(self.theirs)
+        return self.edge / total if total else 0.0
+
+    @property
+    def verdict(self) -> str:
+        if self.band == "in play":
+            return "close"
+        return "ahead" if self.edge > 0 else "behind"
+
+    @property
+    def in_play(self) -> bool:
+        return self.band == "in play"
+
+
+@dataclass(frozen=True)
+class AddTarget:
+    """One swap, priced by what it actually changes over the week."""
+
+    player: PoolPlayer
+    starts: float
+    drop_starts: float
+    deltas: dict[str, float]
+    helps: tuple[str, ...]
+    drop: RosterPlayer | None
+    score: float
+    timing: str
+
+    @property
+    def extra_starts(self) -> float:
+        """The only games number that matters: his starts minus the ones lost."""
+        return self.starts - self.drop_starts
+
+    labels: dict[str, str] = field(default_factory=dict)
+    # Change in expected categories won this week, when priced by the odds.
+    gain: float | None = None
+    # The reasons, section -> lines (season/add_story.py).
+    detail: dict = field(default_factory=dict)
+    # Queued: to be made only after this date's games, because the drop plays
+    # that day (`run._recheck_both`). Empty: made as soon as it is approved.
+    after_games_of: str = ""
+    # The drop's tier when the search chose the swap (`season.tiers`): what
+    # the replay's standing-approval arm makes at once.
+    drop_tier: str = ""
+
+    def moved(self, limit: int = 4) -> str:
+        """The biggest category changes, in the league's own units and labels."""
+        best = sorted(self.deltas.items(), key=lambda kv: -abs(kv[1]))[:limit]
+        return "  ".join(f"{self.labels.get(k, k)} {v:+.1f}" for k, v in best if abs(v) >= 0.05)
+
+
+@dataclass(frozen=True)
+class WeekPlan:
+    week: int
+    start: str
+    end: str
+    opponent: str
+    outlook: tuple[CategoryOutlook, ...] = ()
+    targets: tuple[AddTarget, ...] = ()
+    our_games: int = 0
+    their_games: int = 0
+    adds_used_week: int = 0
+    adds_left_week: int | None = None
+    adds_left_season: int | None = None
+    notes: tuple[str, ...] = field(default=())
+    # Where the week stands: Yahoo's status, the days still to play, and
+    # whether the totals include Yahoo's banked results.
+    status: str = ""
+    days_left: int = 0
+    banked: bool = False
+    odds: object | None = None  # season.odds.WeekOdds
+    # Proposed swaps a re-check priced below the floor (build_week_plan `reprice`).
+    lapsed: tuple[AddTarget, ...] = ()
+    # The odds with every move in `targets` made, in order; None with no moves.
+    planned: object | None = None  # season.odds.WeekOdds
+    # Expected categories per unit more of each counting category (odds.leverage).
+    leverage: dict[str, float] = field(default_factory=dict)
+    # Each category's expected score with every acquisition left spent on it
+    # alone - an upper bound (odds.ceilings).
+    ceiling: dict[str, float] = field(default_factory=dict)
+    # day -> how many of our players with a game would sit: the lineup's choices.
+    bench_calls: dict[str, int] = field(default_factory=dict)
+    # label -> expected categories one more typical skater game of ours adds,
+    # per skater category: where an add would count, when none is proposed.
+    extra_game: dict[str, float] = field(default_factory=dict)
+    # Swaps the search priced and turned down - under the floor - best first,
+    # so "nothing proposed" can be told from "nothing considered".
+    near_misses: tuple[AddTarget, ...] = ()
+
+    @property
+    def expected(self) -> float | None:
+        """Expected categories won this week, when the odds were computed."""
+        return self.odds.expected if self.odds is not None else None
+
+    def close(self) -> tuple[CategoryOutlook, ...]:
+        return tuple(o for o in self.outlook if o.in_play)
+
+    def text(self) -> str:
+        left = f" over {self.days_left} day(s)" if self.banked else ""
+        lines = [
+            f"Week {self.week}  {self.start} -> {self.end}   vs {self.opponent or '?'}",
+            f"  starts left{left}: you {self.our_games}, them {self.their_games}",
+            "",
+        ]
+        if self.banked:
+            lines.append(f"  {'cat':5}{'now':>14}{'projected':>18}{'margin':>10}   where it stands")
+        else:
+            lines.append(f"  {'cat':5}{'you':>10}{'them':>10}{'margin':>10}   where it stands")
+        for o in self.outlook:
+            fmt = ".3f" if o.category.key in DERIVED else ".1f"
+            if self.banked:
+                now = (
+                    f"{o.banked_ours:{fmt}}-{o.banked_theirs:{fmt}}"
+                    if o.banked_ours is not None and o.banked_theirs is not None
+                    else "-"
+                )
+                final = f"{o.ours:{fmt}}-{o.theirs:{fmt}}"
+                lines.append(
+                    f"  {o.category.label:5}{now:>14}{final:>18}{o.margin:>+10{fmt}}   {o.band}"
+                )
+            else:
+                lines.append(
+                    f"  {o.category.label:5}{o.ours:>10{fmt}}{o.theirs:>10{fmt}}"
+                    f"{o.margin:>+10{fmt}}   {o.band}"
+                )
+        close = self.close()
+        lines.append("")
+        lines.append(
+            "  In play: " + (", ".join(o.category.label for o in close) if close else "none")
+        )
+        counted = [o for o in self.outlook if o.measured]
+        # A night with more likely starters than slots is a choice, even when
+        # favouring one category would not change who makes it.
+        if not self.bench_calls and counted and all(o.lineup_room == 0.0 for o in counted):
+            lines.append(
+                "  The lineup has no discretion this week - on every day, everyone "
+                "with a game fits in a slot. Only an add moves anything."
+            )
+        gone = tuple(o for o in self.outlook if not o.reachable)
+        if gone:
+            lines.append(
+                "  Out of reach even with an add: "
+                + ", ".join(f"{o.category.label} ({o.margin:+.1f})" for o in gone)
+            )
+        if self.targets:
+            lines.append("")
+            budget = (
+                f"{self.adds_left_week} left this week, {self.adds_left_season} this season"
+                if self.adds_left_week is not None
+                else "no cap"
+            )
+            lines.append(f"  Adds worth proposing ({budget}):")
+            lines.append(
+                "  Every number below is the NET change to your week - the week "
+                "re-slotted with the swap made, minus the week as it stands."
+            )
+            for t in self.targets:
+                lines.append("")
+                lines.append(
+                    f"    {t.player.name} ({t.player.team} "
+                    f"{'/'.join(sorted(t.player.eligible))})"
+                    + (f" for {t.drop.name}" if t.drop else "")
+                )
+                lines.append(
+                    f"      starts {t.starts:g} this week"
+                    + (
+                        f", {t.drop.name} would have started {t.drop_starts:g}"
+                        f" - net {t.extra_starts:+g}"
+                        if t.drop
+                        else ""
+                    )
+                )
+                moved = t.moved()
+                if moved:
+                    lines.append(f"      net change: {moved}")
+                if t.helps:
+                    lines.append(f"      closes: {', '.join(t.helps)}")
+                lines.append(f"      {t.timing}")
+                for key, title in SECTIONS:
+                    if t.detail.get(key):
+                        lines.append(f"      {title}:")
+                        lines.extend(f"        {line}" for line in t.detail[key])
+        for n in self.notes:
+            lines.append(f"  ! {n}")
+        return "\n".join(lines)
+
+
+# -- projection -------------------------------------------------------------
+
+
+def per_game_rates(frame, cats: tuple[Category, ...]) -> dict[int, dict[str, float]]:
+    """player -> per-game rate for each category the league scores.
+
+    Rate categories are carried as their components (saves and shots against,
+    not save percentage) because a week's save percentage is the ratio of the
+    totals, not the average of the rates.
+    """
+    needed: set[str] = set()
+    for c in cats:
+        needed.update(DERIVED.get(c.key, (c.key,)))
+    out: dict[int, dict[str, float]] = {}
+    for pid, row in frame.iterrows():
+        gp = max(_f(row.get("proj_gp")), 1.0)
+        out[int(pid)] = {k: _f(row.get(k)) / gp for k in needed if k in frame.columns}
+    return out
+
+
+def _f(v) -> float:
+    """A projection cell as a number, treating absent as zero.
+
+    `float(x or 0.0)` is not enough: a goalie has no goals column and a skater
+    no saves column, both arrive as NaN, and NaN is truthy - so the idiom
+    passes NaN straight through and one missing cell turns a whole category
+    total into NaN. Measured the hard way on a real weekly plan, where all
+    twelve categories came back NaN.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if f != f else f
+
+
+def project_totals(
+    games: dict[int, float],
+    rates: dict[int, dict[str, float]],
+    cats: tuple[Category, ...],
+    base: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Category totals for a week, from per-player expected games.
+
+    `base` is what is already banked, as components - saves and shots against
+    rather than save percentage - so a rate comes out as the ratio of the whole
+    week's totals, banked and projected together.
+    """
+    acc: dict[str, float] = dict(base or {})
+    for pid, n in games.items():
+        r = rates.get(pid)
+        if not r or n <= 0:
+            continue
+        for k, v in r.items():
+            acc[k] = acc.get(k, 0.0) + v * n
+    out: dict[str, float] = {}
+    for c in cats:
+        if c.key in DERIVED:
+            num, den = DERIVED[c.key]
+            d = acc.get(den, 0.0)
+            out[c.key] = (acc.get(num, 0.0) / d) if d else 0.0
+        else:
+            out[c.key] = acc.get(c.key, 0.0)
+    return out
+
+
+def remaining_variance(
+    games: dict[int, float],
+    rates: dict[int, dict[str, float]],
+    cats: tuple[Category, ...],
+    totals: dict[str, float],
+    base: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Variance of each category's total from the games still to play.
+
+    Banked results are fixed, so only the remainder is uncertain - which is why
+    the spread, and with it every "in play" call, narrows as the week goes on.
+    Rates use the delta method on the final ratio: the binomial spread of the
+    remaining saves, over the week's shots squared.
+    """
+    var: dict[str, float] = {}
+    for pid, n in games.items():
+        r = rates.get(pid)
+        if not r or n <= 0:
+            continue
+        for k, rate in r.items():
+            if rate <= 0:
+                continue
+            if k in BERNOULLI:
+                per = min(rate, 1.0) * (1.0 - min(rate, 1.0))
+            else:
+                per = DISPERSION.get(k, 1.0) * rate
+            var[k] = var.get(k, 0.0) + per * n
+    out: dict[str, float] = {}
+    acc_rem: dict[str, float] = {}
+    for pid, n in games.items():
+        for k, rate in (rates.get(pid) or {}).items():
+            acc_rem[k] = acc_rem.get(k, 0.0) + rate * max(n, 0.0)
+    for c in cats:
+        if c.key == "save_pct":
+            shots = (base or {}).get("shots_against", 0.0) + acc_rem.get("shots_against", 0.0)
+            p = totals.get("save_pct", 0.0)
+            rem = acc_rem.get("shots_against", 0.0)
+            out[c.key] = (
+                (SV_PCT_INFLATION**2) * p * (1.0 - p) * rem / shots**2 if shots > 0 else 0.0
+            )
+        elif c.key in DERIVED:
+            out[c.key] = 0.0  # unmodelled; its stance falls back to the relative band
+        else:
+            out[c.key] = var.get(c.key, 0.0)
+    return out
+
+
+# Yahoo labels that are not categories here but are components of one.
+_COMPONENT_LABELS = {"GA": "goals_against"}
+
+
+def banked_components(by_label: dict[str, float]) -> dict[str, float]:
+    """Yahoo's week-so-far totals, as the component keys projections use.
+
+    Rates themselves are dropped - a banked save percentage is recomputed from
+    banked saves and shots against - and GAA's hours are backed out of GA and
+    GAA, since Yahoo reports no time on ice.
+    """
+    by_key = {c.label.casefold(): c for c in CATALOG.values()}
+    out: dict[str, float] = {}
+    for label, v in by_label.items():
+        if label in _COMPONENT_LABELS:
+            out[_COMPONENT_LABELS[label]] = v
+            continue
+        c = by_key.get(label.casefold())
+        if c is None or c.key in DERIVED:
+            continue
+        out[c.key] = v
+    gaa = next((v for k, v in by_label.items() if k.casefold() == "gaa"), None)
+    if gaa and "goals_against" in out and gaa > 0:
+        out["toi_hours"] = out["goals_against"] / gaa
+    return out
+
+
+def expected_starts(
+    conn: sqlite3.Connection,
+    runtime: LeagueRuntime,
+    week: Week,
+    players,
+    goalie_source,
+    values,
+    weights: dict[str, float] | None = None,
+    days: list[str] | None = None,
+    exclude: dict[str, set[str]] | None = None,
+    goalie_games: dict[int, list[float]] | None = None,
+    benched: dict[str, int] | None = None,
+) -> dict[int, float]:
+    """Expected *starts* for each player over the week, not team games.
+
+    `benched`, when given, collects day -> how many players with a game would
+    sit: the nights the lineup has a choice to make at all.
+
+    `days` narrows it to part of the week - the days still to play, once some
+    have been banked. Default: all of it. `exclude` removes clubs from a day:
+    games already under way, whose stats are in Yahoo's banked totals and
+    must not be projected a second time.
+
+    The distinction matters. A roster carries more players than it can start -
+    thirteen slots against sixteen or seventeen bodies - so counting every
+    rostered player's team games inflates both sides of the comparison, and
+    inflates them unevenly: the team with the deeper bench gains the most from
+    a number it can never actually collect.
+
+    So the week is walked a day at a time and the same assignment the daily
+    plan uses decides who would actually be in a slot. Goalies are counted by
+    probability rather than by whether they were slotted, because a start is
+    not ours to choose - but only as many as there are G slots, taken in the
+    order the lineup would start them. Summing every goalie's P(start) counted a
+    third goalie's start on nights when he could only have sat.
+    """
+    season = runtime.nhl_season
+    shape = runtime.shape()
+    g_slots = sum(n for pos, n in shape.slots if pos == "G")
+    out: dict[int, float] = {}
+
+    for day in week.dates() if days is None else days:
+        playing = calendar.teams_playing(conn, day, season) - (exclude or {}).get(day, set())
+        p_starts = goalie_source.starts(day) if goalie_source else {}
+        cands = []
+        goalies = []
+        for p in players:
+            pid = p.nhl_player_id
+            if pid is None or getattr(p, "is_out", False) or p.team not in playing:
+                continue
+            if getattr(p, "on_ir", False):
+                continue
+            v = values.per_game_tilted(pid, day, weights) if weights else values.per_game(pid, day)
+            if p.position == "G":
+                p_start = float(p_starts.get(pid, 0.0))
+                goalies.append((p_start * v, p_start, pid))
+                continue
+            cands.append((pid, p.eligible, v))
+        goalies.sort(reverse=True)
+        for _, p_start, pid in goalies[:g_slots]:
+            out[pid] = out.get(pid, 0.0) + p_start
+            if goalie_games is not None and p_start > 0:
+                goalie_games.setdefault(pid, []).append(p_start)
+        slotted = optimize_lineup(cands, shape)
+        for pid in slotted:
+            out[pid] = out.get(pid, 0.0) + 1.0
+        if benched is not None:
+            sat = sum(1 for pid, _, _ in cands if pid not in slotted) + sum(
+                1 for _, p_start, _ in goalies[g_slots:] if p_start >= BENCH_START
+            )
+            if sat:
+                benched[day] = sat
+    return {k: round(v, 2) for k, v in out.items()}
+
+
+@dataclass(frozen=True)
+class Steer:
+    """This week's odds as of this run, for deciding tonight by them.
+
+    `ours` is banked plus the days left, without tonight's goalie games - those
+    are the choice being made (`odds.choose_goalies`); `leverage` is what one
+    more unit of each counting category is worth (`odds.leverage`).
+    """
+
+    leverage: dict[str, float]
+    rates: dict[int, dict[str, float]]
+    model: object  # season.odds.OddsModel
+    cats: tuple[Category, ...]
+    ours: object  # season.odds.Side
+    theirs: object  # season.odds.Side
+
+
+def _skaters_only(players, games: dict[int, float]) -> dict[int, float]:
+    skate = {p.nhl_player_id for p in players if p.position != "G"}
+    return {pid: n for pid, n in games.items() if pid in skate}
+
+
+def tonight_odds(
+    conn: sqlite3.Connection,
+    runtime: LeagueRuntime,
+    league: LeagueConfig,
+    week: Week,
+    ours: TeamRoster,
+    theirs: TeamRoster,
+    goalie_source,
+    values,
+    model,
+    day: str,
+    banked_ours: dict[str, float] | None = None,
+    banked_theirs: dict[str, float] | None = None,
+    started: set[str] | None = None,
+    form_rates: bool | None = None,
+) -> Steer | None:
+    """The week's odds as they stand on this run, for tonight's lineup.
+
+    Built the way `build_week_plan` builds them - Yahoo's banked totals by
+    label, plus both sides' expected starts over the days left from `day`, with
+    games already under way left to the banked side - so a lineup decided at
+    5pm sees the score as it stands at 5pm, not Monday's. None when `day` is
+    not in the week.
+    """
+    from puckpilot.season import odds as odds_mod
+    from puckpilot.season.form import FORM_RATES
+
+    if not week.contains(day):
+        return None
+    cats = league.all_cats
+    days = [d for d in week.dates() if d >= day]
+    use_form = FORM_RATES if form_rates is None else form_rates
+    if use_form and hasattr(values, "rates"):
+        rates = values.rates(cats, day)
+    else:
+        rates = per_game_rates(values.frame, cats)
+    exclude = {day: set(started)} if started else None
+    our_games = expected_starts(
+        conn, runtime, week, ours.players, goalie_source, values, days=days, exclude=exclude
+    )
+    later: dict[int, list[float]] = {}
+    expected_starts(
+        conn, runtime, week, ours.players, goalie_source, values, days=days[1:], goalie_games=later
+    )
+    their_goalies: dict[int, list[float]] = {}
+    their_games = expected_starts(
+        conn,
+        runtime,
+        week,
+        theirs.players,
+        goalie_source,
+        values,
+        days=days,
+        exclude=exclude,
+        goalie_games=their_goalies,
+    )
+    our_side = odds_mod.side(
+        banked_components(banked_ours or {}), _skaters_only(ours.players, our_games), later, rates
+    )
+    their_side = odds_mod.side(
+        banked_components(banked_theirs or {}),
+        _skaters_only(theirs.players, their_games),
+        their_goalies,
+        rates,
+    )
+    return Steer(
+        leverage=odds_mod.leverage(model, cats, our_side, their_side),
+        rates=rates,
+        model=model,
+        cats=cats,
+        ours=our_side,
+        theirs=their_side,
+    )
+
+
+def team_games_in(
+    conn: sqlite3.Connection, runtime: LeagueRuntime, week: Week, days: list[str] | None = None
+) -> dict[str, int]:
+    """team -> games in the week (or in `days` of it). The streaming lever, on its own."""
+    by_team: dict[str, int] = {}
+    for day in week.dates() if days is None else days:
+        for t in calendar.teams_playing(conn, day, runtime.nhl_season):
+            by_team[t] = by_team.get(t, 0) + 1
+    return by_team
+
+
+def headroom(
+    conn: sqlite3.Connection,
+    runtime: LeagueRuntime,
+    week: Week,
+    players,
+    goalie_source,
+    values,
+    rates: dict[int, dict[str, float]],
+    cats: tuple[Category, ...],
+    neutral: dict[str, float],
+    favour: float = 6.0,
+    days: list[str] | None = None,
+) -> dict[str, float]:
+    """How far each category could move if the lineup chased only that one.
+
+    This is what makes "out of reach" a fact rather than a threshold someone
+    picked. A gap is only unreachable if it survives the most one-eyed lineup
+    available - so each category is priced again with itself weighted heavily,
+    the week re-slotted under that, and the difference against the neutral
+    projection is the most a lineup decision could add.
+
+    It deliberately measures the *lineup* lever alone. Adds can move a category
+    much further, which is why a category out of reach here can still be worth
+    proposing a transaction for.
+    """
+    out: dict[str, float | None] = {}
+    for c in cats:
+        if c.key in DERIVED:
+            # A rate is not a total, so "how much could this move" has no
+            # answer in these units. Unmeasured, which reads as "do not claim
+            # it is out of reach" - the alternative concedes every rate
+            # category we trail by a hair.
+            out[c.key] = None
+            continue
+        starts = expected_starts(
+            conn, runtime, week, players, goalie_source, values, weights={c.key: favour}, days=days
+        )
+        best = project_totals(starts, rates, cats)
+        out[c.key] = max(best.get(c.key, 0.0) - neutral.get(c.key, 0.0), 0.0)
+    return out
+
+
+def add_headroom(
+    conn: sqlite3.Connection,
+    runtime: LeagueRuntime,
+    week: Week,
+    ours: TeamRoster,
+    pool,
+    rates: dict[int, dict[str, float]],
+    cats: tuple[Category, ...],
+    league,
+    adds_left: int = 1,
+    days: list[str] | None = None,
+    workload=None,
+) -> dict[str, float | None]:
+    """The most the acquisitions left this week could add to each category.
+
+    The lineup is often the smaller lever - a roster of seventeen into thirteen
+    slots has no choice to make on a night when nine players have games - so a
+    category out of reach for the lineup can be well within range of an add.
+
+    Every part of that sentence is load-bearing. Net of the drop, because the
+    player who makes room takes his own production with him. And over the
+    acquisitions actually remaining rather than one, because this league allows
+    three a week: costing it at one add called a 1.3-goal gap unreachable in
+    week 1, which it plainly is not.
+
+    Best-n against worst-n rather than the best add times n, since you cannot
+    sign the same player three times and each further move displaces a better
+    player than the last. An open roster spot is an add with nothing given up.
+    """
+    from puckpilot.season.legality import ir_changes, open_roster_spots
+
+    games = team_games_in(conn, runtime, week, days)
+    if workload is not None:
+        goalies = {
+            p.nhl_player_id
+            for p in (*ours.players, *pool)
+            if p.position == "G" and p.nhl_player_id is not None
+        }
+        games = SeasonLeft(games, workload.shares((days or week.dates())[0], sorted(goalies)))
+    to_ir = {m.player.player_key for m in ir_changes(runtime, ours)[0] if m.is_ir}
+    droppable = [
+        p
+        for p in ours.players
+        if not tiers.is_never(p)
+        and p.nhl_player_id is not None
+        and not p.on_ir
+        and p.player_key not in to_ir
+    ]
+    free = open_roster_spots(runtime, ours)
+    n = max(int(adds_left), 0)
+    out: dict[str, float | None] = {}
+    for c in cats:
+        if c.key in DERIVED:
+            out[c.key] = None
+            continue
+        if n == 0:
+            out[c.key] = 0.0
+            continue
+
+        def week_total(p, key=c.key):
+            return rates.get(p.nhl_player_id, {}).get(key, 0.0) * games_left(games, p)
+
+        give_up = sorted(week_total(p) for p in droppable)[: max(n - free, 0)]
+        gain = sorted(
+            (week_total(p) for p in pool if p.nhl_player_id is not None and not p.is_out),
+            reverse=True,
+        )[:n]
+        out[c.key] = max(sum(gain) - sum(give_up), 0.0)
+    return out
+
+
+# -- the plan ---------------------------------------------------------------
+
+
+def build_week_plan(
+    conn: sqlite3.Connection,
+    runtime: LeagueRuntime,
+    league: LeagueConfig,
+    week: Week,
+    opponent_name: str,
+    ours: TeamRoster,
+    theirs: TeamRoster,
+    pool: list[PoolPlayer],
+    frame,
+    goalie_source,
+    values,
+    adds_used_week: int = 0,
+    adds_used_season: int = 0,
+    min_gain: float = 0.5,
+    max_targets: int = 5,
+    banked_ours: dict[str, float] | None = None,
+    banked_theirs: dict[str, float] | None = None,
+    from_day: str | None = None,
+    started: set[str] | None = None,
+    status: str = "",
+    find_targets: bool = True,
+    odds_model=None,
+    add_scoring: str = "share",
+    min_expected_gain: float = 0.1,
+    playoff_reserve: int = 0,
+    stream_spots: int = 2,
+    upgrade_margin: float = 0.0,
+    measure_room: bool = True,
+    reprice=None,
+    horizon: str = "this week",
+    workload=None,
+    form_rates: bool | None = None,
+    screen_by: str = "value",
+    screen: int = 20,
+    drop_choice: str = "cheapest",
+    goalie_lane: int = 0,
+    goalie_floor: int = 0,
+    goalie_minimum: int = 0,
+    goalie_appearances: float = 0.0,
+    their_goalie_appearances: float | None = None,
+    time_moves: str = "off",
+    wait_hazard: float = WAIT_HAZARD,
+    switch_after: dict[tuple[str, str], str] | None = None,
+    hold: set[str] | None = None,
+) -> WeekPlan:
+    """Both sides' week: what is banked, plus what the days left should add.
+
+    `banked_*` is Yahoo's week-so-far, by Yahoo label (`LiveMatchup.banked`);
+    `from_day` is the first day not yet played, and `started` the clubs whose
+    game that day is already under way - banked, so not projected again. With
+    neither, this is the whole week from its first day, as before.
+
+    Everything that compares two projections - the lineup headroom, the add
+    deltas - works on the remainder alone: a banked total on one side of a
+    difference would be counted as something an add could change.
+
+    `reprice` - (add, drop) pairs already proposed - prices exactly those
+    instead of searching: `targets` is the ones that still pay, `lapsed` the
+    ones that no longer do (season/run.py re-checks the queue this way).
+
+    `workload` (`goalies.GoalieWorkload`) counts a goalie's games over the rest
+    of the season as his club's times his share of its starts, rather than all
+    of his club's; without it every number is as it was.
+
+    `form_rates` (default `form.FORM_RATES`) prices with per-category rates
+    that have seen this season (`values.rates`) instead of August's.
+
+    `screen_by` / `screen`: how the add search shortlists (`_targets`); "union"
+    needs the odds, and falls back to "value" without them.
+
+    `drop_choice` / `goalie_lane`: which drops each candidate is priced
+    against, and how many free-agent goalies are always priced (`_targets`).
+    `stream_spots` / `upgrade_margin` place the drop tiers (`season.tiers`):
+    who rotates, and how much more an upgrade-only player's replacement must
+    be worth over the rest of the season.
+    `goalie_floor` > 0 keeps that many goalies on the roster: no drop takes it
+    below, and while it is below the best free-agent goalies are priced
+    against the cheapest legal skater (`_targets`).
+
+    `goalie_minimum` > 0 prices the league's weekly goalie minimum into the
+    odds: a side short of it wins no goalie category, so each side's chance of
+    reaching it - from the appearances already banked and the goalie games
+    left - weighs the goalie categories (`odds.Side.p_reach_minimum`). Ours
+    start from `goalie_appearances`; `their_goalie_appearances` None means
+    theirs are unknown, and they are taken to reach it.
+
+    `time_moves` ("off" | "shift" | "search", `TIME_MODES`) prices a swap on
+    its best day of the week, not only today (`_targets`), waiting discounted
+    by `wait_hazard` a day. `switch_after`
+    {(add key, drop key): date} re-prices a queued swap as made after that
+    date's games, the day it was planned for. `hold` is player keys no search
+    may drop - the drops of moves approved and not yet made.
+    """
+    from puckpilot.season.form import FORM_RATES
+
+    cats = league.all_cats
+    if workload is None:
+        workload = getattr(values, "workload", None)
+    days = [d for d in week.dates() if from_day is None or d >= from_day]
+    use_form = FORM_RATES if form_rates is None else form_rates
+    if use_form and days and hasattr(values, "rates"):
+        rates = values.rates(cats, days[0])
+    else:
+        rates = per_game_rates(frame, cats)
+    exclude = {days[0]: set(started)} if days and started else None
+    base_ours = banked_components(banked_ours or {})
+    base_theirs = banked_components(banked_theirs or {})
+    banked = banked_ours is not None
+
+    our_goalie_games: dict[int, list[float]] = {}
+    their_goalie_games: dict[int, list[float]] = {}
+    bench_calls: dict[str, int] = {}
+    our_games = expected_starts(
+        conn,
+        runtime,
+        week,
+        ours.players,
+        goalie_source,
+        values,
+        days=days,
+        exclude=exclude,
+        goalie_games=our_goalie_games,
+        benched=bench_calls,
+    )
+    their_games = expected_starts(
+        conn,
+        runtime,
+        week,
+        theirs.players,
+        goalie_source,
+        values,
+        days=days,
+        exclude=exclude,
+        goalie_games=their_goalie_games,
+    )
+    our_rest = project_totals(our_games, rates, cats)
+    our_totals = project_totals(our_games, rates, cats, base=base_ours)
+    their_totals = project_totals(their_games, rates, cats, base=base_theirs)
+    our_var = remaining_variance(our_games, rates, cats, our_totals, base_ours)
+    their_var = remaining_variance(their_games, rates, cats, their_totals, base_theirs)
+    ours_now = project_totals({}, {}, cats, base=base_ours) if banked else {}
+    theirs_now = project_totals({}, {}, cats, base=base_theirs) if banked else {}
+
+    adds_left_week = (
+        None
+        if runtime.max_weekly_adds is None
+        else max(runtime.max_weekly_adds - adds_used_week, 0)
+    )
+    reach: dict[str, float | None] = {}
+    adds: dict[str, float | None] = {}
+    # How far the lineup and the adds left could move each category. Feeds only
+    # "out of reach"; a replay pricing thousands of adds can skip it.
+    if measure_room:
+        reach = headroom(
+            conn,
+            runtime,
+            week,
+            ours.players,
+            goalie_source,
+            values,
+            rates,
+            cats,
+            our_rest,
+            days=days,
+        )
+        adds = add_headroom(
+            conn,
+            runtime,
+            week,
+            ours,
+            pool,
+            rates,
+            cats,
+            league,
+            adds_left=adds_left_week if adds_left_week is not None else 1,
+            days=days,
+            workload=workload,
+        )
+
+    def sd(key: str) -> float | None:
+        if key in DERIVED and key != "save_pct":
+            return None
+        return math.sqrt(max(our_var.get(key, 0.0) + their_var.get(key, 0.0), 0.0))
+
+    odds = their_side = None
+    leverage: dict[str, float] = {}
+    ceiling: dict[str, float] = {}
+    extra_game: dict[str, float] = {}
+    if odds_model is not None:
+        from puckpilot.season import odds as odds_mod
+
+        their_side = odds_mod.side(
+            base_theirs,
+            _skaters_only(theirs.players, their_games),
+            their_goalie_games,
+            rates,
+            min_appearances=goalie_minimum if their_goalie_appearances is not None else 0,
+            appearances=their_goalie_appearances or 0.0,
+        )
+        our_side = odds_mod.side(
+            base_ours,
+            _skaters_only(ours.players, our_games),
+            our_goalie_games,
+            rates,
+            min_appearances=goalie_minimum,
+            appearances=goalie_appearances,
+        )
+        odds = odds_model.week(cats, our_side, their_side)
+        leverage = odds_mod.leverage(odds_model, cats, our_side, their_side)
+        if adds:
+            ceiling = odds_mod.ceilings(odds_model, cats, our_side, their_side, adds)
+        extra_game = _extra_game(leverage, ours.players, rates, league.skater_cats)
+
+    def chance(key: str) -> tuple[float | None, float | None]:
+        o = odds.of(key) if odds is not None else None
+        return (o.p_win, o.p_tie) if o is not None else (None, None)
+
+    outlook = tuple(
+        CategoryOutlook(
+            category=c,
+            ours=our_totals.get(c.key, 0.0),
+            theirs=their_totals.get(c.key, 0.0),
+            lineup_room=reach.get(c.key),
+            add_room=adds.get(c.key),
+            sd=sd(c.key),
+            banked_ours=ours_now.get(c.key) if banked else None,
+            banked_theirs=theirs_now.get(c.key) if banked else None,
+            p_win=chance(c.key)[0],
+            p_tie=chance(c.key)[1],
+        )
+        for c in cats
+    )
+    close_by_key = {o.category.key: o for o in outlook if o.in_play}
+
+    notes: list[str] = []
+    adds_left_season = (
+        None if runtime.max_adds is None else max(runtime.max_adds - adds_used_season, 0)
+    )
+    if adds_left_week == 0:
+        notes.append("No acquisitions left this week - these are for next week.")
+    if not days:
+        notes.append("The week is over - nothing left to play.")
+
+    targets: tuple[AddTarget, ...] = ()
+    # The season's acquisitions are finite and the playoffs need some: past
+    # the reserve, the regular season stops proposing.
+    holding = (
+        adds_left_season is not None
+        and week.number < runtime.playoff_start_week
+        and adds_left_season <= playoff_reserve
+    )
+    if holding and find_targets:
+        notes.append(
+            f"Holding the last {adds_left_season} acquisition(s) for the playoffs - "
+            f"nothing proposed."
+        )
+    ctx = None
+    floor = min_gain
+    if add_scoring == "odds" and odds is not None and their_side is not None:
+        ctx = OddsContext(
+            model=odds_model,
+            banked=base_ours,
+            theirs=their_side,
+            cats=cats,
+            minimum=goalie_minimum,
+            appearances=goalie_appearances,
+        )
+        floor = min_expected_gain
+    lapsed: tuple[AddTarget, ...] = ()
+    near_misses: tuple[AddTarget, ...] = ()
+    if reprice is not None and days:
+        targets, lapsed = _reprice(
+            conn,
+            runtime,
+            league,
+            week,
+            ours,
+            list(reprice),
+            rates,
+            close_by_key,
+            goalie_source,
+            values,
+            floor,
+            base_totals=our_rest,
+            days=days,
+            odds_ctx=ctx,
+            exclude=exclude,
+            horizon=horizon,
+            workload=workload,
+            switch_after=switch_after,
+        )
+    elif find_targets and days and not holding:
+        misses: list = []
+        targets = _targets(
+            conn,
+            runtime,
+            league,
+            week,
+            ours,
+            pool,
+            rates,
+            close_by_key,
+            goalie_source,
+            values,
+            floor,
+            max_targets,
+            base_totals=our_rest,
+            days=days,
+            odds_ctx=ctx,
+            adds_left=_fewest(
+                adds_left_week,
+                None if adds_left_season is None else adds_left_season - playoff_reserve,
+            ),
+            stream_spots=stream_spots,
+            upgrade_margin=upgrade_margin,
+            exclude=exclude,
+            horizon=horizon,
+            workload=workload,
+            screen=screen,
+            screen_by=screen_by,
+            leverage=leverage,
+            drop_choice=drop_choice,
+            goalie_lane=goalie_lane,
+            goalie_floor=goalie_floor,
+            misses=misses,
+            time_moves=time_moves if horizon == "this week" else "off",
+            wait_hazard=wait_hazard,
+            hold=hold,
+        )
+        near_misses = _near_misses(misses, targets)
+
+    # The week with every move made, in order, priced by the odds whichever
+    # way the moves were chosen - what the plan as a whole is for.
+    planned = None
+    if targets and odds is not None and their_side is not None:
+        evaluate = _evaluator(
+            conn,
+            runtime,
+            week,
+            rates,
+            cats,
+            goalie_source,
+            values,
+            days,
+            OddsContext(
+                model=odds_model,
+                banked=base_ours,
+                theirs=their_side,
+                cats=cats,
+                minimum=goalie_minimum,
+                appearances=goalie_appearances,
+            ),
+            exclude,
+        )
+        planned = evaluate(with_moves(ours.players, targets))[2]
+
+    return WeekPlan(
+        week=week.number,
+        start=week.start,
+        end=week.end,
+        opponent=opponent_name,
+        outlook=outlook,
+        targets=targets,
+        our_games=int(sum(our_games.values())),
+        their_games=int(sum(their_games.values())),
+        status=status,
+        days_left=len(days),
+        banked=banked,
+        odds=odds,
+        adds_used_week=adds_used_week,
+        adds_left_week=adds_left_week,
+        adds_left_season=adds_left_season,
+        notes=tuple(notes),
+        lapsed=lapsed,
+        planned=planned,
+        leverage=leverage,
+        ceiling=ceiling,
+        bench_calls=bench_calls,
+        extra_game=extra_game,
+        near_misses=near_misses,
+    )
+
+
+def _extra_game(leverage, players, rates, skater_cats) -> dict[str, float]:
+    """label -> expected categories from one more game of a typical skater of
+    ours: the median of our skaters' per-game rates, times what a unit is worth."""
+    from statistics import median
+
+    lines = [
+        rates[p.nhl_player_id] for p in players if p.position != "G" and p.nhl_player_id in rates
+    ]
+    out: dict[str, float] = {}
+    for c in skater_cats:
+        if c.key not in leverage or not lines:
+            continue
+        out[c.label] = leverage[c.key] * median(r.get(c.key, 0.0) for r in lines)
+    return out
+
+
+def with_moves(players, targets) -> list:
+    """The roster after each target's add and drop, in order."""
+    out = list(players)
+    for t in targets:
+        if t.drop is not None:
+            out = [p for p in out if p.player_key != t.drop.player_key]
+        out.append(t.player)
+    return out
+
+
+@dataclass
+class OddsContext:
+    """What pricing an add by expected categories needs besides the roster."""
+
+    model: object  # season.odds.OddsModel
+    banked: dict[str, float]  # our banked components
+    theirs: object  # season.odds.Side, fixed for the week
+    cats: tuple[Category, ...]
+    # The week's goalie minimum when it is priced (0: not), and our goalie
+    # appearances already banked toward it.
+    minimum: int = 0
+    appearances: float = 0.0
+
+
+def _targets(
+    conn,
+    runtime,
+    league,
+    week,
+    ours,
+    pool,
+    rates,
+    close_by_key,
+    goalie_source,
+    values,
+    min_gain,
+    max_targets,
+    base_totals=None,
+    screen: int = 20,
+    days: list[str] | None = None,
+    odds_ctx: OddsContext | None = None,
+    adds_left: int | None = None,
+    stream_spots: int = 2,
+    upgrade_margin: float = 0.0,
+    exclude: dict[str, set[str]] | None = None,
+    horizon: str = "this week",
+    workload=None,
+    screen_by: str = "value",
+    leverage: dict[str, float] | None = None,
+    drop_choice: str = "cheapest",
+    goalie_lane: int = 0,
+    goalie_floor: int = 0,
+    misses: list | None = None,
+    time_moves: str = "off",
+    wait_hazard: float = WAIT_HAZARD,
+    hold: set[str] | None = None,
+) -> tuple[AddTarget, ...]:
+    """Adds that move a category in play, priced by re-slotting the actual week.
+
+    The first version of this assumed an added player starts every one of his
+    team's games and the dropped one would have too. Neither is true. On a
+    night when your lineup is already full he displaces somebody, so only the
+    difference counts; on a night with an empty slot he is worth the whole
+    thing. The only honest number is the delta, and the only way to get it is
+    to slot the week both ways and subtract.
+
+    Priced one of two ways: with `odds_ctx`, by the change in expected
+    categories won this week; without, by the share of each live gap closed.
+
+    The result is a set that can all be made, chosen greedily: the best add,
+    then the best given that one, never reusing a drop or an open spot. Priced
+    independently, every candidate named the same cheapest drop, and approving
+    one made the rest impossible.
+
+    Who may go is the drop tiers' (`season.tiers`): a rotation player - by
+    default the `stream_spots` worth least over the rest of the season, as a
+    manager rotates a spot or two at the bottom, never the core - for any move
+    that pays; an upgrade-only player only for one worth more over the rest of
+    the season by `upgrade_margin` of his value, which is not streaming but an
+    upgrade; a never-tier player not at all. Without that, the greedy second
+    add reached for the next-cheapest player, and on a real roster that is
+    soon a regular. With nothing pinned and no margin, the rule is the one the
+    add gate measured.
+
+    Each step costs an optimizer pass per candidate, so the pool is screened
+    cheaply first and only the shortlist is priced properly. `screen_by`
+    "union" adds to the value shortlist the `screen` players whose games move
+    this week's categories most by `leverage` - a specialist in a close
+    category can rank outside the value 20 and is then never priced at all.
+
+    `drop_choice` is which drops a candidate is priced against. "cheapest" is
+    the one with the least rest-of-season value - and with a goalie minimum,
+    only one goalie can ever be that one, however little his starts are worth
+    to this roster (a third goalie whose club plays on nights the other two
+    fill both slots). "goalies" also prices every other goalie he may replace,
+    "all" every legal drop. Either of them judges an upgrade on one scale: a
+    goalie's value a game sits below every skater's, so a skater would
+    otherwise count as an upgrade on any goalie, the best one included.
+
+    `goalie_lane` free-agent goalies are always priced, the most expected
+    starts' worth first: the screen counts a goalie's games only where a G
+    slot is empty, which on a roster with goalies to spare is almost never,
+    and ignores whether he starts at all.
+
+    `goalie_floor` goalies are kept: no drop for a skater takes the roster
+    below it, and while it is below, the `FLOOR_LANE` free agents with the most
+    expected starts' worth are priced against the cheapest legal skater - the
+    only way a goalie add is ever priced on a roster whose goalies are its
+    cheapest players, since no skater is then a streamer to give up for one.
+    On 2026-10-12 a drop took a roster to two goalies; one lost his net, and
+    weeks with two or three goalie appearances followed (one under the
+    minimum, which forfeits every goalie category).
+
+    `misses`, when given, collects every swap priced and turned down.
+
+    `time_moves`: "shift" prices the swap each step chose on today's price
+    made on the morning after each of the drop's remaining games too
+    (`_best_day`), and moves it to a later day when that is worth more after
+    `wait_hazard` a day for the chance the free agent is gone by then - the
+    same moves, a better day. "search" prices each step's `TIMING_TOP` best that
+    way before choosing, so a swap that pays only when timed can be chosen.
+    The card says when; `after_games_of` holds the executor until then.
+    `hold`: never dropped.
+    """
+    if time_moves not in TIME_MODES:
+        raise ValueError(f"time_moves must be one of {TIME_MODES}, not {time_moves!r}")
+    if drop_choice not in DROP_CHOICES:
+        raise ValueError(f"drop_choice must be one of {DROP_CHOICES}, not {drop_choice!r}")
+    from puckpilot.season.legality import ir_changes, open_roster_spots
+
+    cats = league.all_cats
+    days = days if days is not None else week.dates()
+    # Going to IR is not the same as being worth dropping: an injured regular
+    # is put on IR, which frees his spot, rather than cut for a streamer.
+    to_ir = {m.player.player_key for m in ir_changes(runtime, ours)[0] if m.is_ir}
+    # Who may be dropped (never one injured, NA, a protected keeper or an
+    # approved move's drop) and the positional counts - roster legality's own,
+    # so a make-room drop and a swap's drop are chosen by the same rule.
+    droppable = legality.droppable(ours, hold or (), to_ir)
+    counts = legality.position_counts(ours, to_ir)
+    rules = league.draft_rules()
+    spots = open_roster_spots(runtime, ours)
+    # Goalies on the roster who can play: the count `goalie_floor` keeps.
+    n_goalies = sum(
+        1 for p in ours.players
+        if p.position == "G" and not p.on_ir and not p.is_out and p.player_key not in to_ir
+    )  # fmt: skip
+    below_floor = goalie_floor > 0 and n_goalies < goalie_floor
+    evaluate = _evaluator(
+        conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx, exclude
+    )
+    split = (
+        _split_evaluator(
+            conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx, exclude
+        )
+        if time_moves != "off" and len(days) > 1
+        else None
+    )
+    notes: dict[tuple[str, str], str] = {}
+
+    base_players = list(ours.players)
+    base_starts, first_totals, base_odds = evaluate(base_players)
+    if base_totals is None:
+        base_totals = first_totals
+    holes = open_slot_days(conn, runtime, ours.players, goalie_source, values, days)
+    playing = {d: calendar.teams_playing(conn, d, runtime.nhl_season) for d in days}
+    # What each player is worth to the rest of the season, not to this week: a
+    # regular with one game this week is still a regular.
+    season_left = _season_left(conn, runtime, days[0], [*ours.players, *pool], workload)
+    keep = _season_value(droppable, values, season_left, days[0])
+    placed = tiers.board(droppable, keep, stream_spots, upgrade_margin=upgrade_margin)
+
+    def may_drop(p, cand) -> bool:
+        floor_holds = goalie_floor and p.position == "G" and cand.position != "G"
+        if floor_holds and n_goalies - 1 < goalie_floor:
+            return False  # the floor: a goalie goes only for a goalie
+        if below_floor and cand.position == "G":
+            # Under the floor a goalie is worth a skater's roster spot - and
+            # only a skater's: a goalie for a goalie leaves the count short.
+            return p.position != "G"
+        if placed[p.player_key].tier is tiers.Tier.ROTATION:
+            return True
+        if drop_choice != "cheapest" and (p.position == "G") != (cand.position == "G"):
+            return False  # an upgrade is judged on one scale
+        incoming = values.per_game(cand.nhl_player_id, days[0]) * games_left(season_left, cand)
+        return tiers.clears(incoming, keep.get(p.player_key, 0.0), upgrade_margin)
+
+    # Cheap screen: his rate times the games he would actually fill - days his
+    # team plays AND a slot he can take is empty. Ranking by team games alone
+    # favoured a four-game week that lands on nights the lineup is already full.
+    eligible = [
+        c for c in pool if c.nhl_player_id is not None and not c.is_out and c.nhl_player_id in rates
+    ]
+    size = max(screen, max_targets)
+    screened = sorted(
+        eligible,
+        key=lambda c: (
+            -values.per_game(c.nhl_player_id, days[0])
+            * _screen_games(c, holes, playing)
+            * share_of(season_left, c)
+        ),
+    )[:size]
+    if screen_by == "union" and leverage:
+        from puckpilot.season.odds import game_worth
+
+        def fit(c) -> float:
+            per_game = game_worth(leverage, rates[c.nhl_player_id])
+            return per_game * _screen_games(c, holes, playing) * share_of(season_left, c)
+
+        seen = {c.player_key for c in screened}
+        screened += [
+            c for c in sorted(eligible, key=fit, reverse=True)[:size] if c.player_key not in seen
+        ]
+    if goalie_lane > 0:
+        p_by_day = {d: (goalie_source.starts(d) if goalie_source else {}) for d in days}
+
+        def starts_worth(c) -> float:
+            starts = sum(
+                float(p_by_day[d].get(c.nhl_player_id, 0.0))
+                for d in days
+                if c.team in playing.get(d, ())
+            )
+            per_game = values.per_game(c.nhl_player_id, days[0])
+            return per_game * starts * share_of(season_left, c)
+
+        seen = {c.player_key for c in screened}
+        lane = sorted(
+            (c for c in eligible if c.position == "G" and c.player_key not in seen),
+            key=starts_worth,
+            reverse=True,
+        )
+        screened += [c for c in lane[:goalie_lane] if starts_worth(c) > 0]
+
+    if below_floor:
+        p_floor = {d: (goalie_source.starts(d) if goalie_source else {}) for d in days}
+
+        def floor_worth(c) -> float:
+            starts = sum(
+                float(p_floor[d].get(c.nhl_player_id, 0.0))
+                for d in days
+                if c.team in playing.get(d, ())
+            )
+            return values.per_game(c.nhl_player_id, days[0]) * starts
+
+        seen = {c.player_key for c in screened}
+        floor_lane = sorted(
+            (c for c in eligible if c.position == "G" and c.player_key not in seen),
+            key=floor_worth,
+            reverse=True,
+        )
+        screened += [c for c in floor_lane[:FLOOR_LANE] if floor_worth(c) > 0]
+
+    steps = max_targets if adds_left is None else min(max_targets, adds_left)
+    chosen: list[AddTarget] = []
+    used_drops: set[str] = set()
+    for _ in range(max(steps, 0)):
+        best: AddTarget | None = None
+        best_after = None
+        priced: list = []
+        for cand in screened:
+            if any(t.player.player_key == cand.player_key for t in chosen):
+                continue
+            over_cap = counts.get(cand.position, 0) + 1 > rules.caps.get(cand.position, 99)
+            if spots > 0 and not over_cap:
+                options: list = [None]
+            else:
+                options = _legal_drops(
+                    cand,
+                    [p for p in droppable if p.player_key not in used_drops and may_drop(p, cand)],
+                    keep,
+                    counts,
+                    rules,
+                    drop_choice,
+                )
+                if not options:
+                    continue
+            for drop in options:
+                t, after_week = _price(
+                    runtime,
+                    cats,
+                    evaluate,
+                    base_players,
+                    base_starts,
+                    base_totals,
+                    base_odds,
+                    close_by_key,
+                    cand,
+                    drop,
+                )
+                priced.append((t, after_week))
+        if split is not None and time_moves == "search":
+            # The step's best few, made on a later morning instead.
+            for t0, _ in sorted(priced, key=lambda x: -x[0].score)[:TIMING_TOP]:
+                timed = _best_day(
+                    runtime,
+                    cats,
+                    split,
+                    base_players,
+                    base_starts,
+                    base_totals,
+                    base_odds,
+                    close_by_key,
+                    t0,
+                    days,
+                    playing,
+                    wait_hazard,
+                )
+                if timed is not None:
+                    priced.append(timed[:2])
+                    notes[_pair_key(timed[0])] = timed[2]
+        for t, after_week in priced:
+            if not _pays(t, min_gain, close_by_key):
+                # Against the roster as it is: later steps price swaps
+                # against one with earlier moves made.
+                if misses is not None and not chosen and not t.after_games_of:
+                    misses.append(t)
+                continue
+            if best is None or t.score > best.score:
+                best = t
+                best_after = after_week
+        if best is None:
+            break
+        if split is not None and time_moves == "shift":
+            # The swap chosen on today's price, on its best morning.
+            timed = _best_day(
+                runtime,
+                cats,
+                split,
+                base_players,
+                base_starts,
+                base_totals,
+                base_odds,
+                close_by_key,
+                best,
+                days,
+                playing,
+                wait_hazard,
+            )
+            if timed is not None:
+                best, best_after = timed[0], timed[1]
+                notes[_pair_key(best)] = timed[2]
+        best = replace(
+            best,
+            drop_tier=placed[best.drop.player_key].tier.value if best.drop is not None else "",
+            detail=_explain(
+                conn,
+                runtime,
+                days,
+                base_players,
+                best,
+                best_after,
+                base_odds,
+                goalie_source,
+                values,
+                rates,
+                odds_ctx,
+                season_left,
+                chosen,
+                exclude,
+                horizon,
+            ),
+        )
+        if best.after_games_of and _pair_key(best) in notes:
+            detail = dict(best.detail)
+            detail["week"] = [notes[_pair_key(best)], *detail.get("week", [])]
+            best = replace(best, detail=detail)
+        chosen.append(best)
+        # Make it, and price the next one against the roster it leaves.
+        if best.drop is None:
+            spots -= 1
+        else:
+            used_drops.add(best.drop.player_key)
+            counts[best.drop.position] = counts.get(best.drop.position, 0) - 1
+        counts[best.player.position] = counts.get(best.player.position, 0) + 1
+        base_players = [
+            p for p in base_players if best.drop is None or p.player_key != best.drop.player_key
+        ]
+        base_players.append(best.player)
+        base_starts, base_totals, base_odds = evaluate(base_players)
+    return tuple(chosen)
+
+
+def _reprice(
+    conn,
+    runtime,
+    league,
+    week,
+    ours,
+    pairs,
+    rates,
+    close_by_key,
+    goalie_source,
+    values,
+    min_gain,
+    base_totals=None,
+    days: list[str] | None = None,
+    odds_ctx: OddsContext | None = None,
+    exclude: dict[str, set[str]] | None = None,
+    horizon: str = "this week",
+    workload=None,
+    switch_after: dict[tuple[str, str], str] | None = None,
+) -> tuple[tuple[AddTarget, ...], tuple[AddTarget, ...]]:
+    """(still pays, no longer pays) for swaps already proposed, priced as the
+    search would price them today - or, one queued to be made after a day's
+    games (`switch_after`, from its `after_games_of`), made then.
+
+    In the order they were proposed, each against the roster the ones kept
+    before it leave - the search's own greedy order, so a later card still
+    assumes the earlier add. One that no longer pays is not made, and those
+    after it are priced without it. No drop is re-chosen: the card is "add X,
+    drop Y", and a different drop would be a different proposal.
+    """
+    cats = league.all_cats
+    days = days if days is not None else week.dates()
+    evaluate = _evaluator(
+        conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx, exclude
+    )
+    base_players = list(ours.players)
+    base_starts, first_totals, base_odds = evaluate(base_players)
+    if base_totals is None:
+        base_totals = first_totals
+    season_left = _season_left(
+        conn, runtime, days[0], [*ours.players, *(c for c, _ in pairs)], workload
+    )
+    kept: list[AddTarget] = []
+    lapsed: list[AddTarget] = []
+    split = _split_evaluator(
+        conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx, exclude
+    )
+    for cand, drop in pairs:
+        when = (switch_after or {}).get((cand.player_key, drop.player_key if drop else ""), "")
+        # Made the morning after `when`: days left before it are played as is.
+        # A date at or past the week's last day is a move queued for the next
+        # week, priced here as before.
+        k = sum(1 for d in days if d <= when) if when else 0
+        timed = 0 < k < len(days)
+        t, after_week = _price(
+            runtime,
+            cats,
+            evaluate,
+            base_players,
+            base_starts,
+            base_totals,
+            base_odds,
+            close_by_key,
+            cand,
+            drop,
+            split=split if timed else None,
+            k=k if timed else 0,
+        )
+        if timed:
+            t = replace(t, after_games_of=when, timing=f"{t.timing}; {_planned(days[k], drop)}")
+        if not _pays(t, min_gain, close_by_key):
+            lapsed.append(t)
+            continue
+        t = replace(
+            t,
+            detail=_explain(
+                conn,
+                runtime,
+                days,
+                base_players,
+                t,
+                after_week,
+                base_odds,
+                goalie_source,
+                values,
+                rates,
+                odds_ctx,
+                season_left,
+                kept,
+                exclude,
+                horizon,
+            ),
+        )
+        if t.after_games_of:
+            detail = dict(t.detail)
+            detail["week"] = [_planned(days[k], drop).capitalize(), *detail.get("week", [])]
+            t = replace(t, detail=detail)
+        kept.append(t)
+        base_players = after_week[0]
+        base_starts, base_totals, base_odds = evaluate(base_players)
+    return tuple(kept), tuple(lapsed)
+
+
+def _split_evaluator(
+    conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx=None, exclude=None
+):
+    """(before, after, k) -> (expected starts, remaining totals, odds) over
+    `days`, `before` playing days[:k] and `after` from days[k] on.
+
+    A swap made on a later morning: the player going out still plays the days
+    before it, the one coming in only those after.
+    """
+    from puckpilot.season import odds as odds_mod
+
+    def evaluate(before, after, k):
+        starts: dict[int, float] = {}
+        ggames: dict[int, list[float]] = {}
+        skate: set[int] = set()
+        for players, ds in ((before, days[:k]), (after, days[k:])):
+            if not ds:
+                continue
+            got: dict[int, list[float]] = {}
+            s = expected_starts(
+                conn,
+                runtime,
+                week,
+                players,
+                goalie_source,
+                values,
+                days=ds,
+                exclude=exclude,
+                goalie_games=got,
+            )
+            for pid, n in s.items():
+                starts[pid] = starts.get(pid, 0.0) + n
+            for pid, ps in got.items():
+                ggames.setdefault(pid, []).extend(ps)
+            skate |= {p.nhl_player_id for p in players if p.position != "G"}
+        totals = project_totals(starts, rates, cats)
+        odds = None
+        if odds_ctx is not None:
+            side = odds_mod.side(
+                odds_ctx.banked,
+                {pid: n for pid, n in starts.items() if pid in skate},
+                ggames,
+                rates,
+                min_appearances=odds_ctx.minimum,
+                appearances=odds_ctx.appearances,
+            )
+            odds = odds_ctx.model.week(odds_ctx.cats, side, odds_ctx.theirs)
+        return starts, totals, odds
+
+    return evaluate
+
+
+def _planned(morning: str, drop) -> str:
+    """'planned for Wed Oct 14 morning, after Smith's games before it'."""
+    from datetime import date as _date
+
+    day = _date.fromisoformat(morning).strftime("%a %b %d")
+    who = f", after {drop.name}'s games before it" if drop is not None else ""
+    return f"planned for {day} morning{who}"
+
+
+def _pair_key(t) -> tuple[str, str]:
+    return (t.player.player_key, t.drop.player_key if t.drop else "")
+
+
+def _best_day(
+    runtime,
+    cats,
+    split,
+    base_players,
+    base_starts,
+    base_totals,
+    base_odds,
+    close_by_key,
+    now: AddTarget,
+    days: list[str],
+    playing: dict[str, set[str]],
+    wait_hazard: float,
+):
+    """(target, week, note) for `now`'s swap made on its best later morning,
+    or None when making it today is as good.
+
+    Only the mornings after the drop's own games can beat today: before one of
+    them, waiting gives up the add's games and keeps nothing. Each day waited
+    is discounted by `wait_hazard`, the chance the free agent is taken first;
+    a waiver claim is not timed at all.
+    """
+    from datetime import date as _date
+
+    drop, cand = now.drop, now.player
+    if drop is None or getattr(cand, "on_waivers", False):
+        return None
+    ks = sorted({i + 1 for i, d in enumerate(days[:-1]) if drop.team in playing.get(d, ())})
+    best = None
+    for k in ks:
+        t, after = _price(
+            runtime,
+            cats,
+            None,
+            base_players,
+            base_starts,
+            base_totals,
+            base_odds,
+            close_by_key,
+            cand,
+            drop,
+            split=split,
+            k=k,
+        )
+        survive = (1.0 - wait_hazard) ** k
+        raw = t.gain if t.gain is not None else t.score
+        score = raw * survive
+        if score <= now.score + 1e-9 or (best is not None and score <= best[0].score):
+            continue
+        day = _date.fromisoformat(days[k]).strftime("%a %b %d")
+        game = _date.fromisoformat(days[k - 1]).strftime("%A")
+        timed = replace(
+            t,
+            gain=t.gain * survive if t.gain is not None else None,
+            score=score,
+            after_games_of=days[k - 1],
+            timing=(
+                f"{t.timing}; best made {day} morning, after {drop.name}'s {game} game - "
+                f"{cand.name} could be taken by then"
+            ),
+        )
+        note = (
+            f"Best made {day} morning, after {drop.name}'s {game} game: {raw:+.2f} "
+            f"categories expected then, {score:+.2f} allowing a {wait_hazard:.0%} a day chance "
+            f"{cand.name} is taken first (made today: {now.score:+.2f})"
+        )
+        best = (timed, after, note)
+    return best
+
+
+def _evaluator(
+    conn, runtime, week, rates, cats, goalie_source, values, days, odds_ctx=None, exclude=None
+):
+    """players -> (expected starts, remaining totals, odds) over `days`.
+
+    Games already under way (`exclude`) are banked, so they are no more
+    available to an add than to anyone else.
+    """
+    from puckpilot.season import odds as odds_mod
+
+    def evaluate(players):
+        ggames: dict[int, list[float]] = {}
+        starts = expected_starts(
+            conn,
+            runtime,
+            week,
+            players,
+            goalie_source,
+            values,
+            days=days,
+            exclude=exclude,
+            goalie_games=ggames,
+        )
+        totals = project_totals(starts, rates, cats)
+        odds = None
+        if odds_ctx is not None:
+            skate = {p.nhl_player_id for p in players if p.position != "G"}
+            side = odds_mod.side(
+                odds_ctx.banked,
+                {pid: n for pid, n in starts.items() if pid in skate},
+                ggames,
+                rates,
+                min_appearances=odds_ctx.minimum,
+                appearances=odds_ctx.appearances,
+            )
+            odds = odds_ctx.model.week(odds_ctx.cats, side, odds_ctx.theirs)
+        return starts, totals, odds
+
+    return evaluate
+
+
+def _price(
+    runtime,
+    cats,
+    evaluate,
+    base_players,
+    base_starts,
+    base_totals,
+    base_odds,
+    close_by_key,
+    cand,
+    drop,
+    split=None,
+    k: int = 0,
+):
+    """One swap against a roster: its AddTarget, and the week it leaves.
+
+    With `split` and `k` > 0 it is made on the morning of the k-th day left:
+    the roster as it is plays the days before (`_split_evaluator`).
+    """
+    after = [p for p in base_players if drop is None or p.player_key != drop.player_key]
+    after.append(cand)
+    later = split is not None and k > 0
+    after_starts, after_totals, after_odds = (
+        split(base_players, after, k) if later else evaluate(after)
+    )
+    deltas = {
+        c.key: after_totals.get(c.key, 0.0) - base_totals.get(c.key, 0.0)
+        for c in cats
+        if c.key not in DERIVED
+    }
+    gain = None
+    if after_odds is not None and base_odds is not None:
+        gain = after_odds.expected - base_odds.expected
+        helps = _odds_moved(base_odds, after_odds)
+        score = gain
+    else:
+        helps = _helped_by(deltas, close_by_key)
+        score = _score(deltas, close_by_key)
+    t = AddTarget(
+        player=cand,
+        starts=after_starts.get(cand.nhl_player_id, 0.0),
+        # The starts he no longer makes: all of them made now, those after
+        # the switch day when it waits for his games first.
+        drop_starts=(
+            base_starts.get(drop.nhl_player_id, 0.0)
+            - (after_starts.get(drop.nhl_player_id, 0.0) if later else 0.0)
+            if drop is not None
+            else 0.0
+        ),
+        deltas=deltas,
+        helps=helps,
+        drop=drop,
+        score=score,
+        labels={c.key: c.label for c in cats},
+        timing=cand.timing(runtime.waiver_days),
+        gain=gain,
+    )
+    return t, (after, after_starts, after_odds)
+
+
+def _near_misses(misses, chosen, limit: int = 5) -> tuple[AddTarget, ...]:
+    """The best few swaps priced and turned down, one per pair, best first."""
+
+    def key(t):
+        return (t.player.player_key, t.drop.player_key if t.drop else "")
+
+    made = {key(t) for t in chosen}
+    best: dict = {}
+    for t in misses:
+        k = key(t)
+        if k not in made and (k not in best or t.score > best[k].score):
+            best[k] = t
+    return tuple(sorted(best.values(), key=lambda t: -t.score)[:limit])
+
+
+def _pays(t: AddTarget, min_gain: float, close_by_key) -> bool:
+    """Worth proposing: over the floor, and priced by shares, moving a close category."""
+    if t.gain is None and close_by_key and not t.helps:
+        return False
+    return t.score >= min_gain
+
+
+def _explain(
+    conn,
+    runtime,
+    days,
+    base_players,
+    best,
+    best_after,
+    base_odds,
+    goalie_source,
+    values,
+    rates,
+    odds_ctx,
+    season_left,
+    prior=(),
+    exclude=None,
+    horizon="this week",
+) -> dict:
+    """The chosen add's reasons, from the numbers it was priced with."""
+    from puckpilot.season import add_story
+    from puckpilot.season.odds import OddsModel
+
+    after, _after_starts, after_odds = best_after
+    return add_story.explain(
+        conn,
+        runtime,
+        days,
+        base_players,
+        after,
+        best.player,
+        best.drop,
+        goalie_source,
+        values,
+        rates,
+        odds_ctx.model if odds_ctx is not None else OddsModel(),
+        base_odds=base_odds,
+        after_odds=after_odds,
+        season_left=season_left,
+        prior=prior,
+        exclude=exclude,
+        horizon=horizon,
+    )
+
+
+def _fewest(*limits: int | None) -> int | None:
+    """The tightest of several caps, any of which may be absent (None)."""
+    known = [max(x, 0) for x in limits if x is not None]
+    return min(known) if known else None
+
+
+def _odds_moved(before, after, limit: int = 3) -> tuple[str, ...]:
+    """The categories an add moves most, as their chance before and after."""
+    moves = []
+    for b in before.cats:
+        a = after.of(b.category.key)
+        if a is None:
+            continue
+        d = a.expected - b.expected
+        if d > 0.005:
+            moves.append((d, f"{b.category.label} {b.expected:.0%} -> {a.expected:.0%}"))
+    moves.sort(key=lambda x: -x[0])
+    return tuple(label for _, label in moves[:limit])
+
+
+def _season_value(droppable, values, season_left, day) -> dict[str, float]:
+    """What letting each player go costs: his value over the rest of the season.
+
+    This used to be his value over *this week* - rate times this week's games -
+    so a regular whose club happened to play once was the cheapest player on
+    the roster, and the add engine could propose cutting him for a four-game
+    streamer.
+    """
+    return {
+        p.player_key: values.per_game(p.nhl_player_id, day) * games_left(season_left, p)
+        for p in droppable
+    }
+
+
+def keep_values(conn, runtime, players, values, day: str, workload=None) -> dict[str, float]:
+    """Each mapped player's value over the rest of the season, by player key.
+
+    What letting him go costs - the scale every drop is chosen on, a swap's
+    (`_season_value`) and roster legality's make-room drop alike.
+    """
+    mapped = [p for p in players if p.nhl_player_id is not None]
+    left = _season_left(conn, runtime, day, mapped, workload)
+    return _season_value(mapped, values, left, day)
+
+
+def _season_left(conn, runtime, day: str, players, workload=None) -> SeasonLeft:
+    """Each club's games from `day` to the season's end, and - with a goalie
+    `workload` - each of these goalies' expected share of his club's."""
+    by_team = calendar.games_by_team(conn, day, runtime.end_date, runtime.nhl_season)
+    if workload is None:
+        return SeasonLeft(by_team)
+    goalies = {p.nhl_player_id for p in players if p.position == "G" and p.nhl_player_id}
+    return SeasonLeft(by_team, workload.shares(day, sorted(goalies)))
+
+
+def open_slot_days(conn, runtime, players, goalie_source, values, days) -> dict[str, set[str]]:
+    """day -> the engine slots nobody on this roster fills that day."""
+    from puckpilot.engine.lineup import slot_instances
+
+    shape = runtime.shape()
+    out: dict[str, set[str]] = {}
+    for day in days:
+        playing = calendar.teams_playing(conn, day, runtime.nhl_season)
+        p_starts = goalie_source.starts(day) if goalie_source else {}
+        cands = []
+        for p in players:
+            pid = p.nhl_player_id
+            if pid is None or getattr(p, "is_out", False) or getattr(p, "on_ir", False):
+                continue
+            if p.team not in playing:
+                continue
+            v = values.per_game(pid, day)
+            if p.position == "G":
+                v *= float(p_starts.get(pid, 0.0))
+            cands.append((pid, p.eligible, v))
+        filled: dict[str, int] = {}
+        for slot in optimize_lineup(cands, shape).values():
+            filled[slot] = filled.get(slot, 0) + 1
+        empty: set[str] = set()
+        for slot in slot_instances(shape):
+            if filled.get(slot, 0) > 0:
+                filled[slot] -= 1
+            else:
+                empty.add(slot)
+        out[day] = empty
+    return out
+
+
+def _screen_games(cand, holes: dict[str, set[str]], playing: dict[str, set[str]]) -> float:
+    """Games a candidate would play straight into an empty slot, for the screen.
+
+    Plus a quarter of his other games, so a week with no holes at all still
+    ranks by schedule rather than arbitrarily - on a full night he can still
+    displace somebody worse, which the full re-slot then prices.
+    """
+    from puckpilot.engine.lineup import _slots_for
+
+    his = _slots_for(cand.eligible)
+    fills = games = 0
+    for day, empty in holes.items():
+        if cand.team in playing.get(day, ()):
+            games += 1
+            if empty & his:
+                fills += 1
+    return fills + 0.25 * (games - fills)
+
+
+def _helped_by(deltas: dict[str, float], close: dict[str, CategoryOutlook]) -> tuple[str, ...]:
+    """Close categories this swap actually moves, largest share of the gap first."""
+    out: list[tuple[float, str]] = []
+    for key, o in close.items():
+        if key in DERIVED:
+            continue
+        adds = deltas.get(key, 0.0)
+        if adds <= 0:
+            continue
+        share = adds / max(abs(o.margin), MIN_GAP)
+        if share >= MATERIAL:
+            pct = min(share, 1.0)
+            out.append((share, f"{o.category.label} {adds:+.1f} ({pct:.0%} of the gap)"))
+    out.sort(key=lambda x: -x[0])
+    return tuple(label for _, label in out[:3])
+
+
+def _score(deltas: dict[str, float], close: dict[str, CategoryOutlook]) -> float:
+    """Rank by how much of each live gap the swap closes, not by raw value.
+
+    A player who adds six shots into a category you trail by seven is worth
+    more this week than one who adds twelve into a category already won.
+    """
+    if not close:
+        return sum(max(v, 0.0) for v in deltas.values())
+    total = 0.0
+    for key, o in close.items():
+        if key in DERIVED:
+            continue
+        total += max(deltas.get(key, 0.0), 0.0) / max(abs(o.margin), MIN_GAP)
+    return total
+
+
+def _categories_helped(
+    rate: dict[str, float], games: float, close: dict[str, CategoryOutlook]
+) -> tuple[str, ...]:
+    """Close categories this player would move, and by how much.
+
+    Not "does he register in this category at all" - nearly every forward has
+    goals, penalty minutes and power-play points above zero, so that test made
+    every candidate read `helps G, PIM, PPP` and told you nothing. What matters
+    is the size of his week against the size of the gap.
+
+    Rate categories are left out. A skater does not move save percentage, and a
+    goalie's effect on it depends on the rest of the week's saves, which is not
+    a per-player number.
+    """
+    out: list[tuple[float, str]] = []
+    for key, o in close.items():
+        if key in DERIVED:
+            continue
+        adds = rate.get(key, 0.0) * games
+        if adds <= 0:
+            continue
+        # Against the gap, not in absolute terms: +2 penalty minutes into a
+        # dead-level category matters more than +2 into one you lead by ten.
+        # The floor keeps a near-tie from dividing by nothing, and keeps the
+        # most flippable category ranked highest rather than capped.
+        share = adds / max(abs(o.margin), MIN_GAP)
+        if share >= MATERIAL:
+            out.append((share, f"{o.category.label} +{adds:.1f}"))
+    out.sort(key=lambda x: -x[0])
+    return tuple(label for _, label in out[:3])
+
+
+def _legal(cand, p, counts, rules) -> bool:
+    """May `p` be dropped to make room for `cand`?
+
+    Position arithmetic only, the same check `waivers.best_move` makes: over a
+    positional cap the drop must come from that position, and no drop may take
+    a position below its minimum - counting the player coming in, so a centre
+    for a centre is never refused for leaving the roster a centre short.
+    """
+    return legality.legal_drop(cand.position, p, counts, rules)
+
+
+def _cheapest_legal_drop(cand, droppable, drop_values, counts, rules):
+    """The least valuable player we may legally drop to make room."""
+    legal = _legal_drops(cand, droppable, drop_values, counts, rules)
+    return legal[0] if legal else None
+
+
+# Free-agent goalies priced while a roster is under its `goalie_floor`.
+FLOOR_LANE = 3
+
+# Which drops a candidate is priced against (`_targets`' `drop_choice`).
+DROP_CHOICES = ("cheapest", "goalies", "all")
+
+
+def _legal_drops(cand, droppable, drop_values, counts, rules, choice: str = "cheapest") -> list:
+    """The drops to price for `cand`, cheapest first: the cheapest legal one,
+    plus every legal goalie ("goalies") or every legal drop ("all")."""
+    legal = [
+        p
+        for p in sorted(droppable, key=lambda x: drop_values.get(x.player_key, 0.0))
+        if _legal(cand, p, counts, rules)
+    ]
+    if choice == "all" or not legal:
+        return legal
+    if choice == "goalies":
+        return [legal[0], *(p for p in legal[1:] if p.position == "G")]
+    return legal[:1]

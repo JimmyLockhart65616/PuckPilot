@@ -1,0 +1,148 @@
+"""The adds gate's plumbing: as-of values, and banked totals in Yahoo's labels."""
+
+from __future__ import annotations
+
+from puckpilot.season.add_gate import AsOfValues, as_labels
+from puckpilot.season.week import banked_components
+
+
+class _Seen:
+    def __init__(self):
+        self.asked: list[str] = []
+
+    def per_game(self, pid, date):
+        self.asked.append(date)
+        return 1.0
+
+    def per_game_tilted(self, pid, date, weights):
+        self.asked.append(date)
+        return 1.0
+
+    def knows(self, pid):
+        return True
+
+    def projected(self, pid):
+        return 1.0
+
+
+def test_a_replayed_morning_cannot_see_later_in_the_week():
+    """Asked about Saturday on Wednesday, the unclamped model blends in
+    Thursday's and Friday's games."""
+    seen = _Seen()
+    v = AsOfValues(seen, "2026-10-07")
+    v.per_game(1, "2026-10-10")
+    v.per_game_tilted(1, "2026-10-09", {})
+    v.per_game(1, "2026-10-05")
+    assert seen.asked == ["2026-10-07", "2026-10-07", "2026-10-05"]
+
+
+def test_banked_components_round_trip_through_yahoos_labels():
+    comp = {
+        "goals": 4.0,
+        "assists": 6.0,
+        "wins": 2.0,
+        "saves": 180.0,
+        "shots_against": 197.0,
+        "goals_against": 17.0,
+        "toi_hours": 5.0,
+    }
+    labels = as_labels(comp)
+    assert labels["G"] == 4.0 and labels["SV"] == 180.0 and labels["SA"] == 197.0
+    assert labels["GAA"] == 17.0 / 5.0
+    back = banked_components(labels)
+    for k in ("goals", "assists", "wins", "saves", "shots_against", "goals_against"):
+        assert back[k] == comp[k]
+    assert back["toi_hours"] == 5.0
+
+
+def test_an_arm_names_its_options():
+    import pytest
+
+    from puckpilot.season.add_gate import parse_arm
+
+    plain = parse_arm("odds-weekly", 2)
+    assert (plain.kind, plain.spots, plain.preload, plain.queue) == ("odds-weekly", 2, 0, 0)
+    assert parse_arm("odds-weekly-s3", 2).spots == 3
+    assert parse_arm("goalie-odds", 2).kind == "goalie-odds"
+    combo = parse_arm("odds-daily-h-f25-q1", 2)
+    assert (combo.kind, combo.horizon, combo.mid_floor, combo.queue) == (
+        "odds-daily",
+        True,
+        0.25,
+        1,
+    )
+    assert parse_arm("odds-daily-h-f25-x1", 2).skip_last == 1
+    goalies = parse_arm("odds-daily-h-f25-x1-g-l", 2)
+    assert (goalies.goalies, goalies.workload, goalies.skip_last) == (True, True, 1)
+    assert not parse_arm("odds-daily", 2).goalies
+    assert parse_arm("odds-daily-h-f25-x1-k1-r-gfa", 2).floor == "auto"
+    assert parse_arm("odds-daily-gf3-dg", 2).floor == 3
+    assert parse_arm("odds-daily", 2).floor is None
+    with pytest.raises(ValueError, match="unknown option"):
+        parse_arm("odds-weekly-zz", 2)
+    with pytest.raises(ValueError, match="unknown arm"):
+        parse_arm("weekly-odds", 2)
+
+
+def test_the_shortlist_and_steering_options_parse_and_combine():
+    from puckpilot.season.add_gate import parse_arm
+
+    plain = parse_arm("odds-daily-h-f25-x1-k1-r", 2)
+    assert (plain.screen_by, plain.screen, plain.steer) == ("value", 20, False)
+    e = parse_arm("odds-daily-h-f25-x1-k1-r-e", 2)
+    assert e.screen_by == "union" and e.form_rates and e.keepers == 1 and e.mid_floor == 0.25
+    assert parse_arm("odds-daily-h-f25-x1-k1-r-n40", 2).screen == 40
+    t = parse_arm("odds-weekly-t-e", 2)
+    assert t.steer and t.screen_by == "union"
+
+
+def test_a_week_short_of_the_goalie_minimum_wins_no_goalie_category():
+    """Yahoo: "you won't win any stat categories or get any points for their
+    performance" (help.yahoo.com/kb/SLN6878) - every goalie category."""
+    from puckpilot.engine.categories import CATALOG
+    from puckpilot.season.add_gate import week_result
+
+    cats = tuple(CATALOG[k] for k in ("G", "W", "SV", "SV%"))
+    ours = {"goals": 5.0, "wins": 3.0, "saves": 100.0, "shots_against": 108.0}
+    theirs = {"goals": 4.0, "wins": 1.0, "saves": 50.0, "shots_against": 56.0}
+    assert week_result(cats, ours, theirs) == 4.0  # 100/108 = .926 beats 50/56 = .893
+    assert week_result(cats, ours, theirs, our_short=True) == 1.0  # the skater cat only
+    assert week_result(cats, theirs, ours, their_short=True) == 3.0  # their goalies forfeit
+    assert week_result(cats, ours, theirs, our_short=True, their_short=True) == 2.5
+
+
+def test_the_goalie_move_options_parse():
+    from puckpilot.season.add_gate import parse_arm
+
+    spec = parse_arm("odds-daily-h-f25-x1-k1-r-dg-j3-w")
+    assert (spec.drops, spec.lane, spec.minimum) == ("goalies", 3, True)
+    assert parse_arm("odds-weekly-da").drops == "all"
+    plain = parse_arm("odds-weekly")
+    assert (plain.drops, plain.lane, plain.minimum) == ("cheapest", 0, False)
+
+
+def test_the_timing_option_parses():
+    from puckpilot.season.add_gate import parse_arm
+
+    y = parse_arm("odds-daily-h-f25-x1-k1-r-y10")
+    assert (y.timing, y.timing_mode) == (0.1, "search")
+    z = parse_arm("odds-daily-h-f25-x1-k1-r-z10")
+    assert (z.timing, z.timing_mode) == (0.1, "shift")
+    assert parse_arm("odds-weekly-y0").timing == 0.0
+    assert parse_arm("odds-weekly").timing is None
+
+
+def test_the_drop_tier_options_parse():
+    """-b: the upgrade-only margin; -o: a tap's chance and delay; -ow: rotation
+    drops made at once, as a standing approval would - only beside a tap."""
+    import pytest
+
+    from puckpilot.season.add_gate import parse_arm
+
+    spec = parse_arm("odds-daily-h-f25-x1-k1-r-b25")
+    assert spec.margin == 0.25 and spec.tap is None and not spec.standing
+    spec = parse_arm("odds-daily-h-f25-x1-k1-r-o80-ow")
+    assert spec.tap == 0.8 and spec.standing and spec.margin == 0.0
+    assert parse_arm("odds-daily").margin == 0.0
+    with pytest.raises(ValueError, match="-ow needs -o"):
+        parse_arm("odds-daily-ow")

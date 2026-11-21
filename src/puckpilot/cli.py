@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import sys
 import time
 from functools import partial
+from pathlib import Path
 
 from puckpilot.config import Settings
 
@@ -153,15 +155,48 @@ def _cmd_yahoo_playermap(args: argparse.Namespace) -> int:
     is what lets the draft-room websocket (which sends ids, not names) mark
     players off the board, and `draft calibrate` refuses to fit without the ADP
     it carries. The 400 rows on disk were written once, ad hoc.
-    """
-    from pathlib import Path
 
+    `--reresolve-only` skips Yahoo entirely and re-tries every already-fetched
+    row that has no NHL id against `nhl_players` as it stands now. Worth
+    running on its own after `data sync` picks up new rookies - no browser
+    session needed for information Yahoo was never asked to give again.
+    """
     from puckpilot.data import store
-    from puckpilot.yahoo.playermap import build_map
-    from puckpilot.yahoo.session import YahooSession, YahooSessionError
 
     settings = Settings()
     conn = store.connect(settings.resolved_db_path)
+
+    if args.recheck:
+        from puckpilot.yahoo.playermap import recheck_map
+
+        changes = recheck_map(conn, progress=print)
+        print()
+        print(f"{len(changes)} stored match(es) changed:" if changes else "No match changed.")
+        for line in changes:
+            print(f"  {line}")
+        return 0
+
+    if args.reresolve_only:
+        from puckpilot.yahoo.playermap import reresolve_unmatched
+
+        report = reresolve_unmatched(conn, progress=print)
+        print()
+        print(f"Re-resolved {report.matched}/{report.total} previously-unmatched players.")
+        if report.fallbacks:
+            print("  via fallback matching, verify these:")
+            for f in report.fallbacks[:15]:
+                print(f"    {f}")
+        if report.unmatched:
+            shown = ", ".join(report.unmatched[:12])
+            more = f" (+{len(report.unmatched) - 12} more)" if len(report.unmatched) > 12 else ""
+            print(f"  still unmatched: {shown}{more}")
+        return 0
+
+    from pathlib import Path
+
+    from puckpilot.yahoo.playermap import build_map
+    from puckpilot.yahoo.session import YahooSession, YahooSessionError
+
     profile = settings._resolve(Path("secrets/chrome-profile"))
     if not profile.exists():
         print(
@@ -183,6 +218,243 @@ def _cmd_yahoo_playermap(args: argparse.Namespace) -> int:
         return 1
     print()
     print(report.text)
+    return 0
+
+
+def _cmd_yahoo_keepers(args: argparse.Namespace) -> int:
+    """Keeper contracts reconstructed from the league's Yahoo draft history.
+
+    Prints; never writes the league file, which is private and hand-kept.
+    """
+    from pathlib import Path
+
+    from puckpilot.data import store
+    from puckpilot.keepers import _norm
+    from puckpilot.yahoo.keeperhistory import derive_contracts, fetch_history
+    from puckpilot.yahoo.session import YahooSession, YahooSessionError
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    league = _league(args)
+    profile = settings._resolve(Path("secrets/chrome-profile"))
+    try:
+        with YahooSession(profile) as session:
+            key = args.league_key or (session.league_keys("nhl") or [None])[0]
+            if not key:
+                print("No NHL league found for this account.", file=sys.stderr)
+                return 2
+            print(f"Reading keeper history for {key}...")
+            history, current, _meta = fetch_history(
+                session, key, depth=league.keeper_years + 1, progress=print
+            )
+            # What the league has actually declared, once it has: the source of
+            # truth, where the contract history is only a forecast of it.
+            declared = session.keepers(key)
+    except YahooSessionError as e:
+        print(f"\n{e}", file=sys.stderr)
+        return 1
+    if not history:
+        print("No previous seasons found - nothing to reconstruct contracts from.")
+        return 1
+
+    report = derive_contracts(
+        history,
+        current,
+        n_keepers=league.n_keepers,
+        keeper_years=league.keeper_years,
+        roster_rounds=league.shape.roster_size,
+    )
+
+    # Our view of each candidate: projected VORP for the season being drafted
+    # and Yahoo's ADP rank, both through the player map (Yahoo ids are stable
+    # across seasons, so a bare id finds a player in this season's map).
+    bare_to_nhl: dict[str, int] = {}
+    bare_adp: dict[str, int] = {}
+    for pkey, nhl_id, rank in conn.execute(
+        "SELECT player_key, nhl_player_id, adp_rank FROM yahoo_player_map"
+    ):
+        b = str(pkey).rsplit(".", 1)[-1]
+        if nhl_id is not None:
+            bare_to_nhl[b] = int(nhl_id)
+        if rank is not None:
+            bare_adp[b] = int(rank)
+    vorp: dict[int, float] = {}
+    try:
+        from puckpilot.draft.sim import build_universe
+
+        u = build_universe(conn, args.season, tuple(TRAIN_SEASONS), league)
+        vorp = {int(p): float(v) for p, v in zip(u.ids, u.vorp, strict=True)}
+    except Exception as e:  # projections are a nicety here, not the point
+        print(f"  (no projections: {e.__class__.__name__}: {e})")
+
+    def label(b: str) -> str:
+        name = report.names.get(b, f"yahoo {b}")
+        bits = []
+        if bare_to_nhl.get(b) in vorp:
+            bits.append(f"VORP {vorp[bare_to_nhl[b]]:+.1f}")
+        if b in bare_adp:
+            bits.append(f"ADP {bare_adp[b]}")
+        return f"{name} ({', '.join(bits)})" if bits else name
+
+    # Seats: Yahoo's own draft order once it is set, else --order.
+    order = [s.strip().lower() for s in (args.order or "").split(",") if s.strip()]
+    seat_of: dict[str, int] = {}
+    for team in current.values():
+        pos = team.get("draft_position")
+        if str(pos or "").isdigit():
+            seat_of[str(team.get("guid"))] = int(pos) - 1
+    for m in report.managers:
+        if m.guid in seat_of or not order:
+            continue
+        for i, want in enumerate(order):
+            if want in (m.nickname.lower(), m.team_name.lower(), str(m.current_team_key).lower()):
+                seat_of[m.guid] = i
+
+    season_label = f"{args.season[:4]}-{args.season[6:]}"
+    print()
+    print(f"Keeper contracts going into {season_label}, from {', '.join(report.seasons)}")
+    print(f"({league.n_keepers} keepers/team, a contract runs {league.keeper_years} keeps)")
+    print(
+        "Keeper rounds found per season: "
+        + ", ".join(f"{k} last {n}" for k, n in report.keeper_rounds.items())
+    )
+    for m in report.managers:
+        seat = seat_of.get(m.guid)
+        print()
+        print(
+            f"{m.nickname} - {m.team_name} ({m.current_team_key or 'not in this season'})"
+            f"  seat {seat if seat is not None else '?'}"
+        )
+        cont = ", ".join(f"{label(b)} kept {n}x" for b, n in m.continuing) or "none"
+        print(f"  continuing: {cont}")
+        if m.expired:
+            print(f"  expired:    {', '.join(report.names.get(b, b) for b in m.expired)}")
+        slots = m.open_slots(league.n_keepers)
+        if slots:
+            ranked = sorted(
+                m.candidates,
+                key=lambda b: -vorp.get(bare_to_nhl.get(b, -1), float("-inf")),
+            )
+            top = ", ".join(label(b) for b in ranked[: args.candidates])
+            print(f"  {slots} open slot(s); first-year keep candidates by our VORP: {top}")
+    if report.lapsed:
+        print()
+        print(
+            "Kept last season but on no roster at its end: "
+            + ", ".join(report.names.get(b, b) for b in report.lapsed)
+        )
+
+    # Cross-check against the league file, by normalized name.
+    listed = {_norm(n.split("(")[0]): n for n in league.keepers_for_season(args.season)}
+    continuing = {
+        _norm(report.names.get(b, "")): report.names.get(b, b)
+        for m in report.managers
+        for b, _n in m.continuing
+    }
+    print()
+    print(f"Against keepers.by_season.{args.season} ({len(listed)} listed):")
+    missing = [continuing[k] for k in continuing if k not in listed]
+    extra = [listed[k] for k in listed if k not in continuing]
+    print(f"  continuing contracts missing from the file: {', '.join(missing) or 'none'}")
+    print(f"  listed but not a continuing contract:       {', '.join(extra) or 'none'}")
+    print("  (a listed name that is not continuing may be a declared first-year keep - check)")
+
+    # Declared keepers, when the league has set them, replace the forecast.
+    guid_of_team = {k: str(t.get("guid")) for k, t in current.items()}
+    nick_of_team = {k: str(t.get("nickname")) for k, t in current.items()}
+    declared_rows = [
+        {
+            "name": str(p.get("full") or ""),
+            "nhl_id": bare_to_nhl.get(str(p.get("player_key", "")).rsplit(".", 1)[-1]),
+            "owner_team_key": p.get("owner_team_key"),
+            "owner": nick_of_team.get(str(p.get("owner_team_key")), "?"),
+            "seat": seat_of.get(guid_of_team.get(str(p.get("owner_team_key")), "")),
+        }
+        for p in declared
+    ]
+    print()
+    if declared_rows:
+        print(f"DECLARED in Yahoo ({len(declared_rows)} keepers) - this is the list to use:")
+        by_owner: dict[str, list[dict]] = {}
+        for r in declared_rows:
+            by_owner.setdefault(f"{r['owner']} (seat {r['seat']})", []).append(r)
+        for owner, rows in sorted(by_owner.items()):
+            print(f"  {owner}: {', '.join(r['name'] for r in rows)}")
+        declared_norm = {_norm(r["name"]) for r in declared_rows}
+        print(f"Against keepers.by_season.{args.season}:")
+        print(
+            "  declared but missing from the file: "
+            + (
+                ", ".join(r["name"] for r in declared_rows if _norm(r["name"]) not in listed)
+                or "none"
+            )
+        )
+        print(
+            "  in the file but not declared:       "
+            + (", ".join(v for k, v in listed.items() if k not in declared_norm) or "none")
+        )
+        print()
+        print("Suggested TOML (declared keepers):")
+        print(f"[keepers.owners.{args.season}]")
+        for rows in sorted(
+            by_owner.values(), key=lambda rs: 99 if rs[0]["seat"] is None else rs[0]["seat"]
+        ):
+            seat = rows[0]["seat"]
+            names = ", ".join(f'"{r["name"]}"' for r in rows)
+            prefix = f'"{seat}"' if seat is not None else "# seat ?"
+            print(f"{prefix} = [{names}]  # {rows[0]['owner']}")
+    else:
+        print("No keepers declared in Yahoo yet.")
+        print("Suggested TOML - continuing contracts only; add first-year keeps as declared:")
+        print(f"[keepers.owners.{args.season}]")
+        for m in sorted(report.managers, key=lambda m: seat_of.get(m.guid, 99)):
+            seat = seat_of.get(m.guid)
+            names = ", ".join(f'"{report.names.get(b, b)}"' for b, _n in m.continuing)
+            prefix = f'"{seat}"' if seat is not None else "# seat ?"
+            print(f"{prefix} = [{names}]  # {m.nickname}")
+
+    # Saved for `draft preflight`, which runs offline: it can then name the
+    # likely first-year keeps that are still shown as available.
+    import datetime
+    import json
+
+    def player(b: str) -> dict:
+        nhl = bare_to_nhl.get(b)
+        return {
+            "name": report.names.get(b, b),
+            "nhl_id": nhl,
+            "vorp": vorp.get(nhl) if nhl is not None else None,
+            "adp": bare_adp.get(b),
+        }
+
+    saved = {
+        "season": args.season,
+        "league_key": key,
+        "derived_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "from": report.seasons,
+        "keeper_rounds": report.keeper_rounds,
+        "declared": declared_rows,
+        "managers": [
+            {
+                "nickname": m.nickname,
+                "team_name": m.team_name,
+                "team_key": m.current_team_key,
+                "seat": seat_of.get(m.guid),
+                "continuing": [{**player(b), "times_kept": n} for b, n in m.continuing],
+                "expired": [player(b) for b in m.expired],
+                "open_slots": m.open_slots(league.n_keepers),
+                "candidates": sorted(
+                    (player(b) for b in m.candidates),
+                    key=lambda p: p["adp"] if p["adp"] is not None else 10_000,
+                )[:10],
+            }
+            for m in report.managers
+        ],
+    }
+    out = settings._resolve(Path("data")) / f"keepers-{args.season}.json"
+    out.write_text(json.dumps(saved, indent=1), encoding="utf-8")
+    print()
+    print(f"Saved for `ppilot draft preflight`: {out}")
     return 0
 
 
@@ -251,7 +523,19 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
     conn = store.connect(settings.resolved_db_path)
     league = _league(args)
 
-    adp, feed, ctx, pump_fn = None, None, None, None
+    from puckpilot.draft.wsfeed import load_yahoo_names
+    from puckpilot.yahoo.playermap import load_adp, resolve_adp_key
+
+    adp, feed, ctx, pump_fn, league_key = None, None, None, None, None
+    # The ADP source is named on its own, not inferred from whether --yahoo
+    # happened to carry a dot: a bare --yahoo used to build the board on the
+    # proxy ADP and say nothing. Replays use it too, so a rehearsal runs on
+    # the same survival numbers the real draft will.
+    if args.yahoo or args.adp_league_key or args.replay:
+        league_key, notes = resolve_adp_key(conn, args.adp_league_key, args.yahoo)
+        for note in notes:
+            print(note, file=sys.stderr if note.startswith("WARNING") else sys.stdout)
+        adp = load_adp(conn, league_key) if league_key else None
     if args.replay:
         # A draft that already happened, played back. Same poll(board) the
         # websocket drives, so this exercises the whole console offline - no
@@ -262,9 +546,16 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
         from puckpilot.draft.wsfeed import load_yahoo_id_map
 
         root = Path(args.replay)
-        harvests = load_all(root if root.is_dir() else root.parent)
-        if not root.is_dir():
-            harvests = [h for h in harvests if root.name in str(root)]
+        if root.is_file():
+            # One named harvest. The old filter compared the path with itself,
+            # so naming a file replayed whichever harvest sorted first.
+            import json
+
+            from puckpilot.draft.farm import MockResult
+
+            harvests = [MockResult(**json.loads(root.read_text(encoding="utf-8")))]
+        else:
+            harvests = load_all(root)
         if not harvests:
             print(f"No harvested drafts under {root}", file=sys.stderr)
             return 2
@@ -274,6 +565,8 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
             load_yahoo_id_map(conn),
             interval=args.replay_interval,
             n_teams=harvests[0].n_teams,
+            yahoo_names=load_yahoo_names(conn),
+            drop=_parse_drop(args.replay_drop),
         )
         print(f"Replaying {len(picks)} picks at {args.replay_interval}s/pick.")
     elif args.yahoo:
@@ -282,27 +575,138 @@ def _cmd_draft_live(args: argparse.Namespace) -> int:
         from playwright.sync_api import sync_playwright
 
         from puckpilot.draft.wsfeed import WebsocketFeed, load_yahoo_id_map, pump
-        from puckpilot.yahoo.playermap import load_adp
 
         profile = settings._resolve(Path("secrets/chrome-profile"))
         pw = sync_playwright().start()
-        ctx = pw.chromium.launch_persistent_context(str(profile), headless=False, channel="chrome")
+        # This is the window the drafter drafts in: Yahoo allows one draft-room
+        # connection per account, so a second browser would log this one out
+        # and blind the feed. no_viewport lets the page follow the real window
+        # instead of Playwright's fixed 1280x720, and it opens maximized.
+        ctx = pw.chromium.launch_persistent_context(
+            str(profile),
+            headless=False,
+            channel="chrome",
+            no_viewport=True,
+            args=["--start-maximized"],
+        )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         with contextlib.suppress(Exception):
             page.goto(args.room, wait_until="domcontentloaded")
-        feed = WebsocketFeed(ctx, load_yahoo_id_map(conn))
-        key = args.yahoo if "." in str(args.yahoo) else None
-        adp = load_adp(conn, key) if key else None
+        import datetime
+
+        frame_log = settings._resolve(Path("data/captures")) / (
+            f"draft-frames-{datetime.datetime.now():%Y%m%d-%H%M%S}.log"
+        )
+        frame_log.parent.mkdir(parents=True, exist_ok=True)
+        ws_feed = WebsocketFeed(
+            ctx, load_yahoo_id_map(conn), load_yahoo_names(conn), frame_log=frame_log
+        )
+        feed = ws_feed
+        results_key = args.yahoo if "." in str(args.yahoo) else league_key
+        if results_key:
+            # Second source: the room's own draft results, read through this
+            # same logged-in browser from a background tab (not a draft-room
+            # connection, so it cannot log the drafter out). On draft night
+            # the websocket caught 2 of the first 6 picks; this lists them all,
+            # and a restarted console catches up on every pick made so far.
+            from puckpilot.draft.feed import CombinedFeed, YahooDraftFeed
+            from puckpilot.yahoo.playermap import load_map
+            from puckpilot.yahoo.session import YahooSession, YahooSessionError
+
+            class _OpenPageSession(YahooSession):
+                """Reads through whichever Yahoo page this browser already has
+                open - never a tab of its own, which the drafter can close and
+                which steals focus from the draft room when it opens."""
+
+                def get(self, path: str) -> dict:
+                    pages = [
+                        p for p in ctx.pages if not p.is_closed() and "yahoo.com" in (p.url or "")
+                    ]
+                    if not pages:
+                        raise YahooSessionError("no open Yahoo page to read draft results through")
+                    self._page = pages[0]
+                    return super().get(path)
+
+            api = _OpenPageSession(profile, check_oauth=False)
+            key_names = {
+                str(k): str(n)
+                for k, n in conn.execute("SELECT player_key, full_name FROM yahoo_player_map")
+            }
+            feed = CombinedFeed(
+                [
+                    ws_feed,
+                    YahooDraftFeed(
+                        api, results_key, load_map(conn, results_key), key_names, min_interval=3.0
+                    ),
+                ]
+            )
+            print(f"Draft results feed armed for {results_key} (every 3s).")
+        print(f"Raw websocket frames -> {frame_log}")
         pump_fn = partial(pump, ctx)
-        print(f"Websocket feed armed ({len(feed.yahoo_to_nhl)} ids). Join your draft room.")
+        print(f"Websocket feed armed ({len(ws_feed.yahoo_to_nhl)} ids). Join your draft room.")
 
     board = build_live_board(
-        conn, league, seat=args.seat, season=args.season, adp=adp, progress=print
+        conn,
+        league,
+        seat=args.seat,
+        season=args.season,
+        adp=adp,
+        league_key=league_key,
+        progress=print,
     )
     if args.web:
         return _serve_live(board, feed, ctx, args, league)
     run_live(board, feed=feed, cfg=LiveConfig(top=args.top), pump=pump_fn)
     return 0
+
+
+def _cmd_draft_preflight(args: argparse.Namespace) -> int:
+    """Everything that would silently corrupt the draft-night board, in one
+    command that exits non-zero on any of it."""
+    from pathlib import Path
+
+    from puckpilot.data import store
+    from puckpilot.preflight import run_preflight
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    # Load the file directly: the CLI's usual path falls back to generic
+    # settings with one stderr line, which is exactly what this must catch.
+    path = Path(args.league) if getattr(args, "league", None) else settings.resolved_league_path
+
+    prober = None
+    if not args.offline:
+        from puckpilot.yahoo.probe import probe
+
+        def prober():
+            return probe(settings)
+
+    import json
+
+    saved = settings._resolve(Path("data")) / f"keepers-{args.season}.json"
+    history = json.loads(saved.read_text(encoding="utf-8")) if saved.is_file() else None
+
+    report, _board = run_preflight(
+        conn,
+        path,
+        seat=args.seat,
+        season=args.season,
+        adp_league_key=args.adp_league_key,
+        prober=prober,
+        progress=print if args.verbose else (lambda _m: None),
+        keeper_history=history,
+    )
+    print(report.text)
+    return 1 if report.failed else 0
+
+
+def _parse_drop(raw: str | None) -> tuple[int, int] | None:
+    """`--replay-drop 20:10` -> (20, 10): the feed goes dead after 20 room
+    picks and misses the next 10, while the room keeps drafting."""
+    if not raw:
+        return None
+    start, _, count = str(raw).partition(":")
+    return int(start), int(count or 1)
 
 
 def _parse_seats(raw: str | None, default: int) -> list[int]:
@@ -324,22 +728,31 @@ def _push_snapshots(url: str, key: str, state, seats: list[int]) -> str:
     take the local console with it. The drafter on this machine keeps working
     off the loopback view either way.
     """
-    import json
     import urllib.error
     import urllib.request
 
-    body = json.dumps({"seats": {str(s): state.snapshot(s) for s in seats}}).encode("utf-8")
-    req = urllib.request.Request(
-        url.rstrip("/") + "/push",
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/json", "X-PuckPilot-Key": key},
-    )
+    from puckpilot.web import wire
+
     try:
+        # Inside the guard too. Building the snapshot or serializing it can fail
+        # as well as the network can, and this runs in the console's main loop:
+        # an exception here used to end the draft console, not just the push.
+        body = wire.dumps({"seats": {str(s): state.snapshot(s) for s in seats}}).encode("utf-8")
+    except Exception as e:
+        return f"snapshot for push failed: {e.__class__.__name__}: {e}"
+    try:
+        # Constructing the request parses the URL, so a mistyped --publish
+        # ("puckpilot-draft.azurecontainerapps.io", no scheme) raises here.
+        req = urllib.request.Request(
+            url.rstrip("/") + "/push",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json", "X-PuckPilot-Key": key},
+        )
         with urllib.request.urlopen(req, timeout=5) as r:
             r.read()
         return ""
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as e:
         return f"{e.__class__.__name__}: {e}"
 
 
@@ -683,6 +1096,1400 @@ def _cmd_draft_mock(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_draft_e2e(args: argparse.Namespace) -> int:
+    """Whole drafts through board -> snapshot -> local page -> push -> relay -> guest."""
+    import os
+    from pathlib import Path
+
+    import numpy as np
+
+    from puckpilot.data import store
+    from puckpilot.draft import e2e
+    from puckpilot.draft.farm import load_all
+    from puckpilot.draft.feed import ReplayFeed
+    from puckpilot.draft.live import build_live_board
+    from puckpilot.draft.wsfeed import WebsocketFeed, load_yahoo_id_map
+    from puckpilot.web.relay import build_id
+    from puckpilot.yahoo.playermap import load_adp
+
+    def say(msg: str) -> None:
+        print(msg, flush=True)
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    league = _league(args)
+    quiet = (lambda _m: None) if not args.verbose else say
+
+    if args.relay:
+        owner = args.owner_key or os.environ.get("PUCKPILOT_E2E_OWNER_KEY", "")
+        guest = args.guest_key or os.environ.get("PUCKPILOT_E2E_GUEST_KEY", "")
+        if not owner or not guest:
+            say("--relay needs both keys: --owner-key/--guest-key or PUCKPILOT_E2E_*_KEY")
+            return 2
+        relay = e2e.Relay(args.relay.rstrip("/"), owner, guest)
+        say(f"relay: {relay.url}")
+    else:
+        relay = e2e.start_local_relay()
+        say(f"relay: in-process at {relay.url}")
+
+    keys = [r[0] for r in conn.execute("SELECT DISTINCT league_key FROM yahoo_player_map")]
+    league_key = args.adp_league_key or (keys[0] if len(keys) == 1 else None)
+    adp = load_adp(conn, league_key) if league_key else None
+    say(f"ADP: {league_key or 'none'} ({len(adp or {})} players)")
+    names = e2e.yahoo_rows(conn)
+    idmap = load_yahoo_id_map(conn)
+    seats = _parse_seats(args.seats, 0)
+    expect = build_id() if args.expect_build else None
+    sources = {"sim", "harvest", "capture"} if args.source == "all" else {args.source}
+    results = []
+
+    def run(board, polls, name, source, **kw):
+        harness = e2e.Harness(
+            board,
+            relay,
+            cats=kw.pop("cats"),
+            seats=tuple(s for s in seats if s < board.n_teams),
+            every=args.every,
+            names=names,
+            expect_build=expect,
+            browser_every=args.browser,
+            stale_check=args.stale_check,
+        )
+        try:
+            res = harness.run(polls, name, source, **kw)
+        except Exception as e:
+            # One broken draft must not hide the rest of the run's results.
+            res = e2e.E2EResult(name=name, source=source)
+            res.violations.append(f"harness crashed: {e.__class__.__name__}: {e}")
+        results.append(res)
+        say(res.summary())
+
+    try:
+        if "sim" in sources:
+            for i in range(args.drafts):
+                seed = args.seed + i
+                board = build_live_board(
+                    conn, league, seat=seats[0], season=args.season, adp=adp,
+                    league_key=league_key, progress=quiet,
+                )  # fmt: skip
+                rng = np.random.default_rng(seed)
+                run(board, e2e.sim_polls(board, league, rng), f"sim seed {seed}", "sim",
+                    cats=league.all_cats)  # fmt: skip
+
+        if "harvest" in sources:
+            rooms = load_all(Path(args.mocks))[: args.limit or None]
+            for h in rooms:
+                room = e2e.room_league(league, h.n_teams)
+                board = build_live_board(
+                    conn, room, seat=seats[0], season=args.season, adp=adp,
+                    league_key=league_key, progress=quiet,
+                )  # fmt: skip
+                feed = ReplayFeed(h.picks, idmap, interval=0, n_teams=h.n_teams)
+                polls = e2e.replay_polls(feed, len(h.picks) + 5)
+                run(board, polls, f"room {h.started[:16]}", "harvest", cats=league.all_cats,
+                    room_picks=len(h.picks), unmapped=lambda f=feed: f.unmapped,
+                    feed=feed)  # fmt: skip
+
+        if "capture" in sources:
+            dirs = sorted(p.parent for p in Path(args.captures).glob("*/websocket.jsonl"))
+            for d in dirs[: args.limit or None]:
+                frames = e2e.capture_frames(d)
+                feed = WebsocketFeed(e2e._NoContext(), idmap)
+                for f in frames:  # size the room from the frames themselves
+                    feed.ingest(f)
+                n_teams = max((fr.seat for fr in feed.state.picks.values()), default=0)
+                room_picks = len(feed.state.picks)
+                if not n_teams:
+                    say(f"SKIP  {d.name}: no pick frames")
+                    continue
+                feed = WebsocketFeed(e2e._NoContext(), idmap)
+                room = e2e.room_league(league, n_teams)
+                board = build_live_board(
+                    conn, room, seat=seats[0], season=args.season, adp=adp,
+                    league_key=league_key, progress=quiet,
+                )  # fmt: skip
+                run(board, e2e.frame_polls(frames, feed), f"capture {d.name}", "capture",
+                    cats=league.all_cats, room_picks=room_picks,
+                    unmapped=lambda f=feed: f.state.unmapped, feed=feed)  # fmt: skip
+    finally:
+        relay.close()
+
+    failed = [r for r in results if not r.passed]
+    picks = sum(r.picks for r in results)
+    checks = sum(r.checks for r in results)
+    say("")
+    say(
+        f"{len(results)} draft(s), {picks} picks, {checks} verified states, "
+        f"{sum(r.pushes for r in results)} pushes: "
+        + ("ALL PASS" if not failed else f"{len(failed)} FAILED")
+    )
+    return 1 if failed or not results else 0
+
+
+def _season_setup(args, *, need_session: bool = False):
+    """Manager, database, league key and (optionally) a Yahoo read session."""
+    from puckpilot.season import cli_support
+
+    manager = cli_support.resolve_manager(getattr(args, "manager", None))
+    conn = cli_support.open_db(manager)
+    league_key = cli_support.resolve_league_key(conn, manager)
+    session = cli_support.open_session(manager) if need_session else None
+    return manager, conn, league_key, session
+
+
+def _cmd_season_settings(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support
+    from puckpilot.season.fetch import fetch_runtime, load_runtime, save_runtime
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    runtime = None if args.refresh else load_runtime(conn, league_key)
+    if runtime is None:
+        try:
+            runtime = cli_support.run_session(
+                manager,
+                lambda s: fetch_runtime(s, league_key, manager.team_key, progress=print),
+            )
+        except (ManagerError, cli_support.SeasonCliError) as e:
+            return cli_support.report(e)
+        save_runtime(conn, runtime)
+        print(f"saved settings for {league_key}")
+
+    print()
+    print(
+        f"{runtime.name}  ({runtime.league_key})  {runtime.num_teams} teams, {runtime.scoring_type}"
+    )
+    print(f"  season      {runtime.start_date} -> {runtime.end_date}  ({runtime.nhl_season})")
+    print(
+        f"  weeks       {runtime.start_week}-{runtime.end_week}, "
+        f"{runtime.regular_weeks} regular, playoffs from {runtime.playoff_start_week} "
+        f"({runtime.num_playoff_teams} teams)"
+    )
+    print(
+        f"  calendar    {len(runtime.weeks)} week(s) fetched; current week {runtime.current_week}"
+    )
+    mode = "daily" if runtime.is_daily_lineup else "weekly"
+    print(f"  lineups     {mode} ({runtime.weekly_deadline})")
+    print(
+        f"  waivers     type {runtime.waiver_type}, {runtime.waiver_days}-day, "
+        f"FAAB {'yes' if runtime.uses_faab else 'no'}"
+    )
+    print(
+        f"  adds        {runtime.max_weekly_adds} per week, {runtime.max_adds} per season; "
+        f"min games {runtime.min_games_played}"
+    )
+    print(f"  slots       {', '.join(f'{s.position}x{s.count}' for s in runtime.slots)}")
+    print(f"  fetched     {runtime.fetched_at}")
+    return 0
+
+
+def _cmd_season_roster(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support
+    from puckpilot.season.fetch import discover_team_key, fetch_roster, save_roster
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.yahoo import playermap
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        pmap = playermap.load_map(conn, league_key)
+
+        def _read(session):
+            key = manager.team_key or discover_team_key(session, league_key)
+            return fetch_roster(session, key, args.date, player_map=pmap)
+
+        roster = cli_support.run_session(manager, _read)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    save_roster(conn, manager.name, roster)
+    print(f"{roster.team_key}  {roster.date}  {len(roster)} players")
+    print()
+    for p in roster.players:
+        flag = f"  [{p.status_full or p.status}{' - ' + p.injury_note if p.injury_note else ''}]"
+        print(
+            f"  {p.selected_slot:5} {p.name:24} {p.team:4} "
+            f"{'/'.join(sorted(p.eligible)):8}{flag if p.status else ''}"
+        )
+    if roster.unmapped:
+        print()
+        print(f"  not in the player map: {', '.join(roster.unmapped)}")
+        print("  run `ppilot yahoo playermap --reresolve-only` after a data sync")
+    return 0
+
+
+def _cmd_lineup_today(args: argparse.Namespace) -> int:
+    from dataclasses import replace
+
+    from puckpilot.season import cli_support
+    from puckpilot.season.fetch import discover_team_key, fetch_live, fetch_roster, save_roster
+    from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.run import WeekContext, week_for
+    from puckpilot.season.today import build_plan, yahoo_goalie_games
+    from puckpilot.season.values import build_value_model
+    from puckpilot.yahoo import playermap
+
+    date = args.date or cli_support.today_str()
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        if args.steer:
+            # This run only: a preview of the steered lineup, config untouched.
+            lineup = replace(manager.authority.lineup, steer=args.steer)
+            manager = replace(manager, authority=replace(manager.authority, lineup=lineup))
+        runtime = cli_support.load_rules(conn, league_key)
+        pmap = playermap.load_map(conn, league_key)
+        ctx = WeekContext(week=week_for(runtime, date))
+
+        def _read(session):
+            key = manager.team_key or discover_team_key(session, league_key)
+            got = fetch_roster(session, key, date, player_map=pmap)
+            # Steered, tonight is decided on the week's score as it stands now.
+            if manager.authority.lineup.steer == "odds" and ctx.week is not None:
+                ctx.live = fetch_live(session, key, ctx.week.number)[0]
+                opp = ctx.live.theirs.team_key if ctx.live is not None else ""
+                if opp:
+                    ctx.theirs = fetch_roster(session, opp, date, player_map=pmap)
+            return got
+
+        roster = cli_support.run_session(manager, _read)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    save_roster(conn, manager.name, roster)
+    season = runtime.nhl_season
+    train = [s for s in DEFAULT_SEASONS if s < season][-3:][::-1]
+    values = build_value_model(conn, season, tuple(train), manager.league)
+    goalies = ChainedGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0]))
+
+    from puckpilot.season import protocol as protocol_mod
+
+    weights = protocol_mod.lineup_weights(conn, manager, league_key, runtime, date)
+    steer = None
+    if manager.authority.lineup.steer == "odds" and date != cli_support.today_str():
+        # The live score is today's: a later night's odds would miss the days
+        # between, as if nothing were played until then.
+        print("  Not steered: the week's odds can only be read for tonight.")
+    elif manager.authority.lineup.steer == "odds":
+        from puckpilot.season.run import _steer
+
+        try:
+            steer = _steer(conn, manager, runtime, ctx, roster, (values, goalies), date)
+        except Exception as e:  # noqa: BLE001 - the plain lineup still stands
+            print(f"  Not steered ({e}); the lineup below is by season value.")
+
+    plan = build_plan(
+        conn,
+        runtime,
+        roster,
+        values,
+        goalies,
+        date,
+        manager=manager.name,
+        authority=manager.authority.lineup,
+        goalie_starts_so_far=yahoo_goalie_games(roster, runtime, date),
+        weights=weights,
+        steer=steer,
+    )
+    from puckpilot.season import explain
+
+    reasons = explain.move_reasons(conn, runtime, plan)
+    print()
+    for line in explain.plan_story(conn, runtime, plan):
+        print(f"  {line}" if line else "")
+    if plan.moves:
+        print()
+        print("  What to change in Yahoo:")
+        for m in plan.moves:
+            print(f"    {m.describe()}")
+            why = reasons.get(m.player.player_key)
+            if why:
+                print(f"        {why}")
+        print()
+        print(f"  Worth {plan.gain:+.2f} for tonight, in the same units the board used.")
+    print()
+    print(f"  {plan.authority_reason}")
+    _season_publish(manager, conn, league_key, plan=plan, roster=roster, reasons=reasons)
+    if args.explain:
+        print()
+        print("  value tonight:")
+        for c in sorted(plan.playing, key=lambda c: -c.value):
+            extra = f"  {c.note}" if c.note else ""
+            p = f"  P(start) {c.p_start:.0%}" if c.p_start is not None else ""
+            print(f"    {c.value:+7.2f}  {c.player.name:24}{p}{extra}")
+    return 0
+
+
+def _next_scheduled_run(manager, conn, league_key, roster):
+    """When the scheduler runs next, so a manual push does not read as stale."""
+    try:
+        from puckpilot.season import cli_support
+        from puckpilot.season.run import _next_run
+
+        runtime = cli_support.load_rules(conn, league_key)
+        return _next_run(conn, manager, runtime, cli_support.today_str(), roster)
+    except Exception:  # noqa: BLE001 - freshness is advisory; never block a push
+        return None
+
+
+def _season_publish(
+    manager, conn, league_key, plan=None, week_plan=None, roster=None, reasons=None, quiet=False
+):
+    """Collect decisions, then push the view. Never fatal."""
+    from puckpilot.season import publish, snapshot
+    from puckpilot.season.run import lineup_by
+
+    if not manager.page.publishes:
+        return
+    key = manager.page.owner_key or os.environ.get("PUCKPILOT_MANAGER_KEY", "")
+    if not key:
+        if not quiet:
+            print("  (page configured but no key - set PUCKPILOT_MANAGER_KEY)")
+        return
+    try:
+        decisions = publish.collect(manager.page.url, key)
+        for line in snapshot.apply_decisions(conn, decisions, manager=manager.name):
+            print(f"  from your phone: {line}")
+        named = roster or week_plan
+        snap = snapshot.build(
+            conn,
+            manager.name,
+            league_key,
+            team_name=getattr(named, "team_name", "") or manager.name,
+            plan=plan,
+            week_plan=week_plan,
+            roster=roster,
+            reasons=reasons,
+            next_run=_next_scheduled_run(manager, conn, league_key, roster),
+            show_protocol=manager.authority.lineup.follow_protocol,
+            lineup_by=lineup_by(manager),
+        )
+        publish.push(manager.page.url, key, snap)
+        if not quiet:
+            print(f"  published to {manager.page.url}")
+    except publish.PublishError as e:
+        print(f"  page not updated: {e}")
+
+
+def _cmd_season_locks(args: argparse.Namespace) -> int:
+    """When today's slots actually close, and by when a run has to happen."""
+    from puckpilot.season import cli_support, locks
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    day = args.date or cli_support.today_str()
+    teams = locks.roster_teams(conn, manager.name, manager.team_key, day)
+    if not teams:
+        print("No roster snapshot yet - run `ppilot season roster` first.")
+        return 2
+    todays = locks.locks_for(conn, runtime.nhl_season, day, teams)
+    print(locks.describe(day, todays))
+    ahead = locks.upcoming(todays)
+    if day == cli_support.today_str():
+        print()
+        if ahead:
+            print("  Still to come: " + ", ".join(x.pretty for x in ahead))
+            print("  Runs would be scheduled at: " + ", ".join(locks.run_times(ahead)))
+        else:
+            print("  Everything of yours has locked for today.")
+    return 0
+
+
+def _cmd_season_league(args: argparse.Namespace) -> int:
+    """The whole league: standings, each team's adds, and the latest moves."""
+    from puckpilot.season import cli_support
+    from puckpilot.season import league_feed as lf
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.yahoo import playermap
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+        if not args.no_read:
+            pmap = playermap.load_map(conn, league_key)
+            today = args.date or cli_support.today_str()
+            got = cli_support.run_session(
+                manager,
+                lambda s: lf.sync(conn, lf.YahooLeagueSource(s), league_key, runtime,
+                                  manager.name, today, pmap, rosters=not args.no_rosters),
+            )  # fmt: skip
+            print(
+                f"  read: {got['transactions']} transaction rows, {got['standings']} teams, "
+                f"{got['weeks']} week(s) of scores, {got['rosters']} week-start roster(s)"
+            )
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    view = lf.summary(conn, league_key)
+    print(f"\n  Standings {view['date']} (categories W-L-T), and adds this season:")
+    for t in view["teams"]:
+        print(f"    {t['rank']:>2}  {t['name'][:24]:24}  {t['record']:>9}   "
+              f"{t['adds']:>2} adds ({t['goalie_adds']} goalies)")  # fmt: skip
+    recent = conn.execute(
+        "SELECT at, team_key, action, name, positions FROM league_transactions "
+        "WHERE league_key = ? AND action IN ('add', 'drop') ORDER BY at DESC LIMIT ?",
+        (league_key, args.recent),
+    ).fetchall()
+    names = {t["team_key"]: t["name"] for t in view["teams"]}
+    if recent:
+        print(f"\n  Latest {len(recent)} moves:")
+        for r in recent:
+            sign = "+" if r[2] == "add" else "-"
+            print(f"    {r[0][:16].replace('T', ' ')}Z  {names.get(r[1], r[1])[:20]:20}  "
+                  f"{sign}{r[3]} ({r[4]})")  # fmt: skip
+    return 0
+
+
+def _cmd_season_g3(args: argparse.Namespace) -> int:
+    """Live calibration over every team in the league (season/g3.py)."""
+    from puckpilot.season import cli_support, g3
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+    weeks = {int(w) for w in args.weeks.split(",")} if args.weeks else None
+    report = g3.build(conn, runtime, manager.league, our_team=manager.team_key or "", weeks=weeks)
+    if not report.cases:
+        print("No final week with every team's week-start roster saved - `ppilot season league`.")
+        return 0
+    print(report.text())
+    return 0
+
+
+def _cmd_season_moves(args: argparse.Namespace) -> int:
+    """What each move PuckPilot made actually did (season/ledger.py)."""
+    from puckpilot.season import cli_support, ledger
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+    team_key = manager.team_key or ""
+    if not team_key:
+        row = conn.execute(
+            "SELECT team_key FROM waiver_proposals WHERE manager = ? AND team_key != '' LIMIT 1",
+            (manager.name,),
+        ).fetchone()
+        team_key = row[0] if row else ""
+    today = args.date or cli_support.today_str()
+    lines = ledger.build(conn, manager.name, league_key, team_key, runtime.nhl_season, today)
+    if not lines:
+        print("No move made yet.")
+        return 0
+    print("Each move: the nights the player brought in was in a starting slot and played,")
+    print("and what the player let go did on those same nights.\n")
+    for line in lines:
+        print("\n".join(ledger.describe(line, manager.league.all_cats)))
+    return 0
+
+
+def _cmd_season_tiers(args: argparse.Namespace) -> int:
+    """Every player's drop tier, and the manager's pins (season/tiers.py)."""
+    from puckpilot.season import cli_support, tiers
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+    roster = _own_saved_roster(conn, manager, league_key)
+    if roster is None:
+        print("No roster saved yet - run `ppilot season run` (or `season today`) first.")
+        return 1
+    changes = [(x, None) for x in args.auto or []]
+    for spec in args.set or []:
+        name, _, tier = spec.rpartition("=")
+        if not name:
+            print(f'--set takes NAME=TIER, e.g. "Tyler Kleven=rotation"; got {spec!r}')
+            return 2
+        changes.append((name, tier))
+    for name, tier in changes:
+        try:
+            player = _roster_player_named(roster, name)
+            wanted = tiers.tier_of(tier)
+        except ValueError as e:
+            print(e)
+            return 2
+        tiers.pin(conn, manager.name, league_key, player.player_key, wanted, name=player.name,
+                  nhl_player_id=player.nhl_player_id, via="cli")  # fmt: skip
+        print(f"{player.name}: " + (f"set to {wanted.label}" if wanted else "back to automatic"))
+    from puckpilot.season import roster_stats
+
+    roster = tiers.annotate(roster, tiers.pins(conn, manager.name, league_key))
+    day = args.date or cli_support.today_str()
+    placed, keep = _season_tier_board(conn, manager, league_key, runtime, roster, day)
+    stats = roster_stats.describe(
+        roster, keep, roster_stats.season_ranks(conn, manager.league, runtime.nhl_season, day)
+    )
+    order = {tiers.Tier.ROTATION: 0, tiers.Tier.UPGRADE: 1, tiers.Tier.NEVER: 2}
+    print(f"\nDrop tiers for {manager.name} (roster of {roster.date}):")
+    for p in sorted(roster.players, key=lambda q: (order[placed[q.player_key].tier], q.name)):
+        pl = placed[p.player_key]
+        src = {"you": "set by you", "auto": "automatic"}.get(pl.source, pl.source)
+        why = "" if pl.source == tiers.YOU else f" - {pl.why}"
+        print(f"  {pl.tier.label:13} {p.name:24} {src}{why}")
+        print(f"  {'':13} {'':24} {stats[p.player_key]['text']}")
+    gone = [x for x in tiers.listing(conn, manager.name, league_key)
+            if x["player_key"] not in {p.player_key for p in roster.players}]  # fmt: skip
+    if gone:
+        print("\nPinned, not on the roster now (applies if he comes back):")
+        for x in gone:
+            print(f"  {tiers.Tier(x['tier']).label:13} {x['name'] or x['player_key']}  "
+                  f"(set {x['set_at'][:10]} via {x['set_via']})")  # fmt: skip
+    print("\nYahoo's own undroppable flag is not in a saved roster; the run applies it.")
+    return 0
+
+
+def _own_saved_roster(conn, manager, league_key: str):
+    """This manager's own roster as last saved - the league read saves every
+    team's, so the team is the one his runs acted for."""
+    from puckpilot.season import g3, keeper_value
+
+    team_key = manager.team_key or ""
+    if not team_key:
+        row = conn.execute(
+            "SELECT team_key FROM season_actions WHERE manager = ? AND league_key = ? "
+            "AND team_key != '' ORDER BY id DESC LIMIT 1",
+            (manager.name, league_key),
+        ).fetchone()
+        team_key = row[0] if row else ""
+    row = conn.execute(
+        "SELECT MAX(date) FROM yahoo_roster_snapshots WHERE manager = ? AND team_key = ?",
+        (manager.name, team_key),
+    ).fetchone()
+    if not team_key or not row or not row[0]:
+        return None
+    roster = g3.saved_roster(conn, league_key, team_key, row[0])
+    if roster is None:
+        return None
+    latest = conn.execute(
+        "SELECT MAX(week_start) FROM keeper_ranks WHERE manager = ?", (manager.name,)
+    ).fetchone()
+    if latest and latest[0] and manager.authority.transactions.protect_keepers:
+        roster = keeper_value.annotate(roster, keeper_value.load(conn, manager.name, latest[0]))
+    return roster
+
+
+def _roster_player_named(roster, name: str):
+    """The rostered player a typed name means: exact first, then a unique part."""
+    want = name.strip().casefold()
+    exact = [p for p in roster.players if p.name.casefold() == want]
+    if len(exact) == 1:
+        return exact[0]
+    part = [p for p in roster.players if want and want in p.name.casefold()]
+    if len(part) == 1:
+        return part[0]
+    if part:
+        raise ValueError(f"{name!r} could be {', '.join(p.name for p in part)} - be more exact")
+    raise ValueError(f"nobody called {name!r} on the roster")
+
+
+def _season_tier_board(conn, manager, league_key: str, runtime, roster, day: str):
+    """(the tiers as the run places them, the rest-of-season values they are
+    placed by): the same values, the same players who may go."""
+    from puckpilot.season import legality, tiers
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.run import _train_seasons
+    from puckpilot.season.values import build_value_model
+
+    season = runtime.nhl_season
+    values = build_value_model(conn, season, _train_seasons(season), manager.league)
+    keep = weekmod.keep_values(
+        conn, runtime, roster.players, values, day, getattr(values, "workload", None)
+    )
+    terms = manager.authority.transactions
+    placed = tiers.board(
+        roster.players,
+        keep,
+        terms.stream_spots,
+        droppable=legality.droppable(roster),
+        upgrade_margin=terms.upgrade_margin,
+    )
+    return placed, keep
+
+
+def _cmd_season_statuses(args: argparse.Namespace) -> int:
+    """Every tag seen since logging began, what followed, and the play rate by tag."""
+    from puckpilot.season import cli_support, status_log
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    results = status_log.outcomes(
+        conn, league_key, runtime.nhl_season, args.date or cli_support.today_str()
+    )
+    if not results:
+        print("No injury or availability tags seen yet.")
+        return 0
+    for o in results:
+        seen = o.change.new_seen_at[:16].replace("T", " ")
+        nxt = f"next game {o.game_date}: {o.result}" if o.game_date else o.result
+        late = f"  [tag came after the {o.missed_game} game started]" if o.missed_game else ""
+        print(f"  {seen}Z  {o.change.describe()}  - {nxt}{late}")
+    print()
+    for line in status_log.summary(results):
+        print(f"  {line}")
+    return 0
+
+
+def _cmd_season_keepers(args: argparse.Namespace) -> int:
+    """Next season's keepers on the roster, best first, and which are protected."""
+    from puckpilot.season import cli_support
+    from puckpilot.season import keeper_value as kv
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    league = manager.league
+    if league.n_keepers <= 0:
+        print(f"{league.name} keeps nobody - there is nothing to protect.")
+        return 0
+    season = runtime.nhl_season
+    day = args.date or cli_support.today_str()
+    players = kv.saved_roster(conn, manager.name, manager.team_key)
+    if not players:
+        print("No saved roster yet - run `ppilot season run` first.")
+        return 1
+    path = Settings()._resolve(Path("data")) / f"keepers-{season}.json"
+    board = kv.board(conn, league, season, day, path)
+    terms = manager.authority.transactions
+    ranks = board.rank(players, margin=terms.keeper_margin)
+    print(
+        f"Next season's keepers for {manager.name}, as of {day}: you keep {league.n_keepers}, "
+        f"each in place of a {league.keeper_placement}-round pick worth {board.cost:+.1f} "
+        f"next season. Values below are over that pick."
+    )
+    if board.times_kept is None:
+        print(f"  (no {path.name}: every player taken as eligible)")
+    if not terms.protect_keepers:
+        print("  protect_keepers is off: these are not protected from a drop.")
+    print()
+    for k in ranks:
+        rank = f"{k.rank:>3}" if k.rank is not None else "  -"
+        if not k.eligible:
+            note = f"kept {k.times_kept}x - not eligible"
+        elif k.value is None:
+            note = "no projection for next season"
+        else:
+            note = f"{k.value:+6.1f}" + (f"  kept {k.times_kept}x" if k.times_kept else "")
+        flag = "  PROTECTED" if k.protected and terms.protect_keepers else ""
+        print(f"  {rank}  {k.name:26}{note}{flag}")
+    return 0
+
+
+def _cmd_season_hot(args: argparse.Namespace) -> int:
+    """Hot streaks on your roster and among the free agents, with what each is worth."""
+    from puckpilot.season import calendar, cli_support
+    from puckpilot.season import keeper_value as kv
+    from puckpilot.season import streaks as st
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.run import _train_seasons, week_for
+    from puckpilot.season.values import build_value_model
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    season = runtime.nhl_season
+    day = args.date or cli_support.today_str()
+    values = build_value_model(conn, season, _train_seasons(season), manager.league)
+    finder = values.streaks
+    rates = values.rates(manager.league.all_cats, day)
+    week = week_for(runtime, day)
+    end = week.end if week is not None else day
+    games = calendar.games_by_team(conn, day, end, season)
+    scale = dict(zip(values.data.skater_keys, values.vm.sk_sd, strict=False))
+
+    print(
+        f"Hot streaks as of {day}: a player's last {st.STREAK_GAMES} games beat what the model "
+        f"expected going in, by a margin chance gives {st.STREAK_ALPHA:.0%} of the time. "
+        f"Judged from his {st.MIN_GAMES}th game (the range measured)."
+    )
+    print(
+        "  With more ice time a streak is a role change and lasts; without it, mostly luck - "
+        "but hits streaks last about two weeks either way, and PIM fades. "
+        "(`ppilot season streak-check`)"
+    )
+    mine = kv.saved_roster(conn, manager.name, manager.team_key)
+    snaps = conn.execute(
+        "SELECT name, team_abbrev, nhl_player_id FROM yahoo_roster_snapshots WHERE manager = ? "
+        "AND date = (SELECT MAX(date) FROM yahoo_roster_snapshots WHERE manager = ?)",
+        (manager.name, manager.name),
+    ).fetchall()
+    teams = {r[2]: r[1] for r in snaps}
+    roster = [(p.name, teams.get(p.nhl_player_id, ""), "", p.nhl_player_id, None) for p in mine]
+    print()
+    print("Your roster:")
+    ours = st.hot_players(roster, finder, day, rates, games, scale)
+    for h in ours:
+        for s in h.streaks:
+            print(f"  {h.name} ({h.team}): {s.describe()}")
+    if not ours:
+        print("  nobody hot")
+    row = conn.execute(
+        "SELECT MAX(date) FROM yahoo_fa_snapshots WHERE league_key = ? AND date <= ?",
+        (league_key, day),
+    ).fetchone()
+    if not row or not row[0]:
+        print()
+        print("No free-agent read on file yet - the weekly run saves one.")
+        return 0
+    fas = conn.execute(
+        "SELECT name, team_abbrev, positions, nhl_player_id, percent_owned FROM "
+        "yahoo_fa_snapshots WHERE league_key = ? AND date = ? AND nhl_player_id IS NOT NULL",
+        (league_key, row[0]),
+    ).fetchall()
+    hot = [h for h in st.hot_players(fas, finder, day, rates, games, scale) if h.score > 0]
+    print()
+    print(f"Free agents (read {row[0]}), most useful this week first:")
+    for h in hot[: args.top]:
+        owned = f", {h.owned:.0f}% owned" if h.owned is not None else ""
+        adds = ", ".join(
+            f"{v:+.1f} {st.LABELS.get(k, k)}" for k, v in sorted(h.extra.items()) if v > 0
+        )
+        print(f"  {h.name} ({h.team} {h.positions}{owned}) - this week about {adds} over his rate")
+        for s in h.streaks:
+            print(f"      {s.describe()}")
+    if not hot:
+        print("  none with a streak worth anything this week")
+    return 0
+
+
+def _cmd_season_schedule(args: argparse.Namespace) -> int:
+    """Register (or show, or remove) the daily runs."""
+    import os
+
+    from puckpilot.config import REPO_ROOT
+    from puckpilot.season import cli_support, schedule
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager = cli_support.resolve_manager(getattr(args, "manager", None))
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    times = tuple(t.strip() for t in args.at.split(",") if t.strip())
+    items = schedule.tasks(manager.name, REPO_ROOT, times)
+
+    already = schedule.installed()
+    if already:
+        print("Already registered: " + ", ".join(already))
+        print()
+
+    if args.remove:
+        for line in schedule.remove(manager.name):
+            print(line)
+        return 0
+
+    print(schedule.describe(items, bool(os.environ.get("PUCKPILOT_MANAGER_KEY"))))
+    if not args.install:
+        print()
+        print("Nothing registered. Add --install to set these up, --remove to take them away.")
+        return 0
+
+    print()
+    for line in schedule.install(items):
+        print(line)
+    print()
+    print("Remove them with: ppilot season schedule --remove")
+    return 0
+
+
+def _cmd_season_run(args: argparse.Namespace) -> int:
+    """Everything a day needs, in order. Built to be scheduled."""
+    from puckpilot.season import cli_support
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.run import run_day
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    # Today, not `runtime.current_date` - that is a cached field, so a job
+    # running on a settings snapshot from last week would quietly plan last
+    # week's day and look entirely healthy doing it.
+    day = args.date or cli_support.today_str()
+    lines: list[str] = []
+
+    def say(text):
+        lines.append(text)
+        print(text)
+
+    report = run_day(
+        conn,
+        manager,
+        league_key,
+        runtime,
+        day,
+        weekly=True if args.weekly else (False if args.no_weekly else None),
+        do_sync=not args.no_sync,
+        reschedule=not args.no_reschedule,
+        say=say,
+    )
+    if args.log:
+        path = Settings()._resolve(Path(args.log))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(chr(10).join(lines) + chr(10) * 2)
+    return 1 if report.failed else 0
+
+
+def _cmd_season_gate(args: argparse.Namespace) -> int:
+    from puckpilot.data import store
+    from puckpilot.season.replay import protocol_gate_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = protocol_gate_report(
+        conn,
+        season=args.season,
+        n_teams_tested=args.teams,
+        seed=args.seed,
+        league=_league(args),
+        progress=print if args.verbose else None,
+    )
+    print()
+    print(report.text)
+    return 0
+
+
+def _cmd_season_calibrate(args: argparse.Namespace) -> int:
+    """Gate G1: are the category odds honest? Exits non-zero on FAIL."""
+    from puckpilot.data import store
+    from puckpilot.season.calibration import calibration_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = calibration_report(
+        conn,
+        _league(args),
+        fit_season=args.fit_season,
+        test_season=args.test_season,
+        seed=args.seed,
+        progress=print if args.verbose else None,
+        goalies=args.goalies,
+        rates_mode=args.rates,
+    )
+    print()
+    print(report.text)
+    return 0 if report.text.rstrip().endswith("PASS") else 1
+
+
+def _cmd_season_add_gate(args: argparse.Namespace) -> int:
+    """Gate G2 for adds: which way of choosing pickups takes more categories?"""
+    from puckpilot.data import store
+    from puckpilot.season.add_gate import ARMS, add_gate_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    for season in args.season:
+        report = add_gate_report(
+            conn,
+            _league(args),
+            season=season,
+            n_tested=args.teams,
+            seed=args.seed,
+            arms=tuple(args.arms.split(",")) if args.arms else ARMS,
+            progress=print if args.verbose else None,
+            versus=args.versus,
+            goalies=args.goalies,
+            goalies_alt=args.goalies_alt,
+            goalie_minimum=not args.no_goalie_minimum,
+            rivals=args.rivals,
+            rival_rate=args.rival_rate,
+            rival_goalie_share=args.rival_goalie_share,
+        )
+        print()
+        print(report.text)
+    return 0
+
+
+def _cmd_season_goalie_check(args: argparse.Namespace) -> int:
+    """How well the starting-goalie model names starters, tonight and ahead."""
+    from puckpilot.data import store
+    from puckpilot.season.goalie_gate import VARIANTS, goalie_gate_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = goalie_gate_report(
+        conn,
+        seasons=tuple(args.season),
+        variants=tuple(args.variants.split(",")) if args.variants else VARIANTS,
+        versus=args.versus,
+        shares=not args.no_shares,
+        progress=print if args.verbose else None,
+        window=args.window,
+    )
+    print()
+    print(report.text)
+    return 0
+
+
+def _cmd_season_keeper_check(args: argparse.Namespace) -> int:
+    """Ranked on a date, which keepers would have been best the next season?"""
+    from puckpilot.data import store
+    from puckpilot.season.keeper_gate import keeper_gate_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = keeper_gate_report(
+        conn,
+        _league(args),
+        seasons=tuple(args.season),
+        progress=print if args.verbose else None,
+    )
+    print()
+    print(report.text)
+    return 0 if report.text.rstrip().endswith("PASS") else 1
+
+
+def _cmd_season_form_check(args: argparse.Namespace) -> int:
+    """Do rates pulled toward recent form forecast next week better than August's?"""
+    from puckpilot.data import store
+    from puckpilot.season.form_gate import form_gate_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = form_gate_report(
+        conn,
+        _league(args),
+        seasons=tuple(args.season),
+        progress=print if args.verbose else None,
+    )
+    print()
+    print(report.text)
+    return 0
+
+
+def _cmd_season_streak_check(args: argparse.Namespace) -> int:
+    """How long hot streaks last, per category, measured on past seasons."""
+    from puckpilot.data import store
+    from puckpilot.season.streak_gate import streak_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = streak_report(
+        conn, _league(args), seasons=tuple(args.season), progress=print if args.verbose else None
+    )
+    print()
+    print(report.text)
+    return 0
+
+
+def _cmd_season_preflight(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support
+    from puckpilot.season import preflight as pf
+    from puckpilot.season.fetch import discover_team_key, fetch_roster, load_runtime
+    from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.today import build_plan, yahoo_goalie_games
+    from puckpilot.season.values import build_value_model
+    from puckpilot.yahoo import playermap
+
+    report = pf.SeasonPreflightReport()
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        print(f"puckpilot: {e}")
+        return 2
+
+    report.checks.append(pf.check_manager(manager))
+    report.checks.append(pf.check_authority(manager))
+
+    runtime = load_runtime(conn, league_key)
+    report.checks.append(pf.check_runtime(runtime))
+    report.checks.append(pf.check_categories(runtime, manager.league))
+    day = args.date or cli_support.today_str()
+    report.checks.append(pf.check_calendar(runtime, day))
+    report.checks.append(pf.check_player_map(conn, league_key))
+
+    roster = None
+    if runtime is not None:
+        season = runtime.nhl_season
+        report.checks.append(pf.check_schedule(conn, season, day))
+        report.checks.append(pf.check_data_freshness(conn, season, day))
+        if not args.offline:
+            pmap = playermap.load_map(conn, league_key)
+
+            def _read(session):
+                key = manager.team_key or discover_team_key(session, league_key)
+                return fetch_roster(session, key, day, player_map=pmap)
+
+            try:
+                roster = cli_support.run_session(manager, _read)
+            except (ManagerError, cli_support.SeasonCliError) as e:
+                report.checks.append(pf.Check("yahoo session", pf.FAIL, str(e)))
+        report.checks.append(
+            pf.check_roster(roster)
+            if roster or not args.offline
+            else pf.Check("roster", pf.INFO, "skipped (--offline)")
+        )
+
+        train = [x for x in DEFAULT_SEASONS if x < season][-3:][::-1]
+        values = build_value_model(conn, season, tuple(train), manager.league)
+        report.checks.append(pf.check_projections(values, roster))
+        goalies = ChainedGoalieSource(
+            TrailingStartShareSource(conn, season, fallback_season=train[0])
+        )
+        report.checks.append(pf.check_goalies(goalies, roster, day))
+
+        if roster is not None:
+            plan = build_plan(
+                conn,
+                runtime,
+                roster,
+                values,
+                goalies,
+                day,
+                manager=manager.name,
+                authority=manager.authority.lineup,
+                goalie_starts_so_far=yahoo_goalie_games(roster, runtime, day),
+            )
+            report.checks.append(pf.check_plan(plan))
+
+    page_key = manager.page.owner_key or os.environ.get("PUCKPILOT_MANAGER_KEY", "")
+    report.checks.append(pf.check_page(manager, page_key))
+    print(report.text)
+    return 1 if report.failed else 0
+
+
+def _cmd_season_protocol(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support
+    from puckpilot.season import protocol as protocol_mod
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    try:
+        for pid in args.approve or []:
+            print(protocol_mod.decide(conn, pid, True).describe())
+        for pid in args.reject or []:
+            print(protocol_mod.decide(conn, pid, False).describe())
+    except protocol_mod.ProtocolError as e:
+        print(f"puckpilot: {e}")
+        return 2
+    if args.approve or args.reject:
+        return 0
+
+    from puckpilot.season import explain
+
+    rows = protocol_mod.listing(conn, manager.name, league_key)
+    if not rows:
+        print("No protocols yet - run `ppilot season week` to propose one.")
+        return 0
+    for p in rows:
+        print(f"[{p.status.upper()}] #{p.id}")
+        for line in explain.protocol_story(p):
+            print(f"  {line}" if line else "")
+        print()
+    return 0
+
+
+def _cmd_season_proposals(args: argparse.Namespace) -> int:
+    from puckpilot.season import cli_support, proposals
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    from puckpilot.season.run import _executes
+    from puckpilot.season.snapshot import _approve_means
+
+    executes = _executes(manager)
+    try:
+        for pid in args.approve or []:
+            # Approving here is approving the card as it reads: the same rule
+            # decides whether PuckPilot makes the move.
+            means = _approve_means(proposals.get(conn, pid), executes)
+            got = proposals.decide(conn, pid, True, to_execute=means["executes"])
+            print(got.describe())
+            print(f"      {means['approve_means']}")
+        for pid in args.reject or []:
+            print(proposals.decide(conn, pid, False).describe())
+        for pid in args.cancel or []:
+            print(proposals.cancel(conn, pid, args.why).describe())
+    except proposals.ProposalError as e:
+        print(f"puckpilot: {e}")
+        return 2
+    if args.approve or args.reject or args.cancel:
+        return 0
+
+    rows = proposals.listing(conn, manager.name, league_key, status=args.status)
+    if not rows:
+        print("No proposals.")
+        return 0
+    for p in rows:
+        print(p.describe())
+        if p.reason.get("timing"):
+            print(f"      {p.reason['timing']}")
+    print()
+    print("  Approve with: ppilot season proposals --approve <id>")
+    return 0
+
+
+def _cmd_season_week(args: argparse.Namespace) -> int:
+    from puckpilot.draft.sim import build_universe
+    from puckpilot.season import cli_support, pool
+    from puckpilot.season import week as weekmod
+    from puckpilot.season.fetch import fetch_live, fetch_matchups, fetch_roster, save_pool_if_any
+    from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
+    from puckpilot.season.manager import ManagerError
+    from puckpilot.season.matchups import current_or_next, for_week
+    from puckpilot.season.odds import OddsModel, log_week
+    from puckpilot.season.run import (
+        _executes,
+        adds_used,
+        goalie_terms,
+        live_inputs,
+        near_miss_lines,
+    )
+    from puckpilot.season.values import build_value_model
+    from puckpilot.yahoo import playermap
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+        pmap = playermap.load_map(conn, league_key)
+        today = args.date or cli_support.today_str()
+
+        def _read(session):
+            team_key = manager.team_key or runtime.league_key
+            matchups = fetch_matchups(session, team_key)
+            m = for_week(matchups, args.week) if args.week else current_or_next(matchups, today)
+            if m is None:
+                m = for_week(matchups, runtime.current_week)
+            if m is None:
+                raise cli_support.SeasonCliError(
+                    f"no matchup covering {today} and none after it; the season is over."
+                )
+            # Once the week has begun, today's rosters and Yahoo's score so far;
+            # before it, the rosters as they will start it.
+            when = today if m.contains(today) else m.start
+            ours = fetch_roster(session, team_key, when, player_map=pmap)
+            theirs = (
+                fetch_roster(session, m.opponent_key, when, player_map=pmap)
+                if m.opponent_key
+                else ours
+            )
+            live = fetch_live(session, team_key, m.week)[0] if m.contains(today) else None
+            fa = pool.fetch_pool(
+                session, league_key, "FA", limit=args.pool, player_map=pmap, progress=print
+            )
+            # A claim is the one move the executor does not make; a manager
+            # whose approvals PuckPilot makes is not offered one to make by hand.
+            wv = (
+                []
+                if _executes(manager)
+                else pool.fetch_pool(session, league_key, "W", limit=50, player_map=pmap)
+            )
+            return m, ours, theirs, fa + wv, live
+
+        m, ours, theirs, available, live = cli_support.run_session(manager, _read)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+
+    save_pool_if_any(conn, league_key, today, available)
+    from puckpilot.season import tiers as tiers_mod
+
+    ours = tiers_mod.annotate(ours, tiers_mod.pins(conn, manager.name, league_key))
+    season = runtime.nhl_season
+    train = [s for s in DEFAULT_SEASONS if s < season][-3:][::-1]
+    universe = build_universe(conn, season, tuple(train), manager.league)
+    values = build_value_model(conn, season, tuple(train), manager.league)
+    goalies = ChainedGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0]))
+    used_week, used_season = adds_used(ours, m.as_week())
+    # Priced on the roster as it will stand once any make-room move is made -
+    # the same rule the scheduled run follows (`run._resolution`).
+    from puckpilot.season import legality
+    from puckpilot.season.run import _resolution
+
+    resolution = _resolution(conn, manager, runtime, ours, values, today)
+    priced = ours if resolution.legal else legality.as_resolved(ours, resolution)
+
+    plan = weekmod.build_week_plan(
+        conn,
+        runtime,
+        manager.league,
+        m.as_week(),
+        m.opponent_name,
+        priced,
+        theirs,
+        available,
+        universe.frame,
+        goalies,
+        values,
+        adds_used_week=used_week,
+        adds_used_season=used_season,
+        min_gain=manager.authority.transactions.min_weekly_gain,
+        max_targets=args.top,
+        odds_model=OddsModel(),
+        add_scoring=manager.authority.transactions.add_scoring,
+        min_expected_gain=manager.authority.transactions.min_expected_gain,
+        playoff_reserve=manager.authority.transactions.playoff_reserve,
+        stream_spots=manager.authority.transactions.stream_spots,
+        upgrade_margin=manager.authority.transactions.upgrade_margin,
+        screen_by=manager.authority.transactions.screen,
+        **live_inputs(conn, runtime, m.as_week(), live, today),
+        **goalie_terms(manager.authority.transactions, runtime, m.as_week(), today, ours, theirs),
+    )
+    log_week(conn, manager.name, league_key, ours.team_key, plan, today)
+    from puckpilot.season import explain
+
+    print()
+    for line in [*explain.week_story(plan, runtime), *near_miss_lines(plan)]:
+        print(f"  {line}" if line else "")
+    print()
+    print(plan.text())
+    print()
+    from puckpilot.season.moves import MoveKind
+
+    for v in resolution.violations:
+        print(f"  !! {v.message}")
+    for f in resolution.transactions:
+        head = MoveKind.ACTIVATE.head(f.player.name if f.player else "", f.drop.name, f.slot)
+        if args.propose and f.player is not None:
+            from puckpilot.season import proposals
+
+            pr, new = proposals.propose_fix(
+                conn, manager.name, league_key, ours.team_key, f, plan.week
+            )
+            print(f"  {'Queued' if new else 'Waiting'} #{pr.id}: {head} ({f.reason})")
+        else:
+            print(f"  Needed first: {head} ({f.reason})")
+    for why in resolution.unresolved:
+        print(f"  !! {why}")
+    if resolution.transactions and plan.targets:
+        print("  The adds below assume that move is made first.")
+    if args.propose and plan.targets and resolution.unresolved:
+        print("  Not queued: the roster is illegal and nothing on it can be dropped to fix it.")
+    elif args.propose and plan.targets:
+        from puckpilot.season import proposals
+
+        made = proposals.propose(
+            conn,
+            manager.name,
+            league_key,
+            ours.team_key,
+            plan.targets,
+            plan.week,
+            max_pending=manager.authority.transactions.max_pending,
+            supersede=True,
+        )
+        if made:
+            print(f"  Queued {len(made)} proposal(s) for your decision:")
+            for pr in made:
+                print(f"    {pr.describe()}")
+            print("  Decide with: ppilot season proposals --approve N  (or --reject N)")
+        else:
+            print("  Nothing new to queue - these are already awaiting your decision.")
+    else:
+        print("  Nothing here is executed. Approve a move to act on it.")
+
+    from puckpilot.season import protocol as protocol_mod
+    from puckpilot.season.game_plan import GamePlan
+    from puckpilot.season.run import lineup_by
+
+    game = GamePlan.from_week(plan, lineup_by=lineup_by(manager))
+    if game is not None:
+        print()
+        print(game.text())
+
+    # A stance to approve only matters to a lineup that follows one.
+    if manager.authority.lineup.follow_protocol:
+        stance = protocol_mod.derive(
+            plan.outlook, manager.name, league_key, ours.team_key, plan.week, m.opponent_name
+        )
+        existing = protocol_mod.load(conn, manager.name, league_key, plan.week)
+        live = existing if existing and existing.status == protocol_mod.APPROVED else None
+        if live is None:
+            stance = protocol_mod.save(conn, stance)
+        shown = live or stance
+        print()
+        for line in explain.protocol_story(shown, plan.adds_left_week):
+            print(f"  {line}" if line else "")
+        print()
+        if live is not None:
+            print(f"  Already approved (protocol #{live.id}).")
+        else:
+            print(f"  Approve with: ppilot season protocol --approve {shown.id}")
+            print("  Or just ignore it - nothing happens until you decide.")
+
+    _season_publish(manager, conn, league_key, week_plan=plan, roster=ours)
+
+    if args.trending:
+        hot = pool.rising(available, limit=10)
+        print()
+        if not hot:
+            print("  Nobody is being picked up yet - Yahoo's delta is week over week.")
+        else:
+            print("  The league is picking these up:")
+        for x in hot:
+            print(
+                f"    +{x.percent_owned_delta:>4.0f}%  {x.name:22} "
+                f"{x.team:4} ({x.percent_owned:.0f}% owned)"
+            )
+    return 0
+
+
+def _cmd_lineup_verify(args: argparse.Namespace) -> int:
+    from puckpilot.data import store
+    from puckpilot.season.replay import live_policy_report
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    report = live_policy_report(
+        conn,
+        season=args.season,
+        n_drafts=args.drafts,
+        seed=args.seed,
+        league=_league(args),
+        min_gain=args.min_gain,
+        progress=print,
+        goalies=args.goalies,
+    )
+    print()
+    print(report.text)
+    # The live path exists to run the validated policy, not a different one.
+    live = report.totals["live_perfect"]
+    validated = report.totals["validated_perfect"]
+    if validated and (live - validated) / validated < -0.02:
+        print()
+        print("FAIL: the live path is more than 2% behind the policy it replaces.")
+        return 1
+    return 0
+
+
 def _cmd_lineup_replay(args: argparse.Namespace) -> int:
     from puckpilot.data import store
     from puckpilot.engine.lineup_replay import bench_regret_report
@@ -733,6 +2540,37 @@ def _cmd_shadow_season(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_data_toi(args: argparse.Namespace) -> int:
+    """Backfill ice time by situation (power play, short-handed, even strength)."""
+    from puckpilot.data import store
+    from puckpilot.data.nhlstats import NhlStatsClient
+    from puckpilot.data.sync import sync_skater_toi
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    store.init_db(conn)
+    print(f"Ice time by situation for {', '.join(args.seasons)} (one request per game date)...")
+    sync_skater_toi(conn, NhlStatsClient(), args.seasons, progress=print)
+    return 0
+
+
+def _cmd_data_daily(args: argparse.Namespace) -> int:
+    from puckpilot.data import store
+    from puckpilot.data.nhl import NhlClient
+    from puckpilot.data.sync import sync_day
+
+    settings = Settings()
+    conn = store.connect(settings.resolved_db_path)
+    store.init_db(conn)
+    nhl = NhlClient()
+    out = sync_day(conn, nhl, args.season, max_players=args.max_players, progress=print)
+    print(
+        f"{args.season}: {out['boxscores']} boxscore(s), "
+        f"{out['players_synced']} player log(s), {out['still_behind']} still behind"
+    )
+    return 0
+
+
 def _cmd_data_sync(args: argparse.Namespace) -> int:
     from puckpilot.data import store, sync
     from puckpilot.data.moneypuck import MoneyPuckClient, season_start_year
@@ -768,6 +2606,12 @@ def _cmd_data_sync(args: argparse.Namespace) -> int:
 
     print(f"Done: {settings.resolved_db_path}")
     return 0
+
+
+def schedule_times() -> tuple[str, ...]:
+    from puckpilot.season.schedule import DEFAULT_TIMES
+
+    return DEFAULT_TIMES
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -821,7 +2665,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ym.add_argument("--league-key", default=None, help="e.g. 465.l.12345 (default: auto-detect)")
     ym.add_argument("--limit", type=int, default=600, help="How deep into Yahoo's pool to fetch")
+    ym.add_argument(
+        "--reresolve-only",
+        action="store_true",
+        help="Skip Yahoo; re-match already-fetched unmatched rows against nhl_players now",
+    )
+    ym.add_argument(
+        "--recheck",
+        action="store_true",
+        help="Skip Yahoo; re-match EVERY stored row (corrects matches an older resolver got wrong)",
+    )
     ym.set_defaults(func=_cmd_yahoo_playermap)
+
+    yk = yahoo_sub.add_parser(
+        "keepers",
+        help="Reconstruct keeper contracts from the league's Yahoo draft history (prints only)",
+    )
+    yk.add_argument("--league-key", default=None, help="e.g. 477.l.12345 (default: auto-detect)")
+    yk.add_argument("--season", default="20262027", help="Season the keepers are for")
+    yk.add_argument(
+        "--order",
+        default=None,
+        metavar="A,B,...",
+        help="Draft order as manager nicknames or team keys, first pick first - used for "
+        "seat numbers until Yahoo sets draft positions itself",
+    )
+    yk.add_argument(
+        "--candidates", type=int, default=4, help="First-year keep candidates to list per team"
+    )
+    yk.set_defaults(func=_cmd_yahoo_keepers)
 
     data = sub.add_parser("data", help="Local data store commands")
     data_sub = data.add_subparsers(dest="subcommand", required=True)
@@ -848,6 +2720,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sync per-game boxscores only (hits/blocks); use for the one-time backfill",
     )
     sync.set_defaults(func=_cmd_data_sync)
+
+    daily = data_sub.add_parser(
+        "daily", help="In-season catch-up: last night's boxscores and the logs behind them"
+    )
+    daily.add_argument("--season", default="20262027")
+    daily.add_argument(
+        "--max-players", type=int, default=None, help="Cap player log fetches for a quick run"
+    )
+    daily.set_defaults(func=_cmd_data_daily)
+
+    toi = data_sub.add_parser(
+        "toi", help="Backfill ice time by situation per game (power play, short-handed)"
+    )
+    toi.add_argument("--seasons", nargs="+", default=["20262027"])
+    toi.set_defaults(func=_cmd_data_toi)
 
     rosters = data_sub.add_parser(
         "rosters",
@@ -941,6 +2828,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mock.set_defaults(func=_cmd_draft_mock)
 
+    e2e = draft_sub.add_parser(
+        "e2e",
+        help="Whole drafts through board, page, push and relay, verified at every pick "
+        "(bots, harvested rooms, recorded websocket frames - never a live room)",
+    )
+    e2e.add_argument("--source", choices=("all", "sim", "harvest", "capture"), default="all")
+    e2e.add_argument("--drafts", type=int, default=3, help="Bot drafts on the real league")
+    e2e.add_argument("--seed", type=int, default=20260918)
+    e2e.add_argument("--seats", default="0,5", metavar="N,N", help="Seats to verify and push")
+    e2e.add_argument("--every", type=int, default=1, help="Verify every N picks")
+    e2e.add_argument("--season", default="20262027")
+    e2e.add_argument("--limit", type=int, default=0, help="Max rooms per replay source")
+    e2e.add_argument("--mocks", default="data/mocks")
+    e2e.add_argument("--captures", default="data/captures")
+    e2e.add_argument("--adp-league-key", default=None, help="Default: the only key in the map")
+    e2e.add_argument(
+        "--relay", default=None, metavar="URL", help="Remote relay (default: in-process)"
+    )
+    e2e.add_argument("--owner-key", default=None, help="Default: PUCKPILOT_E2E_OWNER_KEY")
+    e2e.add_argument("--guest-key", default=None, help="Default: PUCKPILOT_E2E_GUEST_KEY")
+    e2e.add_argument(
+        "--expect-build",
+        action="store_true",
+        help="Fail unless the relay's /healthz build matches this checkout",
+    )
+    e2e.add_argument(
+        "--browser",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Also open the guest link in headless Chrome (temporary profile) and check "
+        "the rendered page every N picks",
+    )
+    e2e.add_argument(
+        "--stale-check",
+        action="store_true",
+        help="With --browser: after the draft, stop pushing and require NOT LIVE",
+    )
+    e2e.add_argument("--verbose", action="store_true", help="Show board-building output")
+    e2e.set_defaults(func=_cmd_draft_e2e)
+
     farm = draft_sub.add_parser(
         "farm",
         help="Sit through Yahoo mock drafts and harvest pool-coverage / survival data",
@@ -980,6 +2908,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cal.set_defaults(func=_cmd_draft_calibrate)
 
+    pre = draft_sub.add_parser(
+        "preflight",
+        help="Check everything that would silently corrupt the draft-night board; "
+        "exits non-zero on any FAIL",
+    )
+    pre.add_argument("--seat", type=int, required=True, help="Your draft slot (0-based)")
+    pre.add_argument("--season", default="20262027", help="Season being drafted")
+    pre.add_argument(
+        "--adp-league-key",
+        default=None,
+        metavar="KEY",
+        help="League key whose Yahoo ADP the board uses (default: the only mapped league)",
+    )
+    pre.add_argument(
+        "--offline", action="store_true", help="Skip the Yahoo OAuth probe (the only network call)"
+    )
+    pre.add_argument("--verbose", action="store_true", help="Also print the board build log")
+    pre.set_defaults(func=_cmd_draft_preflight)
+
     live = draft_sub.add_parser("live", help="Draft-night console: live recommendations")
     live.add_argument("--seat", type=int, default=0, help="Your draft slot (0-based)")
     live.add_argument("--season", default="20262027", help="Season to draft for")
@@ -1006,6 +2953,14 @@ def build_parser() -> argparse.ArgumentParser:
         "and a built player map). Optionally name a league key for real ADP.",
     )
     live.add_argument(
+        "--adp-league-key",
+        default=None,
+        metavar="KEY",
+        help="League key whose Yahoo ADP to use (default: the key given to --yahoo, "
+        "else the only league in the player map). Without ADP the board runs on a "
+        "proxy, and says so.",
+    )
+    live.add_argument(
         "--room",
         default="https://hockey.fantasysports.yahoo.com/hockey",
         help="Page to open when --yahoo is used",
@@ -1022,6 +2977,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.35,
         help="Seconds per pick when replaying (0 = as fast as possible)",
+    )
+    live.add_argument(
+        "--replay-drop",
+        default=None,
+        metavar="START:COUNT",
+        help="Failure drill: the replayed feed goes silent after START room picks and "
+        "misses COUNT of them while the room keeps drafting. Recover by hand.",
     )
     live.add_argument(
         "--web",
@@ -1062,8 +3024,315 @@ def build_parser() -> argparse.ArgumentParser:
     )
     live.set_defaults(func=_cmd_draft_live)
 
+    # In-season commands all answer "for whom, and on what day", so they share
+    # a parent parser rather than redeclaring the flags five times.
+    seasonal = argparse.ArgumentParser(add_help=False)
+    seasonal.add_argument(
+        "--manager",
+        default=None,
+        metavar="NAME",
+        help="Manager config in managers/ (optional when only one exists)",
+    )
+    seasonal.add_argument(
+        "--date", default=None, metavar="YYYY-MM-DD", help="Day to act on (default: today)"
+    )
+
+    season = sub.add_parser("season", help="In-season league state")
+    season_sub = season.add_subparsers(dest="subcommand", required=True)
+    s_settings = season_sub.add_parser(
+        "settings", parents=[seasonal], help="The league's own rules, read from Yahoo"
+    )
+    s_settings.add_argument(
+        "--refresh", action="store_true", help="Re-read from Yahoo instead of the cache"
+    )
+    s_settings.set_defaults(func=_cmd_season_settings)
+    s_roster = season_sub.add_parser(
+        "roster", parents=[seasonal], help="Your current roster, with slots and injuries"
+    )
+    s_roster.set_defaults(func=_cmd_season_roster)
+
+    s_pre = season_sub.add_parser(
+        "preflight", parents=[seasonal], help="Is everything current enough to act on?"
+    )
+    s_pre.add_argument(
+        "--offline", action="store_true", help="Skip the Yahoo reads and check the rest"
+    )
+    s_pre.set_defaults(func=_cmd_season_preflight)
+
+    s_gate = season_sub.add_parser(
+        "gate", help="Does a week protocol win more categories? (scored on categories, not value)"
+    )
+    s_gate.add_argument("--season", default="20252026")
+    s_gate.add_argument("--teams", type=int, default=6)
+    s_gate.add_argument("--seed", type=int, default=123)
+    s_gate.add_argument("--verbose", action="store_true")
+    s_gate.set_defaults(func=_cmd_season_gate)
+
+    s_cal = season_sub.add_parser(
+        "calibrate",
+        help="Gate G1: do the category odds mean what they say? (replayed seasons)",
+    )
+    s_cal.add_argument("--fit-season", default="20242025")
+    s_cal.add_argument("--test-season", default="20252026")
+    s_cal.add_argument("--seed", type=int, default=20261)
+    s_cal.add_argument(
+        "--goalies",
+        default="",
+        help="Starting-goalie model, e.g. old or club-dw2-chain (default: current)",
+    )
+    s_cal.add_argument(
+        "--rates",
+        choices=("pre", "form"),
+        default="pre",
+        help="Forecast with preseason rates, or rates that have seen the season so far",
+    )
+    s_cal.add_argument("--verbose", action="store_true")
+    s_cal.set_defaults(func=_cmd_season_calibrate)
+
+    s_ag = season_sub.add_parser(
+        "add-gate", help="Gate G2 for adds: which way of choosing pickups wins more categories?"
+    )
+    s_ag.add_argument("--season", nargs="+", default=["20242025", "20252026"])
+    s_ag.add_argument("--teams", type=int, default=12)
+    s_ag.add_argument("--seed", type=int, default=20261)
+    s_ag.add_argument("--arms", default="", help="comma list; default all")
+    s_ag.add_argument("--versus", default="", help="compare every arm with this one")
+    s_ag.add_argument(
+        "--goalies",
+        default="",
+        help="Starting-goalie model, e.g. old or club-dw2-chain (default: current)",
+    )
+    s_ag.add_argument(
+        "--goalies-alt",
+        default="club-dw2-chain",
+        help="The goalie model -g arms give the tested team",
+    )
+    s_ag.add_argument(
+        "--no-goalie-minimum",
+        action="store_true",
+        help="Score weeks without the league's goalie minimum (the gate before 2026-10-11)",
+    )
+    s_ag.add_argument(
+        "--rivals",
+        choices=("frozen", "stream"),
+        default="frozen",
+        help="frozen: nobody else picks anyone up; stream: every other team adds at "
+        "--rival-rate a week (measure it with `season league`)",
+    )
+    s_ag.add_argument("--rival-rate", type=float, default=0.0, help="adds per team a week")
+    s_ag.add_argument(
+        "--rival-goalie-share", type=float, default=0.0, help="share of rival adds that are goalies"
+    )
+    s_ag.add_argument("--verbose", action="store_true")
+    s_ag.set_defaults(func=_cmd_season_add_gate)
+
+    s_gc = season_sub.add_parser(
+        "goalie-check",
+        help="How often the goalie model names the starter, tonight and the week ahead",
+    )
+    s_gc.add_argument("--season", nargs="+", default=["20232024", "20242025", "20252026"])
+    s_gc.add_argument("--variants", default="", help="comma list, e.g. old,club-dw2-share")
+    s_gc.add_argument("--versus", default="old", help="compare every variant with this one")
+    s_gc.add_argument("--no-shares", action="store_true", help="Skip the remaining-share table")
+    s_gc.add_argument(
+        "--window",
+        choices=["late", "early", "all"],
+        default="late",
+        help="Team-dates scored: after the first 21 game dates (late), those dates, or all",
+    )
+    s_gc.add_argument("--verbose", action="store_true")
+    s_gc.set_defaults(func=_cmd_season_goalie_check)
+
+    s_kc = season_sub.add_parser(
+        "keeper-check",
+        help="Ranked on a date, would these keepers have been best the next season?",
+    )
+    s_kc.add_argument("--season", nargs="+", default=["20232024", "20242025"])
+    s_kc.add_argument("--verbose", action="store_true")
+    s_kc.set_defaults(func=_cmd_season_keeper_check)
+
+    s_fc = season_sub.add_parser(
+        "form-check",
+        help="Do rates pulled toward recent form forecast next week better than August's?",
+    )
+    s_fc.add_argument("--season", nargs="+", default=["20232024", "20242025", "20252026"])
+    s_fc.add_argument("--verbose", action="store_true")
+    s_fc.set_defaults(func=_cmd_season_form_check)
+
+    s_sc = season_sub.add_parser(
+        "streak-check", help="How long hot streaks last, per category (past seasons)"
+    )
+    s_sc.add_argument("--season", nargs="+", default=["20232024", "20242025", "20252026"])
+    s_sc.add_argument("--verbose", action="store_true")
+    s_sc.set_defaults(func=_cmd_season_streak_check)
+
+    s_run = season_sub.add_parser(
+        "run",
+        parents=[seasonal],
+        help="Everything for today in one go: sync, decisions, lineup, page (and Mondays)",
+    )
+    s_run.add_argument(
+        "--weekly", action="store_true", help="Also do the weekly plan, whatever day it is"
+    )
+    s_run.add_argument(
+        "--no-weekly", action="store_true", help="Skip the weekly plan even on week one's first day"
+    )
+    s_run.add_argument("--no-sync", action="store_true", help="Skip the data catch-up")
+    s_run.add_argument(
+        "--no-reschedule",
+        action="store_true",
+        help="Do not re-plan today's lock-timed runs",
+    )
+    s_run.add_argument(
+        "--log", default="data/logs/season.log", metavar="PATH", help="Append the run to this file"
+    )
+    s_run.set_defaults(func=_cmd_season_run)
+
+    s_sched = season_sub.add_parser(
+        "schedule", parents=[seasonal], help="Run it daily without being asked (Task Scheduler)"
+    )
+    s_sched.add_argument("--install", action="store_true", help="Actually register the tasks")
+    s_sched.add_argument("--remove", action="store_true", help="Take them away again")
+    s_sched.add_argument(
+        "--at",
+        default=",".join(schedule_times()),
+        metavar="HH:MM,...",
+        help="Local times to run at",
+    )
+    s_sched.set_defaults(func=_cmd_season_schedule)
+
+    s_locks = season_sub.add_parser(
+        "locks", parents=[seasonal], help="When today's slots close, player by player"
+    )
+    s_locks.set_defaults(func=_cmd_season_locks)
+
+    s_league = season_sub.add_parser(
+        "league",
+        parents=[seasonal],
+        help="The whole league: standings, every team's adds and the latest moves",
+    )
+    s_league.add_argument("--no-read", action="store_true", help="Show what is saved; read nothing")
+    s_league.add_argument(
+        "--no-rosters", action="store_true", help="Skip the week-start rosters (12 reads a week)"
+    )
+    s_league.add_argument("--recent", type=int, default=15, help="How many latest moves to list")
+    s_league.set_defaults(func=_cmd_season_league)
+
+    s_g3 = season_sub.add_parser(
+        "g3",
+        parents=[seasonal],
+        help="Live calibration: every team's week-start projection against what happened",
+    )
+    s_g3.add_argument("--weeks", default="", help="comma list of week numbers (default: all final)")
+    s_g3.set_defaults(func=_cmd_season_g3)
+
+    s_moves = season_sub.add_parser(
+        "moves",
+        parents=[seasonal],
+        help="The move ledger: what each move made did, against the player let go",
+    )
+    s_moves.set_defaults(func=_cmd_season_moves)
+
+    s_tiers = season_sub.add_parser(
+        "tiers",
+        parents=[seasonal],
+        help="Drop tiers: who a move may let go (never / upgrade only / rotation), and your pins",
+    )
+    s_tiers.add_argument(
+        "--set",
+        action="append",
+        metavar="NAME=TIER",
+        help='pin a player: never, upgrade or rotation (e.g. "Tyler Kleven=rotation"); repeatable',
+    )
+    s_tiers.add_argument(
+        "--auto", action="append", metavar="NAME", help="take a pin off: back to the rule"
+    )
+    s_tiers.set_defaults(func=_cmd_season_tiers)
+
+    s_tags = season_sub.add_parser(
+        "statuses",
+        parents=[seasonal],
+        help="Injury tags the runs have seen, and whether the player then played",
+    )
+    s_tags.set_defaults(func=_cmd_season_statuses)
+
+    s_keep = season_sub.add_parser(
+        "keepers",
+        parents=[seasonal],
+        help="Next season's keepers on your roster, and which are protected from a drop",
+    )
+    s_keep.set_defaults(func=_cmd_season_keepers)
+
+    s_hot = season_sub.add_parser(
+        "hot",
+        parents=[seasonal],
+        help="Hot streaks on your roster and among free agents, and which ones last",
+    )
+    s_hot.add_argument("--top", type=int, default=10, help="Free agents to list")
+    s_hot.set_defaults(func=_cmd_season_hot)
+
+    s_week = season_sub.add_parser(
+        "week", parents=[seasonal], help="This week's category plan and add targets"
+    )
+    s_week.add_argument("--week", type=int, default=None, help="Fantasy week (default: today's)")
+    s_week.add_argument("--pool", type=int, default=150, help="Free agents to consider")
+    s_week.add_argument("--top", type=int, default=5, help="Targets to propose")
+    s_week.add_argument("--trending", action="store_true", help="Also show rising ownership")
+    s_week.add_argument(
+        "--propose", action="store_true", help="Queue the targets for your approval"
+    )
+    s_week.set_defaults(func=_cmd_season_week)
+
+    s_prop = season_sub.add_parser(
+        "proposals", parents=[seasonal], help="Review, approve or reject queued transactions"
+    )
+    s_prop.add_argument("--status", default=None, help="pending / approved / rejected / executed")
+    s_prop.add_argument("--approve", type=int, nargs="*", metavar="ID")
+    s_prop.add_argument("--reject", type=int, nargs="*", metavar="ID")
+    s_prop.add_argument(
+        "--cancel", type=int, nargs="*", metavar="ID", help="Call off a waiting or approved move"
+    )
+    s_prop.add_argument("--why", default="cancelled by you", help="Reason recorded with --cancel")
+    s_prop.set_defaults(func=_cmd_season_proposals)
+
+    s_proto = season_sub.add_parser(
+        "protocol",
+        parents=[seasonal],
+        help="The week's agreed category stance: what to chase and what to give up",
+    )
+    s_proto.add_argument("--approve", type=int, nargs="*", metavar="ID")
+    s_proto.add_argument("--reject", type=int, nargs="*", metavar="ID")
+    s_proto.set_defaults(func=_cmd_season_protocol)
+
     lineup = sub.add_parser("lineup", help="Daily lineup tools")
     lineup_sub = lineup.add_subparsers(dest="subcommand", required=True)
+    today = lineup_sub.add_parser(
+        "today", parents=[seasonal], help="Tonight's lineup changes, as a diff"
+    )
+    today.add_argument(
+        "--explain", action="store_true", help="Show each playing player's value tonight"
+    )
+    today.add_argument(
+        "--steer",
+        choices=("off", "odds"),
+        default=None,
+        help="Decide bench calls by this week's odds (or not) for this run only - "
+        "a preview; the manager file's authority.lineup.steer is the standing setting",
+    )
+    today.set_defaults(func=_cmd_lineup_today)
+    verify = lineup_sub.add_parser(
+        "verify", help="Score the live daily path against the validated optimizer"
+    )
+    verify.add_argument("--season", default="20252026", help="Season to replay")
+    verify.add_argument("--drafts", type=int, default=1, help="Drafts to source rosters from")
+    verify.add_argument("--seed", type=int, default=123)
+    verify.add_argument("--min-gain", type=float, default=0.0)
+    verify.add_argument(
+        "--goalies",
+        default="",
+        help="Starting-goalie model, e.g. old or club-dw2-chain (default: current)",
+    )
+    verify.set_defaults(func=_cmd_lineup_verify)
     replay = lineup_sub.add_parser(
         "replay", help="Bench-regret replay: optimizer vs hindsight vs set-and-forget"
     )
@@ -1102,6 +3371,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A Windows console (and a scheduled task's) is not UTF-8, and one player
+    # name it cannot encode must not crash a run after the work is done.
+    # Unencodable characters print as "?"; the log file stays UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError):
+            stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
     return args.func(args)
 

@@ -146,3 +146,54 @@ def test_game_value_model_orders_lines():
     assert big > small
     assert vm.actual(data, 3, 1) == pytest.approx(big)
     assert vm.actual(data, 3, 0) == 0.0
+
+
+# -- multi-position eligibility ---------------------------------------------
+#
+# `engine/lineup.py` took one position per player until in-season work needed
+# Yahoo's real eligibility (172 of 562 mapped players are multi-eligible). The
+# LP formulation was always the right shape for it; these pin that widening it
+# changes nothing for single-position callers and gets the flex case right.
+
+FLEX_SHAPE = LeagueShape(n_teams=12, slots=(("C", 1), ("R", 1)), util_slots=0)
+
+
+def test_a_position_set_is_equivalent_to_the_string_for_one_position():
+    """Every sim, replay and backtest still passes a bare string."""
+    as_str = optimize_lineup([(1, "C", 5.0), (2, "C", 3.0), (3, "D", 2.0)], SHAPE)
+    as_set = optimize_lineup(
+        [(1, frozenset({"C"}), 5.0), (2, frozenset({"C"}), 3.0), (3, frozenset({"D"}), 2.0)],
+        SHAPE,
+    )
+    assert as_str == as_set
+
+
+def test_eligibility_widens_and_never_narrows():
+    """A C/RW must still be able to take the C slot."""
+    out = optimize_lineup([(1, frozenset({"C", "R"}), 5.0)], FLEX_SHAPE)
+    assert out[1] in ("C", "R")
+
+
+def test_the_flex_player_yields_the_slot_only_he_can_be_moved_out_of():
+    """The case greedy gets wrong: taking the best slot for the best player
+    strands a single-position player who has nowhere else to go."""
+    players = [
+        (1, frozenset({"C", "R"}), 5.0),  # flex, most valuable
+        (2, "C", 4.0),  # C only
+        (3, "R", 1.0),  # R only
+    ]
+    out = optimize_lineup(players, FLEX_SHAPE)
+    assert out == {1: "R", 2: "C"}  # total 9.0; greedy would take C then R for 6.0
+
+
+def test_a_multi_position_skater_can_still_fill_util():
+    out = optimize_lineup(
+        [(1, "C", 9.0), (2, frozenset({"C", "R"}), 8.0), (3, "D", 1.0), (4, "G", 1.0)], SHAPE
+    )
+    assert out[1] == "C"
+    assert out[2] == "UTIL"
+
+
+def test_an_unknown_position_is_ineligible_not_a_crash():
+    assert optimize_lineup([(1, frozenset({"IR+"}), 9.0)], SHAPE) == {}
+    assert optimize_lineup([(1, "Util", 9.0)], SHAPE) == {}

@@ -1,0 +1,818 @@
+"""The in-season page's own JavaScript, run against the payloads it will get.
+
+Same reasoning as the draft page's version: the page and the payloads are
+written in two languages by two code paths, and a key renamed on one side does
+not fail loudly - it renders "undefined", or throws inside the poll, which the
+draft page used to report as "server unreachable".
+
+So the script is pulled out of PAGE, run in Node against a small DOM, and the
+rendered text is scanned for the tell-tales. Skipped when Node is absent.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+
+import pytest
+
+from puckpilot.web import wire
+from puckpilot.web.season_page import PAGE
+from puckpilot.web.season_relay import SeasonState
+
+NODE = shutil.which("node")
+pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
+
+HARNESS = r"""
+const vm = require('vm');
+const fs = require('fs');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const out = [];
+
+function node(tag) {
+  return {
+    tagName: tag, className: '', _text: '', children: [], style: {}, disabled: false,
+    set textContent(v) { this._text = String(v); this.children = []; },
+    get textContent() {
+      return this._text + this.children.map(c => ' ' + c.textContent).join('');
+    },
+    appendChild(c) { this.children.push(c); c._parent = this; return c; },
+    replaceChild(a, b) {
+      const i = this.children.indexOf(b);
+      if (i >= 0) this.children[i] = a; else this.children.push(a);
+      a._parent = this;
+    },
+    querySelectorAll() { return []; },
+    addEventListener() {},
+    get parentNode() { return this._parent || node('div'); },
+    set parentNode(v) { this._parent = v; },
+  };
+}
+
+const fresh = node('div');
+const app = node('div');
+const doc = {
+  createElement: node,
+  getElementById: (id) => (id === 'fresh' ? fresh : app),
+  addEventListener: () => {},
+  hidden: false,
+};
+
+const sandbox = {
+  document: doc,
+  window: {},
+  location: { search: '?k=test' },
+  URLSearchParams: class { constructor(s) { this.s = s; } get() { return 'test'; } },
+  setInterval: () => {},
+  fetch: () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(input) }),
+  console,
+};
+sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(SCRIPT, sandbox);
+
+// The script calls tick() itself, which resolves on a microtask.
+setTimeout(() => {
+  console.log(JSON.stringify({ fresh: fresh.textContent, app: app.textContent }));
+}, 20);
+"""
+
+
+def run_page(payload: dict) -> dict:
+    script = re.search(r"<script>(.*?)</script>", PAGE, re.S).group(1)
+    harness = "const SCRIPT = " + json.dumps(script) + ";\n" + HARNESS
+    proc = subprocess.run(
+        [NODE, "-e", harness],
+        input=wire.dumps(payload),
+        capture_output=True,
+        text=True,
+        # The page is UTF-8; the platform default is not, on Windows.
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def assert_clean(rendered: dict) -> None:
+    whole = rendered["fresh"] + " " + rendered["app"]
+    for tell in ("undefined", "NaN", "[object Object]"):
+        assert tell not in whole, f"{tell!r} in rendered page: {whole[:400]}"
+
+
+def test_a_cold_relay_draws_a_page_that_says_so():
+    """A fresh URL must not draw "undefined" anywhere - the draft page did
+    exactly that on a cold relay."""
+    out = run_page(SeasonState().get("jimmy"))
+    assert_clean(out)
+    assert "Nothing pushed yet" in out["app"]
+    assert "NOT LIVE" in out["fresh"]
+
+
+def test_a_full_payload_renders_every_section():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "Home Team",
+            "date": "2026-10-07",
+            "moves": [
+                {"kind": "start", "name": "Alex Tuch", "detail": "into LW"},
+                {"kind": "bench", "name": "Will Cuylle", "detail": "was LW"},
+                {"kind": "move", "name": "J.T. Miller", "detail": "C to Util"},
+            ],
+            "out": ["Mathew Barzal (NYI C) [O]"],
+            "lock_local": "7:00 PM",
+            "playing": 9,
+            "rostered": 17,
+            "proposals": [
+                {
+                    "id": 4,
+                    "add": "Shane Pinto",
+                    "drop": "Alex Laferriere",
+                    "why": "+9.6 this week · 4 games · PIM +1.9",
+                    "timing": "free agent - this one is a race",
+                }
+            ],
+            "protocol": {
+                "id": 2,
+                "week": 2,
+                "opponent": "Rival FC",
+                "status": "proposed",
+                "give_up": ["HIT (behind 10.9)"],
+                "go_after": ["PPP (+0.7)"],
+            },
+            "week": {
+                "week": 2,
+                "opponent": "Rival FC",
+                "cats": [
+                    {"label": "G", "ours": 11.0, "theirs": 10.0, "state": "close"},
+                    {"label": "HIT", "ours": 41.2, "theirs": 52.2, "state": "gone"},
+                    {"label": "SV%", "ours": 0.898, "theirs": 0.902, "state": "close"},
+                ],
+                "note": "Everyone with a game fits in a slot this week.",
+                "plan": {
+                    "title": "Week 2 vs Rival FC",
+                    "head": "Expect 5.7 of 11 -> 6.2 if the 2 proposed moves are made",
+                    "groups": [
+                        {"title": "Go after", "lines": ["SOG 54% -> 68%"]},
+                        {"title": "Paying for it", "lines": ["SV 69% -> 61%"]},
+                        {"title": "Giving up", "lines": ["HIT 6%"]},
+                        {"title": "Toss-ups", "lines": ["A 60% · SV% 47%"]},
+                    ],
+                    "notes": ["Lineup: no bench calls - everyone with a game starts"],
+                },
+            },
+            "roster": [
+                {"slot": "C", "name": "Evgeni Malkin", "team": "PIT", "opp": "", "status": ""},
+                {"slot": "IR+", "name": "Mathew Barzal", "team": "NYI", "opp": "", "status": "Out"},
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    for expected in (
+        "This week’s plan",
+        "Expect 5.7 of 11 -> 6.2",
+        "Paying for it",
+        "SV 69% -> 61%",
+        "Giving up",
+        "SV% 47%",
+        "Lineup: no bench calls",
+        "Home Team",
+        "Alex Tuch",
+        "Will Cuylle",
+        "Shane Pinto",
+        "HIT",
+        "Rival FC",
+        "7:00 PM",
+        "Evgeni Malkin",
+    ):
+        assert expected in out["app"], f"{expected!r} missing"
+    assert "updated just now" in out["fresh"]
+
+
+def test_a_payload_missing_optional_sections_still_draws():
+    """The lineup runs before the weekly plan exists, so half a payload is the
+    normal case rather than an error."""
+    state = SeasonState()
+    state.push("jimmy", {"team": "Home Team", "moves": [], "proposals": []})
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    assert "Home Team" in out["app"]
+
+
+def test_an_old_push_renders_as_not_live():
+    """A lineup that was right this morning is wrong by evening, so a stale
+    page has to say so rather than look current."""
+    state = SeasonState(stale_after=0.0)
+    state.push("jimmy", {"team": "Home Team", "moves": []})
+    out = run_page(state.get("jimmy"))
+    assert "NOT LIVE" in out["fresh"]
+
+
+def test_a_zero_value_category_does_not_render_as_undefined():
+    """0 is falsy in JavaScript and a table full of blanks is a real bug."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "week": {
+                "week": 1,
+                "opponent": "X",
+                "cats": [{"label": "PPP", "ours": 0, "theirs": 0, "state": "close"}],
+                "note": "",
+            },
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    assert "PPP" in out["app"]
+
+
+def test_a_week_in_progress_shows_the_score_beside_the_projection():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "Home Team",
+            "moves": [{"kind": "ir", "name": "Jake Sanderson", "detail": "D to IR+"}],
+            "alerts": ["Barzal is no longer eligible for IR+"],
+            "week": {
+                "week": 1,
+                "opponent": "Visitors",
+                "status": "midevent",
+                "days_left": 3,
+                "games_left": {"ours": 23, "theirs": 27},
+                "cats": [
+                    {
+                        "label": "G",
+                        "ours": 9.2,
+                        "theirs": 10.4,
+                        "now_ours": 4.0,
+                        "now_theirs": 6.0,
+                        "state": "in play",
+                    },
+                    {
+                        "label": "SV%",
+                        "ours": 0.912,
+                        "theirs": 0.905,
+                        "now_ours": 0,
+                        "now_theirs": None,
+                        "state": "likely",
+                    },
+                ],
+                "note": "",
+            },
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    for expected in (
+        "Starts left: you 23, them 27",
+        "3 days to play",
+        "now",
+        "final",
+        "4–6",
+        "9.2–10.4",
+        "in play",
+        "IR",
+        "Jake Sanderson",
+        "no longer eligible",
+    ):
+        assert expected in out["app"], expected
+
+
+def test_the_odds_render_as_percentages_with_the_expected_total():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "Home Team",
+            "moves": [],
+            "week": {
+                "week": 1,
+                "opponent": "Visitors",
+                "expected": 5.4,
+                "of": 11,
+                "games_left": {"ours": 23, "theirs": 27},
+                "days_left": 3,
+                "cats": [
+                    {"label": "G", "ours": 9.2, "theirs": 10.4, "state": "in play", "chance": 38},
+                    {"label": "SV", "ours": 103, "theirs": 81, "state": "likely", "chance": 0},
+                    {
+                        "label": "SV%",
+                        "ours": 0.9,
+                        "theirs": 0.91,
+                        "state": "in play",
+                        "chance": None,
+                    },
+                ],
+                "note": "",
+            },
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    for expected in ("Expect 5.4 of 11 categories", "win", "38%", "0%", "–"):
+        assert expected in out["app"], expected
+
+
+def test_the_freshness_line_says_when_the_next_update_is():
+    from datetime import UTC, datetime, timedelta
+
+    state = SeasonState(stale_after=0.0)
+    ahead = (datetime.now(UTC) + timedelta(hours=10)).isoformat()
+    state.push(
+        "jimmy", {"team": "T", "moves": [], "next_run_utc": ahead, "next_local": "Tue 11:00 AM"}
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    assert "next Tue 11:00 AM" in out["fresh"] and "NOT LIVE" not in out["fresh"]
+
+
+def test_a_missed_run_says_which_one():
+    from datetime import UTC, datetime, timedelta
+
+    state = SeasonState()
+    missed = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    state.push(
+        "jimmy", {"team": "T", "moves": [], "next_run_utc": missed, "next_local": "Tue 11:00 AM"}
+    )
+    out = run_page(state.get("jimmy"))
+    assert "NOT LIVE" in out["fresh"] and "a run was due Tue 11:00 AM" in out["fresh"]
+
+
+def test_a_proposal_shows_its_reasons():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [
+                {
+                    "id": 6,
+                    "add": "Marco Rossi",
+                    "drop": "Nick Cousins",
+                    "why": "+0.58 categories expected",
+                    "timing": "free agent",
+                    "detail": [
+                        {
+                            "title": "This week, day by day",
+                            "lines": ["Tue 29: Marco Rossi fills an empty C"],
+                        },
+                        {"title": "Likely range this week (middle 80%)", "lines": ["SOG 4-11"]},
+                    ],
+                },
+                # Made before reasons were kept: no section, and nothing broken.
+                {"id": 7, "add": "Old One", "drop": "", "why": "", "timing": ""},
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    for expected in (
+        "Why",
+        "This week, day by day",
+        "Tue 29: Marco Rossi fills an empty C",
+        "Likely range this week (middle 80%)",
+        "SOG 4-11",
+        "Old One",
+        # Approving records a decision; it never makes the add.
+        "Make it in Yahoo yourself",
+    ):
+        assert expected in out["app"], expected
+
+
+def run_page_and_approve(payload: dict) -> dict:
+    """Draw the page, tap every Approve, and return what each tap sent."""
+    harness = (
+        HARNESS.replace(
+            "fetch: () => Promise.resolve(",
+            "fetch: (u, o) => (o && o.body && posts.push(JSON.parse(o.body)), Promise.resolve(",
+        )
+        .replace(
+            "json: () => Promise.resolve(input) }),",
+            "json: () => Promise.resolve(input) })),",
+        )
+        .replace(
+            "console.log(JSON.stringify({ fresh: fresh.textContent, app: app.textContent }));",
+            """const drawn = app.textContent;
+  (function walk(n) {
+    if (n.tagName === 'button' && n._text === 'Approve') n.onclick();
+    n.children.forEach(walk);
+  })(app);
+  const seen = { fresh: fresh.textContent, app: drawn, posts };
+  setTimeout(() => console.log(JSON.stringify(seen)), 20);""",
+        )
+    )
+    assert harness.count("posts") == 2, "the harness changed shape - update this test"
+    script = re.search(r"<script>(.*?)</script>", PAGE, re.S).group(1)
+    proc = subprocess.run(
+        [NODE, "-e", "const posts = [];\nconst SCRIPT = " + json.dumps(script) + ";\n" + harness],
+        input=wire.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_approve_sends_what_the_card_said():
+    """The run makes a move in Yahoo only for an approval given on words that
+    said it would. Each card's words and the flag its tap sends come from the
+    same server field, card by card - and a push from before the field existed
+    says "make it yourself" and sends no consent."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [
+                {"id": 6, "add": "Marco Rossi", "drop": "Nick Cousins", "why": "", "timing": "",
+                 "executes": True, "approve_means": "Approve and PuckPilot makes this add and "
+                 "drop in Yahoo on its next run."},
+                {"id": 7, "add": "Sean Durzi", "drop": "", "why": "", "timing": "",
+                 "executes": False, "approve_means": "A waiver claim: put it in Yahoo yourself."},
+                {"id": 8, "add": "Old Card", "drop": "", "why": "", "timing": ""},
+            ],
+        },
+    )  # fmt: skip
+    out = run_page_and_approve(state.get("jimmy"))
+    assert_clean(out)
+    assert [(p["id"], p["executes"]) for p in out["posts"]] == [(6, True), (7, False), (8, False)]
+    for words in (
+        "PuckPilot makes this add and drop in Yahoo on its next run.",
+        "A waiver claim: put it in Yahoo yourself.",
+        "Make it in Yahoo yourself",  # the old card
+    ):
+        assert words in out["app"], words
+
+
+def test_the_page_says_whether_the_changes_were_made():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [{"kind": "start", "name": "Kyle Connor", "detail": "into LW"}],
+            "acted": {"ok": False, "text": "NOT made at 6:41 PM - the lineup changed"},
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    assert "NOT made at 6:41 PM - the lineup changed" in out["app"]
+
+
+def test_a_withdrawn_proposal_is_shown_with_its_reason():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "withdrawn": [
+                {"add": "Marco Rossi", "drop": "John Gibson", "why": "now worth +0.03"},
+                {"add": "Sean Durzi", "drop": "", "why": ""},
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    assert "Withdrawn" in out["app"]
+    assert "Marco Rossi" in out["app"] and "now worth +0.03" in out["app"]
+
+
+RELOAD_HARNESS = r"""
+const vm = require('vm');
+const fs = require('fs');
+const states = JSON.parse(fs.readFileSync(0, 'utf8'));
+let reloads = 0;
+let i = 0;
+function node(tag) {
+  return {
+    tagName: tag, className: '', _text: '', children: [], style: {},
+    set textContent(v) { this._text = String(v); this.children = []; },
+    get textContent() { return this._text + this.children.map(c => ' ' + c.textContent).join(''); },
+    appendChild(c) { this.children.push(c); return c; },
+    replaceChild() {}, querySelectorAll() { return []; }, addEventListener() {},
+  };
+}
+const fresh = node('div'), app = node('div');
+const sandbox = {
+  document: { createElement: node, getElementById: (id) => (id === 'fresh' ? fresh : app),
+              addEventListener: () => {}, hidden: false },
+  window: {},
+  location: { search: '?k=test', reload: () => { reloads += 1; } },
+  URLSearchParams: class { get() { return 'test'; } },
+  setInterval: () => {},
+  fetch: () => {
+    const s = states[Math.min(i, states.length - 1)];
+    i += 1;
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(s) });
+  },
+  console,
+};
+sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(SCRIPT, sandbox);
+// The script ticks once on load; two more polls, as the interval would.
+setTimeout(() => {
+  vm.runInContext('tick()', sandbox);
+  setTimeout(() => {
+    vm.runInContext('tick()', sandbox);
+    setTimeout(() => console.log(JSON.stringify({ reloads })), 20);
+  }, 20);
+}, 20);
+"""
+
+
+def _reloads(states: list[dict]) -> int:
+    script = re.search(r"<script>(.*?)</script>", PAGE, re.S).group(1)
+    harness = "const SCRIPT = " + json.dumps(script) + ";\n" + RELOAD_HARNESS
+    proc = subprocess.run(
+        [NODE, "-e", harness],
+        input=json.dumps(states),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])["reloads"]
+
+
+def test_a_tab_left_open_across_a_redeploy_reloads_itself():
+    """The morning after the plan card shipped, an open tab kept drawing with
+    the old script and never showed it. A new build under the page reloads it."""
+    state = SeasonState().get("jimmy")
+    same = [dict(state, build="aaa"), dict(state, build="aaa"), dict(state, build="aaa")]
+    moved = [dict(state, build="aaa"), dict(state, build="aaa"), dict(state, build="bbb")]
+    assert _reloads(same) == 0
+    assert _reloads(moved) == 1
+
+
+def test_a_relay_that_sends_no_build_never_reloads_the_page():
+    state = {k: v for k, v in SeasonState().get("jimmy").items() if k != "build"}
+    assert _reloads([state, state, state]) == 0
+
+
+def test_a_make_room_card_leads_with_its_own_words():
+    """A make-room move is not an add: the server words its first line (`head`),
+    and a push from before `head` existed still reads "Add X - drop Y"."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "alerts": ["Back is no longer eligible for IR+"],
+            "proposals": [
+                {
+                    "id": 21,
+                    "kind": "activate",
+                    "head": "Make room: drop Streamer so Back comes off IR+",
+                    "add": "Back",
+                    "drop": "Streamer",
+                    "why": "Yahoo refuses every add until this is made",
+                    "timing": "",
+                    "executes": True,
+                    "approve_means": "Approve and PuckPilot drops Streamer in Yahoo",
+                    "detail": [{"title": "Why this move", "lines": ["The drop is the player"]}],
+                },
+                {"id": 22, "add": "Old Card", "drop": "Someone", "why": "", "timing": ""},
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    assert "Make room: drop Streamer so Back comes off IR+" in out["app"]
+    assert "Add Back" not in out["app"]
+    assert "Why this move" in out["app"]
+    assert "Add Old Card" in out["app"] and "drop Someone" in out["app"]
+
+
+def test_a_blocker_leads_the_page():
+    """What stops the tool working comes before anything it says."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [],
+            "blockers": [
+                {
+                    "kind": "roster_illegal",
+                    "title": "Roster illegal - no add can be made",
+                    "message": "Approve the make-room move (#17) to clear it.",
+                    "since": "2026-10-19T22:41:00+00:00",
+                }
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    app = out["app"]
+    assert app.index("BLOCKED: Roster illegal") < app.index("Tonight")
+    assert "Approve the make-room move (#17)" in app and "since 2026-10-19" in app
+
+
+def test_the_moves_made_render_with_what_they_did():
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [],
+            "ledger": [
+                {
+                    "head": "#15 Kleven for Gibson",
+                    "since": "2026-10-13",
+                    "nights": 7,
+                    "add": "Kleven: G 1 SOG 11 HIT 10 BLK 16",
+                    "drop": "Gibson on those nights: W 3 SV 106 SV% 0.883",
+                },
+                {
+                    "head": "#13 Rossi into an open spot",
+                    "since": "2026-10-08",
+                    "nights": 1,
+                    "add": "Rossi: SOG 6 HIT 5",
+                    "drop": "",
+                },  # fmt: skip
+            ],
+        },
+    )
+    out = run_page(state.get("jimmy"))
+    assert_clean(out)
+    app = out["app"]
+    assert "Moves made, and what they did" in app
+    assert "#15 Kleven for Gibson" in app and "7 nights in the lineup" in app
+    assert "Gibson on those nights: W 3 SV 106" in app and "1 night in the lineup" in app
+
+
+TIER_TAP = r"""
+  const drawn = app.textContent;
+  function find(n, f) {
+    if (f(n)) return n;
+    for (const c of n.children) { const x = find(c, f); if (x) return x; }
+    return null;
+  }
+  const chip = find(app, n => n.tagName === 'button' && n._text.startsWith(CHIP));
+  chip.onclick();
+  const opened = app.textContent;
+  find(app, n => n.tagName === 'button' && n._text === CHOICE).onclick();
+  setTimeout(() => console.log(JSON.stringify(
+    { fresh: fresh.textContent, app: drawn, opened, after: app.textContent, posts })), 30);"""
+
+
+def run_page_and_pick_tier(payload: dict, chip: str, choice: str) -> dict:
+    """Draw the page, open the roster chip that starts `chip`, tap `choice`,
+    and return the page at each step and what the tap sent where."""
+    harness = HARNESS.replace(
+        "fetch: () => Promise.resolve(",
+        "fetch: (u, o) => (o && o.body && posts.push({ url: u, body: JSON.parse(o.body) }), "
+        "Promise.resolve(",
+    ).replace("json: () => Promise.resolve(input) }),", "json: () => Promise.resolve(input) })),")
+    harness = harness.replace(
+        "\n  console.log(JSON.stringify({ fresh: fresh.textContent, app: app.textContent }));",
+        TIER_TAP,
+    )
+    assert harness.count("posts") == 2, "the harness changed shape - update this test"
+    script = re.search(r"<script>(.*?)</script>", PAGE, re.S).group(1)
+    head = f"const posts = [];\nconst CHIP = {json.dumps(chip)}, CHOICE = {json.dumps(choice)};\n"
+    proc = subprocess.run(
+        [NODE, "-e", head + "const SCRIPT = " + json.dumps(script) + ";\n" + harness],
+        input=wire.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_a_tier_is_shown_on_the_roster_and_changed_from_it():
+    """Each row carries its tier, where it came from and the numbers it is set
+    by; a tap opens the choice in the row - the tiers said once, above the
+    list, not again under it - and sends the new one home, and the row says it
+    is saved for the next run. A player Yahoo locks has no choice - no pin can
+    move him."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [
+                {"id": 4, "add": "Fa", "drop": "Tyler Kleven", "why": "", "timing": "",
+                 "drop_tier": "Tyler Kleven: Upgrade only - goes only for a player worth more"},
+            ],
+            "roster": [
+                {"slot": "D", "name": "Tyler Kleven", "team": "OTT", "opp": "", "status": "",
+                 "player_key": "p.1", "tier": "upgrade", "tier_label": "Upgrade only",
+                 "tier_source": "auto",
+                 "tier_why": "goes only for a player worth more over the rest of the season",
+                 "stats": "Season #109, VORP +1.4 \u00b7 Rest of season 304, 15th of 18"},
+                {"slot": "C", "name": "Locked Star", "team": "TOR", "opp": "", "status": "",
+                 "player_key": "p.2", "tier": "never", "tier_label": "Never",
+                 "tier_source": "yahoo", "tier_why": "Yahoo does not let him be dropped"},
+                {"slot": "BN", "name": "Old Push", "team": "MTL", "opp": "", "status": ""},
+            ],
+        },
+    )  # fmt: skip
+    out = run_page_and_pick_tier(state.get("jimmy"), "Upgrade only", "Rotation")
+    for page in ("app", "opened", "after"):
+        assert_clean({"fresh": out["fresh"], "app": out[page]})
+    assert "Upgrade only \u00b7 auto" in out["app"] and "Never \u00b7 Yahoo" in out["app"]
+    assert "Tyler Kleven: Upgrade only - goes only for a player worth more" in out["app"]
+    assert "Old Push" in out["app"]  # a row from before tiers draws without one
+    assert "Season #109, VORP +1.4 \u00b7 Rest of season 304, 15th of 18" in out["app"]
+    assert "Rotation: for any move that pays this week" in out["app"]  # the legend, once
+    opened = out["opened"]
+    assert opened.count("for any move that pays") == 1  # not repeated under the row
+    assert "Upgrade only \u2013 goes only for a player worth more" in opened
+    assert "Never Upgrade only Rotation Automatic" in opened
+    assert out["posts"] == [{"url": "/tier?k=test", "body": {"player": "p.1", "tier": "rotation"}}]
+    assert "Rotation \u00b7 yours" in out["after"]
+    assert "Saved \u2013 PuckPilot uses it from its next run." in out["after"]
+
+
+def run_page_and_tap(payload: dict, label: str) -> dict:
+    """Draw the page, tap the first button reading `label`, and return the
+    page before and after and what the tap sent."""
+    tap = (
+        "\n  const drawn = app.textContent;\n"
+        "  function find(n) {\n"
+        "    if (n.tagName === 'button' && n._text === LABEL) return n;\n"
+        "    for (const c of n.children) { const x = find(c); if (x) return x; }\n"
+        "    return null;\n"
+        "  }\n"
+        "  find(app).onclick();\n"
+        "  setTimeout(() => console.log(JSON.stringify(\n"
+        "    { fresh: fresh.textContent, app: drawn, after: app.textContent, posts })), 30);"
+    )
+    harness = HARNESS.replace(
+        "fetch: () => Promise.resolve(",
+        "fetch: (u, o) => (o && o.body && posts.push({ url: u, body: JSON.parse(o.body) }), "
+        "Promise.resolve(",
+    ).replace("json: () => Promise.resolve(input) }),", "json: () => Promise.resolve(input) })),")
+    harness = harness.replace(
+        "\n  console.log(JSON.stringify({ fresh: fresh.textContent, app: app.textContent }));", tap
+    )
+    assert harness.count("posts") == 2, "the harness changed shape - update this test"
+    script = re.search(r"<script>(.*?)</script>", PAGE, re.S).group(1)
+    head = f"const posts = [];\nconst LABEL = {json.dumps(label)};\n"
+    proc = subprocess.run(
+        [NODE, "-e", head + "const SCRIPT = " + json.dumps(script) + ";\n" + harness],
+        input=wire.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_a_card_made_unless_stopped_leads_with_its_time_and_a_stop():
+    """Under a standing approval the move happens on its own: its section comes
+    first, it says when, and Stop sends a no that the run will not make."""
+    state = SeasonState()
+    state.push(
+        "jimmy",
+        {
+            "team": "T",
+            "moves": [],
+            "proposals": [
+                {"id": 31, "add": "Streamer", "drop": "Dustin Wolf", "why": "", "timing": "",
+                 "executes": True, "approve_means": "Nothing to do: PuckPilot makes it at 9:05 PM",
+                 "standing": {"at": "2026-11-03T02:05:00+00:00", "due_local": "9:05 PM",
+                              "text": "PuckPilot makes this at 9:05 PM unless you stop it"}},
+                {"id": 32, "add": "Upgrade", "drop": "Tyler Kleven", "why": "", "timing": "",
+                 "executes": True, "approve_means": "Approve and PuckPilot makes this add",
+                 "needs_tap": "Needs your tap: Tyler Kleven is Upgrade only, not Rotation"},
+            ],
+        },
+    )  # fmt: skip
+    out = run_page_and_tap(state.get("jimmy"), "Stop")
+    assert_clean(out)
+    app = out["app"]
+    assert app.index("Making soon unless you stop it") < app.index("Needs your decision")
+    assert "PuckPilot makes this at 9:05 PM unless you stop it" in app
+    assert "Make it now" in app and "Needs your tap: Tyler Kleven is Upgrade only" in app
+    assert out["posts"] == [
+        {"url": "/decide?k=test",
+         "body": {"kind": "proposal", "id": 31, "approve": False, "executes": True}}
+    ]  # fmt: skip
+    assert "Stopped \u2013 PuckPilot will not make it." in out["after"]
