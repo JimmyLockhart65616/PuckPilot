@@ -1625,6 +1625,7 @@ def _cmd_season_g3(args: argparse.Namespace) -> int:
         goalie_age_on=args.goalie_age,
         start_corr=args.start_corr,
         goalie_sv_shrink=args.goalie_sv_shrink,
+        game_shots=args.game_shots,
     )
     if not report.cases:
         print("No final week with every team's week-start roster saved - `ppilot season league`.")
@@ -2175,6 +2176,7 @@ def _cmd_season_calibrate(args: argparse.Namespace) -> int:
         rates_mode=args.rates,
         goalie_rates_per=args.goalie_rates,
         fit_start_corr=args.fit_start_corr,
+        game_shots=args.game_shots,
     )
     print()
     print(report.text)
@@ -3295,6 +3297,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also fit how much a goalie's starts in a week move together (odds.START_CORR)",
     )
+    s_cal.add_argument(
+        "--game-shots",
+        action="store_true",
+        help="scale each goalie game's shots by the opponent's shot rate (start_pricing)",
+    )
     s_cal.add_argument("--verbose", action="store_true")
     s_cal.set_defaults(func=_cmd_season_calibrate)
 
@@ -3482,6 +3489,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="shrink each goalie's save %% toward the league's by this many shots",
+    )
+    s_g3.add_argument(
+        "--game-shots",
+        action="store_true",
+        help="scale each goalie's shots by his opponents' shot rates (start_pricing)",
     )
     s_g3.set_defaults(func=_cmd_season_g3)
 

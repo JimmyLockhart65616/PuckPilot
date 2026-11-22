@@ -547,6 +547,7 @@ def expected_starts(
     goalie_games: dict[int, list[float]] | None = None,
     benched: dict[str, int] | None = None,
     goalie_count: str = "top",
+    goalie_dates: dict[int, list[str]] | None = None,
 ) -> dict[int, float]:
     """Expected *starts* for each player over the week, not team games.
 
@@ -606,6 +607,8 @@ def expected_starts(
             out[pid] = out.get(pid, 0.0) + chance
             if goalie_games is not None and chance > 0:
                 goalie_games.setdefault(pid, []).append(chance)
+                if goalie_dates is not None:
+                    goalie_dates.setdefault(pid, []).append(day)
         slotted = optimize_lineup(cands, shape)
         for pid in slotted:
             out[pid] = out.get(pid, 0.0) + 1.0
@@ -896,6 +899,7 @@ def build_week_plan(
     season_tilt: dict[str, float] | None = None,
     season_keep: bool = False,
     keeper_weight: float = 0.0,
+    opponent_shots=None,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -959,7 +963,10 @@ def build_week_plan(
     season term's scale (`SeasonOutlook.player_value`) instead of value a
     game times games left. `keeper_weight` charges a swap what it takes off
     next season's keepers, in categories a VORP point (`values.keepers`, a
-    `keeper_value.KeeperBoard`); 0, or no board: nothing.
+    `keeper_value.KeeperBoard`); 0, or no board: nothing. `opponent_shots`
+    (`start_pricing.OpponentShots`) scales each goalie's shots faced, saves
+    and goals against by the shot rates of the clubs he is expected to face in
+    the days priced, as of the first of them; None: his flat line, as built.
 
     `their_stream` / `our_stream` (`streams.GoalieStream`) add the goalie
     starts a side will get from adds not yet made this week, as one
@@ -990,6 +997,7 @@ def build_week_plan(
 
     our_goalie_games: dict[int, list[float]] = {}
     their_goalie_games: dict[int, list[float]] = {}
+    goalie_dates: dict[int, list[str]] | None = {} if opponent_shots is not None else None
     bench_calls: dict[str, int] = {}
     our_games = expected_starts(
         conn,
@@ -1003,6 +1011,7 @@ def build_week_plan(
         goalie_games=our_goalie_games,
         benched=bench_calls,
         goalie_count=goalie_count,
+        goalie_dates=goalie_dates,
     )
     their_games = expected_starts(
         conn,
@@ -1015,7 +1024,13 @@ def build_week_plan(
         exclude=exclude,
         goalie_games=their_goalie_games,
         goalie_count=their_goalie_count,
+        goalie_dates=goalie_dates,
     )
+    if opponent_shots is not None and days:
+        rates = _shots_scaled(
+            rates, opponent_shots, [*ours.players, *theirs.players], goalie_dates,
+            {**our_goalie_games, **their_goalie_games}, days[0],
+        )  # fmt: skip
     for pid, stream, games, goalie_games in (
         (OUR_STREAM, our_stream, our_games, our_goalie_games),
         (THEIR_STREAM, their_stream, their_games, their_goalie_games),
@@ -2083,6 +2098,26 @@ def _price(
         gain=gain,
     )
     return t, (after, after_starts, after_odds)
+
+
+_SHOT_KEYS = ("shots_against", "saves", "goals_against")
+
+
+def _shots_scaled(rates, opponent_shots, players, goalie_dates, goalie_games, day: str):
+    """`rates` with each goalie's shot line scaled by his opponents' shot rates,
+    as of `day` (games before it)."""
+    club = {p.nhl_player_id: p.team for p in players if p.position == "G"}
+    out = dict(rates)
+    for pid, dates in (goalie_dates or {}).items():
+        if pid not in club or pid not in out:
+            continue
+        f = opponent_shots.factor(club[pid], dates, goalie_games.get(pid, []), day)
+        line = dict(out[pid])
+        for k in _SHOT_KEYS:
+            if k in line:
+                line[k] = line[k] * f
+        out[pid] = line
+    return out
 
 
 def _claim_wait(cand, runtime, days: list[str]) -> int:

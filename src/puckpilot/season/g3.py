@@ -448,6 +448,7 @@ def build(
     goalie_age_on: str | None = None,
     start_corr: float | None = None,
     goalie_sv_shrink: float | None = None,
+    game_shots: bool = False,
 ) -> G3Report:
     """Every final team-week projected as of its first morning, against the result.
 
@@ -474,6 +475,9 @@ def build(
     lk = runtime.league_key
     season = runtime.nhl_season
     model = OddsModel() if start_corr is None else OddsModel(start_corr=start_corr)
+    from puckpilot.season.start_pricing import OpponentShots
+
+    opp_shots = OpponentShots(conn, season) if game_shots else None
     train = _train_seasons(season)
     values = build_value_model(
         conn,
@@ -536,6 +540,7 @@ def build(
                 add_scoring="odds", from_day=w.start,
                 goalie_count=goalie_count, their_goalie_count=goalie_count,
                 their_stream=their_stream, our_stream=our_stream,
+                opponent_shots=opp_shots,
             )  # fmt: skip
             opp_stats = rows[opp][2]
             by_label = {label_of.get(int(k), k): v for k, v in stats.items() if k.isdigit()}

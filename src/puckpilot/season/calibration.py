@@ -154,6 +154,7 @@ def build_cases(
     rates_mode: str = "pre",
     goalie_count: str = "top",
     goalie_rates_per: str | None = None,
+    game_shots: bool = False,
 ) -> list[Case]:
     """Every matchup-morning of one replayed season, with how its week ended.
 
@@ -161,7 +162,8 @@ def build_cases(
     `goalie_count` is how a night's goalie starts are counted
     (`goalie_count.GOALIE_COUNTS`); the replay's lineups play "top".
     `goalie_rates_per`: a goalie's line per game or per start
-    (`week.GOALIE_RATES_PER`).
+    (`week.GOALIE_RATES_PER`). `game_shots` scales each goalie game's shots by
+    the opponent's shot rate as of the morning (`start_pricing.OpponentShots`).
     `rates_mode` "form" forecasts each morning with per-category rates that have
     seen the season so far (`season.form`); "pre" with the preseason rates.
     """
@@ -227,7 +229,13 @@ def build_cases(
     g_slots = sum(n for pos, n in shape.slots if pos == "G")
     no_club = [""] * len(data.dates)
     # Clubs matter only to the "min" count (two goalies of one club never both start).
-    clubs = team_by_day(conn, season, data, all_pids) if goalie_count == "min" else {}
+    clubs = team_by_day(conn, season, data, all_pids) if goalie_count == "min" or game_shots else {}
+    if game_shots:
+        from puckpilot.season.start_pricing import OpponentShots
+
+        opp_shots = OpponentShots(conn, season)
+    else:
+        opp_shots = None
 
     # Each team's season as the policy plays it: who started each day, and the
     # real line each of them produced.
@@ -266,9 +274,10 @@ def build_cases(
     frozen_cache: dict[tuple[str, str], dict[int, float]] = {}
 
     def remaining(t: int, days: list[int], cutoff: str) -> tuple[dict[int, float], dict]:
-        """Skater starts still to come, and each goalie game's as-of P(start)."""
+        """Skater starts still to come, and each goalie game's as-of P(start) -
+        with `game_shots`, (P(start), the opponent's shot factor) pairs."""
         skater_games: dict[int, float] = {}
-        goalie_games: dict[int, list[float]] = {}
+        goalie_games: dict[int, list] = {}
         for i in days:
             for pid in started[t].get(i, ()):
                 if positions.get(pid) != "G":
@@ -288,7 +297,13 @@ def build_cases(
             )
             for pid, ps in gs.items():
                 if ps > 0:
-                    goalie_games.setdefault(pid, []).append(ps)
+                    if opp_shots is None:
+                        goalie_games.setdefault(pid, []).append(ps)
+                        continue
+                    club = (clubs.get(pid) or no_club)[i]
+                    rival = opp_shots.opponent(data.dates[i], club)
+                    f = opp_shots.ratios(cutoff).get(rival, 1.0)
+                    goalie_games.setdefault(pid, []).append((ps, f))
         return skater_games, goalie_games
 
     def side_of(t, banked, skater_games, goalie_games, at: str) -> Side:
@@ -297,9 +312,14 @@ def build_cases(
         for pid, n in skater_games.items():
             for k, r in (now.get(pid) or {}).items():
                 skaters[k] = skaters.get(k, 0.0) + r * n
-        goalies = [
-            goalie_game(now.get(pid) or {}, p, pid) for pid, ps in goalie_games.items() for p in ps
-        ]
+        goalies = []
+        for pid, ps in goalie_games.items():
+            for p in ps:
+                if isinstance(p, tuple):
+                    g = goalie_game(now.get(pid) or {}, p[0], pid)
+                    goalies.append(replace(g, shots=g.shots * p[1]))
+                else:
+                    goalies.append(goalie_game(now.get(pid) or {}, p, pid))
         return Side(banked=banked, skaters=skaters, goalies=goalies)
 
     cases: list[Case] = []
@@ -513,6 +533,7 @@ def calibration_report(
     rates_mode: str = "pre",
     goalie_rates_per: str | None = None,
     fit_start_corr: bool = False,
+    game_shots: bool = False,
 ) -> CalibrationReport:
     say = progress or (lambda _m: None)
     cats = league.all_cats
@@ -531,6 +552,7 @@ def calibration_report(
         goalies,
         rates_mode,
         goalie_rates_per=goalie_rates_per,
+        game_shots=game_shots,
     )
     test_cases = build_cases(
         conn,
@@ -542,6 +564,7 @@ def calibration_report(
         goalies,
         rates_mode,
         goalie_rates_per=goalie_rates_per,
+        game_shots=game_shots,
     )
     say("fitting")
     model = fit(fit_cases, cats, say, start_corr=fit_start_corr)
