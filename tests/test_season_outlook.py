@@ -172,3 +172,37 @@ def test_a_player_value_is_on_the_season_terms_scale():
     from puckpilot.season.add_gate import parse_arm
 
     assert parse_arm("odds-daily-c50-sk").season_keep and not parse_arm("odds-daily").season_keep
+
+
+def test_a_swap_is_charged_what_it_takes_off_next_seasons_keepers():
+    import pandas as pd
+
+    from puckpilot.league import LeagueConfig
+    from puckpilot.season.keeper_value import KeeperBoard, keeper_loss, keeper_set_value
+    from puckpilot.season.week import AddTarget, _with_keepers
+
+    board = KeeperBoard(
+        league=LeagueConfig(n_keepers=2, keeper_years=3),
+        season="20262027",
+        as_of="2026-11-01",
+        vorp_next=pd.Series({1: 30.0, 2: 20.0, 3: 12.0, 4: 25.0}),
+        cost=10.0,
+        times_kept={3: 3},  # kept out: not eligible
+    )
+    roster = [_p(1, "AAA"), _p(2, "AAA"), _p(3, "AAA")]
+    assert keeper_set_value(roster, board) == pytest.approx(20.0 + 10.0)  # 1 and 2, less cost
+    assert keeper_loss(roster, _p(5, "AAA"), roster[1], board) == pytest.approx(10.0)
+    assert keeper_loss(roster, _p(4, "AAA"), roster[1], board) == pytest.approx(-5.0)  # better one
+    assert keeper_loss(roster, _p(5, "AAA"), roster[2], board) == 0.0  # he was never kept
+    t = AddTarget(
+        player=_p(5, "AAA"), starts=3.0, drop_starts=3.0, deltas={}, helps=(), drop=roster[1],
+        score=0.5, timing="", gain=0.5,
+    )  # fmt: skip
+    values = SimpleNamespace(keepers=board)
+    got = _with_keepers(t, roster, values, 0.02)
+    assert got.gain == pytest.approx(0.5 - 0.2) and "keepers" in got.detail
+    assert _with_keepers(t, roster, values, 0.0) is t
+    assert _with_keepers(t, roster, SimpleNamespace(), 0.02) is t
+    from puckpilot.season.add_gate import parse_arm
+
+    assert parse_arm("odds-daily-kw5").keeper_weight == 0.05

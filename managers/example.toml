@@ -170,6 +170,12 @@ max_pending = 5
 # 0 = free agents only.
 # waiver_pool = 0
 
+# Next season's keepers against this season's categories: a swap is charged
+# the VORP it takes off your best keepers (the league's keeper count) at this
+# many categories a point, and credited one that adds. A trade-off between
+# seasons for you to set; 0 = only the never-drop keeper list protects them.
+# keeper_weight = 0.0
+
 
 [authority.standing]
 # Moves approved in advance: a ROTATION player's drop, each still shown on the

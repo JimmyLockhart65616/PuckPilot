@@ -307,13 +307,17 @@ def season_terms(conn, manager, league_key: str, ours, day: str) -> dict:
     tilt is the manager's pinned category stances (`season.category_plan`).
     """
     weight = float(getattr(manager.authority.transactions, "season_weight", 0.0) or 0.0)
-    if weight <= 0 or ours is None:
+    keeper = float(getattr(manager.authority.transactions, "keeper_weight", 0.0) or 0.0)
+    if ours is None or (weight <= 0 and keeper <= 0):
         return {}
+    if weight <= 0:
+        return {"keeper_weight": keeper}
     from puckpilot.season import category_plan
 
     return {
         "season_rivals": rival_rosters(conn, league_key, ours.team_key, day),
         "season_weight": weight,
+        "keeper_weight": float(getattr(manager.authority.transactions, "keeper_weight", 0.0)),
         "season_tilt": category_plan.tilt(category_plan.pins(conn, manager.name, league_key)),
     }
 

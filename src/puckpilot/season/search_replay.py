@@ -26,6 +26,7 @@ def replay(
     pool_size: int = 150,
     terms=None,
     season_keep: bool = False,
+    keeper_weight: float = 0.0,
 ):
     """The week plan the search makes on `day` with these knobs, or None.
 
@@ -59,7 +60,16 @@ def replay(
     train = _train_seasons(season)
     cutoff = (_date.fromisoformat(day) - timedelta(days=1)).isoformat()
     base = build_value_model(conn, season, train, manager.league)
-    values = AsOfValues(base, cutoff)
+    keepers = None
+    if keeper_weight > 0 and manager.league.n_keepers > 0:
+        from pathlib import Path
+
+        from puckpilot.config import Settings
+        from puckpilot.season import keeper_value as kv
+
+        path = Settings()._resolve(Path("data")) / f"keepers-{season}.json"
+        keepers = kv.board(conn, manager.league, season, cutoff, path)
+    values = AsOfValues(base, cutoff, keepers=keepers)
     goalies = AsOfGoalieSource(TrailingStartShareSource(conn, season, fallback_season=train[0]),
                                cutoff)  # fmt: skip
     pool = load_pool(conn, lk, day)[:pool_size]
@@ -100,6 +110,7 @@ def replay(
         season_rivals=rival_rosters(conn, lk, team, day) if season_weight else None,
         season_weight=season_weight,
         season_keep=season_keep,
+        keeper_weight=keeper_weight,
         **goalie_terms(terms, runtime, week, day, ours, theirs),
     )
 

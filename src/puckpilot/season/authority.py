@@ -363,8 +363,17 @@ class TransactionAuthority:
     # built): free agents only - so a goalie a rival drops is invisible until
     # he clears.
     waiver_pool: int = 0
+    # What next season's keepers are worth against this season's categories: a
+    # swap is charged the VORP it takes off the roster's best keepers
+    # (`keeper_value.keeper_loss`) at this many categories a point, and
+    # credited one that adds. A manager's trade-off between seasons - the add
+    # gate can say what it costs this season, not what it buys next. 0 (as
+    # built): next season is protected only by `-k`'s never-drop list.
+    keeper_weight: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.keeper_weight < 0:
+            raise AuthorityError("authority.transactions.keeper_weight cannot be negative")
         if self.waiver_pool < 0:
             raise AuthorityError("authority.transactions.waiver_pool cannot be negative")
         if self.season_weight < 0:

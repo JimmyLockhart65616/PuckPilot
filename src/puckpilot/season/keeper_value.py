@@ -326,6 +326,31 @@ def annotate(roster, ranks: list[KeeperRank]):
     return replace(roster, players=players)
 
 
+def keeper_set_value(players, keepers: KeeperBoard) -> float:
+    """What the roster's next-season keepers are worth: the best `n_keepers`
+    eligible values above the keeper cost, summed (VORP over a pick's worth)."""
+    n = keepers.league.n_keepers
+    if n <= 0:
+        return 0.0
+    vals = sorted(
+        (
+            v
+            for p in players
+            if keepers.eligible(p.nhl_player_id)
+            and (v := keepers.value(p.nhl_player_id)) is not None
+            and v > 0
+        ),
+        reverse=True,
+    )
+    return float(sum(vals[:n]))
+
+
+def keeper_loss(base, cand, drop, keepers: KeeperBoard) -> float:
+    """VORP the swap takes off next season's keepers (negative: it adds)."""
+    after = [p for p in base if drop is None or p.player_key != drop.player_key] + [cand]
+    return keeper_set_value(base, keepers) - keeper_set_value(after, keepers)
+
+
 def card_lines(cand, drop, roster, keepers: KeeperBoard) -> list[str]:
     """What the swap does to next season's keepers, for a proposal's card."""
     n = keepers.league.n_keepers

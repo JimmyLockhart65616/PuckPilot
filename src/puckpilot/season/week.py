@@ -895,6 +895,7 @@ def build_week_plan(
     season_weight: float = 0.0,
     season_tilt: dict[str, float] | None = None,
     season_keep: bool = False,
+    keeper_weight: float = 0.0,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -956,7 +957,9 @@ def build_week_plan(
     a category's season leverage (`category_plan.tilt`, a pinned stance).
     `season_keep` also places the drop tiers, and judges an upgrade, on the
     season term's scale (`SeasonOutlook.player_value`) instead of value a
-    game times games left.
+    game times games left. `keeper_weight` charges a swap what it takes off
+    next season's keepers, in categories a VORP point (`values.keepers`, a
+    `keeper_value.KeeperBoard`); 0, or no board: nothing.
 
     `their_stream` / `our_stream` (`streams.GoalieStream`) add the goalie
     starts a side will get from adds not yet made this week, as one
@@ -1186,6 +1189,7 @@ def build_week_plan(
             workload=workload,
             switch_after=switch_after,
             outlook=season_outlook,
+            keeper_weight=keeper_weight,
         )
     elif find_targets and days and not holding:
         misses: list = []
@@ -1226,6 +1230,7 @@ def build_week_plan(
             hold=hold,
             outlook=season_outlook,
             season_keep=season_keep,
+            keeper_weight=keeper_weight,
         )
         near_misses = _near_misses(misses, targets)
 
@@ -1355,6 +1360,7 @@ def _targets(
     hold: set[str] | None = None,
     outlook=None,
     season_keep: bool = False,
+    keeper_weight: float = 0.0,
 ) -> tuple[AddTarget, ...]:
     """Adds that move a category in play, priced by re-slotting the actual week.
 
@@ -1630,6 +1636,7 @@ def _targets(
                     **({"split": claims(), "k": wait} if wait else {}),
                 )
                 t = _with_season(t, outlook, conn, runtime, days, rates)
+                t = _with_keepers(t, base_players, values, keeper_weight)
                 priced.append((t, after_week))
         if split is not None and time_moves == "search":
             # The step's best few, made on a later morning instead.
@@ -1649,7 +1656,10 @@ def _targets(
                     wait_hazard,
                 )
                 if timed is not None:
-                    tt = _with_season(timed[0], outlook, conn, runtime, days, rates)
+                    tt = _with_keepers(
+                        _with_season(timed[0], outlook, conn, runtime, days, rates),
+                        base_players, values, keeper_weight,
+                    )  # fmt: skip
                     priced.append((tt, timed[1]))
                     notes[_pair_key(tt)] = timed[2]
         for t, after_week in priced:
@@ -1681,7 +1691,10 @@ def _targets(
                 wait_hazard,
             )
             if timed is not None:
-                best = _with_season(timed[0], outlook, conn, runtime, days, rates)
+                best = _with_keepers(
+                    _with_season(timed[0], outlook, conn, runtime, days, rates),
+                    base_players, values, keeper_weight,
+                )  # fmt: skip
                 best_after = timed[1]
                 notes[_pair_key(best)] = timed[2]
         best = replace(
@@ -1746,6 +1759,7 @@ def _reprice(
     workload=None,
     switch_after: dict[tuple[str, str], str] | None = None,
     outlook=None,
+    keeper_weight: float = 0.0,
 ) -> tuple[tuple[AddTarget, ...], tuple[AddTarget, ...]]:
     """(still pays, no longer pays) for swaps already proposed, priced as the
     search would price them today - or, one queued to be made after a day's
@@ -1798,6 +1812,7 @@ def _reprice(
         if timed:
             t = replace(t, after_games_of=when, timing=f"{t.timing}; {_planned(days[k], drop)}")
         t = _with_season(t, outlook, conn, runtime, days, rates)
+        t = _with_keepers(t, base_players, values, keeper_weight)
         if not _pays(t, min_gain, close_by_key):
             lapsed.append(t)
             continue
@@ -2090,6 +2105,27 @@ def _with_season(t: AddTarget, outlook, conn, runtime, days, rates):
     return replace(
         t, week_gain=t.gain, season_gain=season, gain=t.gain + extra, score=t.score + extra
     )
+
+
+def _with_keepers(t: AddTarget, base, values, weight: float) -> AddTarget:
+    """`t` charged what it takes off next season's keepers, `weight`
+    categories a VORP point (`keeper_value.keeper_loss`); a swap that adds to
+    them is credited. No board, or a weight of 0: `t` as it was."""
+    board = getattr(values, "keepers", None)
+    if not weight or board is None or t.gain is None:
+        return t
+    from puckpilot.season.keeper_value import keeper_loss
+
+    loss = keeper_loss(base, t.player, t.drop, board)
+    if not loss:
+        return t
+    detail = dict(t.detail)
+    detail["keepers"] = [
+        f"Next season's keepers {-loss:+.1f} VORP, counted at {weight:g} a point: "
+        f"{-loss * weight:+.2f} categories",
+        *detail.get("keepers", []),
+    ]
+    return replace(t, gain=t.gain - weight * loss, score=t.score - weight * loss, detail=detail)
 
 
 def _season_noted(t: AddTarget, outlook) -> AddTarget:

@@ -206,6 +206,9 @@ class ArmSpec:
     # -sk: with -cNN, the drop tiers and the upgrade test on the season term's
     # own scale (`week.build_week_plan(season_keep=)`).
     season_keep: bool = False
+    # -kwNN: a swap charged what it takes off next season's keepers, NN/100
+    # categories a VORP point (`week._with_keepers`).
+    keeper_weight: float = 0.0
 
 
 def _swap(roster: list[int], target) -> None:
@@ -288,6 +291,8 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.open_caps = True
         elif tok == "sk":
             spec.season_keep = True
+        elif tok.startswith("kw") and tok[2:].isdigit():
+            spec.keeper_weight = int(tok[2:]) / 100
         elif tok.startswith("o") and tok[1:].isdigit():
             spec.tap = int(tok[1:]) / 100
         elif len(tok) > 1 and tok[0] in "spqfxknjyzbc" and tok[1:].isdigit():
@@ -340,9 +345,12 @@ class AsOfValues:
     Thursday's and Friday's games. Every question is answered as of the cutoff.
     """
 
-    def __init__(self, values, cutoff: str):
+    def __init__(self, values, cutoff: str, keepers=None):
         self.values = values
         self.cutoff = cutoff
+        # Next season's keeper board as of the cutoff (`keeper_value`), for the
+        # search's keeper charge; None: the model's own, if it has one.
+        self.keepers = keepers if keepers is not None else getattr(values, "keepers", None)
 
     def per_game(self, pid: int, date: str) -> float:
         return self.values.per_game(pid, min(date, self.cutoff))
@@ -1031,7 +1039,11 @@ def add_gate_report(
                                 pool,
                                 frame_now,
                                 AsOfGoalieSource(pol, date),
-                                AsOfValues(vals, date),
+                                AsOfValues(
+                                    vals,
+                                    date,
+                                    keepers=keeper_board(date) if spec.keeper_weight else None,
+                                ),
                                 # Queued moves are paid for next week, not now.
                                 adds_used_week=0 if spec.queue else adds_week,
                                 adds_used_season=adds_season,
@@ -1055,6 +1067,7 @@ def add_gate_report(
                                 season_rivals=rivals_on(t, i, date) if spec.season_weight else None,
                                 season_weight=spec.season_weight,
                                 season_keep=spec.season_keep,
+                                keeper_weight=spec.keeper_weight,
                                 goalie_floor=_floor(spec, runtime),
                                 goalie_minimum=(
                                     runtime.min_goalie_games(nw.number) if spec.minimum else 0
@@ -1125,7 +1138,11 @@ def add_gate_report(
                             pool,
                             frame_now,
                             AsOfGoalieSource(pol, date),
-                            AsOfValues(vals, date),
+                            AsOfValues(
+                                vals,
+                                date,
+                                keepers=keeper_board(date) if spec.keeper_weight else None,
+                            ),
                             adds_used_week=adds_week,
                             adds_used_season=adds_season,
                             min_gain=min_gain,
@@ -1151,6 +1168,7 @@ def add_gate_report(
                             season_rivals=rivals_on(t, i, date) if spec.season_weight else None,
                             season_weight=spec.season_weight,
                             season_keep=spec.season_keep,
+                            keeper_weight=spec.keeper_weight,
                             goalie_floor=_floor(spec, runtime),
                             goalie_minimum=(
                                 runtime.min_goalie_games(w.number) if spec.minimum else 0
@@ -1188,7 +1206,11 @@ def add_gate_report(
                                 [],
                                 frame_now,
                                 AsOfGoalieSource(pol, date),
-                                AsOfValues(vals, date),
+                                AsOfValues(
+                                    vals,
+                                    date,
+                                    keepers=keeper_board(date) if spec.keeper_weight else None,
+                                ),
                                 find_targets=False,
                                 reprice=[(x.player, x.drop) for x in targets],
                                 odds_model=OddsModel() if odds_arm else None,
@@ -1205,6 +1227,7 @@ def add_gate_report(
                                 season_rivals=rivals_on(t, i, date) if spec.season_weight else None,
                                 season_weight=spec.season_weight,
                                 season_keep=spec.season_keep,
+                                keeper_weight=spec.keeper_weight,
                                 goalie_minimum=(
                                     runtime.min_goalie_games(weeks[nxt_wi].number)
                                     if spec.minimum
