@@ -160,3 +160,15 @@ def test_a_waiver_claim_waits_for_the_league_waiver_period_within_the_week():
     assert TransactionAuthority().waiver_pool == 0
     with pytest.raises(AuthorityError):
         TransactionAuthority(waiver_pool=-1)
+
+
+def test_a_player_value_is_on_the_season_terms_scale():
+    o = _outlook(leverage={"goals": 0.1, "saves": 0.01})
+    skater = _p(1, "AAA")
+    goalie = _p(9, "AAA", "G")
+    assert o.player_value(skater, RATES, None, {}) == pytest.approx(0.40 * 60 * 0.1)
+    assert o.player_value(goalie, RATES, None, {}) == pytest.approx(25.0 * 0.5 * 60 * 0.01)
+    assert o.player_value(skater, RATES, 1.5, {"AAA": 3}) == pytest.approx(0.40 * 30 * 0.1)
+    from puckpilot.season.add_gate import parse_arm
+
+    assert parse_arm("odds-daily-c50-sk").season_keep and not parse_arm("odds-daily").season_keep

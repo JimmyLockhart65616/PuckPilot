@@ -1798,6 +1798,40 @@ def _cmd_season_goalies(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_season_replay_search(args: argparse.Namespace) -> int:
+    """A real morning's add search again, from what was saved that day (season/search_replay.py)."""
+    from dataclasses import replace
+
+    from puckpilot.season import cli_support, search_replay
+    from puckpilot.season.manager import ManagerError
+
+    try:
+        manager, conn, league_key, _ = _season_setup(args)
+        runtime = cli_support.load_rules(conn, league_key)
+    except (ManagerError, cli_support.SeasonCliError) as e:
+        return cli_support.report(e)
+    day = args.date or cli_support.today_str()
+    terms = manager.authority.transactions
+    changed = {
+        k: v
+        for k, v in (("goalie_lane", args.goalie_lane), ("drop_choice", args.drop_choice))
+        if v is not None
+    }
+    plan = search_replay.replay(
+        conn, runtime, manager, day, season_weight=args.season_weight,
+        their_stream=args.their_stream, terms=replace(terms, **changed) if changed else None,
+    )  # fmt: skip
+    knobs = ", ".join(
+        [f"season weight {args.season_weight:g}"]
+        + (["their stream"] if args.their_stream else [])
+        + [f"{k} {v}" for k, v in changed.items()]
+    )
+    print(f"The add search of {day}, again ({knobs}):")
+    for line in search_replay.lines(plan):
+        print(line)
+    return 0
+
+
 def _own_saved_roster(conn, manager, league_key: str):
     """This manager's own roster as last saved - the league read saves every
     team's, so the team is the one his runs acted for."""
@@ -3477,6 +3511,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s_goalies.add_argument("--since", default="", help="with --check: from this date")
     s_goalies.set_defaults(func=_cmd_season_goalies)
+
+    s_rs = season_sub.add_parser(
+        "replay-search",
+        parents=[seasonal],
+        help="A past morning's add search again from that day's saved rosters and pool",
+    )
+    s_rs.add_argument("--season-weight", type=float, default=0.0)
+    s_rs.add_argument("--their-stream", action="store_true")
+    s_rs.add_argument("--goalie-lane", type=int, default=None)
+    s_rs.add_argument("--drop-choice", default=None, choices=("cheapest", "goalies", "all"))
+    s_rs.set_defaults(func=_cmd_season_replay_search)
 
     s_plan = season_sub.add_parser(
         "plan",

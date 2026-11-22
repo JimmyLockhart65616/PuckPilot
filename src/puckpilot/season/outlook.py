@@ -71,6 +71,21 @@ class SeasonOutlook:
         share = self.goalie_share.get(p.nhl_player_id, 0.0) if p.position == "G" else 1.0
         return share * rest
 
+    def player_value(self, p, rates, starts: float | None, week_games: dict[str, int]) -> float:
+        """A player's rest-of-season expected categories, on the season term's
+        scale: leverage times his line times his starts left. `starts` None:
+        a skater's full share, a goalie's typical-week P(start)."""
+        if p is None or p.nhl_player_id is None:
+            return 0.0
+        n = (
+            self.season_starts(p, starts, week_games)
+            if starts is not None
+            else (self.goalie_share.get(p.nhl_player_id, 0.0) if p.position == "G" else 1.0)
+            * self.rest_games.get(p.team, 0)
+        )
+        line = rates.get(p.nhl_player_id) or {}
+        return sum(lev * line.get(k, 0.0) * n for k, lev in self.leverage.items())
+
     def season_gain(self, t, rates, week_games: dict[str, int]) -> float:
         """Expected categories won over the rest of the season, after v before."""
         if not self.leverage:

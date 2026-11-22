@@ -203,6 +203,9 @@ class ArmSpec:
     # -cNN: a swap is priced over the rest of the season too, at NN% of this
     # week's weight (`season.outlook`); rivals are the league's other rosters.
     season_weight: float = 0.0
+    # -sk: with -cNN, the drop tiers and the upgrade test on the season term's
+    # own scale (`week.build_week_plan(season_keep=)`).
+    season_keep: bool = False
 
 
 def _swap(roster: list[int], target) -> None:
@@ -283,6 +286,8 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.standing = True
         elif tok == "co":
             spec.open_caps = True
+        elif tok == "sk":
+            spec.season_keep = True
         elif tok.startswith("o") and tok[1:].isdigit():
             spec.tap = int(tok[1:]) / 100
         elif len(tok) > 1 and tok[0] in "spqfxknjyzbc" and tok[1:].isdigit():
@@ -1049,6 +1054,7 @@ def add_gate_report(
                                 their_goalie_count=their_goalie_count,
                                 season_rivals=rivals_on(t, i, date) if spec.season_weight else None,
                                 season_weight=spec.season_weight,
+                                season_keep=spec.season_keep,
                                 goalie_floor=_floor(spec, runtime),
                                 goalie_minimum=(
                                     runtime.min_goalie_games(nw.number) if spec.minimum else 0
@@ -1144,6 +1150,7 @@ def add_gate_report(
                             their_goalie_count=their_goalie_count,
                             season_rivals=rivals_on(t, i, date) if spec.season_weight else None,
                             season_weight=spec.season_weight,
+                            season_keep=spec.season_keep,
                             goalie_floor=_floor(spec, runtime),
                             goalie_minimum=(
                                 runtime.min_goalie_games(w.number) if spec.minimum else 0
@@ -1197,6 +1204,7 @@ def add_gate_report(
                                 their_goalie_count=their_goalie_count,
                                 season_rivals=rivals_on(t, i, date) if spec.season_weight else None,
                                 season_weight=spec.season_weight,
+                                season_keep=spec.season_keep,
                                 goalie_minimum=(
                                     runtime.min_goalie_games(weeks[nxt_wi].number)
                                     if spec.minimum

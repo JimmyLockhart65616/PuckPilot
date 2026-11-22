@@ -894,6 +894,7 @@ def build_week_plan(
     season_rivals=None,
     season_weight: float = 0.0,
     season_tilt: dict[str, float] | None = None,
+    season_keep: bool = False,
 ) -> WeekPlan:
     """Both sides' week: what is banked, plus what the days left should add.
 
@@ -953,6 +954,9 @@ def build_week_plan(
     (`season.outlook`): its gain is this week's plus the weight times the
     season's. 0 or no rivals: this week only, as built. `season_tilt` weights
     a category's season leverage (`category_plan.tilt`, a pinned stance).
+    `season_keep` also places the drop tiers, and judges an upgrade, on the
+    season term's scale (`SeasonOutlook.player_value`) instead of value a
+    game times games left.
 
     `their_stream` / `our_stream` (`streams.GoalieStream`) add the goalie
     starts a side will get from adds not yet made this week, as one
@@ -1221,6 +1225,7 @@ def build_week_plan(
             wait_hazard=wait_hazard,
             hold=hold,
             outlook=season_outlook,
+            season_keep=season_keep,
         )
         near_misses = _near_misses(misses, targets)
 
@@ -1349,6 +1354,7 @@ def _targets(
     wait_hazard: float = WAIT_HAZARD,
     hold: set[str] | None = None,
     outlook=None,
+    season_keep: bool = False,
 ) -> tuple[AddTarget, ...]:
     """Adds that move a category in play, priced by re-slotting the actual week.
 
@@ -1483,7 +1489,19 @@ def _targets(
     # What each player is worth to the rest of the season, not to this week: a
     # regular with one game this week is still a regular.
     season_left = _season_left(conn, runtime, days[0], [*ours.players, *pool], workload)
-    keep = _season_value(droppable, values, season_left, days[0])
+    by_season = outlook is not None and outlook.weight and season_keep
+    if by_season:
+        # The drop tiers and the upgrade test on the season term's own scale,
+        # so a move the season price wants is one the drop rule allows: on the
+        # value-a-game scale a goalie is below every skater, and on 2026-11-16
+        # the roster's two goalies were its whole Rotation tier.
+        wg = outlook.week_games(conn, runtime, days)
+        keep = {
+            p.player_key: outlook.player_value(p, rates, base_starts.get(p.nhl_player_id), wg)
+            for p in droppable
+        }
+    else:
+        keep = _season_value(droppable, values, season_left, days[0])
     placed = tiers.board(droppable, keep, stream_spots, upgrade_margin=upgrade_margin)
 
     def may_drop(p, cand) -> bool:
@@ -1498,7 +1516,11 @@ def _targets(
             return True
         if drop_choice != "cheapest" and (p.position == "G") != (cand.position == "G"):
             return False  # an upgrade is judged on one scale
-        incoming = values.per_game(cand.nhl_player_id, days[0]) * games_left(season_left, cand)
+        incoming = (
+            outlook.player_value(cand, rates, None, wg)
+            if by_season
+            else values.per_game(cand.nhl_player_id, days[0]) * games_left(season_left, cand)
+        )
         return tiers.clears(incoming, keep.get(p.player_key, 0.0), upgrade_margin)
 
     # Cheap screen: his rate times the games he would actually fill - days his
