@@ -4,8 +4,10 @@ The add search sees a free-agent goalie as a line of numbers; a manager sees a
 net. This is the net, league-wide, from the same start source the run prices
 with (announced calls in front of the history model when they are used):
 tonight's P(start), Yahoo's call and tag, the starts expected over the rest of
-this week and over the rest of the regular season (his mean P(start) this week
-times his club's games left), and whose roster he is on.
+this week and over the regular season after it (his share of his club's starts,
+`goalies.GoalieWorkload`, times his club's games left), and whose roster he is
+on. The season figure is not this week's P(start) averaged: two days left of a
+week, one the back half of a back-to-back, would read a backup as a starter.
 
 Every run keeps one row a goalie a day (`goalie_forecasts`), so the forecast
 is scored against what happened (`check`) rather than trusted.
@@ -32,15 +34,31 @@ class GoalieRow:
 
 
 def _clubs(conn, season: str) -> dict[int, str]:
-    """goalie -> his club, from his latest game log this season."""
-    out: dict[int, str] = {}
-    for pid, team in conn.execute(
-        "SELECT player_id, team_abbrev FROM nhl_game_logs WHERE season = ? "
-        "AND json_extract(stats_json, '$.gamesStarted') IS NOT NULL ORDER BY game_date",
+    """goalie -> his club: the latest game this season he dressed for or played.
+
+    The start model knows a club's goalies from its boxscores, which list both
+    dressed goalies, so a backup who has sat every game is still his club's;
+    the game logs cover a game whose boxscore is not in yet. Game logs alone
+    leave that backup clubless, with no season starts beside his week's.
+    """
+    from puckpilot.season.goalies import _dressed
+
+    latest: dict[int, tuple[str, str]] = {}
+
+    def seen(pid: int, date: str, team: str) -> None:
+        if team and (pid not in latest or date > latest[pid][0]):
+            latest[pid] = (date, team)
+
+    for pid, date, team in conn.execute(
+        "SELECT player_id, game_date, team_abbrev FROM nhl_game_logs WHERE season = ? "
+        "AND json_extract(stats_json, '$.gamesStarted') IS NOT NULL",
         (season,),
     ):
-        out[pid] = team
-    return out
+        seen(int(pid), date, team)
+    for (date, team), pids in _dressed(conn, season).items():
+        for pid in pids:
+            seen(pid, date, team)
+    return {pid: team for pid, (_date, team) in latest.items()}
 
 
 def owners(conn, league_key: str, day: str) -> dict[int, str]:
@@ -66,13 +84,27 @@ def owners(conn, league_key: str, day: str) -> dict[int, str]:
     return out
 
 
-def board(conn, runtime, week, day: str, source, holders: dict[int, str]) -> list[GoalieRow]:
-    """Every goalie the start source gives a start this week or tonight."""
+def board(
+    conn,
+    runtime,
+    week,
+    day: str,
+    source,
+    holders: dict[int, str],
+    priors: dict[int, float] | None = None,
+) -> list[GoalieRow]:
+    """Every goalie the start source gives a start this week or tonight.
+
+    `priors` (`goalies.projected_shares`) are the preseason shares a goalie's
+    share so far is shrunk toward; without them it is his share so far.
+    """
+    from puckpilot.season.goalies import GoalieWorkload
     from puckpilot.season.outlook import remaining_days
     from puckpilot.season.starters import latest_calls
 
     season = runtime.nhl_season
     club = _clubs(conn, season)
+    workload = GoalieWorkload(conn, season, priors=priors)
     names = dict(conn.execute("SELECT player_id, full_name FROM nhl_players"))
     days = [d for d in week.dates() if d >= day]
     tonight = source.starts(day) if days else {}
@@ -93,7 +125,9 @@ def board(conn, runtime, week, day: str, source, holders: dict[int, str]) -> lis
     rows = []
     for pid, ps in per.items():
         c = club.get(pid, "")
-        share = sum(ps) / len(ps)
+        share = workload.share(pid, day)
+        if share is None:  # never dressed this season and not projected
+            share = sum(ps) / len(ps)
         _team, call, status = calls.get(pid, ("", None, ""))
         rows.append(
             GoalieRow(

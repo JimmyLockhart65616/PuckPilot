@@ -47,6 +47,37 @@ def test_the_board_gives_each_goalie_his_starts_ahead_and_whose_he_is(db):
     assert "Starter One" in goalie_board.text(rows, "2026-11-16")
 
 
+def test_a_backup_who_has_only_dressed_is_still_his_clubs(db):
+    import json
+
+    add_player(db, 1, "Starter One", "G")
+    add_player(db, 3, "Dressed Three", "G")
+    add_goalie_game(db, 1, S, 1, date="2026-11-01")  # AAA, and 3 sat on the bench
+    db.execute(
+        "INSERT INTO nhl_boxscore_stats (game_id, player_id, season, team_abbrev, stats_json)"
+        " VALUES (1, 3, ?, 'AAA', ?)",
+        (S, json.dumps({"playerId": 3, "position": "G"})),
+    )
+    this = ["2026-11-16"]
+    later = ["2026-11-24", "2026-11-26"]
+    _games(db, ["2026-11-01", *this, *later])
+    w1 = _week(1, "2026-11-16", "2026-11-22", this)
+    w2 = _week(2, "2026-11-23", "2026-11-29", later)
+    rt = SimpleNamespace(nhl_season=S, weeks=[w1, w2], playoff_start_week=0)
+    # Tonight the back half of a back-to-back: he is likely to start it, but
+    # his season is his share of AAA's starts (0 of 1 so far), not tonight's.
+    source = StaticGoalieSource({"2026-11-16": {1: 0.1, 3: 0.9}})
+
+    def by(priors=None):
+        rows = goalie_board.board(db, rt, w1, "2026-11-16", source, {}, priors=priors)
+        return {r.player_id: r for r in rows}
+
+    assert by()[3].club == "AAA" and by()[3].week_starts == pytest.approx(0.9)
+    assert by()[3].season_starts == 0.0
+    shrunk = (0 + 10 * 0.2) / (1 + 10)  # goalies.WORKLOAD_PRIOR_GAMES of his projection
+    assert by({3: 0.2})[3].season_starts == pytest.approx(shrunk * 2)
+
+
 def test_a_kept_forecast_is_scored_once_its_week_is_over(db):
     add_goalie_game(db, 1, S, 1, date="2026-11-17")
     add_goalie_game(db, 1, S, 2, date="2026-11-19")

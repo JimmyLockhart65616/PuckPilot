@@ -563,7 +563,9 @@ def run_day(
         _guard(
             report,
             "goalie board",
-            lambda: _keep_goalie_board(conn, league_key, runtime, week, day, models[1], report),
+            lambda: _keep_goalie_board(
+                conn, league_key, runtime, week, day, models[1], models[0].frame, report
+            ),
         )
     plan = None
     acted = None
@@ -950,12 +952,15 @@ def _protected_keepers(conn, manager_name: str) -> set[str]:
     return {k.player_key for k in keeper_value.load(conn, manager_name, row[0]) if k.protected}
 
 
-def _keep_goalie_board(conn, league_key, runtime, week, day, source, report) -> None:
+def _keep_goalie_board(conn, league_key, runtime, week, day, source, frame, report) -> None:
     """Keep this run's forecast of every club's goalies (`season.goalie_board`)."""
+    from puckpilot.engine.aggregate import season_games
     from puckpilot.season import goalie_board
+    from puckpilot.season.goalies import projected_shares
 
+    priors = projected_shares(frame, season_games(conn, runtime.nhl_season))
     rows = goalie_board.board(
-        conn, runtime, week, day, source, goalie_board.owners(conn, league_key, day)
+        conn, runtime, week, day, source, goalie_board.owners(conn, league_key, day), priors
     )
     goalie_board.save(conn, rows, day, week.end)
     free = sum(1 for r in rows if r.owner == "free agent" and r.week_starts >= 1.0)

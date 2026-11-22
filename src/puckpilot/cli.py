@@ -1769,10 +1769,16 @@ def _cmd_season_plan(args: argparse.Namespace) -> int:
 def _cmd_season_goalies(args: argparse.Namespace) -> int:
     """Every club's goalies: who starts, how often, and whose (season/goalie_board.py)."""
     from puckpilot.data import store
+    from puckpilot.engine.aggregate import season_games
     from puckpilot.season import cli_support, goalie_board, starters
-    from puckpilot.season.goalies import ChainedGoalieSource, TrailingStartShareSource
+    from puckpilot.season.goalies import (
+        ChainedGoalieSource,
+        TrailingStartShareSource,
+        projected_shares,
+    )
     from puckpilot.season.manager import ManagerError
     from puckpilot.season.run import _train_seasons, week_for
+    from puckpilot.season.values import build_value_model
 
     try:
         manager, conn, league_key, _ = _season_setup(args)
@@ -1789,11 +1795,14 @@ def _cmd_season_goalies(args: argparse.Namespace) -> int:
         print(f"{day} is not in a week of this league's season.")
         return 1
     season = runtime.nhl_season
-    model = TrailingStartShareSource(conn, season, fallback_season=_train_seasons(season)[0])
+    train = _train_seasons(season)
+    model = TrailingStartShareSource(conn, season, fallback_season=train[0])
     use = manager.authority.lineup.announced_starters == "use"
     source = ChainedGoalieSource(starters.AnnouncedStartSource(conn) if use else None, model)
+    frame = build_value_model(conn, season, train, manager.league).frame
+    priors = projected_shares(frame, season_games(conn, season))
     rows = goalie_board.board(
-        conn, runtime, week, day, source, goalie_board.owners(conn, league_key, day)
+        conn, runtime, week, day, source, goalie_board.owners(conn, league_key, day), priors
     )
     print(goalie_board.text(rows, day))
     return 0
