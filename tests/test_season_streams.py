@@ -93,3 +93,9 @@ def test_the_opponents_stream_enters_their_projected_saves_and_ours_is_refused_t
             db, rt, league, rt.week(1), "B", ours, theirs, [], frame, None,
             _PerGame({1: 1.0, 2: 1.0}), our_stream=stream,
         )  # fmt: skip
+
+
+def test_the_their_stream_arm_parses():
+    from puckpilot.season.add_gate import parse_arm
+
+    assert parse_arm("odds-daily-ts").their_stream and not parse_arm("odds-daily").their_stream

@@ -209,6 +209,9 @@ class ArmSpec:
     # -kwNN: a swap charged what it takes off next season's keepers, NN/100
     # categories a VORP point (`week._with_keepers`).
     keeper_weight: float = 0.0
+    # -ts: the opponent's week priced with the goalie starts it will add
+    # (`add_gate_report(their_stream=)`, a `streams.GoalieStream`).
+    their_stream: bool = False
 
 
 def _swap(roster: list[int], target) -> None:
@@ -291,6 +294,8 @@ def parse_arm(arm: str, stream_spots: int = 2) -> ArmSpec:
             spec.open_caps = True
         elif tok == "sk":
             spec.season_keep = True
+        elif tok == "ts":
+            spec.their_stream = True
         elif tok.startswith("kw") and tok[2:].isdigit():
             spec.keeper_weight = int(tok[2:]) / 100
         elif tok.startswith("o") and tok[1:].isdigit():
@@ -424,6 +429,7 @@ def add_gate_report(
     their_goalie_count: str = "top",
     rival_goalies: int = 0,
     rival_goalie_rate: float = 0.0,
+    their_stream=None,
 ) -> AddGateReport:
     from puckpilot.draft.engine import RosterValuePolicy
     from puckpilot.draft.h2h import round_robin_schedule
@@ -1068,6 +1074,7 @@ def add_gate_report(
                                 season_weight=spec.season_weight,
                                 season_keep=spec.season_keep,
                                 keeper_weight=spec.keeper_weight,
+                                their_stream=their_stream if spec.their_stream else None,
                                 goalie_floor=_floor(spec, runtime),
                                 goalie_minimum=(
                                     runtime.min_goalie_games(nw.number) if spec.minimum else 0
@@ -1169,6 +1176,7 @@ def add_gate_report(
                             season_weight=spec.season_weight,
                             season_keep=spec.season_keep,
                             keeper_weight=spec.keeper_weight,
+                            their_stream=their_stream if spec.their_stream else None,
                             goalie_floor=_floor(spec, runtime),
                             goalie_minimum=(
                                 runtime.min_goalie_games(w.number) if spec.minimum else 0
@@ -1228,6 +1236,7 @@ def add_gate_report(
                                 season_weight=spec.season_weight,
                                 season_keep=spec.season_keep,
                                 keeper_weight=spec.keeper_weight,
+                                their_stream=their_stream if spec.their_stream else None,
                                 goalie_minimum=(
                                     runtime.min_goalie_games(weeks[nxt_wi].number)
                                     if spec.minimum

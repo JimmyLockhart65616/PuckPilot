@@ -2208,6 +2208,7 @@ def _cmd_season_add_gate(args: argparse.Namespace) -> int:
             rival_goalie_share=args.rival_goalie_share,
             rival_goalies=args.rival_goalies,
             rival_goalie_rate=args.rival_goalie_rate,
+            their_stream=_live_stream() if args.their_stream_live else None,
         )
         print()
         print(report.text)
@@ -2215,6 +2216,25 @@ def _cmd_season_add_gate(args: argparse.Namespace) -> int:
             print()
             print(_realism(report))
     return 0
+
+
+def _live_stream():
+    """The live league's in-week goalie stream, league-wide, over its final weeks."""
+    from puckpilot.season import cli_support
+    from puckpilot.season import streams as streams_mod
+
+    manager = cli_support.resolve_manager(None)
+    conn = cli_support.open_db(manager)
+    runtime = cli_support.load_rules(conn, cli_support.resolve_league_key(conn, manager))
+    final = {r[0] for r in conn.execute(
+        "SELECT week FROM league_week_stats WHERE league_key = ? AND status = 'postevent'",
+        (runtime.league_key,))}  # fmt: skip
+    weeks = [w for w in runtime.weeks if w.number in final]
+    teams = [r[0] for r in conn.execute(
+        "SELECT DISTINCT team_key FROM league_week_stats WHERE league_key = ?",
+        (runtime.league_key,))]  # fmt: skip
+    added = streams_mod.added_by_week(conn, runtime.league_key, runtime.nhl_season, weeks)
+    return streams_mod.measure(added, [w.number for w in weeks], teams)
 
 
 def _realism(report) -> str:
@@ -3347,6 +3367,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="depth: in-week goalie streams a rival makes a week",
+    )
+    s_ag.add_argument(
+        "--their-stream-live",
+        action="store_true",
+        help="-ts arms: the opponent's in-week goalie starts as the live league's (streams)",
     )
     s_ag.add_argument(
         "--realism",
