@@ -306,20 +306,55 @@ def season_terms(conn, manager, league_key: str, ours, day: str) -> dict:
     in the league as last saved by the league feed (week-start rosters); the
     tilt is the manager's pinned category stances (`season.category_plan`).
     """
-    weight = float(getattr(manager.authority.transactions, "season_weight", 0.0) or 0.0)
-    keeper = float(getattr(manager.authority.transactions, "keeper_weight", 0.0) or 0.0)
+    terms = manager.authority.transactions
+    weight = float(getattr(terms, "season_weight", 0.0) or 0.0)
+    keeper = float(getattr(terms, "keeper_weight", 0.0) or 0.0)
+    out: dict = {}
+    if getattr(terms, "their_stream", False) and ours is not None:
+        stream = opponent_stream(conn, league_key, ours.team_key, day)
+        if stream is not None:
+            out["their_stream"] = stream
     if ours is None or (weight <= 0 and keeper <= 0):
-        return {}
+        return out
     if weight <= 0:
-        return {"keeper_weight": keeper}
+        return {**out, "keeper_weight": keeper}
     from puckpilot.season import category_plan
 
     return {
+        **out,
         "season_rivals": rival_rosters(conn, league_key, ours.team_key, day),
         "season_weight": weight,
         "keeper_weight": float(getattr(manager.authority.transactions, "keeper_weight", 0.0)),
         "season_tilt": category_plan.tilt(category_plan.pins(conn, manager.name, league_key)),
     }
+
+
+def opponent_stream(conn, league_key: str, our_team: str, day: str):
+    """This week's opponent's in-week goalie stream (`season.streams`), from
+    his own adds over the weeks already played, shrunk toward the league's."""
+    from puckpilot.season import streams as streams_mod
+    from puckpilot.season.fetch import load_runtime
+
+    runtime = load_runtime(conn, league_key)
+    week = week_for(runtime, day) if runtime is not None else None
+    if week is None:
+        return None
+    row = conn.execute(
+        "SELECT opponent_key FROM league_week_stats WHERE league_key = ? AND week = ? "
+        "AND team_key = ?",
+        (league_key, week.number, our_team),
+    ).fetchone()
+    if not row:
+        return None
+    played = [w for w in runtime.weeks if w.end < week.start]
+    teams = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT team_key FROM league_week_stats WHERE league_key = ?", (league_key,)
+        )
+    ]
+    added = streams_mod.added_by_week(conn, league_key, runtime.nhl_season, played)
+    return streams_mod.measure(added, [w.number for w in played], teams, team=row[0])
 
 
 def rival_rosters(conn, league_key: str, our_team: str, day: str) -> list:

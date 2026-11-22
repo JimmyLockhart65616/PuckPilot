@@ -370,6 +370,12 @@ class TransactionAuthority:
     # gate can say what it costs this season, not what it buys next. 0 (as
     # built): next season is protected only by `-k`'s never-drop list.
     keeper_weight: float = 0.0
+    # Price the opponent's week with the goalie starts he will add in it
+    # (`season.streams`: his own in-week goalie adds over the weeks played,
+    # shrunk toward the league's). Measured live (g3, weeks 1-7) it is the
+    # better forecast when every side streams; whether the search should
+    # price it is the add gate's (-ts). Off until it says.
+    their_stream: bool = False
 
     def __post_init__(self) -> None:
         if self.keeper_weight < 0:

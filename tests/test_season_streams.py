@@ -99,3 +99,9 @@ def test_the_their_stream_arm_parses():
     from puckpilot.season.add_gate import parse_arm
 
     assert parse_arm("odds-daily-ts").their_stream and not parse_arm("odds-daily").their_stream
+
+
+def test_the_live_their_stream_knob_is_off_by_default():
+    from puckpilot.season.authority import TransactionAuthority
+
+    assert TransactionAuthority().their_stream is False

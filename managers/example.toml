@@ -176,6 +176,10 @@ max_pending = 5
 # seasons for you to set; 0 = only the never-drop keeper list protects them.
 # keeper_weight = 0.0
 
+# Price this week's opponent with the goalie starts he will add during it,
+# from his own in-week goalie adds so far. Off until the add gate says.
+# their_stream = false
+
 
 [authority.standing]
 # Moves approved in advance: a ROTATION player's drop, each still shown on the
