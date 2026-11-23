@@ -377,6 +377,10 @@ def _reason(t, week: int, horizon: str = "") -> dict:
         # The reasons behind it, section -> lines (season/add_story.py).
         "detail": getattr(t, "detail", {}) or {},
     }
+    if getattr(t, "drop_terms", ""):
+        # Why the drop rule let the drop go - what a standing approval of
+        # upgrades checks (season/standing.py).
+        out["drop_terms"] = t.drop_terms
     if horizon:
         # Priced against another week than the one under way ("next week").
         out["horizon"] = horizon

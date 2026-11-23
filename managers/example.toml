@@ -201,5 +201,10 @@ make_room = true     # drop one so a player back from IR can play (no acquisitio
 same_kind = true     # a free agent for one of the same kind: goalie for goalie, skater for skater
 cross_kind = false   # a skater for a goalie, or the reverse
 
+# Also an Upgrade only player's drop, when the add is worth more over the rest
+# of the season (by the upgrade margin) - the only way an Upgrade only player
+# goes. Never a make-room drop or a swap for the goalie floor.
+upgrades = false
+
 # Moves made without a tap in a week; leave out for only the league's own cap.
 # max_per_week = 2

@@ -233,6 +233,12 @@ class AddTarget:
     # The drop's tier when the search chose the swap (`season.tiers`): what
     # the replay's standing-approval arm makes at once.
     drop_tier: str = ""
+    # Why the drop rule let the drop go (`DROP_TERMS`): "rotation" (a Rotation
+    # player), "upgrade" (worth less over the rest of the season than the add,
+    # by the upgrade margin), "floor" (a skater out to bring a goalie up to the
+    # floor). Empty: not judged by the rule (a re-priced card). Standing
+    # approval covers an Upgrade-only drop only on "upgrade".
+    drop_terms: str = ""
 
     def moved(self, limit: int = 4) -> str:
         """The biggest category changes, in the league's own units and labels."""
@@ -1544,6 +1550,14 @@ def _targets(
         )
         return tiers.clears(incoming, keep.get(p.player_key, 0.0), upgrade_margin)
 
+    def drop_terms(p, cand) -> str:
+        """Which of may_drop's grounds let `p` go for `cand` (it did)."""
+        if placed[p.player_key].tier is tiers.Tier.ROTATION:
+            return "rotation"
+        if below_floor and cand.position == "G":
+            return "floor"
+        return "upgrade"
+
     # Cheap screen: his rate times the games he would actually fill - days his
     # team plays AND a slot he can take is empty. Ranking by team games alone
     # favoured a four-game week that lands on nights the lineup is already full.
@@ -1715,6 +1729,7 @@ def _targets(
         best = replace(
             best,
             drop_tier=placed[best.drop.player_key].tier.value if best.drop is not None else "",
+            drop_terms=drop_terms(best.drop, best.player) if best.drop is not None else "",
             detail=_explain(
                 conn,
                 runtime,

@@ -544,6 +544,11 @@ class StandingApproval:
     make_room: bool = True
     same_kind: bool = True
     cross_kind: bool = False
+    # Also an Upgrade-only player's drop, when the search let him go as an
+    # upgrade: the add is worth more over the rest of the season, by the
+    # upgrade margin (`season.tiers`). Never a make-room drop - nothing comes
+    # in to be worth more - and never one in for the goalie floor.
+    upgrades: bool = False
     # Moves made without a tap in a week. None: the league's own weekly cap
     # and the playoff reserve are the only bound, as for a tapped move.
     max_per_week: int | None = None
@@ -576,8 +581,13 @@ class StandingApproval:
             if self.veto_minutes
             else "made on the run that shows it - no window to stop it"
         )
+        whose = (
+            "a ROTATION player's drop, or an UPGRADE ONLY player's for a better one"
+            if self.upgrades
+            else "a ROTATION player's drop"
+        )
         return [
-            "Moves without a tap: a ROTATION player's drop, approved in advance -",
+            f"Moves without a tap: {whose}, approved in advance -",
             f"  covers: {', '.join(kinds) or 'nothing'}",
             f"  each one {window}",
             (
@@ -585,7 +595,13 @@ class StandingApproval:
                 if self.max_per_week is not None
                 else "  no weekly limit beyond the league's own"
             ),
-            "  a drop set to Never or Upgrade only, or a Stop on the card, is never made this way",
+            (
+                "  a drop set to Never, an Upgrade only drop that is not an upgrade, or a Stop"
+                " on the card, is never made this way"
+                if self.upgrades
+                else "  a drop set to Never or Upgrade only, or a Stop on the card, is never made"
+                " this way"
+            ),
         ]
 
 

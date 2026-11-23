@@ -71,6 +71,41 @@ def test_a_rotation_drop_is_offered_once_and_an_upgrade_only_one_says_why_not(db
     assert offer(db) == []
 
 
+UPGRADES = StandingApproval(enabled=True, veto_minutes=120, upgrades=True)
+
+
+def test_with_upgrades_on_an_upgrade_only_drop_is_covered_only_on_an_upgrade(db):
+    from dataclasses import replace
+
+    [up] = make(db, replace(target(), drop_terms="upgrade"))
+    assert up.reason["drop_terms"] == "upgrade"
+    assert standing.refusal(up, GRANT, UPGRADE, roster(), True) == (
+        "Drop Me is Upgrade only, not Rotation"
+    )  # the grant as it was: Rotation only
+    assert standing.refusal(up, UPGRADES, UPGRADE, roster(), True) == ""
+    for terms in ("floor", "rotation", None):
+        card = proposals.annotate(db, up.id, drop_terms=terms)
+        assert "not an upgrade" in standing.refusal(card, UPGRADES, UPGRADE, roster(), True)
+    never = {"p.drop": tiers.Placement(tiers.Tier.NEVER, tiers.YOU, "set by you")}
+    assert "Never" in standing.refusal(up, UPGRADES, never, roster(), True)
+
+
+def test_an_upgrade_offer_survives_an_upgrade_pin_but_not_never_or_the_grant_off(db):
+    from dataclasses import replace
+
+    [p] = make(db, replace(target(), drop_terms="upgrade"))
+    (got,) = offer(db, grant=UPGRADES, placed=UPGRADE)
+    assert got.reason["standing"]["tier"] == "upgrade"
+    show(db)
+    later = T0 + timedelta(minutes=121)
+    tiers.pin(db, "jimmy", LK, "p.drop", tiers.Tier.UPGRADE, name="Drop Me")
+    assert standing._since(p, got.reason["standing"], UPGRADES, tiers.pins(db, "jimmy", LK)) == ""
+    assert "no longer covered" in standing._since(p, got.reason["standing"], GRANT, {})
+    tiers.pin(db, "jimmy", LK, "p.drop", tiers.Tier.NEVER, name="Drop Me")
+    approved, back = due(db, later, grant=UPGRADES)
+    assert approved == [] and "Never" in back[0][1]
+
+
 def test_what_a_standing_approval_does_not_cover(db, monkeypatch):
     [p] = make(db, target())
 

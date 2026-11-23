@@ -696,6 +696,12 @@ def test_an_add_that_is_an_upgrade_may_replace_anyone(db):
         stream_spots=1,
     )
     assert sorted(t.drop.name for t in got) == ["Depth", "Mid"]
+    # Each says on what terms the drop rule let him go: Depth rotates, Mid is
+    # upgraded on - what a standing approval of upgrades reads.
+    assert {t.drop.name: (t.drop_tier, t.drop_terms) for t in got} == {
+        "Depth": ("rotation", "rotation"),
+        "Mid": ("upgrade", "upgrade"),
+    }
 
 
 def test_priced_by_the_odds_an_add_says_what_it_moves(db):

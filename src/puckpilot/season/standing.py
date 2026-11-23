@@ -29,6 +29,13 @@ numbers does not withdraw it - he agreed to the card as it was shown - and
 whatever makes a move impossible (the add taken, the drop gone) is the
 executor's check, as for a tapped move.
 
+With `upgrades` on (asked for 2026-11-23: "the upgrade tier should make moves
+automatically if it's an upgrade"), an Upgrade-only drop is covered too, but
+only on a card the search let go as an upgrade (`drop_terms` "upgrade": the
+add worth more over the rest of the season by the upgrade margin). A card
+that does not say so - a make-room drop, a goalie-floor swap, a re-priced
+card - waits for a tap.
+
 `PUCKPILOT_STANDING_OFF=1` stops every one: a covered card is then an
 ordinary card again, waiting for a tap.
 """
@@ -100,7 +107,10 @@ def refusal(p, grant, placed, roster, executes: bool, kinds=None, used: int = 0)
     where = (placed or {}).get(p.drop_player_key)
     if drop is None or where is None:
         return f"{p.drop_name} is not on the roster"
-    if where.tier is not tiers.Tier.ROTATION:
+    if where.tier is tiers.Tier.UPGRADE and getattr(grant, "upgrades", False):
+        if what == "make_room" or p.reason.get("drop_terms") != "upgrade":
+            return f"{p.drop_name} is Upgrade only, and this is not an upgrade on him"
+    elif where.tier is not tiers.Tier.ROTATION:
         return f"{p.drop_name} is {where.tier.label}, not Rotation"
     if not grant.covers(what):
         return f"{COVERS[what]} are not covered"
@@ -158,6 +168,7 @@ def offer(
             p.id,
             standing={
                 "kind": move_kind(p, drop, p.reason.get("add_position")),
+                "tier": placed[p.drop_player_key].tier.value,
                 "tier_source": placed[p.drop_player_key].source,
                 "grant": grant_hash(grant),
                 "window": grant.veto_minutes,
@@ -217,9 +228,16 @@ def _since(p, st: dict, grant, pins) -> str:
     if not grant.covers(str(st.get("kind", ""))):
         return f"{COVERS.get(str(st.get('kind', '')), 'these moves')} are no longer covered"
     pin = pins.get(p.drop_player_key)
-    if pin is not None and pin is not tiers.Tier.ROTATION:
+    as_upgrade = st.get("tier") == tiers.Tier.UPGRADE.value
+    if as_upgrade and not getattr(grant, "upgrades", False):
+        return "upgrades are no longer covered"
+    # An upgrade stays one whatever his tier short of Never; a Rotation offer
+    # is withdrawn by any pin off Rotation.
+    if pin is tiers.Tier.NEVER or (
+        pin is not None and not as_upgrade and pin is not tiers.Tier.ROTATION
+    ):
         return f"you set {p.drop_name} to {pin.label}"
-    if pin is None and st.get("tier_source") == tiers.YOU:
+    if pin is None and not as_upgrade and st.get("tier_source") == tiers.YOU:
         return f"you took Rotation off {p.drop_name}"
     return ""
 
